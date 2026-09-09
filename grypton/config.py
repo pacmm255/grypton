@@ -37,6 +37,7 @@ TARGETS_DIR = ENGAGEMENTS_DIR                    # compatibility alias for core 
 RUNTIME_DIR = STATE_DIR / "runtime"
 LOG_DIR = RUNTIME_DIR / "logs"
 PROVIDER_DIR = STATE_DIR / "providers"
+TARGET_DATA_DIR = GRYPTON_HOME / "target"
 RESOURCES_DIR = PACKAGE_DIR / "resources"
 PROMPTS_DIR = RESOURCES_DIR / "prompts"
 SKILLS_DIR = RESOURCES_DIR / "skills"
@@ -63,6 +64,12 @@ VALIDATOR_PROVIDER = "openai"
 VALIDATOR_MODEL = os.environ.get("GRYPTON_VALIDATOR_MODEL", "gpt-6-astra")
 VALIDATOR_EFFORT = os.environ.get("GRYPTON_VALIDATOR_EFFORT", "max")
 MANAGER_KIND = "opencode"
+ASTRA_AUTO_SEVERITIES = frozenset({"P1", "P2"})
+
+
+def astra_auto_validation_required(severity: str) -> bool:
+    """Return whether a claimed severity requires automatic Astra review."""
+    return str(severity or "").strip().upper() in ASTRA_AUTO_SEVERITIES
 
 WORKER_MODEL_ALIASES = {
     "glm": "zai-coding-plan/glm-5.3",
@@ -192,7 +199,10 @@ class GryptonConfig:
 
 def ensure_layout() -> None:
     """Create Grypton's private runtime directories (idempotent)."""
-    for d in (STATE_DIR, ENGAGEMENTS_DIR, RUNTIME_DIR, LOG_DIR, PROVIDER_DIR):
+    for d in (
+        STATE_DIR, ENGAGEMENTS_DIR, RUNTIME_DIR, LOG_DIR, PROVIDER_DIR,
+        TARGET_DATA_DIR,
+    ):
         d.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(d, 0o700)
 

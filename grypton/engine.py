@@ -5,10 +5,10 @@ Each iteration:
   2. Engine detects deltas (new findings / surface) from the workspace ledgers,
      runs anti-fabrication checks, and computes an exhaustion signal.
   3. Manager (Kryptex) is given full vision of the turn + all docs and returns a
-     structured directive (assessment, corrections, new angles, severity verdicts,
-     expansion strategy, scope enforcement).
-  4. Engine applies severity verdicts, enforces non-stop, persists state, surfaces
-     status to the user, and feeds the next directive back to the worker.
+     structured directive (assessment, corrections, new angles, expansion
+     strategy, scope enforcement).
+  4. Engine sends new P1/P2 findings to independent Astra validation, persists
+     state, surfaces status to the user, and feeds the next directive to the worker.
 
 The loop only ends on: explicit user stop, a hard scope/authorization violation
 flagged by the manager, or an unrecoverable fault after retries (I3).
@@ -245,7 +245,8 @@ class Engine:
         self.emit("status", text=(
             f"Kraude online ({config.WORKER_MODEL} · {config.WORKER_EFFORT}). "
             f"Kryptex uses {config.MANAGER_MODEL} · {config.MANAGER_EFFORT}; "
-            f"findings route independently to {config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT}."))
+            f"P1/P2 findings route automatically to {config.VALIDATOR_MODEL} · "
+            f"{config.VALIDATOR_EFFORT}."))
 
     # ----------------------------------------------------------- main loop
 
@@ -355,11 +356,21 @@ class Engine:
                     directive_text = "Continue hunting with full depth; expand the surface if blocked."
                     continue
 
-            # The manager does not grade its own worker.  Every newly recorded
-            # finding goes through a fresh Astra max process, and only those
-            # independent verdicts are allowed into the workspace ledger.
+            # The manager does not grade its own worker. Astra automatically
+            # reviews only claimed P1/P2 findings. Lower severities remain
+            # recorded without a validator call unless the operator explicitly
+            # requests one through `grypton validate`.
             directive.severity_validations = []
-            for finding in new_findings:
+            auto_findings = self._automatic_validation_candidates(new_findings)
+            skipped = [finding for finding in new_findings if finding not in auto_findings]
+            for finding in skipped:
+                if finding.get("status") != "suppressed-by-scope":
+                    self.emit("status", text=(
+                        f"Astra not called for {finding.get('id')} "
+                        f"({finding.get('severity', '?')}): automatic validation is P1/P2 only. "
+                        f"Use `grypton validate {self.slug} {finding.get('id')}` to request it."
+                    ))
+            for finding in auto_findings:
                 if self.stop_requested:
                     break
                 self.emit("validation_start", finding_id=finding.get("id"),
@@ -506,6 +517,14 @@ class Engine:
             user_messages=user_msgs, new_findings=new_findings,
             p1_count=len(self.ws.confirmed_p1s()),
         )
+
+    @staticmethod
+    def _automatic_validation_candidates(findings: list[dict]) -> list[dict]:
+        return [
+            finding for finding in findings
+            if finding.get("status") != "suppressed-by-scope"
+            and config.astra_auto_validation_required(finding.get("severity", ""))
+        ]
 
     def _apply_manager(self, directive, new_findings, ctx) -> None:
         if directive is None:

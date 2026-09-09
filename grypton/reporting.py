@@ -86,8 +86,21 @@ def audit_workspace(ws) -> dict:
     ]
 
     unvalidated = []
+    validation_not_requested = []
     for finding in findings:
         verdict = finding.get("manager_verdict") or {}
+        explicitly_reviewed = (
+            isinstance(finding.get("manager_verdict"), dict) and bool(verdict)
+        )
+        if finding.get("status") == "suppressed-by-scope" and not explicitly_reviewed:
+            continue
+        automatic = (
+            finding.get("status") != "suppressed-by-scope"
+            and config.astra_auto_validation_required(finding.get("severity", ""))
+        )
+        if not automatic and not explicitly_reviewed:
+            validation_not_requested.append(finding.get("id"))
+            continue
         if (verdict.get("validator_model"), verdict.get("validator_effort")) != (
             config.VALIDATOR_MODEL, config.VALIDATOR_EFFORT
         ):
@@ -128,7 +141,7 @@ def audit_workspace(ws) -> dict:
                 "error": str(state.get("error") or state.get("message") or "unknown"),
             })
 
-    target_dir = config.GRYPTON_HOME / "target"
+    target_dir = config.TARGET_DATA_DIR
     target_dir_empty = target_dir.is_dir() and not any(target_dir.iterdir())
     result = {
         "target": ws.load_meta().target,
@@ -150,6 +163,7 @@ def audit_workspace(ws) -> dict:
         "route_errors": route_errors,
         "provider_failures": provider_failures,
         "unvalidated_findings": unvalidated,
+        "validation_not_requested": validation_not_requested,
         "canonical_flow_references": len(references),
         "missing_canonical_flows": missing_flows,
         "scope_violations": scope_violations,
@@ -187,16 +201,23 @@ def render_report(ws) -> str:
     ]
     for finding in findings:
         verdict = finding.get("manager_verdict") or {}
+        astra_state = verdict.get("verdict") or (
+            "pending"
+            if config.astra_auto_validation_required(finding.get("severity", ""))
+            and finding.get("status") != "suppressed-by-scope"
+            else "not requested"
+        )
         values = [
             finding.get("id", "?"), finding.get("status", "reported"),
-            final_severity(finding), verdict.get("verdict", "pending"),
+            final_severity(finding), astra_state,
             finding.get("title", ""),
         ]
         lines.append("| " + " | ".join(str(v).replace("|", "\\|") for v in values) + " |")
     lines.extend(["", "## Integrity", "",
         f"- Exact provider routes: {'yes' if audit['exact_routes'] else 'no'}",
-        f"- Independently validated findings: "
-        f"{len(findings) - len(audit['unvalidated_findings'])}/{len(findings)}",
+        f"- Required Astra validation gaps: {len(audit['unvalidated_findings'])}",
+        f"- Lower-severity findings not explicitly submitted to Astra: "
+        f"{len(audit['validation_not_requested'])}",
         f"- Missing canonical flow references: {len(audit['missing_canonical_flows'])}",
         f"- Structured scope violations: {len(audit['scope_violations'])}",
         f"- Top-level `target/` empty: {'yes' if audit['target_dir_empty'] else 'no'}",

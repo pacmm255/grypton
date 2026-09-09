@@ -1,9 +1,10 @@
 """Kryptex manager and independent finding validation.
 
 Kryptex is a persistent Muse Spark session in OpenCode Go.  It receives the
-worker's complete turn summary and returns a bounded JSON directive.  Finding
-severity is deliberately outside that session: every new finding is reviewed
-by a fresh, tool-disabled GPT-6 Astra process.
+worker's complete turn summary and returns a bounded JSON directive. Finding
+severity is deliberately outside that session: P1 and P2 findings are reviewed
+automatically by a fresh, tool-disabled GPT-6 Astra process. Lower severities
+reach Astra only after an explicit operator request.
 """
 from __future__ import annotations
 
@@ -224,10 +225,21 @@ class KryptexManager:
                 self.on_event({"type": "manager_fallback", "via": "deterministic", "reason": str(exc)})
             return self._fallback_directive(ctx, str(exc))
 
-    async def validate_severity(self, finding: dict, ctx: ManagerContext) -> dict:
+    async def validate_severity(
+        self,
+        finding: dict,
+        ctx: ManagerContext,
+        *,
+        explicit: bool = False,
+    ) -> dict:
         claimed = str(finding.get("severity") or "P3").upper()
         if claimed not in {"P1", "P2", "P3", "P4", "P5"}:
             claimed = "P3"
+        if not explicit and not config.astra_auto_validation_required(claimed):
+            raise ValueError(
+                f"Automatic Astra validation is limited to P1/P2; "
+                f"explicit review is required for {claimed}."
+            )
         try:
             value = await self.validator.validate(
                 self._build_severity_prompt(finding, ctx), self.severity_schema
@@ -319,7 +331,7 @@ Hard rules:
 - Give an executable next step, named surface, evidence goal, and fallback.
 - Require real tool activity and ledger updates. Do not merely say “continue”.
 - Treat claims without captured evidence as unconfirmed and correct fabrication.
-- `severity_validations` MUST be [] in your JSON. GPT-6 Astra validates each pending finding independently.
+- `severity_validations` MUST be [] in your JSON. GPT-6 Astra automatically validates only P1/P2 findings; the operator may explicitly request review of lower severities.
 - Return only one object matching the schema.
 
 TARGET: {ctx.target}
@@ -337,7 +349,7 @@ WORKER REPORT:
 ANTI-FABRICATION FLAGS:
 {json.dumps(ctx.antifab_flags, ensure_ascii=False)}
 
-PENDING INDEPENDENT ASTRA FINDINGS (do not validate them):
+NEW FINDINGS (do not validate them; the engine applies the P1/P2-only Astra policy):
 {pending}
 
 FINDINGS LEDGER:

@@ -117,7 +117,8 @@ def cmd_init(ns) -> int:
           f"  scope      {', '.join(constraints.in_scope)}\n"
           f"  Kraude     {config.WORKER_MODEL} · {config.WORKER_EFFORT}\n"
           f"  Kryptex    {config.MANAGER_MODEL} · {config.MANAGER_EFFORT}\n"
-          f"  validator  {config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT}\n")
+          f"  validator  {config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT} "
+          f"(automatic for P1/P2 only)\n")
     return _run_engagement(ws, ns, brief=ns.brief or f"Assess {target} within recorded scope.", fresh=True)
 
 
@@ -235,9 +236,84 @@ def cmd_findings(ns) -> int:
     for row in rows:
         verdict = row.get("manager_verdict") or {}
         severity = verdict.get("severity") or row.get("severity") or "?"
+        astra_state = verdict.get("verdict") or (
+            "pending"
+            if config.astra_auto_validation_required(row.get("severity", ""))
+            and row.get("status") != "suppressed-by-scope"
+            else "not-requested"
+        )
         print(f"{row.get('id')}: {severity} · {row.get('status', 'reported')} · "
-              f"Astra={verdict.get('verdict', 'pending')} · {row.get('title', '')}")
+              f"Astra={astra_state} · {row.get('title', '')}")
     return 0
+
+
+async def _validate_requested_findings(ws: Workspace, findings: list[dict]) -> list[dict]:
+    """Run explicit Astra reviews without invoking the Spark manager model."""
+    from .manager import KryptexManager, ManagerContext
+    from .prompts import manager_system
+
+    meta = ws.load_meta()
+    constraints = ws.load_constraints()
+    manager = KryptexManager(
+        ws,
+        manager_system(target=meta.target, target_type=meta.target_type, workspace=ws.root),
+    )
+    context = ManagerContext(
+        target=meta.target,
+        target_type=meta.target_type,
+        turn_index=meta.turn_index,
+        constraints_block=constraints.to_prompt_block(),
+        findings_summary=(ws.root / "findings.md").read_text(
+            encoding="utf-8", errors="replace"
+        )[-12_000:],
+        new_findings=findings,
+        p1_count=len(ws.confirmed_p1s()),
+    )
+    results = []
+    try:
+        for finding in findings:
+            verdict = await manager.validate_severity(finding, context, explicit=True)
+            ws.set_severity_verdict(str(finding.get("id") or ""), verdict)
+            results.append(verdict)
+    finally:
+        await manager.aclose()
+    return results
+
+
+def cmd_validate(ns) -> int:
+    try:
+        ws = _existing_workspace(ns.target)
+    except ValueError as exc:
+        print(f"ERROR: {exc}.", file=sys.stderr)
+        return 2
+    if ns.all and ns.finding_ids:
+        print("ERROR: use finding IDs or --all, not both.", file=sys.stderr)
+        return 2
+    rows = ws.findings.all()
+    by_id = {str(row.get("id") or "").upper(): row for row in rows}
+    if ns.all:
+        selected = rows
+    else:
+        requested = [value.upper() for value in ns.finding_ids]
+        if not requested:
+            print("ERROR: provide at least one finding ID or --all.", file=sys.stderr)
+            return 2
+        missing = [value for value in requested if value not in by_id]
+        if missing:
+            print(f"ERROR: unknown finding ID(s): {', '.join(missing)}.", file=sys.stderr)
+            return 2
+        selected = [by_id[value] for value in requested]
+    if not selected:
+        print("No findings recorded.")
+        return 0
+    results = asyncio.run(_validate_requested_findings(ws, selected))
+    if ns.json:
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+    else:
+        for verdict in results:
+            print(f"{verdict.get('finding_id')}: Astra={verdict.get('verdict')} · "
+                  f"{verdict.get('severity')} · confidence={verdict.get('confidence')}")
+    return 1 if any(verdict.get("degraded") for verdict in results) else 0
 
 
 def cmd_surface(ns) -> int:
@@ -301,7 +377,8 @@ def cmd_audit(ns) -> int:
         print(f"Grypton audit — {ws.slug}: {'PASS' if result['ok'] else 'ATTENTION REQUIRED'}")
         print(f"  exact routes       {'yes' if result['exact_routes'] else 'no'}")
         print(f"  provider failures  {len(result['provider_failures'])}")
-        print(f"  validator gaps     {len(result['unvalidated_findings'])}")
+        print(f"  required gaps      {len(result['unvalidated_findings'])}")
+        print(f"  not requested      {len(result['validation_not_requested'])}")
         print(f"  missing flows      {len(result['missing_canonical_flows'])}")
         print(f"  scope violations   {len(result['scope_violations'])}")
         print(f"  target/ empty      {'yes' if result['target_dir_empty'] else 'no'}")
@@ -348,7 +425,8 @@ def cmd_stop(ns) -> int:
 def cmd_models(ns) -> int:
     print(f"Kraude    {config.WORKER_MODEL} · {config.WORKER_EFFORT} · OpenCode Z.AI Coding Plan\n"
           f"Kryptex   {config.MANAGER_MODEL} · {config.MANAGER_EFFORT} · OpenCode Go\n"
-          f"Validator {config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT} · Codex (fresh per finding)")
+          f"Validator {config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT} · "
+          f"Codex (fresh; automatic P1/P2 only)")
     return 0
 
 
@@ -460,7 +538,7 @@ def _run_options(parser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="grypton",
         description="Autonomous scoped testing with GLM Kraude, Spark Kryptex, and Astra validation")
-    parser.add_argument("--version", action="version", version="Grypton 3.0.0")
+    parser.add_argument("--version", action="version", version="Grypton 3.0.1")
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="Create and immediately run an engagement")
     init.add_argument("target", nargs="?")
@@ -481,6 +559,15 @@ def build_parser() -> argparse.ArgumentParser:
     findings = sub.add_parser("findings", help="List findings with independent verdicts")
     findings.add_argument("target"); findings.add_argument("--json", action="store_true")
     findings.set_defaults(func=cmd_findings)
+    validate = sub.add_parser(
+        "validate",
+        help="Explicitly request Astra review for selected findings (including P3-P5)",
+    )
+    validate.add_argument("target")
+    validate.add_argument("finding_ids", nargs="*")
+    validate.add_argument("--all", action="store_true")
+    validate.add_argument("--json", action="store_true")
+    validate.set_defaults(func=cmd_validate)
     surface = sub.add_parser("surface", help="List recorded attack-surface items")
     surface.add_argument("target"); surface.add_argument("--json", action="store_true")
     surface.set_defaults(func=cmd_surface)
@@ -539,5 +626,6 @@ def worker_main(argv=None) -> int:
 
 def manager_main(argv=None) -> int:
     print(f"Kryptex is pinned to {config.MANAGER_MODEL} · {config.MANAGER_EFFORT}; "
-          f"validation uses {config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT}.")
+          f"automatic P1/P2 validation uses "
+          f"{config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT}.")
     return 0

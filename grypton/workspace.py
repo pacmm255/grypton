@@ -300,10 +300,16 @@ class Workspace:
                        surface: str = "", description: str = "", poc: str = "",
                        evidence: str = "", source: str = "worker") -> dict:
         fid = f"F{len(self.findings.all()) + 1:03d}"
-        rec = {"id": fid, "title": title, "severity": severity.upper(),
+        normalized_severity = severity.upper()
+        initial_status = (
+            "validation-pending"
+            if config.astra_auto_validation_required(normalized_severity)
+            else "validation-not-requested"
+        )
+        rec = {"id": fid, "title": title, "severity": normalized_severity,
                "vuln_class": vuln_class, "surface": surface,
                "description": description, "poc": poc, "evidence": evidence,
-               "source": source, "status": "reported",
+               "source": source, "status": initial_status,
                "manager_verdict": None}
         # scope enforcement (R27): suppress out-of-scope findings from headline
         c = self.load_constraints()
@@ -316,6 +322,8 @@ class Workspace:
     def set_severity_verdict(self, finding_id: str, verdict: dict) -> Optional[dict]:
         def apply(record: dict) -> None:
             record["manager_verdict"] = verdict
+            if record.get("status") == "suppressed-by-scope":
+                return
             value = str(verdict.get("verdict") or "").lower()
             if verdict.get("degraded"):
                 record["status"] = "validation-pending"
@@ -332,19 +340,19 @@ class Workspace:
 
     def confirmed_p1s(self) -> list[dict]:
         out = []
-        for f in self.findings.all():
+        for f in self.confirmed_findings():
             v = f.get("manager_verdict") or {}
             sev = (v.get("severity") or f.get("severity") or "").upper()
-            if SEVERITY_RANK.get(sev) == 1 and v.get("verdict") in ("confirm", "agree", "upgrade", None):
-                if v.get("verdict") != "reject":
-                    out.append(f)
+            if SEVERITY_RANK.get(sev) == 1:
+                out.append(f)
         return out
 
     def confirmed_findings(self) -> list[dict]:
         decisive = {"confirm", "agree", "upgrade", "downgrade"}
         return [
             finding for finding in self.findings.all()
-            if str((finding.get("manager_verdict") or {}).get("verdict") or "").lower()
+            if finding.get("status") != "suppressed-by-scope"
+            and str((finding.get("manager_verdict") or {}).get("verdict") or "").lower()
             in decisive
         ]
 

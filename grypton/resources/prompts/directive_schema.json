@@ -32,7 +32,7 @@
     },
     "severity_validations": {
       "type": "array",
-      "description": "Independent severity verdicts for any new findings. Empty array if none this turn.",
+      "description": "Reserved for independent validation and always empty in Spark output.",
       "items": {
         "type": "object",
         "additionalProperties": false,

@@ -13,7 +13,7 @@ from .providers import append_jsonl
 from .workspace import Workspace
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "grypton", "version": "3.0.0"}
+SERVER_INFO = {"name": "grypton", "version": "3.0.1"}
 
 
 def _workspace() -> Workspace:

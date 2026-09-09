@@ -45,6 +45,9 @@ def engagement_summary(slug: str) -> dict:
                 (row.get("manager_verdict") or {}).get("verdict") == "needs-more-evidence"
                 for row in findings
             ),
+            "validation_not_requested": sum(
+                row.get("status") == "validation-not-requested" for row in findings
+            ),
             "validated": sum(isinstance(row.get("manager_verdict"), dict) for row in findings),
             "flows": len(list(ws.flows_dir.glob("flow-*.http"))),
             "tool_calls": len(_jsonl(ws.root / ".ledger/tool-calls.jsonl", 100_000)),
@@ -54,7 +57,7 @@ def engagement_summary(slug: str) -> dict:
 
 def dashboard_state() -> dict:
     engagements = [engagement_summary(slug) for slug in reversed(list_targets())]
-    return {"version": "3.0.0", "models": {
+    return {"version": "3.0.1", "models": {
         "worker": {"name": "Kraude", "route": config.WORKER_MODEL, "effort": config.WORKER_EFFORT},
         "manager": {"name": "Kryptex", "route": config.MANAGER_MODEL, "effort": config.MANAGER_EFFORT},
         "validator": {"name": "Validator", "route": config.VALIDATOR_MODEL, "effort": config.VALIDATOR_EFFORT}},
@@ -88,7 +91,7 @@ def engagement_detail(slug: str) -> dict:
 
 def make_server(port: int = 8765) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
-        server_version = "Grypton/3.0"
+        server_version = "Grypton/3.0.1"
         sys_version = ""
 
         def log_message(self, format, *args):

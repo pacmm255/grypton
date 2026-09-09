@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 from typing import Callable, Optional
 
+from . import config
 from .manager import Directive, ManagerContext
 from .worker import TurnResult
 
@@ -19,7 +20,6 @@ class MockWorker:
     def __init__(self, ws, on_event: Optional[Callable] = None,
                  script: Optional[Callable] = None):
         from types import SimpleNamespace
-        from . import config as _cfg
         self.ws = ws
         self.on_event = on_event
         self.script = script or self._default_script
@@ -27,7 +27,7 @@ class MockWorker:
         self.session_id = "mock-session"
         self._started = False
         # mimic KraudeWorker's .spec.model so engine model-swap logic works in tests
-        self.spec = SimpleNamespace(model=_cfg.WORKER_MODEL, cwd=ws.root,
+        self.spec = SimpleNamespace(model=config.WORKER_MODEL, cwd=ws.root,
                                     session_uuid="mock-session")
 
     async def start(self):
@@ -161,11 +161,17 @@ class MockManager:
             to_user=f"Turn {ctx.turn_index}: {len(ctx.new_findings)} new finding(s); directing next probe.",
             cont=True, confidence=0.8)
 
-    async def validate_severity(self, finding: dict, ctx: ManagerContext) -> dict:
+    async def validate_severity(self, finding: dict, ctx: ManagerContext,
+                                *, explicit: bool = False) -> dict:
         await asyncio.sleep(0)
+        severity = finding.get("severity", "P3")
+        if not explicit and not config.astra_auto_validation_required(severity):
+            raise ValueError("Automatic Astra validation is limited to P1/P2.")
         return {"finding_id": finding.get("id"), "verdict": "confirm",
-                "severity": finding.get("severity", "P3"), "confidence": 0.85,
-                "reasoning": "Independently reproduced."}
+                "severity": severity, "confidence": 0.85,
+                "reasoning": "Independently reproduced.",
+                "validator_model": config.VALIDATOR_MODEL,
+                "validator_effort": config.VALIDATOR_EFFORT}
 
     async def chat(self, user_message: str, ctx: ManagerContext) -> dict:
         await asyncio.sleep(0)

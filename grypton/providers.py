@@ -451,7 +451,7 @@ class OpenCodeClient:
 
 
 class CodexValidator:
-    """A fresh, tool-disabled GPT-6 Astra process for each finding."""
+    """A fresh, tool-disabled GPT-6 Astra process for each requested review."""
 
     def __init__(self, workspace: Path, target_slug: str):
         self.workspace = workspace.resolve()
@@ -461,7 +461,10 @@ class CodexValidator:
 
     async def validate(self, prompt: str, schema: dict, *, timeout: float = 900) -> dict:
         binary = config.require_binary("codex")
-        runtime = private_dir(config.PROVIDER_DIR / self.target_slug / "validator-call")
+        runtime = private_dir(
+            config.PROVIDER_DIR / self.target_slug
+            / f"validator-call-{os.getpid()}-{time.time_ns()}"
+        )
         schema_path = runtime / "schema.json"
         answer_path = runtime / "answer.json"
         atomic_json(schema_path, schema)

@@ -3,7 +3,7 @@
 Grypton is an autonomous, persistent security-testing orchestrator derived from
 Krypton's working loop. Kraude performs scoped work with real tools, Kryptex
 reviews every turn and supplies the next move, and a separate validator reviews
-new findings.
+P1/P2 findings automatically.
 
 | Role | Runner and plan | Exact route | Effort |
 | --- | --- | --- | --- |
@@ -11,9 +11,11 @@ new findings.
 | Kryptex, manager | OpenCode / Go | `opencode-go/muse-spark-1.3-contributor` | `xhigh` |
 | Validator | Codex | `gpt-6-astra` | `max` |
 
-Spark never validates its own worker. For each newly recorded finding, Grypton
-collects the explicitly referenced workspace artifacts and starts a fresh,
-ephemeral, tool-disabled Astra process with a strict verdict schema.
+Spark never validates its own worker. For each newly recorded P1/P2 finding,
+Grypton collects the explicitly referenced workspace artifacts and starts a
+fresh, ephemeral, tool-disabled Astra process with a strict verdict schema.
+P3–P5 findings remain recorded without an Astra call unless the operator uses
+the explicit `validate` command.
 
 ## Start an engagement
 
@@ -36,6 +38,8 @@ Useful controls:
 ./grypton status --json
 ./grypton show example-test
 ./grypton findings example-test
+./grypton validate example-test F003
+./grypton validate example-test --all
 ./grypton surface example-test
 ./grypton history example-test
 ./grypton scope example-test
@@ -54,12 +58,12 @@ to Kryptex during the run, `/worker ...` to relay directly to Kraude, or `/stop`
 Ctrl-C and `grypton stop` terminate an active provider process instead of waiting
 for its full turn timeout.
 
-Finding status follows the independent verdict: `confirmed`,
-`needs-more-evidence`, `rejected`, or `validation-pending`. The dashboard and
-CLI show confirmed findings separately from recorded candidates. `audit`
-checks model routes, provider exits, validator coverage, scope, flow references,
-and the required empty `target/` directory; `report` renders the same corrected
-ledger state as Markdown or JSON.
+P1/P2 findings start as `validation-pending` and then follow the independent
+verdict: `confirmed`, `needs-more-evidence`, or `rejected`. P3–P5 findings start
+as `validation-not-requested`; `grypton validate TARGET FINDING` submits one to
+Astra explicitly. The dashboard and CLI show confirmed findings separately from
+recorded candidates. `audit` checks required validator coverage, model routes,
+provider exits, scope, flow references, and the empty `target/` directory.
 
 State is private under `.state/engagements/<slug>/`. The requested top-level
 `target/` directory stays empty, and this fork does not create a `targets/`

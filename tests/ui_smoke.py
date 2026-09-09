@@ -53,7 +53,12 @@ def main() -> None:
                 "finding_id": finding["id"], "verdict": "confirm", "severity": "P3",
                 "confidence": 0.9, "reasoning": "Synthetic independent fixture verdict.",
                 "independent_checks": [], "exploitability": "Synthetic fixture only.",
+                "validator_model": config.VALIDATOR_MODEL,
+                "validator_effort": config.VALIDATOR_EFFORT,
             })
+            ws.record_finding(title="Synthetic low-priority candidate", severity="P4",
+                              description="Astra review was not explicitly requested.",
+                              source="fixture")
             ws.flows_dir.mkdir(parents=True, exist_ok=True)
             (ws.flows_dir / "flow-smoke.http").write_text(
                 "### REQUEST\nGET http://127.0.0.1:18767/api/profile?id=2\n\n### RESPONSE\nHTTP 200\n",
@@ -91,7 +96,8 @@ def main() -> None:
                     page.get_by_text("FINDINGS / ASTRA VERDICTS", exact=True).wait_for()
                     assert page.locator(".team-card").count() == 3
                     assert page.locator(".case-item").count() == 1
-                    assert page.locator("#count-findings").inner_text() == "1/1"
+                    assert page.locator("#count-findings").inner_text() == "1/2"
+                    assert page.get_by_text("not-requested", exact=True).is_visible()
                     assert page.get_by_text(config.WORKER_MODEL, exact=True).is_visible()
                     assert page.get_by_text(config.MANAGER_MODEL, exact=True).is_visible()
                     assert page.get_by_text(config.VALIDATOR_MODEL, exact=True).is_visible()

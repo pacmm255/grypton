@@ -14,7 +14,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from grypton import config
-from grypton.cli import build_parser
+from grypton.cli import _validate_requested_findings, build_parser
 from grypton.engine import Engine
 from grypton.manager import KryptexManager, ManagerContext, _check_schema, _extract_json
 from grypton.providers import MCP_TIMEOUT_MS, OpenCodeResult
@@ -37,6 +37,7 @@ def isolated_runtime():
             "RUNTIME_DIR": root / ".state/runtime",
             "LOG_DIR": root / ".state/runtime/logs",
             "PROVIDER_DIR": root / ".state/providers",
+            "TARGET_DATA_DIR": root / "target",
         }
         with patch.multiple(config, **values):
             config.ensure_layout()
@@ -87,6 +88,10 @@ class CliTests(unittest.TestCase):
         self.assertEqual(config.MANAGER_EFFORT, "xhigh")
         self.assertEqual(config.VALIDATOR_MODEL, "gpt-6-astra")
         self.assertEqual(config.VALIDATOR_EFFORT, "max")
+        self.assertEqual(config.ASTRA_AUTO_SEVERITIES, {"P1", "P2"})
+        self.assertTrue(config.astra_auto_validation_required("p1"))
+        self.assertTrue(config.astra_auto_validation_required("P2"))
+        self.assertFalse(config.astra_auto_validation_required("P3"))
         self.assertEqual(config.PROMPTS_DIR, config.PACKAGE_DIR / "resources" / "prompts")
         self.assertTrue((config.PROMPTS_DIR / "worker_system.md").is_file())
 
@@ -95,6 +100,9 @@ class CliTests(unittest.TestCase):
         for command in ("show", "findings", "surface", "history", "scope", "audit", "report"):
             parsed = parser.parse_args([command, "example-test"])
             self.assertEqual(parsed.target, "example-test")
+        validate = parser.parse_args(["validate", "example-test", "F003"])
+        self.assertEqual(validate.target, "example-test")
+        self.assertEqual(validate.finding_ids, ["F003"])
 
     def test_cli_exits_when_engine_stops_with_stdin_still_open(self):
         repo = Path(__file__).resolve().parents[1]
@@ -194,13 +202,27 @@ class ToolTests(unittest.TestCase):
 
     def test_read_only_engagement_audit_and_report(self):
         with isolated_runtime() as root, patch.object(config, "GRYPTON_HOME", root):
-            (root / "target").mkdir()
             ws = Workspace("report")
             ws.create("127.0.0.1", "web")
             ws.save_constraints(Constraints(in_scope=["127.0.0.1"]))
+            low = ws.record_finding(title="Low candidate", severity="P3")
+            self.assertEqual(low["status"], "validation-not-requested")
             result = audit_workspace(ws)
             self.assertTrue(result["ok"], result)
             self.assertTrue(result["target_dir_empty"])
+            self.assertEqual(result["validation_not_requested"], [low["id"]])
+            high = ws.record_finding(title="High candidate", severity="P2")
+            self.assertEqual(high["status"], "validation-pending")
+            result = audit_workspace(ws)
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["unvalidated_findings"], [high["id"]])
+            ws.set_severity_verdict(high["id"], {
+                "finding_id": high["id"], "verdict": "confirm", "severity": "P2",
+                "confidence": 0.9, "validator_model": config.VALIDATOR_MODEL,
+                "validator_effort": config.VALIDATOR_EFFORT,
+            })
+            result = audit_workspace(ws)
+            self.assertTrue(result["ok"], result)
             self.assertIn("# Grypton report", render_report(ws))
 
 
@@ -250,6 +272,45 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             for index in range(5):
                 self.assertIn(f"capture-{index}", snapshot)
 
+    async def test_lower_severity_requires_explicit_astra_request(self):
+        with isolated_runtime():
+            ws = Workspace("explicit-validation")
+            ws.create("127.0.0.1", "web")
+            finding = ws.record_finding(title="Medium candidate", severity="P3")
+            manager = KryptexManager(ws, "system")
+            manager.validator.validate = AsyncMock(return_value={
+                "finding_id": finding["id"], "verdict": "confirm", "severity": "P3",
+                "confidence": 0.8, "reasoning": "Explicitly reviewed.",
+                "independent_checks": [], "exploitability": "Evidence supports the claim.",
+            })
+            context = ManagerContext(target="127.0.0.1", target_type="web", turn_index=1)
+            with self.assertRaisesRegex(ValueError, "limited to P1/P2"):
+                await manager.validate_severity(finding, context)
+            manager.validator.validate.assert_not_awaited()
+            verdict = await manager.validate_severity(finding, context, explicit=True)
+            self.assertEqual(verdict["validator_model"], config.VALIDATOR_MODEL)
+            manager.validator.validate.assert_awaited_once()
+
+    async def test_explicit_cli_helper_validates_and_persists_lower_severity(self):
+        with isolated_runtime():
+            ws = Workspace("cli-validation")
+            ws.create("127.0.0.1", "web")
+            finding = ws.record_finding(title="Low candidate", severity="P4")
+            verdict = {
+                "finding_id": finding["id"], "verdict": "confirm", "severity": "P4",
+                "confidence": 0.9, "reasoning": "Explicit review result.",
+                "independent_checks": [], "exploitability": "Low impact.",
+                "validator_model": config.VALIDATOR_MODEL,
+                "validator_effort": config.VALIDATOR_EFFORT,
+            }
+            with patch.object(
+                KryptexManager, "validate_severity", AsyncMock(return_value=verdict)
+            ) as validate:
+                results = await _validate_requested_findings(ws, [finding])
+            self.assertEqual(results, [verdict])
+            self.assertTrue(validate.await_args.kwargs["explicit"])
+            self.assertEqual(ws.findings.all()[0]["status"], "confirmed")
+
 
 class WorkerEventTests(unittest.TestCase):
     def test_tool_error_text_is_rendered_and_retained(self):
@@ -273,6 +334,24 @@ class WorkerEventTests(unittest.TestCase):
 
 
 class EngineTests(unittest.IsolatedAsyncioTestCase):
+    def test_automatic_validation_candidates_are_only_p1_and_p2(self):
+        findings = [
+            {"id": "F001", "severity": "P1", "status": "validation-pending"},
+            {"id": "F002", "severity": "P2", "status": "validation-pending"},
+            {"id": "F003", "severity": "P3", "status": "validation-not-requested"},
+            {"id": "F004", "severity": "P1", "status": "suppressed-by-scope"},
+        ]
+        selected = Engine._automatic_validation_candidates(findings)
+        self.assertEqual([finding["id"] for finding in selected], ["F001", "F002"])
+
+    def test_unvalidated_p1_is_not_confirmed(self):
+        with isolated_runtime():
+            ws = Workspace("pending-p1")
+            ws.create("127.0.0.1", "web")
+            finding = ws.record_finding(title="Critical candidate", severity="P1")
+            self.assertEqual(finding["status"], "validation-pending")
+            self.assertEqual(ws.confirmed_p1s(), [])
+
     async def test_mock_loop_persists_independent_verdict(self):
         with isolated_runtime():
             old_turns, old_seconds = config.CONFIG.max_turns, config.CONFIG.max_run_seconds

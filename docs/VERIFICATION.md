@@ -16,7 +16,8 @@ git diff --check
 ```
 
 The unit suite covers both `init` target forms, exact route pins, clean CLI
-shutdown, the mock worker-manager-validator loop, Spark/Astra separation,
+shutdown, the P1/P2-only automatic validation gate, explicit lower-severity
+review, the mock worker-manager-validator loop, Spark/Astra separation,
 multi-flow evidence handoff, OpenCode error rendering, the 120-second MCP
 ceiling, scoped captures and replay, explicit port binding, redirect blocking,
 large-response preview limits, complete disk captures, report auditing, and CLI
@@ -53,11 +54,13 @@ For a real engagement, finish with:
 ```bash
 ./bin/grypton audit ENGAGEMENT
 ./bin/grypton findings ENGAGEMENT
+./bin/grypton validate ENGAGEMENT FINDING_ID
 ./bin/grypton report ENGAGEMENT --output report.md
 ```
 
 Acceptance requires exact route and effort pairs, zero provider exit failures,
-an Astra verdict for every finding, zero structured scope violations, no missing
-canonical flow references, and an empty `/root/grypton/target/` directory.
+an Astra verdict for every non-suppressed P1/P2 finding, correct Astra provenance
+for explicitly reviewed P3–P5 findings, zero structured scope violations, no
+missing canonical flow references, and an empty `/root/grypton/target/` directory.
 Tool-level negative results may remain in the history when their error text is
 preserved and the worker handles them without route fallback or scope drift.

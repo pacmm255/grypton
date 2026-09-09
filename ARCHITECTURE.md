@@ -18,7 +18,8 @@ operator / CLI / loopback dashboard
                  |
         workspace ledgers and captures
                  |
-          each new finding
+       P1/P2 automatically
+       P3–P5 when requested
                  v
         fresh Codex validator
         GPT-6 Astra max
@@ -37,13 +38,15 @@ progress. Kryptex returns strict JSON with one concrete next burst. Invalid JSON
 gets one schema repair attempt; provider failure falls back to a deterministic,
 bounded in-scope directive.
 
-Kryptex's severity array is discarded. Each new finding is validated through
-`CodexValidator`, which copies only explicitly referenced artifacts from within
-the engagement workspace into a bounded prompt. The byte budget is divided
-across every cited artifact and includes both ends of large captures, so an
-early HTML response cannot hide a later control. The process uses `gpt-6-astra`
-at `max`, runs ephemerally in a read-only sandbox, disables execution features,
-requires a JSON schema, and is rejected if the event stream reports tool use.
+Kryptex's severity array is discarded. New P1/P2 findings are validated through
+`CodexValidator`; P3–P5 findings remain `validation-not-requested` unless the
+operator runs `grypton validate TARGET FINDING`. The validator copies only
+explicitly referenced workspace artifacts into a bounded prompt. Its byte
+budget is divided across every cited artifact and includes both ends of large
+captures, so an early HTML response cannot hide a later control. The process
+uses `gpt-6-astra` at `max`, runs ephemerally in a read-only sandbox, disables
+execution features, requires a JSON schema, and is rejected if its event stream
+reports tool use.
 
 ## Scope and observability
 
@@ -72,9 +75,10 @@ Authentication probes have a cumulative turn-to-turn budget. A target defense
 signal ends that probe family immediately instead of being retried or evaded.
 
 `grypton audit` reads the canonical ledgers and verifies route pins, clean
-provider exits, Astra coverage, network scope, referenced flow existence, and
-the empty top-level `target/`. `grypton report` renders those same final verdicts
-without treating every recorded candidate as confirmed.
+provider exits, required P1/P2 Astra coverage, explicitly requested lower-level
+reviews, network scope, referenced flow existence, and the empty top-level
+`target/`. `grypton report` renders those same final verdicts without treating
+every recorded candidate as confirmed.
 
 ## Active modules
 
