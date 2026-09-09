@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.state/
+target/*
+targets/
+build/
+dist/
+*.log
+.env*
+auth.json

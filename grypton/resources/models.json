@@ -1,0 +1,23 @@
+{
+  "worker": {
+    "runner": "opencode",
+    "provider": "zai-coding-plan",
+    "model": "glm-5.3",
+    "effort": "max",
+    "name": "Kraude"
+  },
+  "manager": {
+    "runner": "opencode",
+    "provider": "opencode-go",
+    "model": "muse-spark-1.3-contributor",
+    "effort": "xhigh",
+    "name": "Kryptex"
+  },
+  "validator": {
+    "runner": "codex",
+    "provider": "openai",
+    "model": "gpt-6-astra",
+    "effort": "max",
+    "name": "Validator"
+  }
+}

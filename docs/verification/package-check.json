@@ -1,0 +1,15 @@
+{
+  "ok": true,
+  "python": "3.13.13",
+  "build_warnings": 0,
+  "wheel": "grypton_review-2.0.0-py3-none-any.whl",
+  "checks": [
+    "isolated wheel import",
+    "offline demo",
+    "Markdown report",
+    "packaged prompts",
+    "packaged skills",
+    "packaged dashboard",
+    "no archived source in wheel"
+  ]
+}

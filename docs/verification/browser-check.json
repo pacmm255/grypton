@@ -1,0 +1,18 @@
+{
+  "ok": true,
+  "synthetic_only": true,
+  "viewports": [
+    1440,
+    768,
+    390
+  ],
+  "checks": [
+    "case selection",
+    "search",
+    "status filter",
+    "literal markup",
+    "refresh",
+    "no horizontal overflow",
+    "no browser errors"
+  ]
+}

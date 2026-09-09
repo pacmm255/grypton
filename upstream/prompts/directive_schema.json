@@ -1,0 +1,63 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["assessment", "directive", "corrections", "new_angles", "exhaustion_breaker", "scope_enforcement", "severity_validations", "to_user", "continue", "stop_reason", "confidence"],
+  "properties": {
+    "assessment": {
+      "type": "string",
+      "description": "Your independent read of what the worker just did: what was real, what was weak, what was missed."
+    },
+    "directive": {
+      "type": "string",
+      "description": "The exact next instruction to inject into the worker. Concrete, specific, actionable — like a rally co-driver's call. Never 'keep going'; always say WHAT to do next and HOW."
+    },
+    "corrections": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Specific mistakes, wrong assumptions, or fabrications to correct. Empty array if none."
+    },
+    "new_angles": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Fresh ideas, untried angles, or connections between clues. Empty array if none."
+    },
+    "exhaustion_breaker": {
+      "type": "string",
+      "description": "If the surface looks exhausted, the concrete NEW expansion strategy (more recon, a new attack class, a bypass, deeper JS/schema analysis, research). Empty string if not exhausted."
+    },
+    "scope_enforcement": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "User-constraint violations to flag and how to correct course. Empty array if none."
+    },
+    "severity_validations": {
+      "type": "array",
+      "description": "Independent severity verdicts for any new findings. Empty array if none this turn.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["finding_id", "verdict", "severity", "confidence", "reasoning"],
+        "properties": {
+          "finding_id": { "type": "string" },
+          "verdict": { "type": "string", "enum": ["confirm", "downgrade", "upgrade", "reject", "needs-more-evidence"] },
+          "severity": { "type": "string", "enum": ["P1", "P2", "P3", "P4", "P5"] },
+          "confidence": { "type": "number" },
+          "reasoning": { "type": "string" }
+        }
+      }
+    },
+    "to_user": {
+      "type": "string",
+      "description": "A short, high-signal status line for the human watching. Empty string if nothing to say."
+    },
+    "continue": {
+      "type": "boolean",
+      "description": "Almost always true. False ONLY on a hard scope/authorization/ethics violation that forbids continuing."
+    },
+    "stop_reason": {
+      "type": "string",
+      "description": "Justification if continue is false; empty string otherwise."
+    },
+    "confidence": { "type": "number", "description": "0.0–1.0 confidence in this directive." }
+  }
+}

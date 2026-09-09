@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "krypton-hunter"
+version = "1.0.0"
+description = "Autonomous, non-stop bug-bounty hunter: Codex (Kryptex) manages a single continuous Claude Code session (Kraude)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Pacman / SecYour" }]
+# Zero third-party runtime dependencies — Krypton drives claude + codex as
+# subprocesses and uses only the Python standard library.
+dependencies = []
+
+[project.scripts]
+krypton = "krypton.cli:main"
+krypton-mcp = "krypton.toolserver:mcp_main"
+krypton-tool = "krypton.toolserver:cli_main"
+
+[tool.setuptools]
+packages = ["krypton"]
+
+[tool.setuptools.package-data]
+krypton = ["../prompts/*.md", "../prompts/*.json"]

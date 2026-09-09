@@ -1,0 +1,33 @@
+# Live engagement data — NEVER commit. Cookies, session jars, real findings,
+# attack-surface notes, jsonl ledgers, all belong to specific targets and
+# include real owner-program scope material.
+targets/
+.runtime/
+.claude/
+
+# Init 0 — frozen Claude session used as the runtime seed for each engagement.
+# 434 MB blob (includes a 271 MB jsonl over GitHub's 100 MB hard limit), and
+# contains raw Claude conversation content from the bootstrap session. Each
+# user generates their own locally via `krypton init-0`.
+sessions/
+
+# Per-session bookkeeping written by the engine
+.ledger/
+*.log
+*.log.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+
+# Editor / OS
+.DS_Store
+*.swp
+.vscode/
+.idea/

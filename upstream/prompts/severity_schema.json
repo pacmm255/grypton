@@ -1,0 +1,32 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["finding_id", "verdict", "severity", "confidence", "reasoning", "independent_checks", "exploitability"],
+  "properties": {
+    "finding_id": { "type": "string" },
+    "verdict": {
+      "type": "string",
+      "enum": ["confirm", "downgrade", "upgrade", "reject", "needs-more-evidence"],
+      "description": "Your independent verdict on the worker's claimed severity."
+    },
+    "severity": {
+      "type": "string",
+      "enum": ["P1", "P2", "P3", "P4", "P5"],
+      "description": "The severity YOU assign after independent analysis."
+    },
+    "confidence": { "type": "number", "description": "0.0–1.0" },
+    "reasoning": {
+      "type": "string",
+      "description": "Why. Cite concrete evidence and impact, and whether you reproduced/verified it."
+    },
+    "independent_checks": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Independent checks you performed or that must be performed to confirm. Empty array if none."
+    },
+    "exploitability": {
+      "type": "string",
+      "description": "Realistic exploitability / preconditions / blast radius. Empty string if unknown."
+    }
+  }
+}
