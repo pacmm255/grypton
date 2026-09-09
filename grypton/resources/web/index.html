@@ -4,37 +4,41 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Grypton · Review desk</title>
+  <title>Grypton · Operations console</title>
   <link rel="stylesheet" href="/app.css">
   <script src="/app.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to reviews</a>
   <aside class="sidebar">
-    <a class="brand" href="/" aria-label="Grypton home"><span class="brand-mark">g</span><span>grypton<span class="version">WORKSPACE / 02</span></span></a>
+    <a class="brand" href="/" aria-label="Grypton home"><span class="brand-mark">g</span><span>grypton<span class="version">WORKSPACE / 2.1</span></span></a>
     <div class="nav-label">WORKSPACE</div>
-    <a class="nav-item active" href="#main"><span aria-hidden="true">▦</span> Review desk <span class="nav-count" id="nav-count">0</span></a>
+    <a class="nav-item active" href="#main"><span aria-hidden="true">▦</span> Operations <span class="nav-count" id="nav-count">0</span></a>
     <a class="nav-item" href="#models"><span aria-hidden="true">◇</span> Model team</a>
+    <a class="nav-item" href="#integrity"><span aria-hidden="true">✓</span> Integrity</a>
+    <a class="nav-item" href="#lab"><span aria-hidden="true">⌁</span> Validation lab</a>
     <div class="side-note"><span class="small-dot"></span> Local workspace<p>Evidence, assessments, and independent validation in one place.</p><code>grypton --help</code></div>
     <div class="sidebar-bottom">G / THREE ROLES. ONE RECORD.</div>
   </aside>
   <div class="workspace">
-    <header class="topbar"><div><span class="muted">Workspace</span><span class="slash">/</span>Review desk</div><div class="connection"><span class="small-dot" id="connection-dot"></span><span id="connection-label">Connecting</span><span class="top-separator"></span><span id="clock">—</span></div></header>
+    <header class="topbar"><div><span class="muted">Grypton</span><span class="slash">/</span>Operations console</div><div class="connection"><span class="small-dot" id="connection-dot"></span><span id="connection-label">Connecting</span><span class="top-separator"></span><span id="clock">—</span></div></header>
     <main id="main">
-      <section class="page-heading"><div><div class="eyebrow">EVIDENCE → ASSESSMENT → VALIDATION</div><h1>Review desk<span class="title-dot">.</span></h1><p>A clear record of what the evidence supports.</p></div><button id="refresh" class="button" type="button"><span aria-hidden="true">↻</span> Refresh</button></section>
+      <section class="page-heading"><div><div class="eyebrow">KRYPTEX → KRAUDE → ASTRA</div><h1>Operations console<span class="title-dot">.</span></h1><p>Engagement context, model activity, evidence, and independent verdicts.</p></div><button id="refresh" class="button" type="button"><span aria-hidden="true">↻</span> Refresh</button></section>
       <div id="error-banner" class="error-banner" role="alert" hidden></div>
       <section class="metrics" aria-label="Review statistics">
-        <article class="metric"><div class="metric-label">Total cases <span>01</span></div><div class="metric-value" id="count-total">0</div><div class="metric-caption">Your review workspace</div></article>
+        <article class="metric"><div class="metric-label">Engagements <span>01</span></div><div class="metric-value" id="count-total">0</div><div class="metric-caption">Persistent workspaces</div></article>
         <article class="metric"><div class="metric-label">In review <span>02</span></div><div class="metric-value accent" id="count-running">0</div><div class="metric-caption">Work currently in progress</div></article>
-        <article class="metric"><div class="metric-label">Supported claims <span>03</span></div><div class="metric-value" id="count-supported">0</div><div class="metric-caption">Completed live reviews</div></article>
-        <article class="metric"><div class="metric-label">Inconclusive <span>04</span></div><div class="metric-value" id="count-inconclusive">0</div><div class="metric-caption">Review limits remain</div></article>
+        <article class="metric"><div class="metric-label">Findings <span>03</span></div><div class="metric-value" id="count-findings">0</div><div class="metric-caption">Candidates and review records</div></article>
+        <article class="metric"><div class="metric-label">Validated <span>04</span></div><div class="metric-value" id="count-validated">0</div><div class="metric-caption">Independent Astra verdicts</div></article>
       </section>
       <section id="models" class="team-section" aria-label="Configured model team"><div class="section-label">YOUR MODEL TEAM <span class="hairline"></span><span class="quiet-label">EXPLICIT ROUTING</span></div><div id="team" class="team"></div></section>
-      <section class="reviews-section" aria-label="Cases">
-        <div class="section-heading"><h2>Cases <span id="case-count" class="pill">0</span></h2><div class="filters"><label class="search-label"><span aria-hidden="true">⌕</span><input id="search" type="search" placeholder="Search cases…" aria-label="Search cases"></label><select id="filter" aria-label="Filter by review status"><option value="all">All statuses</option><option value="draft">Draft</option><option value="running">Running</option><option value="complete">Complete</option><option value="failed">Failed</option><option value="interrupted">Interrupted</option></select></div></div>
-        <div class="review-layout"><div class="case-list" id="case-list" aria-label="Case list"></div><section class="detail-panel" id="detail" aria-label="Selected case"><div class="empty-detail"><span class="empty-symbol" aria-hidden="true">◎</span><h3>Every conclusion needs context.</h3><p>Select a case to see its evidence, review progress, and independent verdict.</p></div></section></div>
+      <section class="reviews-section" aria-label="Engagements">
+        <div class="section-heading"><h2>Engagements <span id="case-count" class="pill">0</span></h2><div class="filters"><label class="search-label"><span aria-hidden="true">⌕</span><input id="search" type="search" placeholder="Search target, claim, or ID…" aria-label="Search engagements"></label><select id="filter" aria-label="Filter by review status"><option value="all">All statuses</option><option value="draft">Draft</option><option value="running">Running</option><option value="complete">Complete</option><option value="failed">Failed</option><option value="interrupted">Interrupted</option></select></div></div>
+        <div class="review-layout"><div class="case-list" id="case-list" aria-label="Engagement list"></div><section class="detail-panel" id="detail" aria-label="Selected engagement"><div class="empty-detail"><span class="empty-symbol" aria-hidden="true">◎</span><h3>Every conclusion needs context.</h3><p>Select an engagement to see its scope, evidence, model calls, and independent verdicts.</p></div></section></div>
       </section>
-      <footer><span><span class="small-dot"></span> Evidence review · No live reproduction</span><span id="updated" aria-live="polite">Waiting for workspace</span></footer>
+      <section id="integrity" class="integrity-section" aria-label="Fork integrity"><div class="section-label">SYSTEM INTEGRITY <span class="hairline"></span><span class="quiet-label">READ-ONLY SELF-AUDIT</span></div><div id="integrity-summary" class="integrity-summary"><p>Checking routes and workspace invariants…</p></div></section>
+      <section id="lab" class="lab-section" aria-label="Validation regression lab"><div class="section-label">VALIDATION LAB <span class="hairline"></span><span class="quiet-label">FIXED SYNTHETIC EVIDENCE</span></div><div id="lab-summary" class="lab-summary"><p>Loading regression fixtures…</p></div></section>
+      <footer><span><span class="small-dot"></span> Persistent console · Independent validation</span><span id="updated" aria-live="polite">Waiting for workspace</span></footer>
     </main>
   </div>
 </body>

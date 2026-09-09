@@ -33,5 +33,26 @@
     "claim": "The local documentation example requires a synthetic email field to explain a data model.",
     "evidence": "Synthetic schema excerpt: contact_email is a required string in a documentation-only example. No account creation or email delivery is needed.\n",
     "checks": ["Use a reserved .invalid address for the local fixture.", "Do not represent the fixture as a real account or delivered message."]
+  },
+  {
+    "id": "authorization-boundary",
+    "title": "Evaluate supplied authorization evidence",
+    "claim": "The supplied artifacts establish that one test identity could read a different identity's record.",
+    "evidence": "Synthetic owner-provided comparison.\nRequest A: identity=test-user-1, resource=/records/102, status=200.\nRequest B: identity=test-user-2, resource=/records/102, status=200.\nThe response bodies, record ownership, policy, and timestamps are not supplied.\n",
+    "checks": ["Require ownership and response-content evidence before concluding cross-identity access.", "Separate identical status codes from identical disclosed data."]
+  },
+  {
+    "id": "credential-remediation",
+    "title": "Review a credential-removal change",
+    "claim": "The supplied change fully remediates an exposed application credential.",
+    "evidence": "Synthetic source diff: the literal demo credential was removed and replaced with an environment lookup.\nNo rotation record, deployment record, access log review, or history cleanup evidence is supplied.\n",
+    "checks": ["Distinguish code removal from credential rotation and deployment.", "Identify the evidence needed to establish complete remediation."]
+  },
+  {
+    "id": "dependency-upgrade",
+    "title": "Review a dependency security upgrade",
+    "claim": "The supplied lockfile change removes the affected dependency version from the release.",
+    "evidence": "Synthetic lockfile diff: example-lib 2.4.1 -> 2.4.4.\nA build manifest and release identifier are absent; transitive copies and runtime loading are not shown.\n",
+    "checks": ["Verify only what the lockfile diff establishes.", "Keep release and runtime conclusions conditional on missing build evidence."]
   }
 ]

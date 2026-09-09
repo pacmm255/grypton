@@ -6,9 +6,23 @@ from importlib.resources import files
 from urllib.parse import unquote, urlsplit
 
 from .config import GryptonError
+from .lab import canonical_digest, load_suite
 from .presentation import case_detail, line, state
 
 ASSETS = {"/": "index.html", "/app.css": "app.css", "/app.js": "app.js"}
+
+
+def lab_summary() -> dict:
+    suite = load_suite()
+    return {"suite_id": suite["suite_id"], "suite_sha256": canonical_digest(suite),
+            "offline_only": suite["offline_only"],
+            "scenario_count": len(suite["scenarios"]),
+            "turn_count": sum(len(item["turns"]) for item in suite["scenarios"]),
+            "scenarios": [{"id": item["id"], "title": item["title"],
+                           "turn_count": len(item["turns"]),
+                           "expected_transitions": [turn["expected"]["verdict"]
+                                                    for turn in item["turns"]]}
+                          for item in suite["scenarios"]]}
 
 
 def make_server(store, port: int = 8765) -> ThreadingHTTPServer:
@@ -59,6 +73,12 @@ def make_server(store, port: int = 8765) -> ThreadingHTTPServer:
                     self.send_body(200, payload, kind + "; charset=utf-8")
                 elif path == "/api/state":
                     self.send_body(200, json.dumps(state(store), ensure_ascii=False).encode())
+                elif path == "/api/lab":
+                    self.send_body(200, json.dumps(lab_summary(), ensure_ascii=False).encode())
+                elif path == "/api/audit":
+                    from .integrity import audit_project
+                    audit = audit_project(store.settings.root, source_root=None, check_auth=False)
+                    self.send_body(200, json.dumps(audit, ensure_ascii=False).encode())
                 elif path.startswith("/api/cases/"):
                     case = store.get(unquote(path.removeprefix("/api/cases/")))
                     self.send_body(200, json.dumps(case_detail(case), ensure_ascii=False).encode())

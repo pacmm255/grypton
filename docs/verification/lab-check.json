@@ -1,0 +1,22 @@
+{
+  "checked_at": "2026-09-09T13:08:07.824351Z",
+  "ok": true,
+  "suite_id": "grypton-offline-review-v1",
+  "suite_sha256": "4bbafd40acb88fad1ade9130fb4b2b5b30370ab9ad788c14a6968fa1a81dbfd4",
+  "mode": "mock",
+  "scenario_count": 3,
+  "turn_count": 9,
+  "score": 0.692308,
+  "transition_adaptation": 0.0,
+  "validator_payload_keys": [
+    [
+      "claim",
+      "evidence"
+    ]
+  ],
+  "model_calls": 36,
+  "tool_calls": 0,
+  "network_calls": 0,
+  "target_interaction": false,
+  "saved_output_rescored": true
+}

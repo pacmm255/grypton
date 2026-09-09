@@ -1,0 +1,281 @@
+{
+  "schema": 1,
+  "inspected_on": "2026-09-09",
+  "source": "/root/krypton",
+  "revision": "3ce1cd003feb07593d4f4b5e89fe11858837bb9b",
+  "basis": "Actual tracked working-tree files in project source paths; no claim that HEAD includes all local changes.",
+  "scope": "Static architecture and compatibility inspection. Core call paths traced; auxiliary helper structure and test contracts indexed. No original application execution.",
+  "excluded": [
+    "target directories",
+    "session histories",
+    "runtime state",
+    "credentials",
+    "untracked engagement artifacts",
+    "vendored dependencies"
+  ],
+  "file_count": 39,
+  "line_count": 10173,
+  "syntax_checks": {
+    "python_files_parsed": 25,
+    "json_schemas_parsed": 3,
+    "shell_files_checked": [
+      "launch_20.sh",
+      "dotfiles/install-advisor.sh"
+    ]
+  },
+  "original_test_functions_indexed": 38,
+  "original_tests_executed": false,
+  "original_live_tests_executed": false,
+  "model_calls_during_audit": 0,
+  "accuracy_comparison_performed": false,
+  "snapshot_files": 28,
+  "omitted_from_snapshot": [
+    "bin/.claude-fable-unlock.py",
+    "bin/advise-mcp",
+    "bin/kraude",
+    "bin/kryptex",
+    "bin/krypton",
+    "bin/krypton-mcp",
+    "bin/krypton-tool",
+    "dotfiles/claude/CLAUDE.md",
+    "dotfiles/claude/commands/advisor.md",
+    "dotfiles/install-advisor.sh",
+    "launch_20.sh"
+  ],
+  "files": [
+    {
+      "path": ".gitignore",
+      "lines": 33,
+      "sha256": "e4837b86141bb5a7b756a45d40badff099171f949f86d028588d236ca0557d17",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "ARCHITECTURE.md",
+      "lines": 125,
+      "sha256": "5d14ec392d9501058fc99649674d732f3c0eca2d35b38c53abb4311ccc9d59e1",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "README.md",
+      "lines": 134,
+      "sha256": "934e9368d653ea73b8b52581a3508d453ffcfff029f804774c2c23e2ea61ed0e",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "bin/.claude-fable-unlock.py",
+      "lines": 187,
+      "sha256": "25b7430abb4c454c08ad8ef19838b7368b90c5faadcdaf9924463b81aae73735",
+      "in_preserved_snapshot": false
+    },
+    {
+      "path": "bin/advise-mcp",
+      "lines": 22,
+      "sha256": "3c0e2b9b0edb42adf0be3d6bfa3c17d015caad848c4595dee6b685dcfe043e14",
+      "in_preserved_snapshot": false
+    },
+    {
+      "path": "bin/kraude",
+      "lines": 73,
+      "sha256": "bbb7976cdefceb5aa2ac7bfd805bd447749aa6a3d050e3c10bfe8d5930ad8651",
+      "in_preserved_snapshot": false
+    },
+    {
+      "path": "bin/kryptex",
+      "lines": 31,
+      "sha256": "d4baa296d32af5d7f73b69e25f061743e06ffa8914ca11f70794be4feef3d6d5",
+      "in_preserved_snapshot": false
+    },
+    {
+      "path": "bin/krypton",
+      "lines": 13,
+      "sha256": "c8157448b84ea91cbf3950d0aa9d9958c464de18e863d8d02d2e26a63af63536",
+      "in_preserved_snapshot": false
+    },
+    {
+      "path": "bin/krypton-mcp",
+      "lines": 13,
+      "sha256": "ce59e01172ff6d92be53acb148678e9c2d34dc305c85fed23a24b157440ee49c",
+      "in_preserved_snapshot": false
+    },
+    {
+      "path": "bin/krypton-tool",
+      "lines": 13,
+      "sha256": "8e15bb9e175f497a430a322c903d79116f574ff64a43ded48bd6e99dac37e920",
+      "in_preserved_snapshot": false
+    },
+    {
+      "path": "docs/REQUIREMENTS.md",
+      "lines": 47,
+      "sha256": "5f8d5ab718eade65311b809283e951c46b504756044fabff4916979abde07e2e",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "dotfiles/claude/CLAUDE.md",
+      "lines": 27,
+      "sha256": "5313d85960cee00dd02c8b2e5b14cffdd81e62724447d31c1ae93f8a6aa39f67",
+      "in_preserved_snapshot": false
+    },
+    {
+      "path": "dotfiles/claude/commands/advisor.md",
+      "lines": 28,
+      "sha256": "a5b1b87844183270ee7a5f85812b13915cc1856b8141c88e7935b4edfb1037f7",
+      "in_preserved_snapshot": false
+    },
+    {
+      "path": "dotfiles/install-advisor.sh",
+      "lines": 44,
+      "sha256": "4568bf7ae64c831ad799d488d380499dbccd5dc7e17234bb5db276f2c147f1de",
+      "in_preserved_snapshot": false
+    },
+    {
+      "path": "krypton/__init__.py",
+      "lines": 4,
+      "sha256": "ee4512b198594e94b0e50ba6ff5fbbb65f5f77f83c5b555c888e6223a3b6c363",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "krypton/__main__.py",
+      "lines": 6,
+      "sha256": "e0930aeba5a3e2e2d94ca6c5fac4f72c0c4eb2be9bba283becf98e909091471c",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "krypton/antifab.py",
+      "lines": 91,
+      "sha256": "0bf2c7425cfac2b168303e70246ccd0bb171ae7ca3af5343c82a9b676425c947",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "krypton/chat.py",
+      "lines": 456,
+      "sha256": "636399ba6f9d92b2bcb8cbfab3e3eaeb50522f121594de0f86b0917a0873d2ef",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "krypton/cli.py",
+      "lines": 549,
+      "sha256": "6a6e221421874721ddb2a696e77ce106f607d129eb5c371660eb201c17741b3c",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "krypton/config.py",
+      "lines": 240,
+      "sha256": "40b3c7f3a188afe7d0c643454e227e9f10e82548e5465bf0e9a0dea7923c9e69",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "krypton/engine.py",
+      "lines": 852,
+      "sha256": "3663b6f70521730dcf3e35e9093eca93e32ab77810cd3be54663326cf3db3d68",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "krypton/manager.py",
+      "lines": 1101,
+      "sha256": "6b9fa364ee11f11e468e3a2d5bb6370802410ad0b6d34bdf0e62cdb5ddff30f0",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "krypton/mockbackends.py",
+      "lines": 177,
+      "sha256": "ccfc0c9a267f0bcb31491f3e44fd5a09a5112987be7690d66a647bc729129f4f",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "krypton/prompts.py",
+      "lines": 92,
+      "sha256": "0308548884bc2346d721feb4a1450052a91582abf7f8cd88eb207e30cea0bab9",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "krypton/sessions.py",
+      "lines": 585,
+      "sha256": "427eda84a4093fb4c051a4542a8045e7ceec1c65f7be79dccd9543b8f8a08c08",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "krypton/tools.py",
+      "lines": 334,
+      "sha256": "ef78501af41191d567291d4ab988e84c51cba9dab6cf65f8aa1adb4f17da9236",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "krypton/toolserver.py",
+      "lines": 631,
+      "sha256": "5be4c25105fe8632f2948cbb18a2ef5e4d146a7753dd33eb1eb8fd7e77ad764b",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "krypton/worker.py",
+      "lines": 693,
+      "sha256": "080ee13f0d9d2174585e3315f1c4d282f96b1c2b0a19a0b2e2f7e2a22634965b",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "krypton/workspace.py",
+      "lines": 546,
+      "sha256": "ad462443babc854b458340b3ad9e5a4195612d8e2d2f45e08cc3df564df77759",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "launch_20.sh",
+      "lines": 63,
+      "sha256": "9b01d6dc9625c94180a54ce783f2b942565a438d780002cb706c3f841de047a7",
+      "in_preserved_snapshot": false
+    },
+    {
+      "path": "prompts/chat_schema.json",
+      "lines": 24,
+      "sha256": "c89a152c66eff0b47139197fb8612e26227bbc1146377a359ed6fb35522f1ca8",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "prompts/directive_schema.json",
+      "lines": 63,
+      "sha256": "3e4e963a2b69872ede496fecc6182f427ad36764d19a6a91c392c752a6b44000",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "prompts/manager_system.md",
+      "lines": 134,
+      "sha256": "23d5260190b00c87c562339506944ab59e5b8966d9124746ab5772d0690ac8c6",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "prompts/severity_schema.json",
+      "lines": 32,
+      "sha256": "81709055bc8f6716d963113129975ac5e56199f26dd5e88dd93acff24a35dcbf",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "prompts/worker_system.md",
+      "lines": 197,
+      "sha256": "6769dee8e38a267b55a364242c1b2a9aa422d79f3a9c9f7d51011f1e565b0088",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "pyproject.toml",
+      "lines": 26,
+      "sha256": "56120891afa0b6ff527ca6b6e912cfbbcb7465daa003932df02818388b14da9f",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "tests/live_engine.py",
+      "lines": 134,
+      "sha256": "f92652404bdea6bf5eeeacb5d848780eeb2f4f285cf0cf30cbdd6835571e066a",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "tests/live_smoke.py",
+      "lines": 177,
+      "sha256": "6c9d67de2c6059ee0019caa701f2ad46e79990eab9ecef2535c4ba1a68274900",
+      "in_preserved_snapshot": true
+    },
+    {
+      "path": "tests/run_all.py",
+      "lines": 2176,
+      "sha256": "e691ff179c0857a2a250fe13c52e1d7b1d4e66009b85b6c019a18997f6ff06a5",
+      "in_preserved_snapshot": true
+    }
+  ]
+}

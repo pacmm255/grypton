@@ -24,12 +24,17 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="grypton-ui-") as name:
         root = Path(name)
+        (root / "target").mkdir()
         store = Store(Settings.load(root))
         for index, scenario in enumerate(json.loads(resource("scenarios.json"))[:3]):
             case = store.create(scenario["title"], scenario["claim"])
             evidence = root / (scenario["id"] + ".txt")
             evidence.write_text(scenario["evidence"])
             store.add_evidence(case["id"], evidence)
+            store.set_scope(case["id"], {"type": "web", "in_scope": ["synthetic-owned.example"],
+                                          "rules": ["Use fixed supplied evidence only."]})
+            store.append_record(case["id"], "observations", "Synthetic fixture loaded.")
+            store.append_record(case["id"], "surface", "/synthetic", category="route")
             asyncio.run(review(store, case["id"], MockBackend()))
         store.create("Literal <b>markup</b> in a case title", "Markup is displayed as inert text.")
         server = make_server(store, 0)
@@ -45,14 +50,21 @@ def main():
                 page.get_by_text("Connected", exact=True).wait_for()
                 page.locator(".case-item").nth(1).click()
                 page.get_by_text("INDEPENDENT VERDICT", exact=True).wait_for()
+                page.get_by_text("FINDING LEDGER", exact=True).wait_for()
+                page.get_by_text("MODEL CALL AUDIT", exact=True).wait_for()
+                page.locator("#integrity-summary .integrity-check").first.wait_for()
+                page.get_by_text("Fork contract verified", exact=True).wait_for()
+                page.locator("#lab-summary .lab-card").first.wait_for()
                 assert page.locator(".team-card").count() == 3
                 assert page.locator(".case-item").count() == 4
                 assert page.locator("#case-list b").count() == 0
-                assert page.locator("#count-supported").inner_text() == "0"
+                assert page.locator("#count-findings").inner_text() == "3"
+                assert page.locator("#count-validated").inner_text() == "3"
+                assert page.locator(".lab-card").count() == 3
                 page.screenshot(path=str(output / "dashboard-desktop.png"), full_page=True)
-                page.get_by_label("Search cases").fill("no matching case")
+                page.get_by_label("Search engagements").fill("no matching case")
                 assert page.get_by_text("No matching cases", exact=True).is_visible()
-                page.get_by_label("Search cases").fill("")
+                page.get_by_label("Search engagements").fill("")
                 page.get_by_label("Filter by review status").select_option("draft")
                 assert page.locator(".case-item").count() == 1
                 page.get_by_label("Filter by review status").select_option("all")
@@ -62,7 +74,7 @@ def main():
                 page.set_viewport_size({"width": 768, "height": 1024})
                 assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
                 page.get_by_role("button", name="Refresh", exact=False).click()
-                page.wait_for_function("!document.getElementById('refresh').disabled")
+                page.locator("#refresh:not([disabled])").wait_for()
                 assert page.locator("#error-banner").is_hidden()
                 browser.close()
         finally:
@@ -71,7 +83,9 @@ def main():
             thread.join(timeout=2)
         assert not errors, errors
         result = {"ok": True, "synthetic_only": True, "viewports": [1440, 768, 390],
-                  "checks": ["case selection", "search", "status filter", "literal markup", "refresh", "no horizontal overflow", "no browser errors"]}
+                  "checks": ["engagement selection", "scope", "finding ledger", "model call audit",
+                             "system integrity", "validation lab", "search", "status filter", "literal markup", "refresh",
+                             "no horizontal overflow", "no browser errors"]}
         (output / "browser-check.json").write_text(json.dumps(result, indent=2) + "\n")
         print(json.dumps(result))
 

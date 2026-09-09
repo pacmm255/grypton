@@ -1,15 +1,35 @@
 {
   "ok": true,
-  "python": "3.13.13",
+  "python": "3.12.3",
   "build_warnings": 0,
-  "wheel": "grypton_review-2.0.0-py3-none-any.whl",
+  "wheel": "grypton_review-2.1.0-py3-none-any.whl",
+  "wheel_assets": {
+    "prompts": 3,
+    "skills": 8,
+    "dashboard": 3,
+    "lab_suite": true
+  },
+  "routes": {
+    "worker": "zai-coding-plan/glm-5.3 / max",
+    "manager": "opencode-go/muse-spark-1.3-contributor / xhigh",
+    "validator": "gpt-6-astra / max"
+  },
   "checks": [
     "isolated wheel import",
-    "offline demo",
-    "Markdown report",
+    "Krypton-compatible --target initialization",
+    "offline nine-turn lab verification",
+    "read-only integrity audit",
     "packaged prompts",
-    "packaged skills",
+    "eight packaged skills",
+    "packaged lab suite",
     "packaged dashboard",
-    "no archived source in wheel"
-  ]
+    "no archived source in wheel",
+    "installed grypton entry point",
+    "installed kraude entry point",
+    "installed kryptex entry point"
+  ],
+  "role_outputs": {
+    "worker": "Kraude  /  zai-coding-plan/glm-5.3 \u00b7 max",
+    "manager": "Kryptex  /  opencode-go/muse-spark-1.3-contributor \u00b7 xhigh"
+  }
 }

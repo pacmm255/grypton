@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "grypton-review"
-version = "2.0.0"
-description = "A three-model workspace for reviewing supplied security evidence and remediation."
+version = "2.1.0"
+description = "A persistent three-model security evidence workspace with independent finding validation."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "LicenseRef-Proprietary"

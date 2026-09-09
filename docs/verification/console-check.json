@@ -1,0 +1,56 @@
+{
+  "checked_at": "2026-09-09T13:12:04.335420Z",
+  "ok": true,
+  "synthetic_only": true,
+  "target_interaction": false,
+  "startup": "init --target <target> --mock",
+  "pty_commands": [
+    "/status",
+    "/scope",
+    "/note Synthetic owner observation.",
+    "/surface add route /health",
+    "pentest console.example",
+    "/evidence /tmp/grypton-pty-pls664mw/synthetic-evidence.txt",
+    "/finding add The supplied statement says the control is enabled.",
+    "/validate",
+    "/findings",
+    "/history 12",
+    "/review",
+    "/resources",
+    "/stop"
+  ],
+  "checks": {
+    "target": "console.example",
+    "scope_type": "web",
+    "automatic_in_scope": [
+      "console.example"
+    ],
+    "standing_instructions": [
+      "pentest console.example"
+    ],
+    "observations": 1,
+    "surface_records": 1,
+    "messages": 4,
+    "findings": 2,
+    "finding_status": "inconclusive",
+    "review_status": "complete",
+    "model_calls_audited": 4,
+    "target_directory_empty": true
+  },
+  "routes": {
+    "worker": "zai-coding-plan/glm-5.3 / max",
+    "manager": "opencode-go/muse-spark-1.3-contributor / xhigh",
+    "validator": "gpt-6-astra / max"
+  },
+  "regression_tests": 56,
+  "browser_viewports": [
+    1440,
+    768,
+    390
+  ],
+  "wheel_entrypoints_checked": [
+    "grypton",
+    "kraude",
+    "kryptex"
+  ]
+}

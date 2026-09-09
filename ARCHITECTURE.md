@@ -5,9 +5,12 @@ and locked-state design. The original application is archived in `upstream/`;
 the installed package is only `grypton`.
 
 ```text
-CLI / loopback dashboard
+Krypton-style terminal / CLI / loopback dashboard
           |
-      Case store <---------------- checkpoints, evidence hashes, review events
+      Engagement store <---------- conversation, standing instructions,
+          |                        checkpoints, evidence hashes, review events
+          |
+          +--> live chat: operator → Kryptex → immediate task kickoff to Kraude
           |
       Finite review engine
           |
@@ -24,7 +27,21 @@ CLI / loopback dashboard
           |
           +--> Kryptex
                   Summary preserving the validator's conclusion
+
+      Finding ledger validation
+          |
+          +--> Kryptex plan → Astra (claim + selected evidence only)
+          |                     → Kryptex summary
+          +--> versioned verdict history and per-call audit digests
 ```
+
+`init <target>` and `init --target <target>` create the same stable engagement,
+seed its in-scope labels, and open the console when attached to a TTY. `resume`
+resolves an ID, target, title, or unique prefix. Task directives are stored before
+the manager call and delegated to Kraude for a concrete kickoff. Conversation,
+standing instructions, observations, scope, surface records, and findings survive
+console restarts. The independent validator receives only the original claim and
+immutable evidence snapshots.
 
 All model calls are text-only. Agent tool permissions and execution features are
 disabled. The application has no API for probing targets, installing tools,
@@ -33,10 +50,12 @@ commands. The original hunt engine is never imported by the new package.
 
 ## State and recovery
 
-Each case has a private `case.json` under `.state/cases/<id>/`. Evidence snapshots
+Each case has a versioned private `case.json` under `.state/cases/<id>/`. Evidence snapshots
 contain text, original basename, artifact ID, SHA-256, and import time. A case
-contains up to 100 review runs; each run records model routes, backend mode, input
-digest, stage checkpoints, resources, and progress events.
+contains up to 100 review runs plus scope, messages, standing instructions,
+observations, surface records, findings, and local-resource events. Each run
+records model routes, backend mode, context digest, role-prompt fingerprints,
+stage checkpoints, resources, progress events, and per-call SHA-256 audit data.
 
 A process-level file lock serializes record access. Atomic writes use unique
 temporary files, fsync, replace, and directory fsync. A separate nonblocking
@@ -66,9 +85,12 @@ structured verdict. Provider errors are failures even if the CLI returns zero.
 | `contracts.py` | Structured output validation and evidence-reference checks |
 | `backends.py` | Isolated OpenCode, ephemeral Codex, process cleanup, mock transport |
 | `engine.py` | Finite stage order, checkpoint/resume, local requirements |
+| `integrity.py` | Read-only routes, assets, snapshot, source-inventory, and credential audit |
+| `lab.py` / `lab_runner.py` | Fixed evidence-transition scoring and isolated pipeline runs |
+| `console.py` | Persistent terminal chat, slash commands, manager-to-worker relay, role consoles |
 | `doctor.py` | Read-only binary, authentication, and model-readiness checks |
 | `presentation.py` | Public projections, terminal output, Markdown reports |
-| `cli.py` | Case operations and predictable CLI behavior |
+| `cli.py` | Target-first engagement operations and predictable CLI behavior |
 | `web.py` | Read-only loopback HTTP server with a route allowlist |
 | `resources/` | Model registry, prompts, skills, scenarios, dashboard assets |
 

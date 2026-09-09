@@ -7,7 +7,12 @@
     390
   ],
   "checks": [
-    "case selection",
+    "engagement selection",
+    "scope",
+    "finding ledger",
+    "model call audit",
+    "system integrity",
+    "validation lab",
     "search",
     "status filter",
     "literal markup",

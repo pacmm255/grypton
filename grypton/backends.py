@@ -135,7 +135,7 @@ def opencode_environment(directory: Path, model: Model) -> tuple[dict, str]:
         "autoupdate": False, "plugin": [], "mcp": {},
         "agent": {"grypton-review": {"description": "Review supplied text only; no tools or external actions.",
                   "mode": "primary", "permission": "deny", "steps": 2,
-                  "prompt": "Review only the supplied evidence. Do not use tools. Return the requested JSON."}},
+                  "prompt": "Use the supplied workspace context. Make concrete progress without tool calls. Return the requested JSON."}},
     }
     env.update({"OPENCODE_CONFIG_CONTENT": json.dumps(inline),
                 "OPENCODE_CONFIG_DIR": str(directory / "config/opencode"),
@@ -232,7 +232,14 @@ class MockBackend:
 
     async def call(self, role: str, stage: str, prompt: str, schema: dict, payload: dict) -> dict:
         await asyncio.sleep(0)
-        if stage == "plan":
+        if stage == "chat":
+            label = "Kryptex" if role == "manager" else "Kraude"
+            return {"reply": f"{label} received the message in offline mock mode.",
+                    "remember": payload.get("user_message", "") if role == "manager" else "",
+                    "disposition": "apply-now" if role == "manager" else "reply-only",
+                    "worker_note": payload.get("user_message", "") if role == "manager" else "",
+                    "requirements": []}
+        if stage in {"plan", "finding_plan"}:
             return {"summary": "Offline demonstration of an evidence review.",
                     "checks": ["Map the claim to supplied evidence.", "Identify missing context and remediation criteria."],
                     "requirements": ["existing_evidence"]}

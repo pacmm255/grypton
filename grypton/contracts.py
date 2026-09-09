@@ -13,7 +13,9 @@ def obj(properties: dict) -> dict:
 TEXT = {"type": "string", "minLength": 1, "maxLength": 12_000}
 TEXTS = {"type": "array", "items": TEXT, "maxItems": 24}
 REQUIREMENTS = {"type": "array", "maxItems": 8, "items": {"type": "string", "enum": [
-    "existing_evidence", "offline_email", "scratch_directory", "external_account", "missing_evidence", "network_access"]}}
+    "existing_evidence", "offline_email", "offline_identity", "temporary_text_fixture",
+    "scratch_directory", "external_account", "missing_evidence", "network_access"]}}
+OPTIONAL_TEXT = {"type": "string", "maxLength": 12_000}
 PLAN = obj({"summary": TEXT, "checks": TEXTS, "requirements": REQUIREMENTS})
 ASSESSMENT = obj({
     "assessment": {"type": "string", "enum": ["supported", "refuted", "inconclusive"]},
@@ -25,6 +27,13 @@ VERDICT = obj({
     "rationale": TEXT, "evidence_ids": TEXTS, "limitations": TEXTS, "remediation": TEXTS,
 })
 SUMMARY = obj({"summary": TEXT, "next_steps": TEXTS})
+CHAT = obj({
+    "reply": TEXT,
+    "remember": OPTIONAL_TEXT,
+    "disposition": {"type": "string", "enum": ["reply-only", "apply-now", "apply-next-review", "remember-only"]},
+    "worker_note": OPTIONAL_TEXT,
+    "requirements": REQUIREMENTS,
+})
 
 
 def validate(value, schema: dict, path: str = "response") -> None:

@@ -18,8 +18,10 @@ from grypton.backends import (LiveBackend, MockBackend, clean, codex_command,
                               opencode_environment, opencode_text, run_process)
 from grypton.cli import main
 from grypton.config import GryptonError, MODELS, Settings, resource
+from grypton.console import Console, PasteParser, _PASSIVE_REFUSAL, _TASK_INTENT
 from grypton.contracts import VERDICT, check_references, obj, parse_output
-from grypton.engine import resolve_requirements, review, stop
+from grypton.engine import resolve_requirements, review, stop, validate_finding
+from grypton.integrity import audit_project
 from grypton.presentation import case_summary, markdown_report, state
 from grypton.storage import Store
 from grypton.web import make_server
@@ -108,6 +110,21 @@ class StorageTests(TempStore):
             with self.assertRaises(GryptonError):
                 self.store.add_evidence(case["id"], self.root / "bad.txt")
 
+    def test_scope_records_and_finding_ledger_are_durable(self):
+        case = self.case()
+        self.store.set_scope(case["id"], {"type": "web", "in_scope": ["owned.example"],
+                                          "out_of_scope": ["third-party.example"],
+                                          "rules": ["Use supplied artifacts only."]})
+        observation = self.store.append_record(case["id"], "observations", "Owner supplied a release note.")
+        surface = self.store.append_record(case["id"], "surface", "/account", category="route")
+        finding = self.store.add_finding(case["id"], "Synthetic control", "The control is enabled.")
+        saved = self.store.get(case["id"])
+        self.assertEqual(saved["schema_version"], 2)
+        self.assertEqual(saved["scope"]["in_scope"], ["owned.example"])
+        self.assertEqual(observation["id"], "obs-0001")
+        self.assertEqual(surface["id"], "surface-0001")
+        self.assertEqual(finding["evidence_ids"], [case["evidence"][0]["id"]])
+
 
 class ContractTests(unittest.TestCase):
     def test_rejects_duplicate_keys_trailing_text_and_unknown_fields(self):
@@ -143,6 +160,21 @@ class ContractTests(unittest.TestCase):
         with self.assertRaises(GryptonError) as caught:
             opencode_text(json.dumps({"type": "error", "error": {"message": "fake_secret_value_123"}}), "fake_secret_value_123")
         self.assertNotIn("fake_secret_value_123", str(caught.exception))
+
+    def test_bracketed_multiline_paste_is_one_message(self):
+        parser = PasteParser()
+        self.assertEqual(list(parser.feed("typed message\n")), ["typed message"])
+        self.assertEqual(list(parser.feed("\x1b[200~first line\n")), [])
+        self.assertEqual(list(parser.feed("second line\x1b[201~\n")),
+                         ["first line\nsecond line"])
+
+    def test_task_and_passive_refusal_detection_covers_provider_variants(self):
+        for directive in ("pentest demo.invalid", "scan the supplied fixture",
+                          "start a bug bounty review", "enumerate the review hypotheses"):
+            self.assertRegex(directive, _TASK_INTENT)
+        for refusal in ("I can't perform that.", "I'm unable to help.",
+                        "We do not have the capability.", "No tools are available."):
+            self.assertRegex(refusal, _PASSIVE_REFUSAL)
 
 
 class BackendConfigTests(TempStore):
@@ -214,7 +246,12 @@ class EngineTests(TempStore):
         validator_payload = backend.calls[2][2]
         self.assertEqual(set(validator_payload), {"claim", "evidence"})
         self.assertEqual(run["status"], "complete")
+        self.assertEqual(len(run["calls"]), 4)
+        self.assertEqual({call["route"]["qualified"] for call in run["calls"]},
+                         {MODELS[role].qualified for role in MODELS})
+        self.assertEqual(len(run["prompt_fingerprints"]), 3)
         self.assertEqual(run["stages"]["validation"]["verdict"], "inconclusive")
+        self.assertEqual(self.store.get(case["id"])["findings"][0]["status"], "inconclusive")
         self.assertEqual(state(self.store)["counts"]["supported"], 0)
         self.assertIn("Mode: mock", markdown_report(self.store.get(case["id"])))
 
@@ -239,6 +276,15 @@ class EngineTests(TempStore):
         extra.write_text("More evidence.")
         self.store.add_evidence(case["id"], extra)
         with self.assertRaisesRegex(GryptonError, "changed"):
+            asyncio.run(review(self.store, case["id"], MockBackend(), resume=True))
+
+    def test_resume_refuses_changed_prompt_bundle(self):
+        case = self.case()
+        with self.assertRaises(GryptonError):
+            asyncio.run(review(self.store, case["id"], RecordingBackend("assessment")))
+        changed = {role: "0" * 64 for role in ("manager", "worker", "validator")}
+        with patch("grypton.engine.prompt_fingerprints", return_value=changed), \
+             self.assertRaisesRegex(GryptonError, "prompts"):
             asyncio.run(review(self.store, case["id"], MockBackend(), resume=True))
 
     def test_no_evidence_means_no_model_call(self):
@@ -295,6 +341,9 @@ class EngineTests(TempStore):
         self.assertIn(".invalid", result[0]["detail"])
         self.assertTrue((self.root / "scratch").is_dir())
         self.assertEqual(result[2]["status"], "unavailable")
+        empty = self.store.create("Empty", "No evidence")
+        self.assertEqual(resolve_requirements(["existing_evidence"], empty, self.root)[0]["status"],
+                         "unavailable")
 
     def test_worker_followup_is_bounded_and_requests_recorded(self):
         case = self.case()
@@ -320,6 +369,167 @@ class EngineTests(TempStore):
         backend = Repeated()
         asyncio.run(review(self.store, case["id"], backend))
         self.assertEqual(len(backend.calls), 4)
+
+    def test_console_persists_user_intent_and_manager_relays_to_worker(self):
+        case = self.store.create("console.example", "Review supplied material.",
+                                 stable=True, target="console.example")
+        backend = RecordingBackend()
+        console = Console(self.store, case["id"], backend)
+        responses = asyncio.run(console.message("focus on the supplied authorization notes"))
+        self.assertEqual([call[:2] for call in backend.calls],
+                         [("manager", "chat"), ("worker", "chat")])
+        self.assertEqual([name for name, _ in responses], ["Kryptex", "Kraude"])
+        saved = self.store.get(case["id"])
+        self.assertIn("focus on the supplied authorization notes", saved["standing_instructions"])
+        self.assertTrue(any(item["text"].startswith("Kryptex → Kraude:")
+                            for item in saved["messages"]))
+
+    def test_console_kickoff_is_remembered_and_delegated_without_manager_note(self):
+        case = self.store.create("kickoff.example", "Review supplied material.",
+                                 stable=True, target="kickoff.example")
+
+        class PassiveManager(RecordingBackend):
+            async def call(self, role, stage, prompt, schema, payload):
+                result = await super().call(role, stage, prompt, schema, payload)
+                if role == "manager":
+                    result.update(reply="I can't perform this assessment because no tools are available.",
+                                  remember="", disposition="reply-only", worker_note="")
+                return result
+
+        backend = PassiveManager()
+        responses = asyncio.run(Console(self.store, case["id"], backend).message(
+            "pentest kickoff.example"))
+        self.assertEqual([call[:2] for call in backend.calls],
+                         [("manager", "chat"), ("worker", "chat")])
+        self.assertEqual([name for name, _ in responses], ["Kryptex", "Kraude"])
+        self.assertNotIn("can't", responses[0][1])
+        self.assertIn("delegated the kickoff", responses[0][1])
+        self.assertIn("pentest kickoff.example",
+                      self.store.get(case["id"])["standing_instructions"])
+
+    def test_console_recovers_plaintext_manager_refusal_but_not_transport_failure(self):
+        case = self.store.create("recovery.example", "Review supplied material.",
+                                 stable=True, target="recovery.example")
+
+        class PlaintextRefusal(RecordingBackend):
+            async def call(self, role, stage, prompt, schema, payload):
+                self.calls.append((role, stage, payload))
+                if role == "manager":
+                    raise GryptonError("The model returned invalid JSON; no review result was accepted.")
+                return await MockBackend().call(role, stage, prompt, schema, payload)
+
+        recovered = asyncio.run(Console(self.store, case["id"], PlaintextRefusal()).message(
+            "scan recovery.example"))
+        self.assertEqual([name for name, _ in recovered], ["Kryptex", "Kraude"])
+        self.assertIn("delegated the kickoff", recovered[0][1])
+
+        class TransportFailure(MockBackend):
+            async def call(self, role, stage, prompt, schema, payload):
+                raise GryptonError("OpenCode: quota unavailable")
+
+        with self.assertRaisesRegex(GryptonError, "quota"):
+            asyncio.run(Console(self.store, case["id"], TransportFailure()).message(
+                "scan recovery.example"))
+
+    def test_console_returns_a_resolved_local_blocker_to_kraude(self):
+        case = self.store.create("blocked.example", "Review supplied material.",
+                                 stable=True, target="blocked.example")
+
+        class NeedsEmail(RecordingBackend):
+            async def call(self, role, stage, prompt, schema, payload):
+                result = await super().call(role, stage, prompt, schema, payload)
+                if role == "worker" and not payload.get("resolved_resources"):
+                    result["requirements"] = ["offline_email"]
+                elif role == "worker":
+                    result["reply"] = "Used the supplied synthetic email fixture."
+                    result["requirements"] = []
+                return result
+
+        backend = NeedsEmail()
+        with contextlib.redirect_stdout(io.StringIO()):
+            responses = asyncio.run(Console(self.store, case["id"], backend).message(
+                "Use a local placeholder in the example.", to_worker=True))
+        self.assertEqual(len(backend.calls), 2)
+        supplied = backend.calls[1][2]["resolved_resources"]
+        self.assertEqual([(item["kind"], item["status"]) for item in supplied],
+                         [("offline_email", "resolved")])
+        self.assertIn("synthetic email fixture", responses[0][1])
+
+    def test_console_resolves_sequential_local_blockers_without_operator(self):
+        case = self.store.create("resources.example", "Review supplied material.",
+                                 stable=True, target="resources.example")
+
+        class Sequential(RecordingBackend):
+            async def call(self, role, stage, prompt, schema, payload):
+                result = await super().call(role, stage, prompt, schema, payload)
+                kinds = {item["kind"] for item in payload.get("resolved_resources", [])}
+                if "offline_email" not in kinds:
+                    result["requirements"] = ["offline_email"]
+                elif "offline_identity" not in kinds:
+                    result["requirements"] = ["offline_identity"]
+                else:
+                    result["requirements"] = []
+                    result["reply"] = "Both local blockers were resolved."
+                return result
+
+        backend = Sequential()
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = asyncio.run(Console(self.store, case["id"], backend).message(
+                "Complete the local example.", to_worker=True))
+        self.assertEqual(len(backend.calls), 3)
+        self.assertIn("Both local blockers", result[0][1])
+        self.assertEqual({item["kind"] for item in self.store.get(case["id"])["resource_events"]},
+                         {"offline_email", "offline_identity"})
+
+    def test_console_resources_include_staged_review_decisions(self):
+        case = self.case()
+        asyncio.run(review(self.store, case["id"], MockBackend()))
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            asyncio.run(Console(self.store, case["id"], MockBackend()).command("/resources"))
+        self.assertIn("review · existing_evidence · resolved", output.getvalue())
+
+    def test_kryptex_coordinates_independent_finding_validation(self):
+        case = self.case()
+        finding = self.store.add_finding(case["id"], "Candidate", "The control is enabled.")
+        backend = RecordingBackend()
+        result = asyncio.run(validate_finding(self.store, case["id"], finding["id"], backend))
+        self.assertEqual([call[1] for call in backend.calls],
+                         ["finding_plan", "finding_validation", "finding_summary"])
+        self.assertEqual(set(backend.calls[1][2]), {"claim", "evidence"})
+        self.assertEqual(result["status"], "inconclusive")
+        self.assertEqual(result["severity"], "unknown")
+        self.assertEqual(len(result["validation_history"]), 1)
+        self.assertEqual([call["role"] for call in result["validation_run"]["calls"]],
+                         ["manager", "validator", "manager"])
+
+    def test_stop_cancels_finding_validation_and_restores_engagement(self):
+        case = self.case()
+        finding = self.store.add_finding(case["id"], "Candidate", "The control is enabled.")
+
+        async def exercise():
+            entered = asyncio.Event()
+
+            class Waiting(MockBackend):
+                async def call(self, role, stage, prompt, schema, payload):
+                    if stage == "finding_validation":
+                        entered.set()
+                        await asyncio.Event().wait()
+                    return await super().call(role, stage, prompt, schema, payload)
+
+            task = asyncio.create_task(validate_finding(
+                self.store, case["id"], finding["id"], Waiting()))
+            await asyncio.wait_for(entered.wait(), 2)
+            stop(self.store, case["id"])
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 2)
+
+        asyncio.run(exercise())
+        saved = self.store.get(case["id"])
+        self.assertEqual(saved["status"], "draft")
+        self.assertEqual(saved["findings"][0]["status"], "candidate")
+        self.assertEqual(saved["findings"][0]["validation_run"]["status"], "interrupted")
+        self.assertFalse((self.store.directory(case["id"]) / ".stop.json").exists())
 
 
 class CliTests(TempStore):
@@ -356,6 +566,89 @@ class CliTests(TempStore):
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(stdout)["run"]["status"], "complete")
 
+    def test_init_matches_krypton_shape_without_required_claim(self):
+        code, stdout, stderr = self.call_cli("init", "service.example", "--no-interact", "--json")
+        self.assertEqual((code, stderr), (0, ""))
+        created = json.loads(stdout)
+        self.assertEqual(created["id"], "service-example")
+        self.assertEqual(created["target"], "service.example")
+        record = self.store.get("service-example")
+        self.assertIn("service.example", record["claim"])
+        self.assertEqual(record["scope"]["in_scope"], ["service.example"])
+        code, stdout, _ = self.call_cli("status", "service.example", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout)["cases"][0]["id"], "service-example")
+
+        code, stdout, stderr = self.call_cli(
+            "init", "--target", "option.example", "--no-interact", "--json")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(json.loads(stdout)["id"], "option-example")
+
+    def test_init_reuses_existing_target_and_persists_new_brief(self):
+        existing = self.store.create("Existing", "Existing claim")
+        code, stdout, stderr = self.call_cli("init", "Existing", "-m", "remember this",
+                                             "--no-interact", "--json")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(json.loads(stdout)["id"], existing["id"])
+        record = self.store.get(existing["id"])
+        self.assertEqual(record["brief"], "remember this")
+        self.assertIn("remember this", record["standing_instructions"])
+
+    def test_scope_ledger_validation_and_lab_commands(self):
+        code, stdout, _ = self.call_cli(
+            "init", "scope.example", "--no-interact", "--type", "web",
+            "--in-scope", "scope.example,/owned", "--out-scope", "third-party.example", "--json")
+        self.assertEqual(code, 0)
+        case_id = json.loads(stdout)["id"]
+        evidence = self.root / "scope-evidence.txt"
+        evidence.write_text("Synthetic owner-supplied configuration statement.")
+        self.assertEqual(self.call_cli("evidence", "add", case_id, str(evidence), "--json")[0], 0)
+        code, stdout, _ = self.call_cli("findings", "add", case_id,
+                                        "The supplied configuration enables the control.", "--json")
+        self.assertEqual(code, 0)
+        finding_id = json.loads(stdout)["finding"]["id"]
+        code, stdout, _ = self.call_cli("findings", "validate", case_id, finding_id, "--mock", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout)["status"], "inconclusive")
+        code, stdout, _ = self.call_cli("resume", case_id, "-m", "remember this constraint",
+                                        "--no-interact", "--json")
+        self.assertEqual(code, 0)
+        saved = self.store.get(case_id)
+        self.assertEqual(saved["scope"]["type"], "web")
+        self.assertIn("scope.example", saved["scope"]["in_scope"])
+        self.assertIn("remember this constraint", saved["standing_instructions"])
+        code, stdout, _ = self.call_cli("lab", "verify", "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout)["turn_count"], 9)
+        code, stdout, _ = self.call_cli("lab", "run", "--scenario",
+                                        "cookie-release-transition", "--mock", "--json")
+        self.assertEqual(code, 0)
+        lab_run = json.loads(stdout)
+        self.assertEqual(lab_run["turn_count"], 3)
+        self.assertEqual(len(lab_run["suite_sha256"]), 64)
+        self.assertFalse(lab_run["target_interaction"])
+        for run in lab_run["results"]["cookie-release-transition"].values():
+            self.assertEqual(run["lab_trace"]["validator_payload_keys"], ["claim", "evidence"])
+            self.assertEqual(run["lab_trace"]["tool_calls"], 0)
+        saved = self.root / "saved-lab-run.json"
+        saved.write_text(json.dumps(lab_run))
+        code, stdout, _ = self.call_cli("lab", "score", str(saved), "--json")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout)["suite_id"], "grypton-offline-review-v1")
+
+    def test_integrity_audit_and_console_history_limit(self):
+        (self.root / "target").mkdir()
+        audit = audit_project(self.root, source_root=None, check_auth=False)
+        self.assertTrue(audit["ok"])
+        self.assertFalse(audit["target_interaction"])
+        self.assertEqual(audit["coverage"]["kraude_glm_5_3_max"], "verified")
+        self.assertEqual(audit["coverage"]["astra_max_finding_validation"], "verified")
+
+        case = self.store.create("history.example", "Review supplied material.",
+                                 stable=True, target="history.example")
+        with self.assertRaisesRegex(GryptonError, "at least 1"):
+            asyncio.run(Console(self.store, case["id"], MockBackend()).command("/history 0"))
+
 
 class WebTests(TempStore):
     def setUp(self):
@@ -373,15 +666,31 @@ class WebTests(TempStore):
         self.thread.join(timeout=2)
 
     def test_dashboard_and_api_have_no_evidence_text_or_credentials(self):
+        self.store.append_message(self.case_record["id"], role="user",
+                                  text="private conversation marker")
+        self.store.mutate(self.case_record["id"], lambda value: value.update(
+            internal_secret="never expose this internal field"))
         with urlopen(self.base + "/") as response:
             self.assertIn("frame-ancestors 'none'", response.headers["Content-Security-Policy"])
-            self.assertIn("Review desk", response.read().decode())
+            self.assertIn("Operations console", response.read().decode())
         with urlopen(self.base + "/api/state") as response:
             payload = response.read().decode()
             self.assertNotIn("secure_cookie = true", payload)
             self.assertNotIn('"key"', payload)
+        with urlopen(self.base + "/api/lab") as response:
+            lab = json.loads(response.read().decode())
+            self.assertEqual(lab["turn_count"], 9)
+            self.assertNotIn('"text"', json.dumps(lab))
+        with urlopen(self.base + "/api/audit") as response:
+            audit = json.loads(response.read().decode())
+            self.assertFalse(audit["target_interaction"])
+            self.assertEqual(audit["model_calls"], 0)
+            self.assertNotIn('"key"', json.dumps(audit))
         with urlopen(self.base + "/api/cases/" + self.case_record["id"]) as response:
-            self.assertNotIn('"text"', response.read().decode())
+            detail = response.read().decode()
+            self.assertNotIn('"text"', detail)
+            self.assertNotIn("private conversation marker", detail)
+            self.assertNotIn("never expose this internal field", detail)
 
     def test_mutations_external_origins_and_arbitrary_files_are_rejected(self):
         requests = [

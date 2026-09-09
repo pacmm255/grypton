@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Source-checkout launcher for the Muse-backed Kryptex role console."""
+import os
+from pathlib import Path
+import sys
+
+project = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(project))
+os.environ.setdefault("GRYPTON_ROOT", str(project))
+from grypton.cli import manager_main
+
+raise SystemExit(manager_main())
