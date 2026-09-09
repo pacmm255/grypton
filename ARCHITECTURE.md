@@ -1,99 +1,96 @@
 # Grypton architecture
 
-Grypton is an evidence-review application derived from Krypton's role separation
-and locked-state design. The original application is archived in `upstream/`;
-the installed package is only `grypton`.
-
 ```text
-Krypton-style terminal / CLI / loopback dashboard
-          |
-      Engagement store <---------- conversation, standing instructions,
-          |                        checkpoints, evidence hashes, review events
-          |
-          +--> live chat: operator → Kryptex → immediate task kickoff to Kraude
-          |
-      Finite review engine
-          |
-          +--> Kryptex / OpenCode Go / Muse Spark 1.3 Contributor xhigh
-          |       Structured review checklist and local requirements
-          |
-          +--> Kraude / Z.AI Coding Plan / GLM-5.3 max
-          |       Evidence assessment and remediation
-          |       At most one follow-up for a new local capability
-          |
-          +--> Codex / GPT-6 Astra max
-          |       Independent claim + original evidence only
-          |       Checked verdict, severity, evidence IDs, limitations
-          |
-          +--> Kryptex
-                  Summary preserving the validator's conclusion
-
-      Finding ledger validation
-          |
-          +--> Kryptex plan → Astra (claim + selected evidence only)
-          |                     → Kryptex summary
-          +--> versioned verdict history and per-call audit digests
+operator / CLI / loopback dashboard
+                 |
+                 v
+        persistent Engine loop
+                 |
+        +--------+---------+
+        |                  |
+        v                  v
+ Kraude worker        Kryptex manager
+ OpenCode             OpenCode
+ GLM 5.3 max          Muse Spark 1.3 xhigh
+ native + MCP tools   tools denied
+        |                  |
+        +--------+---------+
+                 |
+        workspace ledgers and captures
+                 |
+          each new finding
+                 v
+        fresh Codex validator
+        GPT-6 Astra max
+        ephemeral, schema-bound, tools denied
 ```
 
-`init <target>` and `init --target <target>` create the same stable engagement,
-seed its in-scope labels, and open the console when attached to a TTY. `resume`
-resolves an ID, target, title, or unique prefix. Task directives are stored before
-the manager call and delegated to Kraude for a concrete kickoff. Conversation,
-standing instructions, observations, scope, surface records, and findings survive
-console restarts. The independent validator receives only the original claim and
-immutable evidence snapshots.
+The engine starts Kraude with a target-specific prompt, current scope, embedded
+operating skills, and target-type playbooks. OpenCode resumes one worker session
+across turns. Tool events stream into the terminal while structured Grypton MCP
+calls update locked ledgers and private flow captures.
 
-All model calls are text-only. Agent tool permissions and execution features are
-disabled. The application has no API for probing targets, installing tools,
-reproducing exploits, creating accounts, or treating model output as executable
-commands. The original hunt engine is never imported by the new package.
+After each worker turn the engine detects new surface and findings, checks text
+claims against workspace artifacts, tracks idle/exhaustion streaks, and gives
+Kryptex the worker report, complete tool summary, scope, recent ledgers, and
+progress. Kryptex returns strict JSON with one concrete next burst. Invalid JSON
+gets one schema repair attempt; provider failure falls back to a deterministic,
+bounded in-scope directive.
 
-## State and recovery
+Kryptex's severity array is discarded. Each new finding is validated through
+`CodexValidator`, which copies only explicitly referenced artifacts from within
+the engagement workspace into a bounded prompt. The byte budget is divided
+across every cited artifact and includes both ends of large captures, so an
+early HTML response cannot hide a later control. The process uses `gpt-6-astra`
+at `max`, runs ephemerally in a read-only sandbox, disables execution features,
+requires a JSON schema, and is rejected if the event stream reports tool use.
 
-Each case has a versioned private `case.json` under `.state/cases/<id>/`. Evidence snapshots
-contain text, original basename, artifact ID, SHA-256, and import time. A case
-contains up to 100 review runs plus scope, messages, standing instructions,
-observations, surface records, findings, and local-resource events. Each run
-records model routes, backend mode, context digest, role-prompt fingerprints,
-stage checkpoints, resources, progress events, and per-call SHA-256 audit data.
+## Scope and observability
 
-A process-level file lock serializes record access. Atomic writes use unique
-temporary files, fsync, replace, and directory fsync. A separate nonblocking
-review lock prevents simultaneous runs and evidence edits for one case. Invalid
-state is reported explicitly. Resume validates the input digest and model routes
-before reusing any result. New evidence makes the previous verdict historical.
+`scope-rules.json` is the source of truth. Host matching supports exact hosts,
+explicit wildcard subdomains, and CIDRs. A bare domain does not silently permit
+every subdomain. Structured HTTP, Goja, browser, DNS, TLS, port, httpx, and
+subfinder tools enforce these rules before action. Goja has a managed PID and
+Grypton stops only the process it started.
 
-Provider calls have bounded time and output. Cancellation and timeout terminate
-the process group, including descendants whose parent has already exited. A stop
-marker is checked while the active call runs. Process crashes leave completed
-checkpoints available to a subsequent `resume`.
+Each structured call appends `.ledger/tool-calls.jsonl`. HTTP tools also create
+private `flows/flow-*.http` request/response captures. Provider transports append
+redacted raw event streams and per-call metadata to `transcripts/`, including
+route, effort, session ID, timing, usage, cost, and prompt/output hashes.
 
-## Output contracts
+OpenCode success payloads use `state.output`; rejected and timed-out calls use
+`state.error`. The worker normalizes both into visible tool results. The MCP
+transport has a 120-second outer ceiling, while HTTP and other network tools
+retain smaller operation-specific limits. Full HTTP captures are never trimmed;
+only the model-facing response preview is bounded.
 
-Each role has a fixed JSON schema. Extra fields, duplicate keys, invalid values,
-unknown evidence IDs, and unsupported severity claims are rejected. A model
-cannot mark its own output as independently validated. The manager's closing
-response has only summary and next-step fields; it cannot overwrite Codex's
-structured verdict. Provider errors are failures even if the CLI returns zero.
+`grypton stop` writes a stop marker. The engine checks it every second during a
+worker turn, terminates the provider process group, and saves session IDs and the
+turn index. Hard scope or authorization stops are binding. Idle or ordinary
+blocker responses are converted into another concrete action inside scope.
+Authentication probes have a cumulative turn-to-turn budget. A target defense
+signal ends that probe family immediately instead of being retried or evaded.
 
-## Modules
+`grypton audit` reads the canonical ledgers and verifies route pins, clean
+provider exits, Astra coverage, network scope, referenced flow existence, and
+the empty top-level `target/`. `grypton report` renders those same final verdicts
+without treating every recorded candidate as confirmed.
+
+## Active modules
 
 | Module | Responsibility |
 | --- | --- |
-| `config.py` | Exact model routes, resources, workspace selection |
-| `storage.py` | Private case records, locks, snapshots, bounded imports |
-| `contracts.py` | Structured output validation and evidence-reference checks |
-| `backends.py` | Isolated OpenCode, ephemeral Codex, process cleanup, mock transport |
-| `engine.py` | Finite stage order, checkpoint/resume, local requirements |
-| `integrity.py` | Read-only routes, assets, snapshot, source-inventory, and credential audit |
-| `lab.py` / `lab_runner.py` | Fixed evidence-transition scoring and isolated pipeline runs |
-| `console.py` | Persistent terminal chat, slash commands, manager-to-worker relay, role consoles |
-| `doctor.py` | Read-only binary, authentication, and model-readiness checks |
-| `presentation.py` | Public projections, terminal output, Markdown reports |
-| `cli.py` | Target-first engagement operations and predictable CLI behavior |
-| `web.py` | Read-only loopback HTTP server with a route allowlist |
-| `resources/` | Model registry, prompts, skills, scenarios, dashboard assets |
-
-Provider isolation depends on the installed CLI honoring its configuration.
-Read-only sandboxing alone does not imply that a model cannot read host data;
-the explicit tool disabling and supplied-text workflow are essential here.
+| `config.py` | pinned routes, state layout, binary discovery |
+| `providers.py` | isolated OpenCode sessions and ephemeral Codex validation |
+| `worker.py` | GLM turn adapter and streamed tool events |
+| `manager.py` | Spark JSON direction, chat, Astra handoff |
+| `engine.py` | persistent autonomous loop and stop/recovery logic |
+| `workspace.py` | private ledgers, rendered documents, constraints |
+| `tools.py` | scoped HTTP, Goja, captures, recon, installation |
+| `toolserver.py` | MCP registry, audit dispatch, matching CLI |
+| `scenarios.py` | target-type kickoff playbooks |
+| `local_lab.py` | deterministic loopback integration target |
+| `chat.py` | live terminal renderer and operator steering |
+| `web.py` | read-only loopback operations dashboard |
+| `reporting.py` | integrity audit and final report rendering |
+| `cli.py` | autonomous run, review, report, tools, lab, dashboard, and doctor commands |

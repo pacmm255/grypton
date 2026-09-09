@@ -3,9 +3,9 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "grypton-review"
-version = "2.1.0"
-description = "A persistent three-model security evidence workspace with independent finding validation."
+name = "grypton-hunter"
+version = "3.0.0"
+description = "Autonomous scoped security testing with a GLM worker, Spark manager, and independent Astra validation."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "LicenseRef-Proprietary"
@@ -17,13 +17,15 @@ dependencies = []
 grypton = "grypton.cli:main"
 kraude = "grypton.cli:worker_main"
 kryptex = "grypton.cli:manager_main"
+grypton-mcp = "grypton.toolserver:mcp_main"
+grypton-tool = "grypton.toolserver:cli_main"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["grypton", "grypton.*"]
 
 [tool.setuptools.package-data]
-grypton = ["resources/*.json", "resources/prompts/*.md", "resources/skills/*.md", "resources/web/*"]
+grypton = ["resources/*.json", "resources/prompts/*", "resources/skills/*.md", "resources/web/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

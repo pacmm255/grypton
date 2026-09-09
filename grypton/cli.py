@@ -1,496 +1,543 @@
-"""A predictable CLI: parseable JSON, actionable errors, and explicit live calls."""
+"""Command-line entry point for the autonomous Grypton orchestrator."""
 from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
-import sys
-import tempfile
+import os
 from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+from urllib.parse import urlsplit
 
-from . import __version__
-from .backends import LiveBackend, MockBackend, clean
-from .config import GryptonError, MODELS, Settings, resource
-from .doctor import doctor
-from .engine import review, stop, validate_finding
-from .presentation import case_detail, case_summary, json_output, line, markdown_report, print_state, state
-from .storage import SCOPE_KEYS, Store, atomic_json
-
-
-def common(parser):
-    parser.add_argument("--root", default=argparse.SUPPRESS, help="Grypton workspace (or GRYPTON_ROOT)")
-    parser.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="Emit one JSON result on stdout")
+from . import config
+from .workspace import Constraints, Workspace, list_targets
 
 
-def scope_args(parser):
-    parser.add_argument("--type", choices=["auto", "web", "apk", "network", "cidr", "binary", "contract", "code"],
-                        default=argparse.SUPPRESS, help="Engagement material type")
-    parser.add_argument("--in-scope", default=argparse.SUPPRESS, help="Comma-separated in-scope labels")
-    parser.add_argument("--out-scope", default=argparse.SUPPRESS, help="Comma-separated excluded labels")
-    parser.add_argument("--only", default=argparse.SUPPRESS, help="Comma-separated severities to retain")
-    parser.add_argument("--include", default=argparse.SUPPRESS, help="Comma-separated review classes to emphasize")
-    parser.add_argument("--exclude", default=argparse.SUPPRESS, help="Comma-separated review classes to exclude")
-    parser.add_argument("--rule", action="append", default=argparse.SUPPRESS, help="Binding scope rule; repeatable")
+def _csv(value: str) -> list[str]:
+    return [item.strip() for item in (value or "").split(",") if item.strip()]
 
 
-def scope_values(args) -> dict:
-    mapping = {"in_scope": "in_scope", "out_scope": "out_of_scope", "only": "only_severities",
-               "include": "include_classes", "exclude": "exclude_classes"}
-    value = {}
-    if hasattr(args, "type"):
-        value["type"] = args.type
-    for attribute, key in mapping.items():
-        if hasattr(args, attribute):
-            value[key] = [item.strip() for item in getattr(args, attribute).split(",") if item.strip()]
-    if hasattr(args, "rule"):
-        value["rules"] = args.rule
+def _target_value(ns) -> str:
+    positional = (getattr(ns, "target", "") or "").strip()
+    named = (getattr(ns, "target_option", "") or "").strip()
+    if positional and named and positional != named:
+        raise ValueError(f"target conflict: positional {positional!r} != --target {named!r}")
+    target = named or positional
+    if not target:
+        raise ValueError("a target is required (use `grypton init --target HOST`)")
+    return target
+
+
+def _constraints(ns, target: str) -> Constraints:
+    value = Constraints(
+        included_severities=_csv(getattr(ns, "only", "")),
+        excluded_classes=_csv(getattr(ns, "exclude", "")),
+        included_classes=_csv(getattr(ns, "include", "")),
+        in_scope=_csv(getattr(ns, "in_scope", "")) or [target],
+        out_of_scope=_csv(getattr(ns, "out_scope", "")),
+    )
+    for rule in getattr(ns, "rule", []) or []:
+        value.add_rule(rule)
+    value.add_rule("Network actions must match an in-scope host and avoid every out-of-scope rule.")
+    authorization = getattr(ns, "authorization_file", None)
+    if authorization:
+        path = Path(authorization).expanduser().resolve()
+        data = path.read_bytes()
+        value.notes = (f"Authorization record: {path.name}; sha256="
+                       f"{hashlib.sha256(data).hexdigest()}; recorded={int(time.time())}")
+    else:
+        value.notes = ("The operator started this engagement explicitly from the CLI. "
+                       "Grypton enforces the exact in-scope host list above.")
     return value
 
 
-def safe_lab_path(value: Path) -> Path:
-    path = value.expanduser().absolute()
-    if ({"target", "targets"} & set(path.parts) or path == Path("/root/krypton")
-            or Path("/root/krypton") in path.parents
-            or any(parent.is_symlink() for parent in (path, *path.parents))):
-        raise GryptonError("Lab files cannot use original-project, target, or symlinked paths.")
-    return path
+def _configure_run(ns) -> None:
+    if getattr(ns, "auto_stop_time", None) is not None:
+        config.CONFIG.max_run_seconds = int(ns.auto_stop_time) * 60
+    elif getattr(ns, "max_seconds", None) is not None:
+        config.CONFIG.max_run_seconds = int(ns.max_seconds)
+    if getattr(ns, "max_turns", None) is not None:
+        config.CONFIG.max_turns = int(ns.max_turns)
+    config.CONFIG.stop_on_p1 = bool(getattr(ns, "stop_on_p1", False))
+    config.CONFIG.backend = getattr(ns, "backend", "real")
 
 
-def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(prog="grypton", description="Review supplied security evidence with Kraude, Kryptex, and an independent Codex validator.",
-        epilog="Live review sends the attached evidence to the configured providers. Use demo or review --mock for offline work.")
-    root.add_argument("--version", action="version", version=f"grypton {__version__}")
-    common(root)
-    commands = root.add_subparsers(dest="command")
-    status = commands.add_parser("status", help="List engagements and review outcomes")
-    common(status)
-    status.add_argument("target", nargs="?", help="Optional engagement ID or target")
-    for name, help_text in [("models", "Show the exact model and plan routes"),
-                            ("doctor", "Check installed CLIs, model variants, and authentication"),
-                            ("scenarios", "List packaged review scenarios")]:
-        common(commands.add_parser(name, help=help_text))
-    audit = commands.add_parser("audit", help="Verify fork integrity, routes, assets, and source parity")
-    common(audit)
-    audit.add_argument("--source", type=Path, default=Path("/root/krypton"),
-                       help="Original source root to verify (default: /root/krypton)")
-    audit.add_argument("--skip-source", action="store_true", help="Skip the recorded original-source hash check")
-    audit.add_argument("--auth", action="store_true", help="Verify connector credentials without displaying values")
-    init = commands.add_parser("init", help="Initialize an engagement and open its console")
-    common(init)
-    init.add_argument("target", nargs="?", help="Target or project label")
-    init.add_argument("--target", dest="target_option", help="Target or project label (Krypton-compatible form)")
-    init.add_argument("-m", "--brief", default="", help="Mission brief or standing instruction")
-    init.add_argument("--claim", help="Explicit evidence claim (defaults to a target-relevant assessment)")
-    init.add_argument("--mock", action="store_true", help="Use offline model responses in the console")
-    init.add_argument("--no-interact", action="store_true", help="Create the engagement without opening a TTY console")
-    scope_args(init)
-    evidence = commands.add_parser("evidence", help="Attach or list supplied text artifacts")
-    common(evidence)
-    ev = evidence.add_subparsers(dest="evidence_command", required=True)
-    add = ev.add_parser("add", help="Import one regular UTF-8 file")
-    common(add)
-    add.add_argument("case")
-    add.add_argument("file", type=Path)
-    ls = ev.add_parser("list", help="List artifact IDs and hashes")
-    common(ls)
-    ls.add_argument("case")
-    run = commands.add_parser("review", help="Run the manager/worker/validator review sequence")
-    common(run)
-    run.add_argument("case")
-    run.add_argument("--mock", action="store_true", help="Use deterministic offline responses")
-    run.add_argument("--dry-run", action="store_true", help="Show the plan without invoking models")
-    run.add_argument("--resume", action="store_true", help="Reuse completed checkpoints after a failure or stop")
-    run.add_argument("--timeout", type=float, default=600, help="Per-call timeout in seconds (default: 600)")
-    resume = commands.add_parser("resume", help="Resume an engagement console")
-    common(resume)
-    resume.add_argument("case")
-    resume.add_argument("-m", "--brief", default="", help="New standing instruction for Kryptex")
-    resume.add_argument("--mock", action="store_true", help="Use offline model responses in the console")
-    resume.add_argument("--review", action="store_true", help="Resume an interrupted review immediately")
-    resume.add_argument("--timeout", type=float, default=600, help="Per-call timeout in seconds (default: 600)")
-    resume.add_argument("--no-interact", action="store_true", help="Show state without opening a TTY console")
-    show = commands.add_parser("show", help="Show a case and its review checkpoints")
-    common(show)
-    show.add_argument("case")
-    show.add_argument("--evidence", action="store_true", help="Include the explicitly attached artifact text")
-    report = commands.add_parser("report", help="Write a Markdown report to stdout")
-    common(report)
-    report.add_argument("case")
-    cancel = commands.add_parser("stop", help="Cancel an active review and preserve its checkpoints")
-    common(cancel)
-    cancel.add_argument("case")
-    demo = commands.add_parser("demo", help="Create and review a synthetic case offline")
-    common(demo)
-    demo.add_argument("--scenario", choices=[s["id"] for s in json.loads(resource("scenarios.json"))], default="configuration-review")
-    serve = commands.add_parser("serve", help="Open a read-only dashboard on 127.0.0.1")
-    common(serve)
-    serve.add_argument("--port", type=int, default=8765)
-    scope = commands.add_parser("scope", help="Show or update the stored engagement boundary")
-    common(scope)
-    scope_sub = scope.add_subparsers(dest="scope_command", required=True)
-    scope_show = scope_sub.add_parser("show", help="Show scope and binding rules")
-    common(scope_show)
-    scope_show.add_argument("case")
-    scope_set = scope_sub.add_parser("set", help="Replace selected scope fields")
-    common(scope_set)
-    scope_set.add_argument("case")
-    scope_args(scope_set)
-    history = commands.add_parser("history", help="Show explicit terminal conversation history")
-    common(history)
-    history.add_argument("case")
-    history.add_argument("--limit", type=int, default=20)
-    note = commands.add_parser("note", help="Append a workspace observation")
-    common(note)
-    note.add_argument("case")
-    note.add_argument("text")
-    surface = commands.add_parser("surface", help="Manage supplied attack-surface records")
-    common(surface)
-    surface_sub = surface.add_subparsers(dest="surface_command", required=True)
-    surface_list = surface_sub.add_parser("list", help="List surface records")
-    common(surface_list)
-    surface_list.add_argument("case")
-    surface_add = surface_sub.add_parser("add", help="Append a surface record")
-    common(surface_add)
-    surface_add.add_argument("case")
-    surface_add.add_argument("kind")
-    surface_add.add_argument("text")
-    findings = commands.add_parser("findings", help="Manage the persistent finding ledger")
-    common(findings)
-    finding_sub = findings.add_subparsers(dest="finding_command", required=True)
-    finding_list = finding_sub.add_parser("list", help="List candidate and validated findings")
-    common(finding_list)
-    finding_list.add_argument("case")
-    finding_add = finding_sub.add_parser("add", help="Add a candidate backed by attached evidence")
-    common(finding_add)
-    finding_add.add_argument("case")
-    finding_add.add_argument("claim")
-    finding_add.add_argument("--title", default="")
-    finding_add.add_argument("--evidence", action="append", default=None, help="Attached artifact ID; repeatable")
-    finding_validate = finding_sub.add_parser("validate", help="Have Kryptex coordinate independent Astra validation")
-    common(finding_validate)
-    finding_validate.add_argument("case")
-    finding_validate.add_argument("finding")
-    finding_validate.add_argument("--mock", action="store_true")
-    finding_validate.add_argument("--timeout", type=float, default=600)
-    lab = commands.add_parser("lab", help="Inspect or score the bundled nine-turn regression lab")
-    common(lab)
-    lab_sub = lab.add_subparsers(dest="lab_command", required=True)
-    for name, help_text in (("list", "List fixed synthetic scenarios and evidence turns"),
-                            ("verify", "Validate the suite and print its stable digest")):
-        common(lab_sub.add_parser(name, help=help_text))
-    lab_run = lab_sub.add_parser("run", help="Run fixed fixtures through the complete model pipeline")
-    common(lab_run)
-    lab_run.add_argument("--scenario", help="Run one scenario (default: all three)")
-    mode = lab_run.add_mutually_exclusive_group()
-    mode.add_argument("--mock", dest="live", action="store_false", help="Run without provider calls (default)")
-    mode.add_argument("--live", dest="live", action="store_true", help="Call the configured models with synthetic fixtures")
-    lab_run.set_defaults(live=False)
-    lab_run.add_argument("--save", type=Path, help="Write complete result JSON to a private file")
-    lab_score = lab_sub.add_parser("score", help="Score a JSON result map without invoking models")
-    common(lab_score)
-    lab_score.add_argument("results", type=Path)
-    return root
+def _run_engagement(ws: Workspace, ns, *, brief: str, fresh: bool) -> int:
+    from .chat import Renderer, interact
+    from .engine import Engine
 
+    _configure_run(ns)
+    renderer = Renderer()
+    engine = Engine(ws.slug, backend=config.CONFIG.backend, emit=renderer.emit)
 
-def dispatch(args) -> tuple[object, int]:
-    settings = Settings.load(getattr(args, "root", None), getattr(args, "timeout", 600))
-    store = Store(settings)
-    command = args.command or "status"
-    if command == "status":
-        value = state(store)
-        if getattr(args, "target", None):
-            case_id = store.resolve(args.target)
-            value["cases"] = [case_summary(store.get(case_id))]
-            selected = value["cases"][0]
-            value["counts"] = {"total": 1, "running": int(selected["status"] == "running"),
-                               "findings": selected["finding_count"],
-                               "validated": selected["validated_finding_count"],
-                               "supported": int(selected["mode"] == "live" and selected["review_complete"]
-                                                and selected["verdict"] == "supported"),
-                               "inconclusive": int(selected["verdict"] == "inconclusive")}
-        if not getattr(args, "json", False):
-            print_state(value)
-            return None, 0
-        return value, 0
-    if command == "models":
-        return {role: model.public() for role, model in MODELS.items()}, 0
-    if command == "doctor":
-        value = asyncio.run(doctor())
-        return value, 0 if value["ok"] else 1
-    if command == "audit":
-        from .integrity import audit_project
-        value = audit_project(settings.root, source_root=None if args.skip_source else args.source,
-                              check_auth=args.auth)
-        return value, 0 if value["ok"] else 1
-    if command == "scenarios":
-        return [{k: v for k, v in item.items() if k != "evidence"} for item in json.loads(resource("scenarios.json"))], 0
-    if command == "init":
-        if args.target and args.target_option and args.target != args.target_option:
-            raise GryptonError("Provide the target once, either positionally or with --target.")
-        target = (args.target or args.target_option or "").strip()
-        if not target:
-            raise GryptonError("Provide a target: `grypton init TARGET` or `grypton init --target TARGET`.")
-        claim = (args.claim or f"Assess the supplied evidence relevant to {target}.").strip()
-        try:
-            existing = store.resolve(target)
-        except GryptonError as exc:
-            if not str(exc).startswith("Unknown engagement:"):
-                raise
-            case = store.create(target, claim, stable=True, target=target, brief=args.brief)
-        else:
-            case = store.set_target(existing, store.get(existing).get("target") or target)
-            if args.claim:
-                case = store.set_claim(existing, args.claim)
-            if args.brief:
-                case = store.set_brief(existing, args.brief)
-        values = scope_values(args)
-        if not case["scope"]["in_scope"] and "in_scope" not in values:
-            values["in_scope"] = [target]
-        if values:
-            case = store.set_scope(case["id"], values)
-        if sys.stdin.isatty() and not args.no_interact and not getattr(args, "json", False):
-            from .console import interact
-            asyncio.run(interact(store, case["id"], MockBackend() if args.mock else LiveBackend(settings)))
-            return None, 0
-        return {**case_summary(case), "target": target,
-                "next": f"grypton resume {case['id']}"}, 0
-    if command == "evidence":
-        case_id = store.resolve(args.case)
-        case = store.add_evidence(case_id, args.file) if args.evidence_command == "add" else store.get(case_id)
-        return case_detail(case)["evidence"], 0
-    if command == "show":
-        case = store.get(store.resolve(args.case))
-        if getattr(args, "json", False):
-            detail = case_detail(case)
-            if args.evidence:
-                detail["evidence"] = case["evidence"]
-            return detail, 0
-        print(markdown_report(case), end="")
-        if args.evidence:
-            for evidence in case["evidence"]:
-                line(f"\n{evidence['id']} · {evidence['name']}")
-                line(evidence["text"])
-        return None, 0
-    if command == "report":
-        report = markdown_report(store.get(store.resolve(args.case)))
-        if getattr(args, "json", False):
-            return {"markdown": report}, 0
-        print(report, end="")
-        return None, 0
-    if command == "stop":
-        return stop(store, store.resolve(args.case)), 0
-    if command == "serve":
-        if not 0 <= args.port <= 65535:
-            raise GryptonError("Port must be between 0 and 65535.")
-        from .web import serve
-        serve(store, args.port)
-        return None, 0
-    if command == "scope":
-        case_id = store.resolve(args.case)
-        if args.scope_command == "set":
-            values = scope_values(args)
-            if not values:
-                raise GryptonError("Provide at least one scope field to update.")
-            case = store.set_scope(case_id, values)
-        else:
-            case = store.get(case_id)
-        return {"engagement": case_id, "scope": case["scope"]}, 0
-    if command == "history":
-        if not 1 <= args.limit <= 200:
-            raise GryptonError("History limit must be between 1 and 200.")
-        case_id = store.resolve(args.case)
-        case = store.get(case_id)
-        return {"engagement": case_id, "messages": case["messages"][-args.limit:],
-                "standing_instructions": case["standing_instructions"]}, 0
-    if command == "note":
-        case_id = store.resolve(args.case)
-        return {"engagement": case_id, "observation": store.append_record(case_id, "observations", args.text)}, 0
-    if command == "surface":
-        case_id = store.resolve(args.case)
-        if args.surface_command == "add":
-            item = store.append_record(case_id, "surface", args.text, category=args.kind)
-            return {"engagement": case_id, "surface": item}, 0
-        return {"engagement": case_id, "surface": store.get(case_id)["surface"]}, 0
-    if command == "findings":
-        case_id = store.resolve(args.case)
-        if args.finding_command == "list":
-            return {"engagement": case_id, "findings": store.get(case_id)["findings"]}, 0
-        if args.finding_command == "add":
-            title = args.title.strip() or args.claim.strip().splitlines()[0][:200]
-            finding = store.add_finding(case_id, title, args.claim, evidence_ids=args.evidence)
-            return {"engagement": case_id, "finding": finding,
-                    "next": f"grypton findings validate {case_id} {finding['id']}"}, 0
-        backend = MockBackend() if args.mock else LiveBackend(settings)
-        def event(item):
-            line(f"[{item['stage']}] {item['status']}: {item['detail']}", stream=sys.stderr)
-        return asyncio.run(validate_finding(store, case_id, args.finding, backend, emit=event)), 0
-    if command == "lab":
-        from .lab import canonical_digest, load_suite, score_suite
-        suite = load_suite()
-        if args.lab_command == "list":
-            return {"suite_id": suite["suite_id"], "offline_only": suite["offline_only"],
-                    "scenarios": [{"id": item["id"], "title": item["title"],
-                                   "turns": [{"id": turn["id"], "expected_verdict": turn["expected"]["verdict"],
-                                              "expected_severity": turn["expected"]["severity"]}
-                                             for turn in item["turns"]]}
-                                  for item in suite["scenarios"]]}, 0
-        if args.lab_command == "verify":
-            return {"ok": True, "suite_id": suite["suite_id"], "suite_sha256": canonical_digest(suite),
-                    "scenario_count": len(suite["scenarios"]),
-                    "turn_count": sum(len(item["turns"]) for item in suite["scenarios"]),
-                    "model_calls": 0, "target_interaction": False}, 0
-        if args.lab_command == "run":
-            from .lab_runner import run_lab
-            def progress(item):
-                line(f"[lab] {item['scenario']} / {item['turn']} · {item['status']}" +
-                     (f" · score {item['score']:.3f}" if "score" in item else ""), stream=sys.stderr)
-            result = asyncio.run(run_lab(settings, scenario_id=args.scenario, live=args.live, emit=progress))
-            result["suite_sha256"] = canonical_digest(suite)
-            if args.save:
-                path = safe_lab_path(args.save)
-                atomic_json(path, result)
-                result["saved_to"] = str(path)
-            return result, 0
-        path = safe_lab_path(args.results)
-        try:
-            results = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, UnicodeError) as exc:
-            raise GryptonError("Lab results must be a readable UTF-8 JSON object.") from exc
-        if (isinstance(results, dict) and isinstance(results.get("results"), dict)
-                and results.get("suite_id") == suite["suite_id"]):
-            results = results["results"]
-        return score_suite(results, suite), 0
-    if command == "demo":
-        scenario = next(s for s in json.loads(resource("scenarios.json")) if s["id"] == args.scenario)
-        case = store.create(scenario["title"], scenario["claim"])
-        with tempfile.TemporaryDirectory(prefix="grypton-demo-") as name:
-            path = Path(name) / "synthetic-evidence.txt"
-            path.write_text(scenario["evidence"], encoding="utf-8")
-            store.add_evidence(case["id"], path)
-        value = asyncio.run(review(store, case["id"], MockBackend()))
-        return {"case": case["id"], "run": value, "next": f"grypton show {case['id']}"}, 0
-    if command == "resume":
-        case_id = store.resolve(args.case)
-        if args.brief:
-            store.set_brief(case_id, args.brief)
-        if args.review:
-            backend = MockBackend() if args.mock else LiveBackend(settings)
-            def event(item):
-                line(f"[{item['stage']}] {item['status']}: {item['detail']}", stream=sys.stderr)
-            return asyncio.run(review(store, case_id, backend, resume=True, emit=event)), 0
-        if sys.stdin.isatty() and not args.no_interact and not getattr(args, "json", False):
-            from .console import interact
-            asyncio.run(interact(store, case_id, MockBackend() if args.mock else LiveBackend(settings)))
-            return None, 0
-        case = store.get(case_id)
-        return {**case_detail(case), "next": f"grypton resume {case_id}"}, 0
-    if command == "review":
-        case_id = store.resolve(args.case)
-        case = store.get(case_id)
-        if args.dry_run:
-            return {"case": case_id, "evidence_count": len(case["evidence"]),
-                    "mode": "mock" if args.mock else "live", "models": {role: model.public() for role, model in MODELS.items()},
-                    "stages": ["Kryptex plans", "Kraude assesses", "At most one local-requirement follow-up",
-                               "Codex independently validates", "Kryptex summarizes"],
-                    "max_model_calls": 5, "tools": "disabled", "timeout_per_call": settings.timeout}, 0
-        def event(item):
-            line(f"[{item['stage']}] {item['status']}: {item['detail']}", stream=sys.stderr)
-        backend = MockBackend() if args.mock else LiveBackend(settings)
-        return asyncio.run(review(store, case_id, backend, resume=args.resume, emit=event)), 0
-    raise GryptonError("Unknown command.")
+    async def execute():
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, lambda s=sig: engine.request_stop(f"signal {s.name}"))
+            except (NotImplementedError, RuntimeError):
+                pass
+        meta = ws.load_meta()
+        await engine.setup(brief=brief, target=meta.target, target_type=meta.target_type,
+                           fresh_clone=fresh)
+        await interact(engine)
 
-
-def main(argv: list[str] | None = None) -> int:
-    args = parser().parse_args(argv)
     try:
-        value, code = dispatch(args)
-        if value is not None:
-            if getattr(args, "json", False):
-                json_output(value)
-            else:
-                render(value)
-        return code
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        line("Review interrupted. Use grypton resume CASE with the same backend to continue.", stream=sys.stderr)
-        return 130
-    except BrokenPipeError:
-        return 0
-    except (GryptonError, OSError) as exc:
-        message = clean(str(exc))
-        if getattr(args, "json", False):
-            json_output({"ok": False, "error": message})
-        else:
-            line("grypton: " + message, stream=sys.stderr)
-        return 1
+        asyncio.run(execute())
+    except KeyboardInterrupt:
+        print("\nGrypton stopped.")
+    return 0
 
 
-def render(value):
-    if isinstance(value, dict) and "checks" in value and "ok" in value:
-        for check in value["checks"]:
-            line(f"{'OK' if check['ok'] else 'FAIL'}  {check['check']}: {check['detail']}")
-        for note in value.get("notes", []):
-            line(note)
-    elif isinstance(value, dict) and set(value) == set(MODELS):
-        for role, model in value.items():
-            line(f"{model['name']} ({role})  {model['qualified']}  /  {model['effort']}")
-    elif isinstance(value, dict) and "stages" in value and "mode" in value and "id" in value:
-        line(f"Review {value['status']} · {value['mode']}")
-        verdict = value["stages"].get("validation", {})
-        if verdict:
-            line(f"Verdict: {verdict['verdict']} · Severity: {verdict['severity']}")
-            line(verdict["rationale"])
-        if "summary" in value["stages"]:
-            line(value["stages"]["summary"]["summary"])
-    elif isinstance(value, dict) and "next" in value:
-        line(f"Engagement: {value.get('case', value.get('id', ''))}")
-        if "run" in value:
-            line("Offline demonstration complete · MOCK · Inconclusive")
-        line(value["next"])
-    elif isinstance(value, dict) and "findings" in value:
-        line(f"Findings for {value['engagement']}")
-        if not value["findings"]:
-            line("  (none)")
-        for finding in value["findings"]:
-            line(f"  {finding['id']} · {finding['status']} · {finding.get('severity', 'unknown')} · {finding['title']}")
-    elif isinstance(value, dict) and "scope" in value:
-        line(f"Scope for {value['engagement']} · type {value['scope']['type']}")
-        for key in SCOPE_KEYS:
-            line(f"  {key.replace('_', ' ')}: " + (", ".join(value["scope"][key]) or "(unset)"))
-    elif isinstance(value, dict) and "messages" in value and "standing_instructions" in value:
-        line(f"Conversation for {value['engagement']}")
-        for item in value["messages"]:
-            line(f"  {item['role']}: {item['text']}")
-        if not value["messages"]:
-            line("  (no messages)")
-    elif isinstance(value, dict) and "validation" in value and str(value.get("id", "")).startswith("finding-"):
-        line(f"{value['id']} · {value['status']} · {value.get('severity', 'unknown')}")
-        line(value["validation"]["rationale"])
-    elif isinstance(value, dict) and "suite_id" in value:
-        if "mode" in value and "score" in value:
-            score = value["score"].get("score", 0)
-            line(f"Lab {value['suite_id']} · {value['mode']} · {value['scenario_count']} scenario(s) · "
-                 f"{value['turn_count']} turn(s) · score {score:.3f}")
-            if value.get("saved_to"):
-                line("Saved complete results to " + value["saved_to"])
-        elif "component_names" in value:
-            line(f"Lab score {value['suite_id']} · {value['score']:.3f} · "
-                 f"transition adaptation {value.get('transition_adaptation')}")
-        elif "scenarios" in value:
-            line(f"Lab {value['suite_id']} · {len(value['scenarios'])} scenario(s)")
-            for scenario in value["scenarios"]:
-                line(f"  {scenario['id']} · {len(scenario['turns'])} evidence turn(s) · {scenario['title']}")
-        else:
-            line(f"Lab {value['suite_id']} verified · {value.get('scenario_count', 0)} scenario(s) · "
-                 f"{value.get('turn_count', 0)} turn(s) · sha256:{value.get('suite_sha256', '')}")
+def cmd_init(ns) -> int:
+    try:
+        target = _target_value(ns)
+        constraints = _constraints(ns, target)
+    except (ValueError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    slug = config.slugify(target)
+    ws = Workspace(slug)
+    if ws.exists() and not ns.force:
+        print(f"ERROR: engagement {slug!r} already exists; use `grypton resume {slug}` "
+              "or `grypton init --force --target ...`.", file=sys.stderr)
+        return 2
+    if not ws.exists():
+        ws.create(target, ns.type)
     else:
-        line(json.dumps(value, ensure_ascii=False, indent=2))
+        ws.update_meta(target=target, target_type=ns.type, turn_index=0,
+                       last_directive="", worker_uuid="", manager_session_id="")
+    ws.save_constraints(constraints)
+    print(f"Grypton engagement: {slug}\n"
+          f"  target     {target}\n"
+          f"  scope      {', '.join(constraints.in_scope)}\n"
+          f"  Kraude     {config.WORKER_MODEL} · {config.WORKER_EFFORT}\n"
+          f"  Kryptex    {config.MANAGER_MODEL} · {config.MANAGER_EFFORT}\n"
+          f"  validator  {config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT}\n")
+    return _run_engagement(ws, ns, brief=ns.brief or f"Assess {target} within recorded scope.", fresh=True)
 
 
-def worker_main() -> int:
-    from .console import role_console
-    return role_console("worker")
+def cmd_resume(ns) -> int:
+    slug = config.slugify(ns.target)
+    ws = Workspace(slug)
+    if not ws.exists():
+        print(f"ERROR: no engagement {slug!r}.", file=sys.stderr)
+        return 2
+    return _run_engagement(ws, ns, brief=ns.brief or "", fresh=False)
 
 
-def manager_main() -> int:
-    from .console import role_console
-    return role_console("manager")
+def _count_lines(path: Path) -> int:
+    try:
+        with path.open(encoding="utf-8") as stream:
+            return sum(1 for line in stream if line.strip())
+    except OSError:
+        return 0
+
+
+def _status(slug: str) -> dict:
+    ws = Workspace(slug)
+    if not ws.exists():
+        return {"slug": slug, "missing": True}
+    meta = ws.load_meta()
+    calls = ws.transcripts_dir / "provider-calls.jsonl"
+    by_role = {"worker": 0, "manager": 0, "validator": 0}
+    try:
+        for line in calls.read_text(encoding="utf-8").splitlines():
+            role = json.loads(line).get("role")
+            if role in by_role:
+                by_role[role] += 1
+    except (OSError, ValueError):
+        pass
+    return {"slug": slug, "target": meta.target, "status": meta.status,
+            "type": meta.target_type, "turns": meta.turn_index,
+            "findings": len(ws.findings.all()),
+            "confirmed_findings": len(ws.confirmed_findings()),
+            "confirmed_p1": len(ws.confirmed_p1s()),
+            "surface": len(ws.surface.all()), "tested": len(ws.tested.all()),
+            "tool_calls": _count_lines(ws.root / ".ledger" / "tool-calls.jsonl"),
+            "provider_calls": by_role,
+            "models": {"worker": f"{config.WORKER_MODEL} · {config.WORKER_EFFORT}",
+                       "manager": f"{config.MANAGER_MODEL} · {config.MANAGER_EFFORT}",
+                       "validator": f"{config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT}"},
+            "workspace": str(ws.root)}
+
+
+def cmd_status(ns) -> int:
+    slugs = [config.slugify(ns.target)] if ns.target else list_targets()
+    rows = [_status(slug) for slug in slugs]
+    if ns.json:
+        print(json.dumps(rows[0] if ns.target and rows else rows, indent=2))
+        return 0
+    if not rows:
+        print("No engagements yet.")
+        return 0
+    for row in rows:
+        if row.get("missing"):
+            print(f"{row['slug']}: missing")
+            continue
+        calls = row["provider_calls"]
+        print(f"{row['slug']}: {row['status']} · turns={row['turns']} · tools={row['tool_calls']} · "
+              f"surface={row['surface']} · tested={row['tested']} · "
+              f"findings={row['findings']} ({row['confirmed_findings']} confirmed) · "
+              f"providers=Kraude:{calls['worker']}/Kryptex:{calls['manager']}/Astra:{calls['validator']}")
+    return 0
+
+
+def _existing_workspace(target: str) -> Workspace:
+    ws = Workspace(config.slugify(target))
+    if not ws.exists():
+        raise ValueError(f"no engagement {target!r}")
+    return ws
+
+
+def cmd_show(ns) -> int:
+    try:
+        ws = _existing_workspace(ns.target)
+    except ValueError as exc:
+        print(f"ERROR: {exc}.", file=sys.stderr)
+        return 2
+    row = _status(ws.slug)
+    meta = ws.load_meta()
+    row["scope"] = ws.load_constraints().in_scope
+    row["last_directive"] = meta.last_directive
+    row["files"] = {name: str(ws.root / name) for name in (
+        "findings.md", "attack-surface.md", "tested-techniques.md",
+        "progress.md", "scope-rules.md",
+    )}
+    if ns.json:
+        print(json.dumps(row, ensure_ascii=False, indent=2))
+    else:
+        cmd_status(argparse.Namespace(target=ws.slug, json=False))
+        print(f"  scope={', '.join(row['scope']) or '(none)'}")
+        print(f"  workspace={ws.root}")
+        if meta.last_directive:
+            print(f"  last directive={meta.last_directive.splitlines()[0][:180]}")
+    return 0
+
+
+def cmd_findings(ns) -> int:
+    try:
+        ws = _existing_workspace(ns.target)
+    except ValueError as exc:
+        print(f"ERROR: {exc}.", file=sys.stderr)
+        return 2
+    rows = ws.findings.all()
+    if ns.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        print("No findings recorded.")
+        return 0
+    for row in rows:
+        verdict = row.get("manager_verdict") or {}
+        severity = verdict.get("severity") or row.get("severity") or "?"
+        print(f"{row.get('id')}: {severity} · {row.get('status', 'reported')} · "
+              f"Astra={verdict.get('verdict', 'pending')} · {row.get('title', '')}")
+    return 0
+
+
+def cmd_surface(ns) -> int:
+    try:
+        ws = _existing_workspace(ns.target)
+    except ValueError as exc:
+        print(f"ERROR: {exc}.", file=sys.stderr)
+        return 2
+    rows = ws.surface.all()
+    if ns.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+    else:
+        for row in rows:
+            print(f"{row.get('id')}: [{row.get('kind')}] {row.get('item')}")
+    return 0
+
+
+def cmd_history(ns) -> int:
+    try:
+        ws = _existing_workspace(ns.target)
+    except ValueError as exc:
+        print(f"ERROR: {exc}.", file=sys.stderr)
+        return 2
+    from .reporting import read_jsonl
+    rows = read_jsonl(ws.transcripts_dir / "turns.jsonl")
+    if ns.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+    else:
+        for row in rows:
+            summary = str(row.get("assistant_text") or "").strip().splitlines()
+            print(f"Turn {row.get('turn')}: tools={len(row.get('tools') or [])} · "
+                  f"{(summary[-1] if summary else '(no summary)')[:180]}")
+    return 0
+
+
+def cmd_scope(ns) -> int:
+    try:
+        ws = _existing_workspace(ns.target)
+    except ValueError as exc:
+        print(f"ERROR: {exc}.", file=sys.stderr)
+        return 2
+    if ns.json:
+        from dataclasses import asdict
+        print(json.dumps(asdict(ws.load_constraints()), ensure_ascii=False, indent=2))
+    else:
+        print(ws.load_constraints().to_prompt_block())
+    return 0
+
+
+def cmd_audit(ns) -> int:
+    try:
+        ws = _existing_workspace(ns.target)
+    except ValueError as exc:
+        print(f"ERROR: {exc}.", file=sys.stderr)
+        return 2
+    from .reporting import audit_workspace
+    result = audit_workspace(ws)
+    if ns.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        print(f"Grypton audit — {ws.slug}: {'PASS' if result['ok'] else 'ATTENTION REQUIRED'}")
+        print(f"  exact routes       {'yes' if result['exact_routes'] else 'no'}")
+        print(f"  provider failures  {len(result['provider_failures'])}")
+        print(f"  validator gaps     {len(result['unvalidated_findings'])}")
+        print(f"  missing flows      {len(result['missing_canonical_flows'])}")
+        print(f"  scope violations   {len(result['scope_violations'])}")
+        print(f"  target/ empty      {'yes' if result['target_dir_empty'] else 'no'}")
+        counts = result["counts"]
+        print(f"  evidence           tools={counts['tool_calls']} flows={counts['flows']} "
+              f"surface={counts['surface']} tested={counts['tested']}")
+    return 0 if result["ok"] else 1
+
+
+def cmd_report(ns) -> int:
+    try:
+        ws = _existing_workspace(ns.target)
+    except ValueError as exc:
+        print(f"ERROR: {exc}.", file=sys.stderr)
+        return 2
+    from .reporting import audit_workspace, render_report
+    if ns.format == "json":
+        content = json.dumps({"audit": audit_workspace(ws),
+                              "findings": ws.findings.all()}, ensure_ascii=False, indent=2) + "\n"
+    else:
+        content = render_report(ws)
+    if ns.output:
+        path = Path(ns.output).expanduser().resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        print(path)
+    else:
+        print(content, end="" if content.endswith("\n") else "\n")
+    return 0
+
+
+def cmd_stop(ns) -> int:
+    ws = Workspace(config.slugify(ns.target))
+    if not ws.exists():
+        print(f"ERROR: no engagement {ns.target!r}.", file=sys.stderr)
+        return 2
+    path = ws.root / ".ledger" / "STOP"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"requested {time.time()}\n", encoding="utf-8")
+    print(f"Stop requested for {ws.slug}; active provider processes are interrupted within one second.")
+    return 0
+
+
+def cmd_models(ns) -> int:
+    print(f"Kraude    {config.WORKER_MODEL} · {config.WORKER_EFFORT} · OpenCode Z.AI Coding Plan\n"
+          f"Kryptex   {config.MANAGER_MODEL} · {config.MANAGER_EFFORT} · OpenCode Go\n"
+          f"Validator {config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT} · Codex (fresh per finding)")
+    return 0
+
+
+def _model_in_catalog(route: str) -> bool:
+    provider, model = route.split("/", 1)
+    try:
+        result = subprocess.run([config.require_binary("opencode"), "models", provider],
+                                capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0 and any(line.strip() == route for line in result.stdout.splitlines())
+
+
+def _mcp_probe() -> tuple[bool, str]:
+    env = {**os.environ, "GRYPTON_TARGET": "doctor", "KRYPTON_TARGET": "doctor"}
+    try:
+        result = subprocess.run([sys.executable, "-m", "grypton.toolserver"],
+            input=(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}) + "\n" +
+                   json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}) + "\n"),
+            capture_output=True, text=True, timeout=10, env=env, cwd=str(config.GRYPTON_HOME))
+        rows = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+        count = len(rows[1]["result"]["tools"])
+        return result.returncode == 0 and count >= 20, f"{count} tools"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def cmd_doctor(ns) -> int:
+    from .providers import opencode_credential
+    checks = []
+    for binary in ("opencode", "codex", "curl", "httpx", "playwright",
+                   "google-chrome", "subfinder"):
+        found = config.find_binary(binary)
+        checks.append((binary, bool(found), found or "missing"))
+    for provider in (config.WORKER_PROVIDER, config.MANAGER_PROVIDER):
+        try:
+            opencode_credential(provider)
+            checks.append((provider + " connector", True, "connected (credential hidden)"))
+        except Exception as exc:
+            checks.append((provider + " connector", False, str(exc)))
+    checks.append((config.WORKER_MODEL, _model_in_catalog(config.WORKER_MODEL), "OpenCode catalog"))
+    checks.append((config.MANAGER_MODEL, _model_in_catalog(config.MANAGER_MODEL), "OpenCode catalog"))
+    mcp_ok, mcp_detail = _mcp_probe()
+    checks.append(("Grypton MCP", mcp_ok, mcp_detail))
+    checks.append(("Goja", (config.GOJA_DIR / "bin/goja-proxy").is_file(),
+                   str(config.GOJA_DIR / "bin/goja-proxy")))
+    print("Grypton doctor")
+    for name, passed, detail in checks:
+        print(f"  {'OK' if passed else 'FAIL':4}  {name:45} {detail}")
+    return 0 if all(passed for _, passed, _ in checks) else 1
+
+
+def cmd_tools(ns) -> int:
+    from .toolserver import cli_main
+    return cli_main(ns.arguments)
+
+
+def cmd_scenarios(ns) -> int:
+    from .scenarios import load_scenarios
+    rows = load_scenarios()
+    if ns.json:
+        print(json.dumps(rows, indent=2))
+    else:
+        for row in rows:
+            print(f"{row['id']}: {row['title']} [{', '.join(row['target_types'])}]")
+            for move in row["moves"]:
+                print(f"  - {move}")
+    return 0
+
+
+def cmd_lab(ns) -> int:
+    from .local_lab import serve
+    serve(ns.host, ns.port, ns.log)
+    return 0
+
+
+def cmd_serve(ns) -> int:
+    from .web import serve
+    serve(ns.port)
+    return 0
+
+
+def cmd_demo(ns) -> int:
+    ns.target = "http://127.0.0.1:1"
+    ns.target_option = ""
+    ns.type = "web"
+    ns.brief = "Exercise the autonomous loop with deterministic mock backends."
+    ns.only = ns.exclude = ns.include = ns.in_scope = ns.out_scope = ""
+    ns.rule = []
+    ns.authorization_file = None
+    ns.force = True
+    ns.backend = "mock"
+    ns.max_turns = ns.turns
+    ns.max_seconds = None
+    ns.auto_stop_time = None
+    ns.stop_on_p1 = False
+    return cmd_init(ns)
+
+
+def _run_options(parser) -> None:
+    parser.add_argument("-m", "--brief", default="", help="Engagement mission")
+    parser.add_argument("--backend", choices=["real", "mock"], default="real", help=argparse.SUPPRESS)
+    parser.add_argument("--max-seconds", type=int, default=None)
+    parser.add_argument("--max-turns", type=int, default=None)
+    parser.add_argument("--auto-stop-time", type=int, metavar="MINUTES", default=None)
+    parser.add_argument("--stop-on-p1", action="store_true")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="grypton",
+        description="Autonomous scoped testing with GLM Kraude, Spark Kryptex, and Astra validation")
+    parser.add_argument("--version", action="version", version="Grypton 3.0.0")
+    sub = parser.add_subparsers(dest="command", required=True)
+    init = sub.add_parser("init", help="Create and immediately run an engagement")
+    init.add_argument("target", nargs="?")
+    init.add_argument("--target", dest="target_option")
+    init.add_argument("--type", choices=["auto", "web", "api", "network", "cidr", "binary", "contract"], default="auto")
+    init.add_argument("--only", default=""); init.add_argument("--exclude", default="")
+    init.add_argument("--include", default=""); init.add_argument("--in-scope", default="")
+    init.add_argument("--out-scope", default=""); init.add_argument("--rule", action="append", default=[])
+    init.add_argument("--authorization-file"); init.add_argument("--force", action="store_true")
+    _run_options(init); init.set_defaults(func=cmd_init)
+    resume = sub.add_parser("resume", help="Resume a persistent engagement")
+    resume.add_argument("target"); _run_options(resume); resume.set_defaults(func=cmd_resume)
+    status = sub.add_parser("status"); status.add_argument("target", nargs="?")
+    status.add_argument("--json", action="store_true"); status.set_defaults(func=cmd_status)
+    show = sub.add_parser("show", help="Show one engagement and its review paths")
+    show.add_argument("target"); show.add_argument("--json", action="store_true")
+    show.set_defaults(func=cmd_show)
+    findings = sub.add_parser("findings", help="List findings with independent verdicts")
+    findings.add_argument("target"); findings.add_argument("--json", action="store_true")
+    findings.set_defaults(func=cmd_findings)
+    surface = sub.add_parser("surface", help="List recorded attack-surface items")
+    surface.add_argument("target"); surface.add_argument("--json", action="store_true")
+    surface.set_defaults(func=cmd_surface)
+    history = sub.add_parser("history", help="Show persistent worker turn history")
+    history.add_argument("target"); history.add_argument("--json", action="store_true")
+    history.set_defaults(func=cmd_history)
+    scope = sub.add_parser("scope", help="Show binding scope and standing instructions")
+    scope.add_argument("target"); scope.add_argument("--json", action="store_true")
+    scope.set_defaults(func=cmd_scope)
+    audit = sub.add_parser("audit", help="Verify routes, validation, scope, and evidence integrity")
+    audit.add_argument("target"); audit.add_argument("--json", action="store_true")
+    audit.set_defaults(func=cmd_audit)
+    report = sub.add_parser("report", help="Render a Markdown or JSON engagement report")
+    report.add_argument("target"); report.add_argument("--format", choices=["markdown", "json"],
+                                                        default="markdown")
+    report.add_argument("--output"); report.set_defaults(func=cmd_report)
+    stop = sub.add_parser("stop"); stop.add_argument("target"); stop.set_defaults(func=cmd_stop)
+    models = sub.add_parser("models"); models.set_defaults(func=cmd_models)
+    doctor = sub.add_parser("doctor"); doctor.set_defaults(func=cmd_doctor)
+    tools_parser = sub.add_parser("tools", help="Call the scoped HTTP/Goja/capture tool surface")
+    tools_parser.add_argument("arguments", nargs=argparse.REMAINDER); tools_parser.set_defaults(func=cmd_tools)
+    scenarios = sub.add_parser("scenarios", help="Show autonomous target-type playbooks")
+    scenarios.add_argument("--json", action="store_true"); scenarios.set_defaults(func=cmd_scenarios)
+    lab = sub.add_parser("lab", help="Run the instrumented loopback integration target")
+    lab.add_argument("--host", default="127.0.0.1"); lab.add_argument("--port", type=int, default=0)
+    lab.add_argument("--log", default=""); lab.set_defaults(func=cmd_lab)
+    serve = sub.add_parser("serve", help="Run the loopback read-only operations dashboard")
+    serve.add_argument("--port", type=int, default=8765); serve.set_defaults(func=cmd_serve)
+    demo = sub.add_parser("demo"); demo.add_argument("--turns", type=int, default=5); demo.set_defaults(func=cmd_demo)
+    return parser
+
+
+def main(argv=None) -> int:
+    # Keep progress visible when output is piped through tee or a log collector.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True, write_through=True)
+        except (AttributeError, OSError):
+            pass
+    config.ensure_layout()
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    # The tool CLI owns its option namespace. Dispatch it before the outer
+    # parser so flags such as `--target` and `--json` reach the tool parser.
+    if arguments and arguments[0] == "tools":
+        from .toolserver import cli_main
+        return cli_main(arguments[1:])
+    ns = build_parser().parse_args(arguments)
+    return ns.func(ns)
+
+
+def worker_main(argv=None) -> int:
+    print(f"Kraude is pinned to {config.WORKER_MODEL} · {config.WORKER_EFFORT}. "
+          "Start it with `grypton init --target HOST`.")
+    return 0
+
+
+def manager_main(argv=None) -> int:
+    print(f"Kryptex is pinned to {config.MANAGER_MODEL} · {config.MANAGER_EFFORT}; "
+          f"validation uses {config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT}.")
+    return 0

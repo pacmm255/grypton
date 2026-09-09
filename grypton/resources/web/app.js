@@ -1,142 +1,25 @@
 "use strict";
 const $ = id => document.getElementById(id);
-let workspace = null, labData = null, auditData = null, selected = null, refreshInFlight = false, detailSequence = 0, casesSignature = "";
-const labels = {plan:"Kryptex · Review plan",assessment:"Kraude · Evidence assessment",assessment_followup:"Kraude · Local follow-up",validation:"Codex · Independent validation",summary:"Kryptex · Closing review",requirements:"Local requirements",review:"Review"};
-function node(tag, className, text) { const value = document.createElement(tag); if (className) value.className = className; if (text !== undefined) value.textContent = text; return value; }
-function badge(value) { const known = ["supported","refuted","inconclusive","complete","running","failed","interrupted","draft","unreviewed","candidate","validating","outdated"]; return node("span", "badge " + (known.includes(value) ? value : ""), value); }
-function section(title) { const wrap = node("section", "detail-section"); wrap.append(node("h4", "detail-label", title)); return wrap; }
-function list(values) { const ul = node("ul", "gap-list"); for (const value of values) ul.append(node("li", "", value)); return ul; }
-function stat(label, value) { const item = node("div", "workspace-stat"); item.append(node("strong", "", String(value)),node("span", "", label)); return item; }
-async function request(path) { const response = await fetch(path, {cache:"no-store",credentials:"same-origin",signal:AbortSignal.timeout(12000)}); if (!response.ok) { const value = await response.json().catch(() => ({})); throw new Error(value.error || "Could not load workspace (" + response.status + ")."); } return response.json(); }
-function renderModels(models) {
-  const team = $("team"); team.replaceChildren();
-  const friendly = {worker:"GLM-5.3",manager:"Muse Spark 1.3 Contributor",validator:"GPT-6 Astra"};
-  const plans = {worker:"Z.AI Coding Plan",manager:"OpenCode Go",validator:"Codex"};
-  for (const [role, model] of Object.entries(models)) {
-    const card = node("article", "team-card"); card.append(node("span", "role-icon " + role, role === "worker" ? "K" : role === "manager" ? "◇" : "✓"));
-    const copy = node("div", "role-copy"), title = node("div", "role-title", model.name); title.append(node("span", "role-tag", role)); copy.append(title);
-    copy.append(node("div", "role-model", friendly[role] || model.model)); const provider = node("div", "role-provider", plans[role]); provider.append(node("span", "role-effort", "· " + model.effort)); copy.append(provider);
-    card.title = model.qualified; card.append(copy); team.append(card);
-  }
-}
-function renderCases() {
-  const query = $("search").value.trim().toLocaleLowerCase(), filter = $("filter").value;
-  const all = workspace?.cases || [], visible = all.filter(item => (filter === "all" || item.status === filter) && ([item.target,item.title,item.id,item.claim].join(" ")).toLocaleLowerCase().includes(query));
-  $("case-count").textContent = visible.length;
-  const signature = JSON.stringify([visible,selected,query,filter]); if (signature === casesSignature) return; casesSignature = signature;
-  const box = $("case-list"); const focusedCase = document.activeElement?.dataset?.caseId; box.replaceChildren();
-  if (!visible.length) {
-    const empty = node("div", "empty-list"); empty.append(node("span", "empty-symbol", "◇")); empty.append(node("h3", "", all.length ? "No matching cases" : "Your first case starts here"));
-    empty.append(node("p", "", all.length ? "Try another search or status filter." : "Create an engagement from the CLI, or inspect the fixed validation lab."));
-    if (!all.length) empty.append(node("code", "", "grypton init \"project.example\"")); box.append(empty); return;
-  }
-  for (const item of visible) {
-    const button = node("button", "case-item" + (item.id === selected ? " selected" : "")); button.type = "button"; button.dataset.caseId = item.id; button.setAttribute("aria-pressed", String(item.id === selected));
-    const topline = node("div", "case-topline"); topline.append(node("span", "case-id", "ENG / " + item.id.toUpperCase())); if (item.mode === "mock") topline.append(node("span", "mock", "MOCK")); button.append(topline);
-    button.append(node("div", "case-title", item.target || item.title)); const meta = node("div", "case-meta"); meta.append(badge(item.status),node("span", "", item.evidence_count + " artifact" + (item.evidence_count === 1 ? "" : "s")),node("span", "", item.finding_count + " finding" + (item.finding_count === 1 ? "" : "s"))); button.append(meta);
-    button.addEventListener("click", () => { selected = item.id; renderCases(); loadDetail(); }); box.append(button);
-    if (focusedCase === item.id) button.focus({preventScroll:true});
-  }
-}
-function renderDetail(data) {
-  const box = $("detail"); box.replaceChildren(); const runs = data.runs || [], run = runs.at(-1), stages = run?.stages || {};
-  const heading = node("div", "detail-heading"); heading.append(node("span", "detail-eyebrow", "ENGAGEMENT / " + data.id.toUpperCase()),badge(data.status)); box.append(heading,node("h3", "detail-title", data.target || data.title),node("p", "detail-claim", data.claim));
-  const workspaceStats = node("div", "workspace-stats"); workspaceStats.append(
-    stat("messages", data.message_count), stat("instructions", data.standing_instruction_count),
-    stat("observations", data.observation_count), stat("surface records", data.surface.length)); box.append(workspaceStats);
-  if (run?.mode === "mock") box.append(node("p", "note", "MOCK REVIEW · No models were called. This walkthrough cannot validate a finding."));
-  if (data.review_stale) box.append(node("p", "note", "EVIDENCE CHANGED · The previous review below is historical. Start a new review of the updated evidence."));
-  const scopeValues = data.scope || {}, scopeRows = [];
-  for (const key of ["in_scope","out_of_scope","only_severities","include_classes","exclude_classes","rules"]) if (scopeValues[key]?.length) scopeRows.push(key.replaceAll("_"," ") + " · " + scopeValues[key].join(", "));
-  const scope = section("ENGAGEMENT SCOPE"); scope.append(node("p", "scope-type", "TYPE / " + (scopeValues.type || "auto").toUpperCase()));
-  scope.append(scopeRows.length ? list(scopeRows) : node("p", "detail-text", "No additional scope labels are stored; analysis remains limited to supplied material.")); box.append(scope);
-  const evidence = section("ATTACHED EVIDENCE");
-  for (const item of data.evidence) { const entry = node("div", "artifact"), copy = node("div", "", item.name); copy.append(node("small", "", item.id + " · " + item.sha256.slice(0,16) + "…")); entry.append(node("span", "artifact-icon", "▤"),copy); evidence.append(entry); }
-  if (!data.evidence.length) evidence.append(node("p", "detail-text", "No artifacts attached yet.")); box.append(evidence);
-  if (data.surface.length) { const surface = section("SURFACE RECORDS"); for (const item of data.surface) { const row = node("div", "surface-row"); row.append(node("span", "surface-kind", item.category),node("span", "", item.text)); surface.append(row); } box.append(surface); }
-  if (run?.events?.length) {
-    const progress = section("REVIEW PROGRESS"), timeline = node("ol", "timeline");
-    const latest = new Map(); for (const event of run.events) latest.set(event.stage,event);
-    for (const [stage,event] of latest) { const li = node("li", "", (labels[stage] || stage) + " · " + event.status); li.append(node("small", "", event.detail)); timeline.append(li); } progress.append(timeline); box.append(progress);
-  }
-  if (stages.validation) {
-    const verdict = stages.validation, validation = section("INDEPENDENT VERDICT"), title = node("div", "validation-title"); title.append(badge(verdict.verdict),node("span", "", "Severity: " + verdict.severity));
-    validation.append(title,node("p", "detail-text", verdict.rationale));
-    if (verdict.limitations.length) validation.append(node("h4", "detail-label", "LIMITATIONS"),list(verdict.limitations));
-    if (verdict.remediation.length) validation.append(node("h4", "detail-label", "REMEDIATION"),list(verdict.remediation));
-    validation.append(node("p", "note", "This verdict describes the supplied evidence. It does not establish live reproduction.")); box.append(validation);
-  }
-  if (stages.summary) { const summary = section("KRYPTEX SUMMARY"); summary.append(node("p", "detail-text", stages.summary.summary),list(stages.summary.next_steps)); box.append(summary); }
-  if (data.findings.length) {
-    const ledger = section("FINDING LEDGER");
-    for (const finding of data.findings.slice().reverse()) {
-      const card = node("article", "finding-card"), top = node("div", "finding-top"); top.append(node("span", "finding-id", finding.id),badge(finding.status)); card.append(top,node("h5", "", finding.title));
-      const meta = node("p", "finding-meta", "Severity " + (finding.severity || "unknown") + " · " + finding.evidence_ids.length + " cited artifact" + (finding.evidence_ids.length === 1 ? "" : "s")); card.append(meta);
-      if (finding.validation?.rationale) card.append(node("p", "detail-text", finding.validation.rationale)); ledger.append(card);
-    }
-    box.append(ledger);
-  }
-  if (run?.calls?.length) {
-    const audit = section("MODEL CALL AUDIT"), table = node("div", "call-audit");
-    for (const call of run.calls) { const row = node("div", "call-row"); row.append(node("span", "call-stage", call.stage),node("span", "", call.route.qualified),node("span", "", call.route.effort),node("span", "", call.duration_ms + " ms"),badge(call.status)); table.append(row); }
-    audit.append(table,node("p", "note", "Inputs and outputs are represented by SHA-256 digests in state; raw provider prompts are not stored.")); box.append(audit);
-  }
-  if (run?.error) { const error = section("REVIEW ERROR"); error.append(node("p", "detail-text", run.error)); box.append(error); }
-  const resources = [...(run?.resources || []),...(data.resource_events || [])]; if (resources.length) { const area = section("LOCAL REQUIREMENTS"); area.append(list(resources.slice(-20).map(item => item.kind.replaceAll("_"," ") + " · " + item.status + " · " + (Array.isArray(item.detail) ? item.detail.join(", ") : item.detail)))); box.append(area); }
-  const action = section("CONTINUE IN THE CLI"); let command;
-  if (data.status === "running") command = "grypton stop " + data.id;
-  else if (["failed","interrupted"].includes(data.status)) command = "grypton resume " + data.id + " --review" + (run?.mode === "mock" ? " --mock" : "");
-  else if (!data.evidence.length) command = "grypton evidence add " + data.id + " /path/to/evidence.txt";
-  else if (data.status === "draft") command = "grypton review " + data.id + " --dry-run";
-  else command = "grypton report " + data.id;
-  action.append(node("code", "detail-command", command)); box.append(action);
-}
-function renderLab(data) {
-  const box = $("lab-summary"); box.replaceChildren(); const intro = node("div", "lab-intro");
-  intro.append(node("strong", "", data.scenario_count + " scenarios · " + data.turn_count + " evidence turns"),node("span", "", "sha256:" + data.suite_sha256.slice(0,16) + "…")); box.append(intro);
-  const grid = node("div", "lab-grid"); for (const scenario of data.scenarios) { const card = node("article", "lab-card"); card.append(node("span", "lab-id", scenario.id),node("h3", "", scenario.title),node("p", "", scenario.turn_count + " turns · " + scenario.expected_transitions.join(" → "))); grid.append(card); } box.append(grid,node("code", "detail-command", "grypton lab verify"));
-}
-function renderAudit(data) {
-  const box = $("integrity-summary"); box.replaceChildren();
-  const passed = data.checks.filter(item => item.ok && !item.skipped).length;
-  const active = data.checks.filter(item => !item.skipped).length;
-  const intro = node("div", "integrity-intro"); intro.append(
-    node("div", "integrity-score", passed + "/" + active),
-    node("div", "", data.ok ? "Fork contract verified" : "Review failed checks"),
-    badge(data.ok ? "complete" : "failed")); box.append(intro);
-  const grid = node("div", "integrity-grid");
-  for (const item of data.checks.filter(value => !value.skipped)) {
-    const row = node("article", "integrity-check " + (item.ok ? "ok" : "fail"));
-    row.append(node("span", "integrity-mark", item.ok ? "✓" : "!"));
-    const copy = node("div"); copy.append(node("strong", "", item.check),node("small", "", item.detail)); row.append(copy); grid.append(row);
-  }
-  box.append(grid,node("p", "note", "Read-only structural audit · no model calls · no target interaction. Run grypton audit --auth for connector checks."));
-}
-async function loadDetail() {
-  if (!selected) return; const id = selected, sequence = ++detailSequence;
-  try { const data = await request("/api/cases/" + encodeURIComponent(id)); if (selected === id && sequence === detailSequence) renderDetail(data); }
-  catch (error) { if (selected !== id || sequence !== detailSequence) return; $("detail").replaceChildren(node("p", "detail-text", error.message)); }
-}
-async function refresh() {
-  if (refreshInFlight) return; refreshInFlight = true; $("refresh").disabled = true;
-  try {
-    const next = await request("/api/state"); const previous = workspace?.cases?.find(item => item.id === selected); workspace = next;
-    for (const key of ["total","running","findings","validated"]) $("count-" + key).textContent = workspace.counts[key];
-    $("nav-count").textContent = workspace.counts.total;
-    if (!$("team").children.length) renderModels(workspace.models);
-    if (!auditData) { auditData = await request("/api/audit"); renderAudit(auditData); }
-    if (!labData) { labData = await request("/api/lab"); renderLab(labData); }
-    if (!selected && workspace.cases.length) selected = workspace.cases[0].id;
-    if (selected && !workspace.cases.some(item => item.id === selected)) { selected = null; detailSequence++; $("detail").replaceChildren(node("p", "detail-text", "The selected case is no longer available.")); }
-    renderCases(); const current = workspace.cases.find(item => item.id === selected);
-    if (current && (!previous || previous.updated_at !== current.updated_at)) await loadDetail();
-    $("error-banner").hidden = true; $("connection-label").textContent = "Connected"; $("connection-dot").classList.remove("offline");
-    $("updated").textContent = "Updated " + new Date().toLocaleTimeString([], {hour:"2-digit",minute:"2-digit",second:"2-digit"});
-  } catch (error) { $("error-banner").textContent = error.message + " Existing results may be out of date."; $("error-banner").hidden = false; $("connection-label").textContent = "Disconnected"; $("connection-dot").classList.add("offline"); }
-  finally { refreshInFlight = false; $("refresh").disabled = false; }
-}
-$("search").addEventListener("input",renderCases); $("filter").addEventListener("change",renderCases);
-$("refresh").addEventListener("click", () => { refresh(); if (selected) loadDetail(); });
-document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(); });
-function tick() { $("clock").textContent = new Date().toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"}); }
-tick(); refresh(); setInterval(tick,30000); setInterval(() => { if (!document.hidden) refresh(); },5000);
+const el = (tag, cls, text) => { const n=document.createElement(tag); if(cls)n.className=cls; if(text!==undefined)n.textContent=text; return n; };
+let state=null, selected=null, busy=false;
+async function get(path){const r=await fetch(path,{cache:"no-store",credentials:"same-origin",signal:AbortSignal.timeout(10000)});if(!r.ok)throw new Error((await r.json().catch(()=>({}))).error||`HTTP ${r.status}`);return r.json();}
+function badge(text){return el("span","badge "+String(text).toLowerCase(),text);}
+function stat(label,value){const n=el("div","workspace-stat");n.append(el("strong","",String(value)),el("span","",label));return n;}
+function section(title){const n=el("section","detail-section");n.append(el("h4","detail-label",title));return n;}
+function list(items,format=x=>String(x)){const n=el("ul","gap-list");for(const item of items)n.append(el("li","",format(item)));return n;}
+function renderModels(){const box=$("team");box.replaceChildren();for(const [role,model] of Object.entries(state.models)){const card=el("article","team-card");card.append(el("span","role-icon "+role,role==="worker"?"K":role==="manager"?"◇":"✓"));const copy=el("div","role-copy"),title=el("div","role-title",model.name);title.append(el("span","role-tag",role));copy.append(title,el("div","role-model",model.route),el("div","role-provider",model.effort+" effort"));card.append(copy);box.append(card);}}
+function renderList(){const q=$("search").value.toLowerCase(),f=$("filter").value;const rows=state.engagements.filter(x=>(f==="all"||x.status===f)&&`${x.id} ${x.target}`.toLowerCase().includes(q));$("engagement-count").textContent=rows.length;const box=$("engagement-list");box.replaceChildren();if(!rows.length){const e=el("div","empty-list");e.append(el("span","empty-symbol","◇"),el("h3","","No matching engagements"),el("code","","grypton init --target HOST"));box.append(e);return;}for(const row of rows){const b=el("button","case-item"+(selected===row.id?" selected":""));b.type="button";const top=el("div","case-topline");top.append(el("span","case-id","ENG / "+row.id.toUpperCase()),badge(row.status));b.append(top,el("div","case-title",row.target));const meta=el("div","case-meta");meta.append(el("span","",`${row.turns} turns`),el("span","",`${row.tool_calls} tools`),el("span","",`${row.flows} flows`),el("span","",`${row.confirmed}/${row.findings} confirmed`));b.append(meta);b.onclick=()=>{selected=row.id;renderList();loadDetail();};box.append(b);}}
+function keyValue(title,rows){const s=section(title),grid=el("div","kv-grid");for(const [k,v] of rows){const r=el("div","kv-row");r.append(el("span","kv-key",k),el("span","kv-value",String(v)));grid.append(r);}s.append(grid);return s;}
+function renderDetail(d){const box=$("detail");box.replaceChildren();const h=el("div","detail-heading");h.append(el("span","detail-eyebrow","ENGAGEMENT / "+d.id.toUpperCase()),badge(d.status));box.append(h,el("h3","detail-title",d.target));const stats=el("div","workspace-stats");stats.append(stat("turns",d.turns),stat("tool calls",d.tool_calls),stat("flows",d.flows),stat("confirmed",`${d.confirmed}/${d.findings}`));box.append(stats);
+box.append(keyValue("PINNED ROUTE ACTIVITY",[["Kraude calls",d.provider_calls.worker],["Kryptex calls",d.provider_calls.manager],["Astra calls",d.provider_calls.validator],["workspace",d.workspace]]));
+const scope=section("BINDING SCOPE");scope.append(list([`in: ${d.scope.in_scope.join(", ")||"—"}`,`out: ${d.scope.out_of_scope.join(", ")||"—"}`,...d.scope.hard_rules]));box.append(scope);
+if(d.tool_rows.length){const s=section("RECENT TOOL ACTIVITY");s.append(list(d.tool_rows.slice(-20).reverse(),x=>`${x.ok?"✓":"!"} ${x.tool} · ${x.summary}`));box.append(s);}
+if(d.flow_rows.length){const s=section("BURP-LIKE CAPTURES");s.append(list(d.flow_rows.slice(0,20),x=>`${x.id} · ${x.bytes} bytes`));box.append(s);}
+if(d.finding_rows.length){const s=section("FINDINGS / ASTRA VERDICTS");for(const f of d.finding_rows.slice().reverse()){const c=el("article","finding-card"),top=el("div","finding-top");top.append(el("span","finding-id",f.id),badge(f.manager_verdict?.verdict||"pending"));const sev=f.manager_verdict?.severity||f.severity;c.append(top,el("h5","",`${sev} · ${f.title}`),el("p","detail-text",f.manager_verdict?.reasoning||f.description||"Awaiting independent validation."));s.append(c);}box.append(s);}
+if(d.surface_rows.length){const s=section("RECENT ATTACK SURFACE");s.append(list(d.surface_rows.slice(-20).reverse(),x=>`${x.kind||"item"} · ${x.item}`));box.append(s);}
+if(d.tested_rows.length){const s=section("RECENT TESTED TECHNIQUES");s.append(list(d.tested_rows.slice(-20).reverse(),x=>`${x.surface} · ${x.technique} → ${x.result}`));box.append(s);}
+if(d.last_directive)box.append(keyValue("NEXT KRYPTEX DIRECTIVE",[["directive",d.last_directive]]));}
+async function loadDetail(){if(!selected)return;try{renderDetail(await get("/api/engagements/"+encodeURIComponent(selected)));}catch(e){$("detail").replaceChildren(el("p","detail-text",e.message));}}
+async function refresh(){if(busy)return;busy=true;$("refresh").disabled=true;try{state=await get("/api/state");for(const k of ["engagements","running","tools"])$("count-"+k).textContent=state.counts[k];$("count-findings").textContent=`${state.counts.confirmed}/${state.counts.findings}`;$("nav-count").textContent=state.counts.engagements;renderModels();if(!selected&&state.engagements.length)selected=state.engagements[0].id;if(selected&&!state.engagements.some(x=>x.id===selected))selected=null;renderList();if(selected)await loadDetail();$("connection-label").textContent="Connected";$("connection-dot").classList.remove("offline");$("error-banner").hidden=true;$("updated").textContent="Updated "+new Date().toLocaleTimeString();}catch(e){$("error-banner").textContent=e.message;$("error-banner").hidden=false;$("connection-label").textContent="Disconnected";$("connection-dot").classList.add("offline");}finally{busy=false;$("refresh").disabled=false;}}
+$("search").oninput=renderList;$("filter").onchange=renderList;$("refresh").onclick=refresh;
+function tick(){$("clock").textContent=new Date().toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});}tick();refresh();setInterval(tick,30000);setInterval(()=>{if(!document.hidden)refresh();},5000);

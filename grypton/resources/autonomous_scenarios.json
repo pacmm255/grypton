@@ -1,0 +1,82 @@
+[
+  {
+    "id": "web-surface-bootstrap",
+    "title": "Web surface bootstrap",
+    "target_types": ["web", "api", "auto"],
+    "moves": [
+      "capture the root and redirects with http_request",
+      "inspect robots, security.txt, linked scripts, and response headers",
+      "record routes, parameters, technologies, and negative results"
+    ]
+  },
+  {
+    "id": "identity-boundary-diff",
+    "title": "Identity and object-boundary differential",
+    "target_types": ["web", "api", "auto"],
+    "moves": [
+      "identify existing anonymous or supplied test identities",
+      "compare self, peer, missing, and malformed object references with controls",
+      "capture each request pair and avoid creating accounts when a local fixture suffices"
+    ]
+  },
+  {
+    "id": "frontend-source-map",
+    "title": "Frontend intelligence",
+    "target_types": ["web", "api", "auto"],
+    "moves": [
+      "read JavaScript and source-map references",
+      "extract routes, schemas, feature flags, and role assumptions",
+      "test only extracted leads that match scope"
+    ]
+  },
+  {
+    "id": "workflow-state",
+    "title": "Workflow and state transitions",
+    "target_types": ["web", "api", "auto"],
+    "moves": [
+      "map valid state transitions before varying order, repetition, and stale identifiers",
+      "compare responses against a valid control",
+      "avoid destructive actions and sustained load"
+    ]
+  },
+  {
+    "id": "blocked-path-recovery",
+    "title": "Operational blocker recovery",
+    "target_types": ["auto", "web", "api", "network", "cidr", "binary", "contract"],
+    "moves": [
+      "use tool_inventory before declaring a dependency missing",
+      "install a local dependency or build a synthetic local fixture when appropriate",
+      "pivot to another recorded in-scope lead when a real prerequisite is unavailable"
+    ]
+  },
+  {
+    "id": "network-inventory",
+    "title": "Bounded network inventory",
+    "target_types": ["network", "cidr"],
+    "moves": [
+      "resolve only recorded in-scope hosts",
+      "check a bounded port set and inspect reachable TLS certificates",
+      "record service evidence before deeper protocol-specific work"
+    ]
+  },
+  {
+    "id": "finding-proof",
+    "title": "Finding proof and validation handoff",
+    "target_types": ["auto", "web", "api", "network", "cidr", "binary", "contract"],
+    "moves": [
+      "save the positive and control evidence",
+      "state preconditions, affected boundary, and realistic impact",
+      "reference exact artifacts so Astra can independently grade the claim"
+    ]
+  },
+  {
+    "id": "defense-aware-authentication",
+    "title": "Defense-aware authentication checks",
+    "target_types": ["auto", "web", "api", "network"],
+    "moves": [
+      "budget invalid-authentication controls cumulatively across the engagement",
+      "stop the probe family at the first CAPTCHA, 429, WAF challenge, temporary block, or lockout",
+      "record the defense response and pivot to passive or unrelated read-only evidence"
+    ]
+  }
+]

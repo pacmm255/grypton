@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Source-checkout launcher for the Muse-backed Kryptex role console."""
+"""Source-checkout launcher for the Grypton MCP stdio server."""
 import os
 from pathlib import Path
 import sys
@@ -7,6 +7,6 @@ import sys
 project = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project))
 os.environ.setdefault("GRYPTON_HOME", str(project))
-from grypton.cli import manager_main
+from grypton.toolserver import mcp_main
 
-raise SystemExit(manager_main())
+raise SystemExit(mcp_main())

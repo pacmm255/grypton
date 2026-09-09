@@ -1,9 +1,7 @@
 # Severity calibration
 
-Assign a severity only when the claim is supported by the supplied evidence.
-Base it on demonstrated impact, affected boundary, prerequisites, repeatability,
-and scope. Keep severity `unknown` for refuted or inconclusive claims.
-
-Do not increase severity because Kraude or Kryptex suggested one. Distinguish the
-observed impact from possible impact and describe missing deployment, ownership,
-reachability, or reproduction evidence as a limitation.
+Base severity on demonstrated impact, affected trust boundary, prerequisites,
+repeatability, and reachable population. Distinguish observed impact from a
+possible chain. Use `needs-more-evidence` when the positive/control pair or
+identity context is missing. Kraude's claimed severity is a hypothesis; the
+fresh Astra verdict is the recorded independent judgment.

@@ -6,7 +6,7 @@ import sys
 
 project = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project))
-os.environ.setdefault("GRYPTON_ROOT", str(project))
+os.environ.setdefault("GRYPTON_HOME", str(project))
 from grypton.cli import main
 
 raise SystemExit(main())

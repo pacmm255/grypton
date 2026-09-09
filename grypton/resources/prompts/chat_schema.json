@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["reply", "remember", "disposition", "worker_note"],
+  "properties": {
+    "reply": {
+      "type": "string",
+      "description": "Your direct, conversational reply to the user — shown to them immediately. Acknowledge what they asked and say what you'll do."
+    },
+    "remember": {
+      "type": "string",
+      "description": "A standing instruction to remember and obey for the rest of the engagement (verbatim or refined), or empty string if nothing to persist. Conditional rules ('if X happens, do Y') go here."
+    },
+    "disposition": {
+      "type": "string",
+      "enum": ["apply-now", "apply-next-turn", "remember-only"],
+      "description": "apply-now: Kraude should act on this at its next yield (asap). apply-next-turn: fold into the next directive. remember-only: just keep in mind for when relevant."
+    },
+    "worker_note": {
+      "type": "string",
+      "description": "The concrete instruction to relay to Kraude if disposition is apply-now/apply-next-turn, or empty string."
+    }
+  }
+}
