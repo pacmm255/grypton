@@ -152,6 +152,9 @@ class ToolTests(unittest.TestCase):
             first = http_request(ws, f"http://127.0.0.1:{port}/first")
             self.assertTrue(first["ok"], first)
             self.assertIn("local-lab", first["data"]["response"])
+            head = http_request(ws, f"http://127.0.0.1:{port}/first", method="HEAD")
+            self.assertTrue(head["ok"], head)
+            self.assertEqual(head["data"]["returncode"], 0)
             flow_id = Path(first["data"]["flow"]).stem
             self.assertIn("GET http://127.0.0.1", flow_read(ws, flow_id)["data"]["text"])
             replay = flow_replay(ws, flow_id, url=f"http://127.0.0.1:{port}/second")

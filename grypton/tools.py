@@ -197,8 +197,14 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
     if not re.fullmatch(r"[A-Z]{1,20}", method):
         return _err("Invalid HTTP method.")
     argv = [curl, "--silent", "--show-error", "--include", "--compressed",
-            "--max-time", str(timeout), "--connect-timeout", str(min(timeout, 15)),
-            "--request", method]
+            "--max-time", str(timeout), "--connect-timeout", str(min(timeout, 15))]
+    # `--request HEAD` only changes the verb; curl still expects a response
+    # body and reports error 18 when a conforming server sends none. `--head`
+    # selects curl's actual header-only transfer mode.
+    if method == "HEAD":
+        argv.append("--head")
+    else:
+        argv += ["--request", method]
     if insecure:
         argv.append("--insecure")
     if proxy:
