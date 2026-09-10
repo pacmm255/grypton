@@ -37,6 +37,13 @@ TARGETS_DIR = ENGAGEMENTS_DIR                    # compatibility alias for core 
 RUNTIME_DIR = STATE_DIR / "runtime"
 LOG_DIR = RUNTIME_DIR / "logs"
 PROVIDER_DIR = STATE_DIR / "providers"
+# OpenCode's project discovery walks above engagement directories even when
+# Git's ceiling variables are set. Keep its tiny execution workspaces outside
+# the Grypton source checkout while evidence stays under ENGAGEMENTS_DIR.
+OPENCODE_WORKSPACES_DIR = Path(os.environ.get(
+    "GRYPTON_OPENCODE_WORKSPACES_DIR",
+    str(Path.home() / ".local/state/grypton/opencode-workspaces"),
+)).resolve()
 TARGET_DATA_DIR = GRYPTON_HOME / "target"
 RESOURCES_DIR = PACKAGE_DIR / "resources"
 PROMPTS_DIR = RESOURCES_DIR / "prompts"
@@ -201,6 +208,7 @@ def ensure_layout() -> None:
     """Create Grypton's private runtime directories (idempotent)."""
     for d in (
         STATE_DIR, ENGAGEMENTS_DIR, RUNTIME_DIR, LOG_DIR, PROVIDER_DIR,
+        OPENCODE_WORKSPACES_DIR,
         TARGET_DATA_DIR,
     ):
         d.mkdir(parents=True, exist_ok=True, mode=0o700)

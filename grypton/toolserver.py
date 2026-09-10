@@ -8,7 +8,7 @@ import sys
 import time
 from typing import Callable
 
-from . import tools
+from . import config, tools
 from .providers import append_jsonl
 from .workspace import Workspace
 
@@ -35,7 +35,11 @@ def _record_finding(ws, args):
         vuln_class=args.get("vuln_class", ""), surface=args.get("surface", ""),
         description=args.get("description", ""), poc=args.get("poc", ""),
         evidence=args.get("evidence", ""), source="worker")
-    return {"ok": True, "summary": f"Recorded {record['id']} for independent Astra validation.",
+    if config.astra_auto_validation_required(record["severity"]):
+        summary = f"Recorded {record['id']} for independent Astra validation."
+    else:
+        summary = f"Recorded {record['id']}; automatic Astra validation is not requested for {record['severity']}."
+    return {"ok": True, "summary": summary,
             "data": record}
 
 

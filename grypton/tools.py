@@ -210,11 +210,25 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
         argv += ["--data-binary", body]
     argv += ["--", url]
     started = time.time()
+    # Write curl output to a real file descriptor. Through some SOCKS/TLS
+    # fingerprint proxies curl can report error 23 while writing decoded
+    # Brotli data to a subprocess pipe; a regular file avoids that transport
+    # failure and still lets us bound what enters the evidence flow/model.
+    workspace.scratch_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    capture_path = workspace.scratch_dir / f".curl-{time.time_ns()}.capture"
+    fd = os.open(capture_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
     try:
-        result = subprocess.run(argv, capture_output=True, timeout=timeout + 5)
+        with os.fdopen(fd, "wb") as capture:
+            result = subprocess.run(argv, stdout=capture, stderr=subprocess.PIPE,
+                                    timeout=timeout + 5)
+        response_bytes = capture_path.stat().st_size
+        with capture_path.open("rb") as capture:
+            raw_output = capture.read(MAX_RESPONSE_BYTES)
     except subprocess.TimeoutExpired:
         return _err(f"HTTP request timed out after {timeout}s.")
-    output = result.stdout[:MAX_RESPONSE_BYTES].decode("utf-8", "replace")
+    finally:
+        capture_path.unlink(missing_ok=True)
+    output = raw_output.decode("utf-8", "replace")
     stderr = result.stderr[:8000].decode("utf-8", "replace")
     flow = _save_flow(workspace, method, url, clean_headers, body, output,
                       transport=transport, returncode=result.returncode, stderr=stderr)
@@ -222,8 +236,8 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
                   "no HTTP status")
     data = {"status_line": status, "response": output[:MAX_INLINE_RESPONSE_CHARS],
             "response_truncated": (len(output) > MAX_INLINE_RESPONSE_CHARS or
-                                   len(result.stdout) > MAX_RESPONSE_BYTES),
-            "response_bytes": len(result.stdout), "stderr": stderr,
+                                   response_bytes > MAX_RESPONSE_BYTES),
+            "response_bytes": response_bytes, "stderr": stderr,
             "returncode": result.returncode, "duration_s": round(time.time() - started, 3),
             "flow": str(flow), "transport": transport}
     if result.returncode:

@@ -17,7 +17,7 @@ from grypton import config
 from grypton.cli import _validate_requested_findings, build_parser
 from grypton.engine import Engine
 from grypton.manager import KryptexManager, ManagerContext, _check_schema, _extract_json
-from grypton.providers import MCP_TIMEOUT_MS, OpenCodeResult
+from grypton.providers import MCP_TIMEOUT_MS, OpenCodeClient, OpenCodeResult
 from grypton.reporting import audit_workspace, render_report
 from grypton.toolserver import REGISTRY, dispatch
 from grypton.tools import (check_host_scope, check_url_scope, flow_read, flow_replay,
@@ -37,6 +37,7 @@ def isolated_runtime():
             "RUNTIME_DIR": root / ".state/runtime",
             "LOG_DIR": root / ".state/runtime/logs",
             "PROVIDER_DIR": root / ".state/providers",
+            "OPENCODE_WORKSPACES_DIR": root / ".opencode-workspaces",
             "TARGET_DATA_DIR": root / "target",
         }
         with patch.multiple(config, **values):
@@ -200,6 +201,15 @@ class ToolTests(unittest.TestCase):
             log = ws.root / ".ledger/tool-calls.jsonl"
             self.assertEqual(json.loads(log.read_text().splitlines()[0])["tool"], "tool_inventory")
 
+    def test_record_finding_summary_matches_astra_threshold(self):
+        with isolated_runtime():
+            ws = Workspace("threshold-summary")
+            ws.create("127.0.0.1", "web")
+            low = dispatch(ws, "record_finding", {"title": "Low", "severity": "P5"})
+            high = dispatch(ws, "record_finding", {"title": "High", "severity": "P2"})
+            self.assertIn("not requested for P5", low["summary"])
+            self.assertIn("independent Astra validation", high["summary"])
+
     def test_read_only_engagement_audit_and_report(self):
         with isolated_runtime() as root, patch.object(config, "GRYPTON_HOME", root):
             ws = Workspace("report")
@@ -313,6 +323,29 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WorkerEventTests(unittest.TestCase):
+    def test_opencode_transport_workspace_is_outside_engagement(self):
+        with isolated_runtime() as root:
+            workspace = config.ENGAGEMENTS_DIR / "transport-test"
+            workspace.mkdir(parents=True)
+            client = OpenCodeClient(
+                role="worker",
+                route="zai-coding-plan/glm-5.3",
+                effort="max",
+                workspace=workspace,
+                target_slug="transport-test",
+                allow_tools=True,
+                agent_prompt="test",
+            )
+            self.assertEqual(
+                client.transport_workspace,
+                root / ".opencode-workspaces/transport-test/worker",
+            )
+            self.assertEqual(
+                (client.transport_workspace / "engagement").resolve(),
+                workspace.resolve(),
+            )
+            self.assertEqual(client.transcripts, workspace / "transcripts")
+
     def test_tool_error_text_is_rendered_and_retained(self):
         with isolated_runtime():
             events = []

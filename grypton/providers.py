@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import time
 from typing import Callable, Optional
@@ -19,6 +20,7 @@ from . import config
 
 MAX_STREAM_BYTES = 16_000_000
 MCP_TIMEOUT_MS = 120_000
+_OPENCODE_VERSION: Optional[str] = None
 _CONTROL = re.compile(
     r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|"
     r"[\x00-\x08\x0b-\x1f\x7f-\x9f]"
@@ -80,6 +82,65 @@ def clean(text: str, secrets=()) -> str:
 
 def _host_xdg(kind: str, default: str) -> Path:
     return Path(os.environ.get(f"XDG_{kind}_HOME", str(Path.home() / default)))
+
+
+def _installed_opencode_version() -> str:
+    """Return the CLI version used to select a matching local plugin SDK."""
+    global _OPENCODE_VERSION
+    if _OPENCODE_VERSION is not None:
+        return _OPENCODE_VERSION
+    try:
+        result = subprocess.run(
+            [config.require_binary("opencode"), "--version"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5,
+        )
+        _OPENCODE_VERSION = result.stdout.strip() if result.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        _OPENCODE_VERSION = ""
+    return _OPENCODE_VERSION
+
+
+def _package_version(directory: Path) -> str:
+    try:
+        value = json.loads((directory / "package.json").read_text(encoding="utf-8"))
+        return str(value.get("version") or value.get("dependencies", {}).get(
+            "@opencode-ai/plugin", ""
+        ))
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def _seed_opencode_dependencies(destination: Path) -> None:
+    """Hardlink a matching local SDK so isolated roles never race npm setup."""
+    version = _installed_opencode_version()
+    plugin = destination / "node_modules/@opencode-ai/plugin"
+    if not version or _package_version(plugin) == version:
+        return
+    candidates = [_host_xdg("CONFIG", ".config") / "opencode"]
+    for role in ("worker", "manager"):
+        candidates.extend(config.PROVIDER_DIR.glob(f"*/{role}/config/opencode"))
+    source = next((candidate for candidate in candidates
+                   if candidate != destination
+                   and _package_version(candidate) == version
+                   and _package_version(candidate / "node_modules/@opencode-ai/plugin") == version
+                   and (candidate / "package-lock.json").is_file()), None)
+    if source is None:
+        return
+    private_dir(destination)
+    modules = destination / "node_modules"
+    if modules.exists():
+        modules.replace(destination / f"node_modules.incomplete-{time.time_ns()}")
+
+    def link_or_copy(source_path: str, target_path: str) -> str:
+        try:
+            os.link(source_path, target_path)
+            return target_path
+        except OSError:
+            return shutil.copy2(source_path, target_path)
+
+    shutil.copytree(source / "node_modules", modules, copy_function=link_or_copy)
+    for name in ("package.json", "package-lock.json"):
+        shutil.copy2(source / name, destination / name)
 
 
 def opencode_credential(provider: str) -> dict:
@@ -161,6 +222,18 @@ class OpenCodeClient:
         self.agent_prompt = agent_prompt
         self.event_callback = event_callback
         self.runtime = private_dir(config.PROVIDER_DIR / target_slug / role)
+        # OpenCode discovers the parent Git checkout itself and performs project
+        # copy/snapshot work before the first model event. Engagements live under
+        # the Grypton checkout, so use a tiny persistent transport directory
+        # outside that repository. Evidence and transcripts remain in the real
+        # engagement workspace, and the MCP server resolves it from target_slug.
+        transport_root = private_dir(config.OPENCODE_WORKSPACES_DIR)
+        self.transport_workspace = private_dir(transport_root / target_slug / role)
+        engagement_link = self.transport_workspace / "engagement"
+        if engagement_link.is_symlink() and engagement_link.resolve() != self.workspace:
+            engagement_link.unlink()
+        if not engagement_link.exists():
+            engagement_link.symlink_to(self.workspace, target_is_directory=True)
         self.transcripts = private_dir(self.workspace / "transcripts")
         self.proc: Optional[asyncio.subprocess.Process] = None
 
@@ -168,6 +241,7 @@ class OpenCodeClient:
         auth = opencode_credential(self.provider)
         for kind in ("config", "data", "cache", "state"):
             private_dir(self.runtime / kind)
+        _seed_opencode_dependencies(self.runtime / "config/opencode")
         atomic_json(self.runtime / "data/opencode/auth.json", {self.provider: auth})
         source_catalog = _host_xdg("CACHE", ".cache") / "opencode/models.json"
         catalog_target = self.runtime / "cache/opencode/models.json"
@@ -186,6 +260,12 @@ class OpenCodeClient:
         }
         inline = {
             "$schema": "https://opencode.ai/config.json",
+            # Grypton already records immutable request/response flows, append-only
+            # ledgers, and full provider event streams. OpenCode's separate Git
+            # snapshot refresh can deadlock before the first model event when
+            # several isolated sessions initialize concurrently, so disable that
+            # redundant layer for provider transports.
+            "snapshot": False,
             "enabled_providers": [self.provider],
             "model": self.route,
             "small_model": self.route,
@@ -247,9 +327,20 @@ class OpenCodeClient:
             "OPENCODE_DISABLE_PROJECT_CONFIG": "true",
             "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS": "true",
             "OPENCODE_DISABLE_DEFAULT_PLUGINS": "true",
+            # OpenCode 1.18.x can still enter the repository-copy path while
+            # selecting a session even when snapshot tracking is disabled.
+            # Provider sessions use Grypton's immutable logs and work directly
+            # in their engagement workspace, so that copy is unnecessary.
+            "OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT": "true",
             "OPENCODE_PERMISSION": json.dumps(permissions),
+            # Engagement workspaces live below the Grypton source checkout.
+            # Prevent Git/OpenCode from treating the whole source repository as
+            # the model's project; that caused startup scans and snapshot work
+            # across every runtime when three engagements launched together.
+            "GIT_CEILING_DIRECTORIES": str(config.GRYPTON_HOME),
             "GRYPTON_HOME": str(config.GRYPTON_HOME),
             "GRYPTON_TARGET": self.target_slug,
+            "GRYPTON_ENGAGEMENT_DIR": str(self.workspace),
             "KRYPTON_HOME": str(config.GRYPTON_HOME),
             "KRYPTON_TARGET": self.target_slug,
             "PATH": f"{config.BIN_DIR}:{env.get('PATH', '')}",
@@ -272,7 +363,7 @@ class OpenCodeClient:
             "--model", self.route, "--variant", self.effort,
             "--agent", f"grypton-{self.role}",
             "--title", title or f"Grypton {self.role}",
-            "--dir", str(self.workspace), "--thinking",
+            "--dir", str(self.transport_workspace), "--thinking",
         ]
         if self.allow_tools:
             argv.append("--auto")
@@ -283,7 +374,7 @@ class OpenCodeClient:
         prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         self.proc = await asyncio.create_subprocess_exec(
             *argv,
-            cwd=str(self.workspace),
+            cwd=str(self.transport_workspace),
             env=env,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
