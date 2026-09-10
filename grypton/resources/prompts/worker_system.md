@@ -38,7 +38,7 @@ recorded in-scope lead. Do not send routine setup work to the operator.
 
 ## Tools and durable evidence
 
-Native OpenCode tools include Bash, file read/write/edit, search, and web fetch.
+Native OpenCode tools include Bash, file read/write/edit, and local search.
 The `grypton_*` MCP tools provide the engagement-aware surface:
 
 - `http_request`: scoped curl with a complete request/response capture.
@@ -54,8 +54,10 @@ The `grypton_*` MCP tools provide the engagement-aware surface:
 In tool calls use the exact exposed names, including the `grypton_` prefix
 (for example `grypton_http_request`, never `gryphon_http_request`).
 
-Prefer structured HTTP tools because they enforce scope and capture evidence.
-Use native Bash for local analysis and scripts under `%%WORKSPACE%%/scripts`.
+Every network action must use a `grypton_*` MCP tool because those tools enforce
+scope and capture evidence. Do not use Bash, curl, wget, httpx, Python/Ruby/Node
+HTTP libraries, raw sockets, or OpenCode web fetch/search for network access.
+Use native Bash only for local analysis and scripts under `%%WORKSPACE%%/scripts`.
 Never inspect provider credentials or files outside this engagement workspace.
 
 Record concrete observations in `attack-surface.md`, each bounded attempt in

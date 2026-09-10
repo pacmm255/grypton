@@ -200,6 +200,43 @@ class OpenCodeResult:
 class OpenCodeClient:
     """One role-specific OpenCode session with isolated, persistent XDG state."""
 
+    @staticmethod
+    def _permissions(allow_tools: bool) -> dict:
+        if not allow_tools:
+            return {
+                "*": "deny",
+                "question": "deny",
+                "task": "deny",
+                "external_directory": "deny",
+            }
+
+        # Kraude needs a shell for local parsing and evidence work, but native
+        # network clients bypass Grypton's scope guard and immutable flow
+        # capture. OpenCode evaluates Bash permissions per parsed command, so
+        # deny the network executables while retaining ordinary local shell
+        # commands. The corresponding operations remain available through the
+        # scoped grypton_* MCP tools.
+        bash = {"*": "allow"}
+        for executable in (
+            "curl", "wget", "httpx", "nmap", "subfinder", "dnsx",
+            "naabu", "masscan", "nc", "ncat", "netcat", "telnet",
+            "ftp", "sftp", "scp", "ssh",
+        ):
+            bash[f"{executable} *"] = "deny"
+            bash[f"*/{executable} *"] = "deny"
+        bash["openssl s_client *"] = "deny"
+        bash["*/openssl s_client *"] = "deny"
+
+        return {
+            "*": "allow",
+            "bash": bash,
+            "webfetch": "deny",
+            "websearch": "deny",
+            "question": "deny",
+            "task": "deny",
+            "external_directory": "deny",
+        }
+
     def __init__(
         self,
         *,
@@ -252,12 +289,7 @@ class OpenCodeClient:
             except (OSError, ValueError, KeyError):
                 pass
 
-        permissions = {
-            "*": "allow" if self.allow_tools else "deny",
-            "question": "deny",
-            "task": "deny",
-            "external_directory": "deny",
-        }
+        permissions = self._permissions(self.allow_tools)
         inline = {
             "$schema": "https://opencode.ai/config.json",
             # Grypton already records immutable request/response flows, append-only

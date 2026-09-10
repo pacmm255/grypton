@@ -349,6 +349,17 @@ class WorkerEventTests(unittest.TestCase):
             )
             self.assertEqual(client.transcripts, workspace / "transcripts")
 
+    def test_worker_permissions_force_network_through_captured_tools(self):
+        permissions = OpenCodeClient._permissions(True)
+        self.assertEqual(permissions["webfetch"], "deny")
+        self.assertEqual(permissions["websearch"], "deny")
+        self.assertEqual(permissions["bash"]["*"], "allow")
+        for command in ("curl *", "*/curl *", "httpx *", "*/nmap *"):
+            self.assertEqual(permissions["bash"][command], "deny")
+
+        manager_permissions = OpenCodeClient._permissions(False)
+        self.assertEqual(manager_permissions["*"], "deny")
+
     def test_tool_error_text_is_rendered_and_retained(self):
         with isolated_runtime():
             events = []

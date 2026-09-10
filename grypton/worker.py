@@ -80,7 +80,7 @@ class OpenCodeWorker:
             "subtype": "init",
             "cwd": str(self.spec.cwd),
             "session_id": self.session_id,
-            "tools": ["bash", "read", "write", "edit", "webfetch", "grypton MCP"],
+            "tools": ["bash", "read", "write", "edit", "grypton MCP"],
             "mcp_servers": [{"name": "grypton", "status": "configured"}],
             "model": self.spec.model,
             "permissionMode": "auto",
@@ -106,11 +106,13 @@ class OpenCodeWorker:
         return (
             self.spec.system_prompt
             + "\n\n=== OPENCODE GLM WORKER RUNTIME ===\n"
-              "Native Bash/read/write/edit/web tools and `grypton_*` MCP tools are "
-              "available. Prefer Grypton HTTP tools because they capture Burp-like "
-              "request/response flows, and prefer ledger tools for durable findings, "
-              "surface entries, and tested techniques. Native Bash may run curl and "
-              "installed utilities. Re-read scope-rules.md before network actions. "
+              "Native Bash/read/write/edit tools and `grypton_*` MCP tools are "
+              "available. Every network action MUST use a `grypton_*` MCP tool so "
+              "scope checks and Burp-like request/response capture cannot be bypassed. "
+              "Native Bash is only for local analysis; do not use curl, wget, httpx, "
+              "language HTTP libraries, sockets, or built-in web fetch/search for "
+              "network access. Prefer ledger tools for durable findings, surface "
+              "entries, and tested techniques. Re-read scope-rules.md before network actions. "
               "Do not inspect files outside this engagement workspace.\n"
             + f"CLI fallback: `{tool_bin} --target {slug} ...`\n\n"
               "=== KRYPTEX DIRECTIVE ===\n"
