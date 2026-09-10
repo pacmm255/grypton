@@ -33,25 +33,62 @@ def _target_value(ns) -> str:
 
 
 def _constraints(ns, target: str) -> Constraints:
+    program_profile = None
+    program_path = getattr(ns, "bugcrowd_brief", None)
+    if program_path:
+        from .bugcrowd import analyze_snapshot, matching_scope_rules, out_of_scope_rules
+        program_profile = analyze_snapshot(program_path)
+        if program_profile["automation_prohibited"]:
+            raise ValueError(
+                "Bugcrowd brief prohibits automated tools/scanners; this program is "
+                "incompatible with an autonomous Grypton run"
+            )
+        matches = matching_scope_rules(program_profile, target)
+        if not matches:
+            raise ValueError("target does not match an in-scope target in the Bugcrowd brief")
+        ns._bugcrowd_profile = program_profile
+    else:
+        matches = []
+
     value = Constraints(
         included_severities=_csv(getattr(ns, "only", "")),
         excluded_classes=_csv(getattr(ns, "exclude", "")),
         included_classes=_csv(getattr(ns, "include", "")),
-        in_scope=_csv(getattr(ns, "in_scope", "")) or [target],
+        in_scope=_csv(getattr(ns, "in_scope", "")) or matches or [target],
         out_of_scope=_csv(getattr(ns, "out_scope", "")),
     )
+    if program_profile:
+        value.out_of_scope = list(dict.fromkeys(
+            value.out_of_scope + out_of_scope_rules(program_profile)
+        ))
+        value.add_rule(
+            "Read program-brief.md before testing a new target or vulnerability class; "
+            "program exclusions and access rules are binding."
+        )
+        if program_profile["credential_requirement"]:
+            value.add_rule(
+                "The program has a Bugcrowd credential/account requirement. Do not "
+                "substitute an unrelated inbox or identity; use assigned researcher "
+                "credentials or choose an anonymous target that does not require them."
+            )
     for rule in getattr(ns, "rule", []) or []:
         value.add_rule(rule)
     value.add_rule("Network actions must match an in-scope host and avoid every out-of-scope rule.")
     authorization = getattr(ns, "authorization_file", None)
+    notes = []
     if authorization:
         path = Path(authorization).expanduser().resolve()
         data = path.read_bytes()
-        value.notes = (f"Authorization record: {path.name}; sha256="
-                       f"{hashlib.sha256(data).hexdigest()}; recorded={int(time.time())}")
+        notes.append(f"Authorization record: {path.name}; sha256="
+                     f"{hashlib.sha256(data).hexdigest()}; recorded={int(time.time())}")
     else:
-        value.notes = ("The operator started this engagement explicitly from the CLI. "
-                       "Grypton enforces the exact in-scope host list above.")
+        notes.append("The operator started this engagement explicitly from the CLI.")
+    if program_profile:
+        notes.append(
+            f"Bugcrowd brief: {Path(program_profile['source']).name}; "
+            f"sha256={program_profile['sha256']}."
+        )
+    value.notes = " ".join(notes)
     return value
 
 
@@ -112,6 +149,9 @@ def cmd_init(ns) -> int:
         ws.update_meta(target=target, target_type=ns.type, turn_index=0,
                        last_directive="", worker_uuid="", manager_session_id="")
     ws.save_constraints(constraints)
+    profile = getattr(ns, "_bugcrowd_profile", None)
+    if profile:
+        ws.save_program_brief(profile["brief_text"], profile)
     print(f"Grypton engagement: {slug}\n"
           f"  target     {target}\n"
           f"  scope      {', '.join(constraints.in_scope)}\n"
@@ -434,7 +474,7 @@ def _model_in_catalog(route: str) -> bool:
     provider, model = route.split("/", 1)
     try:
         result = subprocess.run([config.require_binary("opencode"), "models", provider],
-                                capture_output=True, text=True, timeout=30)
+                                capture_output=True, text=True, timeout=60)
     except (OSError, subprocess.SubprocessError):
         return False
     return result.returncode == 0 and any(line.strip() == route for line in result.stdout.splitlines())
@@ -503,6 +543,41 @@ def cmd_lab(ns) -> int:
     return 0
 
 
+def cmd_bugcrowd_brief(ns) -> int:
+    from .bugcrowd import analyze_snapshot, matching_scope_rules, public_profile
+    try:
+        profile = analyze_snapshot(ns.file)
+    except (ValueError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    output = public_profile(profile)
+    if ns.target:
+        output["target"] = ns.target
+        output["matching_scope_rules"] = matching_scope_rules(profile, ns.target)
+    blocked = output["automation_prohibited"] or bool(
+        ns.target and not output.get("matching_scope_rules")
+    )
+    if ns.json:
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+    else:
+        if output["automation_prohibited"]:
+            compatibility = "BLOCKED: automation prohibited"
+        elif ns.target and not output.get("matching_scope_rules"):
+            compatibility = "BLOCKED: target is not in listed scope"
+        else:
+            compatibility = "autonomous preflight passed"
+        print(f"Bugcrowd brief: {output['program']} · {compatibility}\n"
+              f"  in-scope targets  {sum(1 for row in output['targets'] if row['in_scope'])}\n"
+              f"  credential rule  {'yes' if output['credential_requirement'] else 'no'}\n"
+              f"  known issues     {'login required' if output['known_issues_enabled'] and not output['logged_in_snapshot'] else 'available/none'}")
+        if ns.target:
+            print(f"  target matches   {', '.join(output['matching_scope_rules']) or 'NONE'}")
+        print("\nHighest-signal listed targets:")
+        for row in output["recommended_targets"][:8]:
+            print(f"  {row['group']}: {row['name']} ({row['category']}, score={row['score']})")
+    return 1 if blocked else 0
+
+
 def cmd_serve(ns) -> int:
     from .web import serve
     serve(ns.port)
@@ -538,7 +613,7 @@ def _run_options(parser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="grypton",
         description="Autonomous scoped testing with GLM Kraude, Spark Kryptex, and Astra validation")
-    parser.add_argument("--version", action="version", version="Grypton 3.0.1")
+    parser.add_argument("--version", action="version", version="Grypton 3.1.0")
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="Create and immediately run an engagement")
     init.add_argument("target", nargs="?")
@@ -547,7 +622,8 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--only", default=""); init.add_argument("--exclude", default="")
     init.add_argument("--include", default=""); init.add_argument("--in-scope", default="")
     init.add_argument("--out-scope", default=""); init.add_argument("--rule", action="append", default=[])
-    init.add_argument("--authorization-file"); init.add_argument("--force", action="store_true")
+    init.add_argument("--authorization-file"); init.add_argument("--bugcrowd-brief")
+    init.add_argument("--force", action="store_true")
     _run_options(init); init.set_defaults(func=cmd_init)
     resume = sub.add_parser("resume", help="Resume a persistent engagement")
     resume.add_argument("target"); _run_options(resume); resume.set_defaults(func=cmd_resume)
@@ -591,6 +667,9 @@ def build_parser() -> argparse.ArgumentParser:
     tools_parser.add_argument("arguments", nargs=argparse.REMAINDER); tools_parser.set_defaults(func=cmd_tools)
     scenarios = sub.add_parser("scenarios", help="Show autonomous target-type playbooks")
     scenarios.add_argument("--json", action="store_true"); scenarios.set_defaults(func=cmd_scenarios)
+    brief = sub.add_parser("bugcrowd-brief", help="Inspect a saved Bugcrowd brief before autonomous testing")
+    brief.add_argument("file"); brief.add_argument("--target", default="")
+    brief.add_argument("--json", action="store_true"); brief.set_defaults(func=cmd_bugcrowd_brief)
     lab = sub.add_parser("lab", help="Run the instrumented loopback integration target")
     lab.add_argument("--host", default="127.0.0.1"); lab.add_argument("--port", type=int, default=0)
     lab.add_argument("--log", default=""); lab.set_defaults(func=cmd_lab)

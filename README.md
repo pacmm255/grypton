@@ -52,6 +52,22 @@ Useful controls:
 ./grypton scenarios
 ```
 
+For a Bugcrowd program, save the current public engagement JSON and run its
+rules through preflight before starting:
+
+```bash
+./grypton bugcrowd-brief /path/to/brief.json --target https://api.example.test/graphql
+./grypton init --target https://api.example.test/graphql \
+  --bugcrowd-brief /path/to/brief.json
+```
+
+Preflight verifies the target against the listed scope, imports matching
+wildcards and exclusions, exposes credential requirements and high-signal
+targets, and returns a nonzero exit status when the brief prohibits automation
+or the selected target is not listed. The complete normalized brief is saved as
+`program-brief.md` for Kraude and Kryptex; a shortened mission cannot override
+it.
+
 The live terminal shows worker text, every tool request/result, heartbeats,
 manager assessment and directive, findings, and Astra verdicts. Type a message
 to Kryptex during the run, `/worker ...` to relay directly to Kraude, or `/stop`.
@@ -111,6 +127,13 @@ model while the complete response remains in the private flow capture.
 Invalid-authentication checks share a cumulative budget across turns. A CAPTCHA,
 429, WAF challenge, temporary block, or lockout ends that probe family and sends
 the worker to passive or unrelated read-only work.
+
+The engine tracks normalized network request shapes and unique surface rows.
+Repeated query values, numbered sentinels, cache hashes, and passive checkpoints
+do not reset exhaustion. Kryptex receives the novelty counters and gets one
+concrete pivot; if the next turn still has no new request shape, surface, or
+finding, the engine closes the converged run instead of consuming the remaining
+time on bookkeeping.
 
 ## Local integration target and dashboard
 

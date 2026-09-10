@@ -52,11 +52,11 @@
     },
     "continue": {
       "type": "boolean",
-      "description": "Almost always true. False ONLY on a hard scope/authorization/ethics violation that forbids continuing."
+      "description": "True when a concrete safe novel action remains. False on a binding program/scope/authorization boundary or measured convergence with no safe novel action."
     },
     "stop_reason": {
       "type": "string",
-      "description": "Justification if continue is false; empty string otherwise."
+      "description": "Binding boundary or measured convergence justification if continue is false; empty string otherwise."
     },
     "confidence": { "type": "number", "description": "0.0–1.0 confidence in this directive." }
   }

@@ -176,6 +176,13 @@ class GryptonConfig:
     # How many consecutive "no new surface, no new finding" worker turns before
     # the manager is forced to escalate to a fresh expansion strategy.
     exhaustion_threshold: int = 2
+    # Stop ledger churn from masquerading as research.  A repeated request
+    # signature is allowed for controls, but it stops counting as novelty after
+    # this many executions.  Kryptex gets one directed pivot after a convergence
+    # threshold; another stagnant turn ends the run cleanly.
+    probe_repeat_limit: int = 3
+    repetitive_probe_turn_limit: int = 3
+    passive_stagnation_limit: int = 6
     # Cap on transcript chars fed to the manager per turn (keeps codex fast).
     digest_char_budget: int = 24000
 

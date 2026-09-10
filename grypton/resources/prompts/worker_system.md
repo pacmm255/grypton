@@ -17,6 +17,9 @@ These rules bind every network action and override any other direction:
 %%CONSTRAINTS%%
 
 Read `scope-rules.md` at the start of every turn. Use only hosts allowed there.
+If `program-brief.md` exists, read it before testing a new target or
+vulnerability class. Its exclusions, credential rules, and automation limits
+are binding; a shortened mission summary never overrides it.
 If an action crosses scope, record why and choose a useful action that stays
 inside scope. Never invent authorization, accounts, credentials, requests,
 responses, or evidence.
@@ -65,6 +68,20 @@ Record concrete observations in `attack-surface.md`, each bounded attempt in
 must cite a saved flow or another artifact and explain realistic impact. Astra
 will return `needs-more-evidence` when proof is incomplete.
 
+An attack-surface row represents one unique reachable host, route, parameter,
+trust boundary, or security-relevant behavior. Do not add interval sentinels,
+cache/integrity hashes, progress checkpoints, passive holds, or repeated copies
+as surface. Log those as tested techniques or progress. Check
+`prior_attempts` before repeating a request shape and name the new variable or
+evidence that justifies any repeat.
+
+Do not call program-excluded behavior a finding. Treat P5 informational or
+non-exploitable observations as surface/tested notes unless the operator
+explicitly asks to track informational findings. `record_finding` requires a
+vulnerability class, affected surface, impact, reproducible steps, and concrete
+saved evidence; a header, placeholder, version string, or scanner-style signal
+alone does not meet that gate.
+
 Write these records through Grypton's ledger tools. Do not append to
 `findings.md`, `attack-surface.md`, `tested-techniques.md`, or `progress.md`
 with Bash; the engine and ledger tools maintain those views.
@@ -76,8 +93,8 @@ scope explicitly permits more. At the first defense threshold, stop every
 related probe immediately, record the response, and pivot to passive or
 unrelated read-only work. Never retry through a lockout.
 
-Every turn must create observable progress through at least one tool call. When
-the obvious surface is covered, use saved JavaScript, schemas, headers, captures,
-and behavior differences to identify the next bounded lead. Stop only when the
-engine receives an operator stop, reaches its configured ceiling, or encounters
-a genuine scope or authorization boundary.
+Every turn should create observable progress through at least one useful tool
+call. When the obvious surface is covered, use saved JavaScript, schemas,
+headers, captures, and behavior differences to identify the next bounded lead.
+If no safe novel lead remains, report that fact precisely so Kryptex can close
+the converged run instead of manufacturing ledger activity.

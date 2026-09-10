@@ -10,11 +10,13 @@ import subprocess
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
 from grypton import config
-from grypton.cli import _validate_requested_findings, build_parser
+from grypton.bugcrowd import analyze_snapshot, matching_scope_rules, out_of_scope_rules
+from grypton.cli import _constraints, _validate_requested_findings, build_parser
 from grypton.engine import Engine
 from grypton.manager import KryptexManager, ManagerContext, _check_schema, _extract_json
 from grypton.providers import MCP_TIMEOUT_MS, OpenCodeClient, OpenCodeResult
@@ -104,6 +106,54 @@ class CliTests(unittest.TestCase):
         validate = parser.parse_args(["validate", "example-test", "F003"])
         self.assertEqual(validate.target, "example-test")
         self.assertEqual(validate.finding_ids, ["F003"])
+
+    def test_bugcrowd_brief_preflight_imports_scope_and_blocks_automation(self):
+        document = {
+            "id": "synthetic",
+            "knownIssuesEnabled": True,
+            "isLoggedIn": False,
+            "data": {
+                "brief": {"description": (
+                    "Test using only accounts created with @bugcrowdninja.com email addresses."
+                )},
+                "scope": [
+                    {"name": "web", "inScope": True, "targets": [
+                        {"name": "*.example.test", "uri": "*.example.test", "category": "website"},
+                        {"name": "GraphQL", "uri": "https://api.example.test/graphql", "category": "api"},
+                    ]},
+                    {"name": "excluded", "inScope": False, "targets": [
+                        {"name": "admin.example.test", "uri": "https://admin.example.test", "category": "website"},
+                    ]},
+                ],
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "brief.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            profile = analyze_snapshot(path)
+            self.assertTrue(profile["credential_requirement"])
+            self.assertIn("Target [IN SCOPE] GraphQL", profile["brief_text"])
+            self.assertIn("Target [OUT OF SCOPE] admin.example.test", profile["brief_text"])
+            self.assertEqual(matching_scope_rules(profile, "https://api.example.test/graphql"),
+                             ["*.example.test", "https://api.example.test/graphql"])
+            self.assertEqual(matching_scope_rules(profile, "https://api.example.test/"),
+                             ["*.example.test"])
+            self.assertEqual(matching_scope_rules(profile, "https://outside.test/"), [])
+            self.assertEqual(out_of_scope_rules(profile), ["https://admin.example.test"])
+            ns = SimpleNamespace(
+                bugcrowd_brief=str(path), only="", exclude="", include="",
+                in_scope="", out_scope="", rule=[], authorization_file=None,
+            )
+            constraints = _constraints(ns, "https://api.example.test/graphql")
+            self.assertIn("*.example.test", constraints.in_scope)
+            self.assertIn("https://admin.example.test", constraints.out_of_scope)
+
+            document["data"]["brief"]["description"] += (
+                " Use of any automated tools/scanners is strictly prohibited."
+            )
+            path.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "prohibits automated"):
+                _constraints(ns, "https://api.example.test/graphql")
 
     def test_cli_exits_when_engine_stops_with_stdin_still_open(self):
         repo = Path(__file__).resolve().parents[1]
@@ -208,10 +258,22 @@ class ToolTests(unittest.TestCase):
         with isolated_runtime():
             ws = Workspace("threshold-summary")
             ws.create("127.0.0.1", "web")
-            low = dispatch(ws, "record_finding", {"title": "Low", "severity": "P5"})
-            high = dispatch(ws, "record_finding", {"title": "High", "severity": "P2"})
+            common = {"vuln_class": "test", "surface": "/local",
+                      "description": "Synthetic impact", "poc": "1. Send request",
+                      "evidence": "flows/synthetic.http"}
+            low = dispatch(ws, "record_finding", {"title": "Low", "severity": "P5", **common})
+            high = dispatch(ws, "record_finding", {"title": "High", "severity": "P2", **common})
             self.assertIn("not requested for P5", low["summary"])
             self.assertIn("independent Astra validation", high["summary"])
+
+    def test_record_finding_rejects_incomplete_worker_hypothesis(self):
+        with isolated_runtime():
+            ws = Workspace("finding-gate")
+            ws.create("127.0.0.1", "web")
+            result = dispatch(ws, "record_finding", {"title": "Signal", "severity": "P3"})
+            self.assertFalse(result["ok"])
+            self.assertIn("quality gate", result["summary"])
+            self.assertEqual(ws.findings.all(), [])
 
     def test_read_only_engagement_audit_and_report(self):
         with isolated_runtime() as root, patch.object(config, "GRYPTON_HOME", root):
@@ -246,6 +308,20 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         errors = _check_schema(value, {"type": "object", "additionalProperties": False,
             "required": ["x"], "properties": {"x": {"type": "number"}}})
         self.assertEqual(errors, [])
+
+    async def test_static_manager_prompt_is_not_reinjected_each_turn(self):
+        with isolated_runtime():
+            ws = Workspace("manager-prompt")
+            ws.create("127.0.0.1", "web")
+            marker = "STATIC-MANAGER-MARKER"
+            manager = KryptexManager(ws, marker)
+            prompt = manager._build_direction_prompt(ManagerContext(
+                target="127.0.0.1", target_type="web", turn_index=1,
+                convergence_reason="repeated probe convergence",
+            ))
+            self.assertIn(marker, manager.client.agent_prompt)
+            self.assertNotIn(marker, prompt)
+            self.assertIn("CONVERGENCE GUARD", prompt)
 
     async def test_spark_cannot_supply_validation_verdicts(self):
         with isolated_runtime():
@@ -379,6 +455,16 @@ class WorkerEventTests(unittest.TestCase):
             self.assertEqual(result["content"], "MCP error -32001: Request timed out")
             self.assertEqual(MCP_TIMEOUT_MS, 120_000)
 
+    def test_static_worker_prompt_is_not_reinjected_each_turn(self):
+        with isolated_runtime():
+            marker = "STATIC-WORKER-MARKER"
+            worker = OpenCodeWorker(WorkerSpec(
+                session_uuid="", cwd=Path(config.ENGAGEMENTS_DIR) / "prompt",
+                system_prompt=marker, extra_env={"GRYPTON_TARGET": "prompt"},
+            ))
+            self.assertIn(marker, worker.client.agent_prompt)
+            self.assertNotIn(marker, worker._build_prompt("do one bounded check"))
+
 
 class EngineTests(unittest.IsolatedAsyncioTestCase):
     def test_automatic_validation_candidates_are_only_p1_and_p2(self):
@@ -398,6 +484,37 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
             finding = ws.record_finding(title="Critical candidate", severity="P1")
             self.assertEqual(finding["status"], "validation-pending")
             self.assertEqual(ws.confirmed_p1s(), [])
+
+    def test_network_novelty_collapses_query_values_and_detects_repetition(self):
+        with isolated_runtime():
+            ws = Workspace("novelty")
+            ws.create("https://example.test", "web")
+            engine = Engine("novelty", backend="mock")
+            first = {"name": "grypton_http_request", "input": {
+                "method": "HEAD", "url": "https://EXAMPLE.test/robots.txt?b=1&a=2"}}
+            second = {"name": "grypton_http_request", "input": {
+                "method": "HEAD", "url": "https://example.test/robots.txt?a=9&b=8"}}
+            self.assertEqual(Engine._network_signature(first), Engine._network_signature(second))
+            self.assertEqual(engine._network_novelty([first])["novel"], 1)
+            repeat = engine._network_novelty([second])
+            self.assertEqual(repeat["novel"], 0)
+            self.assertEqual(repeat["repeated"], 1)
+
+    def test_surface_novelty_does_not_reward_numbered_sentinels(self):
+        first = {"kind": "cache", "item": "Interval sentinel checkpoint #33"}
+        second = {"kind": "cache", "item": "Interval sentinel checkpoint #84"}
+        self.assertEqual(Engine._surface_key(first), Engine._surface_key(second))
+        self.assertTrue(Engine._surface_is_bookkeeping(first))
+        self.assertTrue(Engine._surface_is_bookkeeping({
+            "kind": "behavior", "item": "Second passive stability checkpoint (turn 14)"}))
+        self.assertFalse(Engine._surface_is_bookkeeping({
+            "kind": "endpoint", "item": "POST /graphql"}))
+
+    def test_convergence_stop_reasons_are_accepted(self):
+        reason = "convergence: no safe novel action remains"
+        self.assertFalse(Engine._is_hard_stop(reason))
+        self.assertTrue(Engine._is_hard_stop(reason, convergence_allowed=True))
+        self.assertTrue(Engine._is_hard_stop("program automation prohibited"))
 
     async def test_mock_loop_persists_independent_verdict(self):
         with isolated_runtime():
@@ -419,6 +536,31 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(engine.ws.load_meta().status, "stopped")
             finally:
                 config.CONFIG.max_turns, config.CONFIG.max_run_seconds = old_turns, old_seconds
+
+    async def test_convergence_guard_allows_one_pivot_then_stops_churn(self):
+        with isolated_runtime():
+            fields = ("max_turns", "max_run_seconds", "passive_stagnation_limit",
+                      "repetitive_probe_turn_limit", "exhaustion_threshold")
+            old = {field: getattr(config.CONFIG, field) for field in fields}
+            config.CONFIG.max_turns = 10
+            config.CONFIG.max_run_seconds = 0
+            config.CONFIG.passive_stagnation_limit = 2
+            config.CONFIG.repetitive_probe_turn_limit = 99
+            config.CONFIG.exhaustion_threshold = 99
+            try:
+                ws = Workspace("converged-loop")
+                ws.create("127.0.0.1", "web")
+                ws.save_constraints(Constraints(in_scope=["127.0.0.1"]))
+                engine = Engine("converged-loop", backend="mock")
+                await engine.setup(brief="convergence regression", target="127.0.0.1",
+                                   target_type="web")
+                engine.worker.script = lambda _worker, _directive: "No new evidence."
+                await engine.run()
+                self.assertEqual(engine.turn_index, 3)
+                self.assertIn("convergence guard", engine.stop_reason)
+            finally:
+                for field, value in old.items():
+                    setattr(config.CONFIG, field, value)
 
 
 if __name__ == "__main__":

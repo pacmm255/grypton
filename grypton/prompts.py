@@ -68,9 +68,10 @@ xhigh) directs each turn; GPT-6 Astra max validates new findings independently.
 - Target: `{target}`  ·  Type: `{target_type}`
 - Workspace: `{workspace}`
 - Log findings/techniques via Grypton MCP tools (or `grypton-tool`).
-- **Log the attack surface EXHAUSTIVELY** with `attack_surface_add` — every host,
-  endpoint, param, header, cookie, tech/version, error, leaked string, and clue.
-  When in doubt, log it; bigger is always better.
+- Use `attack_surface_add` once for each unique reachable host, route, parameter,
+  trust boundary, or security-relevant behavior. Put repeated responses, cache
+  hashes, checkpoints, passive holds, and negative attempts in
+  `tested_technique_log`; they do not create new attack surface.
 - Goja SOCKS5 proxy: `{config.GOJA_SOCKS}`.
 - Read `findings.md`, `attack-surface.md`, `tested-techniques.md`, `progress.md`
   here to orient.

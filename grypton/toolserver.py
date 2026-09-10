@@ -13,7 +13,7 @@ from .providers import append_jsonl
 from .workspace import Workspace
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "grypton", "version": "3.0.1"}
+SERVER_INFO = {"name": "grypton", "version": "3.1.0"}
 
 
 def _workspace() -> Workspace:
@@ -31,6 +31,17 @@ def _object(properties: dict, required=()) -> dict:
 
 
 def _record_finding(ws, args):
+    required = ("title", "severity", "vuln_class", "surface", "description", "poc", "evidence")
+    missing = [key for key in required if not str(args.get(key) or "").strip()]
+    if missing:
+        return {
+            "ok": False,
+            "summary": (
+                "Finding quality gate rejected the candidate; supply "
+                + ", ".join(missing)
+                + ". Keep incomplete hypotheses in tested_technique_log."
+            ),
+        }
     record = ws.record_finding(title=args["title"], severity=args["severity"],
         vuln_class=args.get("vuln_class", ""), surface=args.get("surface", ""),
         description=args.get("description", ""), poc=args.get("poc", ""),
@@ -84,7 +95,8 @@ def _save_research(ws, args):
 
 def _read_doc(ws, args):
     mapping = {"findings": "findings.md", "surface": "attack-surface.md",
-        "tested": "tested-techniques.md", "progress": "progress.md", "scope": "scope-rules.md"}
+        "tested": "tested-techniques.md", "progress": "progress.md", "scope": "scope-rules.md",
+        "program": "program-brief.md"}
     path = ws.root / mapping.get(args.get("name", "findings"), "findings.md")
     value = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
     return {"ok": True, "summary": f"Read {path.name} ({len(value)} characters).",
@@ -92,12 +104,13 @@ def _read_doc(ws, args):
 
 
 REGISTRY: dict[str, tuple[str, dict, Callable]] = {
-    "record_finding": ("Record an evidence-backed finding for independent Astra validation.",
+    "record_finding": ("Record a fully evidenced candidate; only P1/P2 queue for Astra automatically.",
         _object({"title": _string("Short title"),
                  "severity": {"type": "string", "enum": ["P1", "P2", "P3", "P4", "P5"]},
                  "vuln_class": _string("Vulnerability class"), "surface": _string("Affected surface"),
                  "description": _string("Impact and behavior"), "poc": _string("Reproduction steps"),
-                 "evidence": _string("Capture path or concrete evidence")}, ("title", "severity")),
+                 "evidence": _string("Capture path or concrete evidence")},
+                ("title", "severity", "vuln_class", "surface", "description", "poc", "evidence")),
         _record_finding),
     "attack_surface_add": ("Record a discovered in-scope host, route, parameter, behavior, or clue.",
         _object({"item": _string("Observed surface"), "kind": _string("Surface kind"),
@@ -166,7 +179,7 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
         _object({"topic": _string("Topic"), "content": _string("Markdown")}, ("topic", "content")),
         _save_research),
     "read_doc": ("Read findings, surface, tested, progress, or scope.",
-        _object({"name": {"type": "string", "enum": ["findings", "surface", "tested", "progress", "scope"]}}),
+        _object({"name": {"type": "string", "enum": ["findings", "surface", "tested", "progress", "scope", "program"]}}),
         _read_doc),
     "tool_inventory": ("List available native binaries and Goja state.", _object({}),
         lambda ws, args: tools.inventory()),

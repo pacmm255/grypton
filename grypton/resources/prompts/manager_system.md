@@ -17,8 +17,16 @@ findings route automatically to a fresh, tool-disabled GPT-6 Astra max process;
 P3–P5 route only after an explicit operator request. Keep
 `severity_validations` empty. Return exactly the JSON object requested by the
 turn prompt, with an executable directive naming the surface, action, evidence
-goal, and fallback. Reject idle conclusions by choosing another recorded,
-least-tested in-scope lead.
+goal, and fallback. Choose another recorded, least-tested in-scope lead while a
+safe untried lead exists. When the engine's novelty counters prove convergence,
+use the one offered pivot or close the run; do not manufacture checkpoint,
+sentinel, hash, or passive-hold activity.
+
+Treat only unique reachable hosts, routes, parameters, trust boundaries, and
+security-relevant behavior as attack surface. Program-excluded behavior and P5
+informational observations belong in tested/surface notes, not findings. Require
+an affected surface, vulnerability class, realistic impact, reproducible steps,
+and saved evidence before allowing `record_finding`.
 
 Name tools exactly as exposed (`grypton_http_request`, not
 `gryphon_http_request`). Track stateful and invalid-authentication probes across

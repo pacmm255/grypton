@@ -10,16 +10,20 @@ Each iteration:
   4. Engine sends new P1/P2 findings to independent Astra validation, persists
      state, surfaces status to the user, and feeds the next directive to the worker.
 
-The loop only ends on: explicit user stop, a hard scope/authorization violation
-flagged by the manager, or an unrecoverable fault after retries (I3).
+The loop ends on an explicit user stop, a binding program/scope boundary,
+measured convergence after one attempted pivot, a configured ceiling, or an
+unrecoverable fault after retries.
 """
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
+import json
 import time
 import traceback
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import parse_qsl, urlsplit
 
 import re
 
@@ -160,6 +164,16 @@ class Engine:
         self._start_time = 0.0
         self._fault_count = 0
         self._turn_tool_count = 0
+        self._surface_keys: set[str] = set()
+        self._network_signatures: Counter[str] = Counter()
+        self._passive_stagnation_streak = 0
+        self._repetitive_probe_streak = 0
+        self._convergence_alerted = False
+        self._last_network_metrics = {
+            "calls": 0, "novel": 0, "repeated": 0, "over_limit": 0,
+            "signatures": [],
+        }
+        self._raw_new_surface = 0
 
     # ---------------------------------------------------------------- setup
 
@@ -255,6 +269,7 @@ class Engine:
         self.running = True
         self._start_time = time.time()
         self._counts = (len(self.ws.findings.all()), len(self.ws.surface.all()))
+        self._rehydrate_novelty_state()
 
         directive_text = await self._opening_directive()
         # Real-time user↔Kryptex chat runs concurrently with worker turns (R10).
@@ -309,11 +324,15 @@ class Engine:
 
             # ---- detect deltas ----
             new_findings, new_surface = self._deltas()
+            network = self._network_novelty(turn.tool_uses or [])
             for f in new_findings:
                 self.emit("finding", finding=f)
             self.ws.append_progress(
                 f"Turn {self.turn_index}: {len(turn.tool_uses)} tool calls, "
-                f"+{len(new_findings)} finding(s), +{new_surface} surface item(s).")
+                f"+{len(new_findings)} finding(s), +{new_surface} novel surface "
+                f"item(s) ({self._raw_new_surface} rows), "
+                f"{network['novel']} novel network signature(s), "
+                f"{network['repeated']} repeated network call(s).")
 
             # ---- anti-fabrication ----
             flags = antifab.scan(turn.assistant_text, cwd=self.ws.root)
@@ -328,12 +347,38 @@ class Engine:
             else:
                 self._idle_streak = 0
 
-            # ---- exhaustion signal ----
+            # ---- exhaustion and convergence signals ----
             if not new_findings and new_surface == 0:
                 self._exhaustion_streak += 1
             else:
                 self._exhaustion_streak = 0
-            exhausted = self._exhaustion_streak >= config.CONFIG.exhaustion_threshold
+
+            if not new_findings and new_surface == 0 and network["novel"] == 0:
+                self._passive_stagnation_streak += 1
+            else:
+                self._passive_stagnation_streak = 0
+            if network["calls"] and network["novel"] == 0:
+                self._repetitive_probe_streak += 1
+            else:
+                self._repetitive_probe_streak = 0
+
+            convergence_reason = self._convergence_reason()
+            exhausted = (
+                self._exhaustion_streak >= config.CONFIG.exhaustion_threshold
+                or bool(convergence_reason)
+            )
+
+            # Kryptex gets one chance to pivot to a new request shape or newly
+            # discovered surface.  If the following turn is still converged,
+            # stop rather than pay for hours of sentinel/checkpoint churn.
+            if convergence_reason and self._convergence_alerted:
+                self.ws.append_progress(
+                    f"Convergence guard stopped the run after the directed pivot "
+                    f"also stagnated: {convergence_reason}.")
+                self._stop(f"convergence guard: {convergence_reason}")
+                break
+            if not convergence_reason:
+                self._convergence_alerted = False
 
             # If a stop was requested during the worker turn, exit now rather than
             # spending a slow manager turn first.
@@ -345,7 +390,8 @@ class Engine:
             # block, so the turn directive doesn't re-drain them here.
             ctx = self._build_context(turn, new_findings, flags, exhausted, [],
                                       worker_was_idle=worker_was_idle,
-                                      worker_idle_streak=self._idle_streak)
+                                      worker_idle_streak=self._idle_streak,
+                                      convergence_reason=convergence_reason)
             try:
                 async with self._mgr_lock:
                     directive = await self.manager.direct(ctx)
@@ -384,11 +430,14 @@ class Engine:
 
             self._apply_manager(directive, new_findings, ctx)
 
-            # A genuine authorization or scope boundary is binding.  Routine
-            # blockers and weak "we are done" responses are reframed into a new
-            # bounded action instead of being relayed to the operator.
+            # A genuine program/scope boundary is binding. Machine-measured
+            # convergence may also close the run. Routine blockers and an
+            # unsupported "we are done" response are reframed into a new action.
             if not directive.cont:
-                if self._is_hard_stop(directive.stop_reason):
+                if self._is_hard_stop(
+                    directive.stop_reason,
+                    convergence_allowed=bool(convergence_reason),
+                ):
                     self._stop(directive.stop_reason or "scope or authorization boundary")
                     break
                 self.emit("status", text=(
@@ -402,6 +451,9 @@ class Engine:
                     f"Pick a different recorded in-scope surface item with the least "
                     f"coverage and execute one concrete, bounded tool call. Record it."
                 )
+
+            if convergence_reason:
+                self._convergence_alerted = True
 
             # ---- P1 handling ----
             self._handle_p1s()
@@ -501,7 +553,8 @@ class Engine:
         return task.result()
 
     def _build_context(self, turn, new_findings, flags, exhausted, user_msgs,
-                       worker_was_idle=False, worker_idle_streak=0) -> ManagerContext:
+                       worker_was_idle=False, worker_idle_streak=0,
+                       convergence_reason="") -> ManagerContext:
         c = self.ws.load_constraints()
         return ManagerContext(
             target=self.target, target_type=self.target_type, turn_index=self.turn_index,
@@ -509,12 +562,19 @@ class Engine:
             worker_last_text=(turn.assistant_text if turn else ""),
             worker_tool_summary=self._tool_summary(turn.tool_uses if turn else []),
             findings_summary=self._doc_tail(self.ws.root / "findings.md", 3000),
-            surface_summary=self._doc_tail(self.ws.root / "attack-surface.md", 3000),
-            tested_summary=self._doc_tail(self.ws.root / "tested-techniques.md", 2500),
+            surface_summary=self._doc_window(self.ws.root / "attack-surface.md", 3000),
+            tested_summary=self._doc_window(self.ws.root / "tested-techniques.md", 2500),
             progress_tail=self._doc_tail(self.ws.root / "progress.md", 1500, tail=True),
             antifab_flags=flags,
             worker_was_idle=worker_was_idle, worker_idle_streak=worker_idle_streak,
             exhaustion=exhausted, exhaustion_streak=self._exhaustion_streak,
+            network_calls=self._last_network_metrics["calls"],
+            novel_network_signatures=self._last_network_metrics["novel"],
+            repeated_network_calls=self._last_network_metrics["repeated"],
+            over_limit_network_calls=self._last_network_metrics["over_limit"],
+            passive_stagnation_streak=self._passive_stagnation_streak,
+            repetitive_probe_streak=self._repetitive_probe_streak,
+            convergence_reason=convergence_reason,
             user_messages=user_msgs, new_findings=new_findings,
             p1_count=len(self.ws.confirmed_p1s()),
         )
@@ -593,9 +653,132 @@ class Engine:
         all_s = self.ws.surface.all()
         old_f, old_s = self._counts
         new_findings = all_f[old_f:]
-        new_surface = max(0, len(all_s) - old_s)
+        new_rows = all_s[old_s:]
+        self._raw_new_surface = len(new_rows)
+        new_surface = 0
+        for row in new_rows:
+            key = self._surface_key(row)
+            if key not in self._surface_keys:
+                self._surface_keys.add(key)
+                if not self._surface_is_bookkeeping(row):
+                    new_surface += 1
         self._counts = (len(all_f), len(all_s))
         return new_findings, new_surface
+
+    @staticmethod
+    def _surface_key(row: dict) -> str:
+        """Collapse counters and opaque hashes without merging real routes."""
+        kind = re.sub(r"\s+", " ", str(row.get("kind") or "").strip().lower())
+        item = re.sub(r"\s+", " ", str(row.get("item") or "").strip().lower())
+        item = re.sub(r"\b([a-f0-9]{24,})\b", "{hash}", item)
+        item = re.sub(
+            r"(?i)\b(checkpoint|sentinel|interval)\s*(?:#|number)?\s*\d+\b",
+            r"\1 {n}", item,
+        )
+        return f"{kind}::{item}"
+
+    @staticmethod
+    def _surface_is_bookkeeping(row: dict) -> bool:
+        kind = str(row.get("kind") or "")
+        item = str(row.get("item") or "")
+        return bool(re.search(
+            r"(?i)(?:checkpoint|sentinel|passive\s+(?:stability|hold)|"
+            r"continuity\s+hold|hash\s+(?:watch|register|check)|ledger\s+integrity|"
+            r"non[- ]finding|negative[- ]result)",
+            f"{kind} {item}",
+        ))
+
+    @staticmethod
+    def _network_signature(tool_use: dict) -> str:
+        name = str(tool_use.get("name") or "").lower()
+        name = name.removeprefix("grypton_")
+        network_tools = {
+            "http_request", "goja_request", "flow_replay", "httpx_probe",
+            "browse", "dns_lookup", "tls_certificate", "port_scan",
+            "subdomain_enum",
+        }
+        if name not in network_tools:
+            return ""
+        args = tool_use.get("input") if isinstance(tool_use.get("input"), dict) else {}
+        method = str(args.get("method") or ("GET" if name == "browse" else name)).upper()
+        raw_url = str(args.get("url") or "")
+        if raw_url:
+            split = urlsplit(raw_url if "://" in raw_url else "//" + raw_url)
+            scheme = split.scheme.lower() or "https"
+            host = (split.hostname or "").lower().rstrip(".")
+            port = f":{split.port}" if split.port else ""
+            path = re.sub(r"/+", "/", split.path or "/")
+            query_keys = sorted({key for key, _ in parse_qsl(split.query, keep_blank_values=True)})
+            shape = f"{scheme}://{host}{port}{path}"
+            if query_keys:
+                shape += "?" + "&".join(query_keys)
+        elif name == "flow_replay":
+            shape = f"flow:{args.get('flow_id') or ''}"
+        elif name == "httpx_probe":
+            shape = "targets:" + " ".join(sorted(str(args.get("targets") or "").split()))
+        else:
+            host = str(args.get("host") or args.get("domain") or "").lower().rstrip(".")
+            extra = ""
+            if name == "port_scan":
+                extra = ":" + ",".join(str(p) for p in sorted(args.get("ports") or []))
+            elif name == "tls_certificate":
+                extra = ":" + str(args.get("port") or 443)
+            shape = host + extra
+        return f"{name}|{method}|{shape}"
+
+    def _network_novelty(self, tool_uses: list[dict]) -> dict:
+        metrics = {"calls": 0, "novel": 0, "repeated": 0, "over_limit": 0,
+                   "signatures": []}
+        limit = max(1, int(config.CONFIG.probe_repeat_limit))
+        for tool_use in tool_uses:
+            signature = self._network_signature(tool_use)
+            if not signature:
+                continue
+            prior = self._network_signatures[signature]
+            metrics["calls"] += 1
+            if prior == 0:
+                metrics["novel"] += 1
+            else:
+                metrics["repeated"] += 1
+            if prior >= limit:
+                metrics["over_limit"] += 1
+            self._network_signatures[signature] += 1
+            metrics["signatures"].append(signature)
+        self._last_network_metrics = metrics
+        return metrics
+
+    def _rehydrate_novelty_state(self) -> None:
+        self._surface_keys = {self._surface_key(row) for row in self.ws.surface.all()}
+        self._network_signatures.clear()
+        path = self.ws.transcripts_dir / "turns.jsonl"
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return
+        for line in lines:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            for tool_use in row.get("tools") or []:
+                signature = self._network_signature(tool_use)
+                if signature:
+                    self._network_signatures[signature] += 1
+
+    def _convergence_reason(self) -> str:
+        repeat_limit = max(1, int(config.CONFIG.repetitive_probe_turn_limit))
+        passive_limit = max(1, int(config.CONFIG.passive_stagnation_limit))
+        if self._repetitive_probe_streak >= repeat_limit:
+            return (
+                f"{self._repetitive_probe_streak} consecutive turns used no new "
+                "network request signature"
+            )
+        if self._passive_stagnation_streak >= passive_limit:
+            return (
+                f"{self._passive_stagnation_streak} consecutive turns produced no "
+                "finding, novel surface, or new network request signature"
+            )
+        return ""
 
     @staticmethod
     def _tool_summary(tool_uses) -> str:
@@ -624,6 +807,19 @@ class Engine:
         if len(text) <= budget:
             return text
         return ("…\n" + text[-budget:]) if tail else (text[:budget] + "\n…")
+
+    @staticmethod
+    def _doc_window(path: Path, budget: int) -> str:
+        """Keep document framing plus the newest rows within one fixed budget."""
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        if len(text) <= budget:
+            return text
+        head = max(200, budget // 3)
+        tail = max(0, budget - head - 3)
+        return text[:head] + "\n…\n" + text[-tail:]
 
     def _persist_turn(self, turn) -> None:
         import json as _json
@@ -668,11 +864,17 @@ class Engine:
         return "\n".join(lines) + "\n\n" + directive_text
 
     @staticmethod
-    def _is_hard_stop(reason: str) -> bool:
+    def _is_hard_stop(reason: str, *, convergence_allowed: bool = False) -> bool:
         r = (reason or "").lower()
-        return any(k in r for k in ("scope", "authoriz", "authoris", "permission",
-                                    "illegal", "ethic", "out-of-scope", "out of scope",
-                                    "unauthorized", "forbidden"))
+        boundary = any(k in r for k in (
+            "scope", "authoriz", "authoris", "permission", "illegal", "ethic",
+            "out-of-scope", "out of scope", "unauthorized", "forbidden",
+            "automation prohibited", "automation ban",
+        ))
+        converged = convergence_allowed and any(k in r for k in (
+            "convergence", "exhaust", "defense ceiling", "no safe novel",
+        ))
+        return boundary or converged
 
     def _stop(self, reason: str) -> None:
         self.stop_requested = True

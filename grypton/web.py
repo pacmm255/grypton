@@ -57,7 +57,7 @@ def engagement_summary(slug: str) -> dict:
 
 def dashboard_state() -> dict:
     engagements = [engagement_summary(slug) for slug in reversed(list_targets())]
-    return {"version": "3.0.1", "models": {
+    return {"version": "3.1.0", "models": {
         "worker": {"name": "Kraude", "route": config.WORKER_MODEL, "effort": config.WORKER_EFFORT},
         "manager": {"name": "Kryptex", "route": config.MANAGER_MODEL, "effort": config.MANAGER_EFFORT},
         "validator": {"name": "Validator", "route": config.VALIDATOR_MODEL, "effort": config.VALIDATOR_EFFORT}},
@@ -91,7 +91,7 @@ def engagement_detail(slug: str) -> dict:
 
 def make_server(port: int = 8765) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
-        server_version = "Grypton/3.0.1"
+        server_version = "Grypton/3.1.0"
         sys_version = ""
 
         def log_message(self, format, *args):

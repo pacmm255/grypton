@@ -35,6 +35,13 @@ class ManagerContext:
     worker_idle_streak: int = 0
     exhaustion: bool = False
     exhaustion_streak: int = 0
+    network_calls: int = 0
+    novel_network_signatures: int = 0
+    repeated_network_calls: int = 0
+    over_limit_network_calls: int = 0
+    passive_stagnation_streak: int = 0
+    repetitive_probe_streak: int = 0
+    convergence_reason: str = ""
     user_messages: list[str] = field(default_factory=list)
     new_findings: list[dict] = field(default_factory=list)
     p1_count: int = 0
@@ -154,7 +161,8 @@ class KryptexManager:
                 "as authoritative. Resolve routine operational blockers yourself by giving "
                 "a concrete alternative; never send setup chores back to the human. Stay "
                 "inside scope. Return only the requested JSON object. You do not validate "
-                "severity; an independent Astra reviewer does that."
+                "severity; an independent Astra reviewer does that.\n\n"
+                + self.system_prompt
             ),
             event_callback=self._provider_event,
         )
@@ -318,9 +326,7 @@ class KryptexManager:
             "The worker used tools this turn. Judge their evidence and choose the next bounded action."
         )
         pending = json.dumps(ctx.new_findings, ensure_ascii=False, indent=2) if ctx.new_findings else "[]"
-        return f"""{self.system_prompt}
-
-You are managing turn {ctx.turn_index} of an authorized engagement whose exact boundaries are below.
+        return f"""You are managing turn {ctx.turn_index} of an authorized engagement whose exact boundaries are below.
 Do not ask the operator to solve routine blockers. If Kraude asks for an account, inbox, token, build,
 tool, or environment dependency, direct a lawful local substitute, install/configure it, use existing
 anonymous functionality, or pivot to another in-scope lead. Never invent credentials or authorization.
@@ -330,7 +336,13 @@ Hard rules:
 - Obey the supplied scope record exactly. A real missing authorization or scope boundary is a valid stop.
 - Give an executable next step, named surface, evidence goal, and fallback.
 - Require real tool activity and ledger updates. Do not merely say “continue”.
+- A surface row counts only for a unique reachable host, route, parameter, boundary, or behavior.
+  Checkpoints, hashes, holds, and repeated observations are tested/progress records, not new surface.
+- Use the machine novelty counters below. If convergence is flagged, either name a genuinely new
+  request shape/surface for one final pivot or set `continue` false with a convergence reason.
 - Treat claims without captured evidence as unconfirmed and correct fabrication.
+- Program-excluded classes and non-exploitable P5 observations are not findings. Direct Kraude to
+  retain them in the tested/surface ledgers instead.
 - `severity_validations` MUST be [] in your JSON. GPT-6 Astra automatically validates only P1/P2 findings; the operator may explicitly request review of lower severities.
 - Return only one object matching the schema.
 
@@ -365,6 +377,12 @@ RECENT PROGRESS:
 {ctx.progress_tail or '(empty)'}
 
 EXHAUSTION SIGNAL: {ctx.exhaustion} (streak {ctx.exhaustion_streak})
+NETWORK NOVELTY THIS TURN: {ctx.novel_network_signatures} new signature(s) across
+{ctx.network_calls} network call(s); {ctx.repeated_network_calls} repeated and
+{ctx.over_limit_network_calls} beyond the repeat allowance.
+PASSIVE STAGNATION STREAK: {ctx.passive_stagnation_streak}
+REPETITIVE PROBE TURN STREAK: {ctx.repetitive_probe_streak}
+CONVERGENCE GUARD: {ctx.convergence_reason or '(not reached)'}
 CONFIRMED P1 COUNT: {ctx.p1_count}
 
 JSON SCHEMA:
@@ -372,9 +390,7 @@ JSON SCHEMA:
 """
 
     def _build_chat_prompt(self, user_message: str, ctx: ManagerContext) -> str:
-        return f"""{self.system_prompt}
-
-The operator sent this message during the live engagement:
+        return f"""The operator sent this message during the live engagement:
 {user_message}
 
 Reply as Kryptex. Persist useful standing intent, and convert it into a concrete Kraude instruction.

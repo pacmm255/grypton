@@ -65,7 +65,8 @@ class OpenCodeWorker:
                 "Use tools and produce observable progress. Obey scope-rules.md exactly. "
                 "Record surface, tested techniques, and findings with the grypton MCP "
                 "tools. Resolve routine local blockers yourself. Never inspect or reveal "
-                "provider credentials. End with a concise factual summary."
+                "provider credentials. End with a concise factual summary.\n\n"
+                + self.spec.system_prompt
             ),
             event_callback=self._translate_event,
         )
@@ -104,8 +105,7 @@ class OpenCodeWorker:
         tool_bin = config.find_binary("grypton-tool") or str(config.BIN_DIR / "grypton-tool")
         slug = self.spec.extra_env.get("GRYPTON_TARGET", self.spec.cwd.name)
         return (
-            self.spec.system_prompt
-            + "\n\n=== OPENCODE GLM WORKER RUNTIME ===\n"
+            "=== OPENCODE GLM WORKER RUNTIME ===\n"
               "Native Bash/read/write/edit tools and `grypton_*` MCP tools are "
               "available. Every network action MUST use a `grypton_*` MCP tool so "
               "scope checks and Burp-like request/response capture cannot be bypassed. "

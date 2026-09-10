@@ -285,6 +285,18 @@ class Workspace:
         _atomic_write(self.constraints_path, json.dumps(asdict(c), indent=2))
         self._render_scope()
 
+    def save_program_brief(self, text: str, profile: dict) -> None:
+        """Persist the reviewed public brief inside the model-visible workspace."""
+        _atomic_write(
+            self.root / "program-brief.md",
+            "# Program brief snapshot\n\n" + text.strip() + "\n",
+        )
+        public = {key: value for key, value in profile.items() if key != "brief_text"}
+        _atomic_write(
+            self.root / ".ledger" / "program-profile.json",
+            json.dumps(public, indent=2, ensure_ascii=False) + "\n",
+        )
+
     def add_standing_instruction(self, text: str) -> Constraints:
         """Persist a user instruction for the rest of the engagement (R27/I4)."""
         text = text.strip()
