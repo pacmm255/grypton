@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
+from contextlib import redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 import os
 from pathlib import Path
@@ -16,7 +18,9 @@ from unittest.mock import AsyncMock, patch
 
 from grypton import config
 from grypton.bugcrowd import analyze_snapshot, matching_scope_rules, out_of_scope_rules
-from grypton.cli import _constraints, _validate_requested_findings, build_parser
+from grypton.chat import Renderer, _command_limit, _route_input
+from grypton.cli import (_activity_snapshot, _constraints, _validate_requested_findings,
+                         build_parser, main)
 from grypton.engine import Engine
 from grypton.hard_lab import HardLab, score_workspace
 from grypton.manager import KryptexManager, ManagerContext, _check_schema, _extract_json
@@ -115,6 +119,54 @@ class CliTests(unittest.TestCase):
         scored = parser.parse_args(["benchmark", "score", "/tmp/benchmark/manifest.json", "lab-target"])
         self.assertEqual(served.out, "/tmp/benchmark")
         self.assertEqual(scored.target, "lab-target")
+
+    def test_operator_cli_plan_and_activity_parse_without_starting_a_provider(self):
+        parser = build_parser()
+        plan = parser.parse_args(["plan", "--target", "preview.test", "--type", "web"])
+        activity = parser.parse_args(["activity", "preview-test", "--kind", "flows", "--limit", "3"])
+        self.assertEqual(plan.target_option, "preview.test")
+        self.assertEqual(activity.kind, "flows")
+        self.assertEqual(activity.limit, 3)
+        with isolated_runtime() as root, redirect_stdout(io.StringIO()):
+            self.assertEqual(main(["plan", "--target", "preview.test", "--type", "web"]), 0)
+            self.assertFalse((root / ".state" / "engagements" / "preview-test").exists())
+
+    def test_operator_console_commands_persist_note_and_change_view(self):
+        with isolated_runtime():
+            ws = Workspace("operator-console")
+            ws.create("console.test", "web")
+            ws.save_constraints(Constraints(in_scope=["console.test"]))
+            engine = SimpleNamespace(
+                ws=ws, turn_index=2, _start_time=0.0,
+                request_stop=lambda reason: None,
+                submit_user=lambda text, to_worker=False: None,
+            )
+            renderer = Renderer()
+            with redirect_stdout(io.StringIO()):
+                self.assertFalse(_route_input(engine, renderer, "/view quiet"))
+                self.assertFalse(_route_input(engine, renderer, "/note prioritize state transitions"))
+                self.assertFalse(_route_input(engine, renderer, "/summary"))
+            self.assertEqual(renderer.view, "quiet")
+            self.assertIn("prioritize state transitions", "\n".join(
+                ws.load_constraints().standing_instructions
+            ))
+            self.assertEqual(_command_limit("4", 8), 4)
+            with self.assertRaises(ValueError):
+                _command_limit("0", 8)
+
+    def test_activity_snapshot_redacts_inline_secrets(self):
+        with isolated_runtime():
+            ws = Workspace("activity-redaction")
+            ws.create("activity.test", "web")
+            ws.save_constraints(Constraints(in_scope=["activity.test"]))
+            ledger = ws.root / ".ledger" / "tool-calls.jsonl"
+            ledger.write_text(json.dumps({
+                "tool": "http_request", "ok": True,
+                "summary": "password=do-not-print token=also-hidden",
+            }) + "\n", encoding="utf-8")
+            snapshot = _activity_snapshot(ws, 1)
+            self.assertNotIn("do-not-print", snapshot["tools"][0]["summary"])
+            self.assertNotIn("also-hidden", snapshot["tools"][0]["summary"])
 
     def test_bugcrowd_brief_preflight_imports_scope_and_blocks_automation(self):
         document = {

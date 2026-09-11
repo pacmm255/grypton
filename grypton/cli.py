@@ -7,7 +7,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
+import shlex
 import subprocess
 import sys
 import time
@@ -121,7 +123,7 @@ def _run_engagement(ws: Workspace, ns, *, brief: str, fresh: bool) -> int:
         meta = ws.load_meta()
         await engine.setup(brief=brief, target=meta.target, target_type=meta.target_type,
                            fresh_clone=fresh)
-        await interact(engine)
+        await interact(engine, renderer)
 
     try:
         asyncio.run(execute())
@@ -257,6 +259,211 @@ def cmd_show(ns) -> int:
         print(f"  workspace={ws.root}")
         if meta.last_directive:
             print(f"  last directive={meta.last_directive.splitlines()[0][:180]}")
+    return 0
+
+
+def _jsonl_tail(path: Path, limit: int) -> list[dict]:
+    """Read a small JSONL tail for a human-facing live view."""
+    rows: list[dict] = []
+    try:
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                try:
+                    value = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(value, dict):
+                    rows.append(value)
+    except OSError:
+        return []
+    return rows[-max(1, min(int(limit), 100)):]
+
+
+_INLINE_SECRET_RX = re.compile(
+    r"(?i)\b(password|passwd|secret|token|api[_-]?key|authorization|cookie)"
+    r"([:=]\s*|%3[dD])[^\s,;&]+"
+)
+
+
+def _redact_summary(value: object) -> str:
+    """Keep live operational views useful without reproducing sensitive values."""
+    text = " ".join(str(value or "").split())
+    return _INLINE_SECRET_RX.sub(lambda match: f"{match.group(1)}=[REDACTED]", text)
+
+
+def _finding_overview(row: dict | None) -> dict | None:
+    if not row:
+        return None
+    verdict = row.get("manager_verdict") or {}
+    return {
+        "id": row.get("id"),
+        "title": row.get("title"),
+        "claimed_severity": row.get("severity"),
+        "severity": verdict.get("severity") or row.get("severity"),
+        "status": row.get("status"),
+        "validator_verdict": verdict.get("verdict"),
+        "confidence": verdict.get("confidence"),
+    }
+
+
+def _activity_snapshot(ws: Workspace, limit: int) -> dict:
+    """Return summaries only: capture bodies and tool arguments stay private."""
+    tools = []
+    for row in _jsonl_tail(ws.root / ".ledger" / "tool-calls.jsonl", limit):
+        tools.append({"at": row.get("at"), "tool": row.get("tool"), "ok": row.get("ok"),
+                      "summary": _redact_summary(row.get("summary")),
+                      "duration_s": row.get("duration_s")})
+    turns = []
+    for row in _jsonl_tail(ws.transcripts_dir / "turns.jsonl", limit):
+        text = " ".join(str(row.get("assistant_text") or "").strip().split())
+        turns.append({"turn": row.get("turn"), "tools": len(row.get("tools") or []),
+                      "error": bool(row.get("is_error")), "summary": _redact_summary(text[-240:])})
+    try:
+        flows = sorted(ws.flows_dir.glob("flow-*.http"), key=lambda path: path.stat().st_mtime,
+                       reverse=True)[:limit]
+    except OSError:
+        flows = []
+    try:
+        progress = [line for line in (ws.root / "progress.md").read_text(
+            encoding="utf-8", errors="replace").splitlines() if line.strip()][-limit:]
+    except OSError:
+        progress = []
+    return {
+        "tools": tools,
+        "turns": turns,
+        "flows": [{"id": path.stem, "bytes": path.stat().st_size} for path in flows],
+        "progress": [_redact_summary(line) for line in progress],
+    }
+
+
+def cmd_activity(ns) -> int:
+    try:
+        ws = _existing_workspace(ns.target)
+    except ValueError as exc:
+        print(f"ERROR: {exc}.", file=sys.stderr)
+        return 2
+    limit = max(1, min(ns.limit, 100))
+    snapshot = _activity_snapshot(ws, limit)
+    requested = ns.kind
+    output = {requested: snapshot[requested]} if requested != "all" else snapshot
+    if ns.json:
+        print(json.dumps({"target": ws.slug, **output}, ensure_ascii=False, indent=2))
+        return 0
+    if requested in ("all", "tools"):
+        print("Tool activity")
+        if not snapshot["tools"]:
+            print("  (none)")
+        for row in snapshot["tools"]:
+            marker = "OK" if row.get("ok") else "ERR"
+            print(f"  {marker:3}  {str(row.get('tool') or '?'):<24} "
+                  f"{str(row.get('summary') or '')[:180]}")
+    if requested in ("all", "turns"):
+        print("Worker turns")
+        if not snapshot["turns"]:
+            print("  (none)")
+        for row in snapshot["turns"]:
+            print(f"  turn {str(row.get('turn') or '?'):>3} · tools={row['tools']} · "
+                  f"{row['summary'] or '(no summary)'}")
+    if requested in ("all", "flows"):
+        print("Captured flows")
+        if not snapshot["flows"]:
+            print("  (none)")
+        for row in snapshot["flows"]:
+            print(f"  {row['id']:<34} {row['bytes']:>8} bytes")
+    if requested in ("all", "progress"):
+        print("Progress")
+        for line in snapshot["progress"] or ["(none)"]:
+            print(f"  {line}")
+    return 0
+
+
+def cmd_overview(ns) -> int:
+    try:
+        ws = _existing_workspace(ns.target)
+    except ValueError as exc:
+        print(f"ERROR: {exc}.", file=sys.stderr)
+        return 2
+    row = _status(ws.slug)
+    meta = ws.load_meta()
+    constraints = ws.load_constraints()
+    findings = ws.findings.all()
+    latest = findings[-1] if findings else None
+    output = {
+        **row,
+        "scope": constraints.in_scope,
+        "out_of_scope": constraints.out_of_scope,
+        "standing_instruction_count": len(constraints.standing_instructions),
+        "last_directive": _redact_summary(meta.last_directive),
+        "latest_finding": _finding_overview(latest),
+        "activity": _activity_snapshot(ws, max(1, min(ns.limit, 100))),
+    }
+    if ns.json:
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+        return 0
+    calls = row["provider_calls"]
+    print(f"Grypton overview — {row['slug']} · {row['status']}")
+    print(f"  target       {row['target']} ({row['type']})")
+    print(f"  coverage     turns={row['turns']} tools={row['tool_calls']} surface={row['surface']} "
+          f"tested={row['tested']} findings={row['confirmed_findings']}/{row['findings']} confirmed")
+    print(f"  model calls  Kraude={calls['worker']} Kryptex={calls['manager']} Astra={calls['validator']}")
+    print(f"  scope        {', '.join(constraints.in_scope) or '—'}")
+    if latest:
+        verdict = latest.get("manager_verdict") or {}
+        print(f"  latest       {latest.get('id')} · {verdict.get('severity') or latest.get('severity', '?')} · "
+              f"{verdict.get('verdict') or latest.get('status', 'recorded')} · {latest.get('title', '')}")
+    else:
+        print("  latest       no finding recorded")
+    directive = _redact_summary(meta.last_directive)
+    print(f"  next         {directive[:240] or 'No manager directive recorded yet.'}")
+    print(f"  workspace    {row['workspace']}")
+    return 0
+
+
+def cmd_plan(ns) -> int:
+    """Preflight a run without creating an engagement or starting a provider."""
+    try:
+        target = _target_value(ns)
+        constraints = _constraints(ns, target)
+    except (ValueError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    from .scenarios import load_scenarios
+    selected_type = ns.type
+    scenarios = [row["id"] for row in load_scenarios()
+                 if selected_type == "auto" or selected_type in row.get("target_types", [])]
+    output = {
+        "target": target,
+        "type": selected_type,
+        "slug": config.slugify(target),
+        "workspace": str(Workspace(config.slugify(target)).root),
+        "scope": constraints.in_scope,
+        "out_of_scope": constraints.out_of_scope,
+        "hard_rules": constraints.hard_rules,
+        "models": {
+            "worker": {"route": config.WORKER_MODEL, "effort": config.WORKER_EFFORT},
+            "manager": {"route": config.MANAGER_MODEL, "effort": config.MANAGER_EFFORT},
+            "validator": {"route": config.VALIDATOR_MODEL, "effort": config.VALIDATOR_EFFORT,
+                          "automatic_severities": sorted(config.ASTRA_AUTO_SEVERITIES)},
+        },
+        "scenario_ids": scenarios,
+        "created": False,
+    }
+    if ns.json:
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+        return 0
+    command = f"grypton init --target {shlex.quote(target)} --type {shlex.quote(selected_type)}"
+    if ns.brief:
+        command += f" --brief {shlex.quote(ns.brief)}"
+    print("Grypton preflight — no workspace or provider was started")
+    print(f"  target       {target} ({selected_type})")
+    print(f"  workspace    {output['workspace']}")
+    print(f"  in scope     {', '.join(constraints.in_scope) or '—'}")
+    print(f"  out of scope {', '.join(constraints.out_of_scope) or '—'}")
+    print(f"  models       GLM → Spark → Astra (P1/P2 automatic)")
+    print(f"  playbooks    {', '.join(scenarios) or 'auto routing at startup'}")
+    print(f"  start        {command}")
     return 0
 
 
@@ -640,7 +847,7 @@ def _run_options(parser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="grypton",
         description="Autonomous scoped testing with GLM Kraude, Spark Kryptex, and Astra validation")
-    parser.add_argument("--version", action="version", version="Grypton 3.2.0")
+    parser.add_argument("--version", action="version", version="Grypton 3.3.0")
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="Create and immediately run an engagement")
     init.add_argument("target", nargs="?")
@@ -652,13 +859,35 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--authorization-file"); init.add_argument("--bugcrowd-brief")
     init.add_argument("--force", action="store_true")
     _run_options(init); init.set_defaults(func=cmd_init)
+    plan = sub.add_parser("plan", help="Preview scope, models, and playbooks without starting a run")
+    plan.add_argument("target", nargs="?")
+    plan.add_argument("--target", dest="target_option")
+    plan.add_argument("--type", choices=["auto", "web", "api", "network", "cidr", "binary", "contract"],
+                      default="auto")
+    plan.add_argument("-m", "--brief", default="", help="Proposed engagement mission")
+    plan.add_argument("--only", default=""); plan.add_argument("--exclude", default="")
+    plan.add_argument("--include", default=""); plan.add_argument("--in-scope", default="")
+    plan.add_argument("--out-scope", default=""); plan.add_argument("--rule", action="append", default=[])
+    plan.add_argument("--authorization-file"); plan.add_argument("--bugcrowd-brief")
+    plan.add_argument("--json", action="store_true"); plan.set_defaults(func=cmd_plan)
     resume = sub.add_parser("resume", help="Resume a persistent engagement")
     resume.add_argument("target"); _run_options(resume); resume.set_defaults(func=cmd_resume)
-    status = sub.add_parser("status"); status.add_argument("target", nargs="?")
+    status = sub.add_parser("status", aliases=["ls"], help="List engagements and current run counters")
+    status.add_argument("target", nargs="?")
     status.add_argument("--json", action="store_true"); status.set_defaults(func=cmd_status)
     show = sub.add_parser("show", help="Show one engagement and its review paths")
     show.add_argument("target"); show.add_argument("--json", action="store_true")
     show.set_defaults(func=cmd_show)
+    overview = sub.add_parser("overview", aliases=["inspect"],
+                              help="Show a compact engagement picture and current next step")
+    overview.add_argument("target"); overview.add_argument("--limit", type=int, default=5)
+    overview.add_argument("--json", action="store_true"); overview.set_defaults(func=cmd_overview)
+    activity = sub.add_parser("activity", aliases=["tail"],
+                              help="Review sanitized tool, turn, capture, or progress summaries")
+    activity.add_argument("target")
+    activity.add_argument("--kind", choices=["all", "tools", "turns", "flows", "progress"], default="all")
+    activity.add_argument("--limit", type=int, default=10)
+    activity.add_argument("--json", action="store_true"); activity.set_defaults(func=cmd_activity)
     findings = sub.add_parser("findings", help="List findings with independent verdicts")
     findings.add_argument("target"); findings.add_argument("--json", action="store_true")
     findings.set_defaults(func=cmd_findings)

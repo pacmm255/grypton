@@ -2,9 +2,9 @@
 
 You talk to **Kryptex** (the manager) by default; `/worker <msg>` talks to **Kraude**
 directly. Kryptex replies to your messages in REAL TIME (concurrent with whatever
-Kraude is doing) and remembers them. The terminal shows *everything*: system init,
-Kraude's thinking + output, every tool call with its command/code, tool results,
-Codex's own reasoning/commands, directives, findings, and severity verdicts.
+Kraude is doing) and remembers them. The console exposes system init, Kraude's
+stream, tool activity, directives, findings, and severity verdicts. Operators can
+switch between quiet, normal, and full views without changing durable evidence.
 """
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ import re
 import shutil
 import sys
 import textwrap
+import time
+from pathlib import Path
 
 # Natural-language stop intent: a message made up ONLY of stop words + filler
 # (e.g. "ok enough you can stop now") halts the engine. A nuanced message like
@@ -43,6 +45,26 @@ _ANSI_CTRL_RX = re.compile(
     r"|\x1b[NOP=>]"                      # SS2/SS3/keypad
     r"|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]" # other C0 controls (keep \t \n \r)
 )
+
+# Terminal output is often copied to tickets or screen-shared. Captures remain
+# complete in the private workspace, while the operator console removes common
+# credential forms from streamed output and command previews.
+_DISPLAY_SECRET_RX = re.compile(
+    r'(?i)(\b(?:password|passwd|secret|token|api[_-]?key|hmac[_ -]?key|authorization|cookie)\b'
+    r'\s*[:=]\s*)([^\s,;&}\]\)]+)'
+)
+_DISPLAY_JSON_SECRET_RX = re.compile(
+    r'(?i)("(?:password|passwd|secret|token|api[_-]?key|hmac[_-]?key|authorization|cookie)"\s*:\s*")'
+    r'([^"\\]*(?:\\.[^"\\]*)*)(")'
+)
+_DISPLAY_BEARER_RX = re.compile(r'(?i)(\bbearer\s+)[\w.\-+/=]+')
+
+
+def _redact_display(text: object) -> str:
+    value = str(text or "")
+    value = _DISPLAY_JSON_SECRET_RX.sub(r'\1[REDACTED]\3', value)
+    value = _DISPLAY_SECRET_RX.sub(r'\1[REDACTED]', value)
+    return _DISPLAY_BEARER_RX.sub(r'\1[REDACTED]', value)
 
 
 def _sanitize_input(text: str) -> str:
@@ -110,19 +132,19 @@ def _render_tool(name: str, inp):
         desc = inp.get("description", "")
         if desc:
             head += dim(f"  — {desc}")
-        body = "$ " + str(inp["command"])
+        body = "$ " + _redact_display(inp["command"])
     elif name == "Write" and "file_path" in inp:
         head += "  " + str(inp["file_path"])
-        body = str(inp.get("content", ""))
+        body = _redact_display(inp.get("content", ""))
     elif name == "Edit" and "file_path" in inp:
         head += "  " + str(inp["file_path"])
-        body = f"- {inp.get('old_string', '')}\n+ {inp.get('new_string', '')}"
+        body = _redact_display(f"- {inp.get('old_string', '')}\n+ {inp.get('new_string', '')}")
     elif name in ("Read", "NotebookEdit") and "file_path" in inp:
         head += "  " + str(inp["file_path"])
     elif name in ("WebFetch", "WebSearch"):
         head += "  " + str(inp.get("url") or inp.get("query", ""))
     elif inp:
-        body = json.dumps(inp, ensure_ascii=False)
+        body = _redact_display(json.dumps(inp, ensure_ascii=False))
     return head, body
 
 
@@ -134,6 +156,16 @@ class Renderer:
         self._line_open = False     # a streamed line is awaiting its newline
         self._stream_mode = None    # None | 'text' | 'thinking'
         self._streamed_text = False  # did final text stream this turn?
+        # Evidence is always retained in the workspace. This only controls how
+        # much of the live stream reaches the terminal.
+        self.view = "normal"        # quiet | normal | full
+
+    def set_view(self, view: str) -> bool:
+        value = (view or "").strip().lower()
+        if value not in {"quiet", "normal", "full"}:
+            return False
+        self.view = value
+        return True
 
     def emit(self, kind: str, **d) -> None:
         try:
@@ -183,7 +215,8 @@ class Renderer:
                        f"tools={d.get('tools','?')} mcp=[{mcp}]"))
 
         elif kind == "worker_thinking":
-            self._stream("thinking", dim("  🧠 Kraude (thinking):"), d.get("text", ""), dimmed=True)
+            if self.view != "quiet":
+                self._stream("thinking", dim("  🧠 Kraude (thinking):"), d.get("text", ""), dimmed=True)
 
         elif kind == "worker_delta":
             self._stream("text", green("  ▼ Kraude:"), d.get("text", ""))
@@ -196,10 +229,17 @@ class Renderer:
                 print(_block(body))
 
         elif kind == "worker_tool_result":
-            content = d.get("content", "")
+            content = _redact_display(d.get("content", ""))
             label = red("  ↳ result (error):") if d.get("is_error") else dim("  ↳ result:")
             print(label)
-            print(_block(content, maxlen=1400, maxlines=30))
+            if self.view == "quiet":
+                first = next((line.strip() for line in str(content).splitlines() if line.strip()),
+                             "(empty result)")
+                print(_wrap(first[:360] + (" …" if len(first) > 360 else ""), "      "))
+            elif self.view == "full":
+                print(_block(content, maxlen=3600, maxlines=100))
+            else:
+                print(_block(content, maxlen=1400, maxlines=30))
 
         elif kind == "worker_turn":
             txt = (d.get("text") or "").strip()
@@ -316,22 +356,165 @@ class Renderer:
 
 
 HELP = """\
-Grypton chat commands:
-  <text>            message Kryptex (the manager) — replies in real time
-  /worker <text>    message Kraude (the worker) directly
-  /stop             stop the engagement
-  /status           run status
-  /findings         print findings.md
-  /surface          print attack-surface.md
-  /help             this help
+Grypton operator console
+
+  <text>                 message Kryptex; it replies and relays actionable intent
+  /worker <text>         send a concrete instruction to Kraude's next work burst
+  /note <text>           save an operator note without spending a manager call
+  /summary               compact live state: coverage, finding, and next-action view
+  /status                current turn and coverage counters
+  /plan                  show Kryptex's current directive
+  /activity [N]          recent audited tool calls (default 8)
+  /flows [N]             recent capture IDs and sizes (default 8; bodies stay private)
+  /history [N]           recent worker-turn summaries (default 5)
+  /findings              findings ledger
+  /surface               attack-surface ledger
+  /tested                tested-techniques ledger
+  /scope                 binding scope and standing instructions
+  /models                pinned model routes
+  /audit                 evidence, scope, and validator integrity check
+  /view quiet|normal|full control live-stream detail; current mode is shown on /status
+  /clear                 clear the visible terminal buffer
+  /stop                  stop after the active worker step
+  /help                  this help
 """
 
 
-async def interact(engine) -> None:
-    print(bold(cyan("\n╔══ Grypton ══╗  ")) +
-          dim(f"target={engine.target}  mode={engine.backend}  (/help for commands)\n"))
+def _tail_lines(path: Path, limit: int) -> list[str]:
+    """Read a bounded tail without forcing the live console to load big ledgers."""
+    try:
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            rows = [line.rstrip("\n") for line in stream if line.strip()]
+    except OSError:
+        return []
+    return rows[-max(1, min(limit, 50)):]
+
+
+def _command_limit(argument: str, default: int) -> int:
+    text = (argument or "").strip()
+    if not text:
+        return default
+    try:
+        value = int(text)
+    except ValueError:
+        raise ValueError("expected a whole-number limit") from None
+    if not 1 <= value <= 50:
+        raise ValueError("limit must be between 1 and 50")
+    return value
+
+
+def _print_status(engine, renderer: Renderer) -> None:
+    meta = engine.ws.load_meta()
+    elapsed = int(time.time() - engine._start_time) if engine._start_time else 0
+    print(cyan(
+        f"◆ status={meta.status} · turn={engine.turn_index} · elapsed={elapsed // 60}m{elapsed % 60:02d}s "
+        f"· findings={len(engine.ws.findings.all())} · surface={len(engine.ws.surface.all())} "
+        f"· P1s={len(engine.ws.confirmed_p1s())} · stream={renderer.view}"
+    ))
+
+
+def _print_summary(engine, renderer: Renderer) -> None:
+    """A decision-oriented snapshot intended for use while a turn is running."""
+    meta = engine.ws.load_meta()
+    constraints = engine.ws.load_constraints()
+    findings = engine.ws.findings.all()
+    confirmed = engine.ws.confirmed_findings()
+    latest = findings[-1] if findings else {}
+    print(bold(cyan("\n╭─ Grypton live summary")))
+    print(f"│ target      {meta.target} ({meta.target_type}) · {meta.status} · turn {engine.turn_index}")
+    print(f"│ coverage    surface={len(engine.ws.surface.all())} · tested={len(engine.ws.tested.all())} "
+          f"· findings={len(confirmed)}/{len(findings)} confirmed")
+    print(f"│ scope       {', '.join(constraints.in_scope) or '—'}")
+    if latest:
+        verdict = latest.get("manager_verdict") or {}
+        state = verdict.get("verdict") or latest.get("status", "recorded")
+        severity = verdict.get("severity") or latest.get("severity", "?")
+        print(f"│ latest      {latest.get('id', '?')} · {severity} · {state} · "
+              f"{str(latest.get('title', ''))[:110]}")
+    else:
+        print("│ latest      no finding recorded")
+    directive = _redact_display((meta.last_directive or "").strip().replace("\n", " "))
+    print(f"│ next        {directive[:220] or 'Kryptex is preparing the next directive.'}")
+    print(f"│ stream      {renderer.view} · `/activity`, `/flows`, and `/plan` provide detail")
+    print(bold(cyan("╰────────────────────────────────────────────────────────────────")))
+
+
+def _print_activity(engine, limit: int) -> None:
+    rows = _tail_lines(engine.ws.root / ".ledger" / "tool-calls.jsonl", limit)
+    if not rows:
+        print(dim("No audited tool calls yet."))
+        return
+    print(bold("Recent audited tool activity:"))
+    for raw in rows:
+        try:
+            row = json.loads(raw)
+        except ValueError:
+            continue
+        marker = green("✓") if row.get("ok") else red("!")
+        tool = str(row.get("tool") or "tool")
+        summary = " ".join(_redact_display(row.get("summary")).split())
+        print(f"  {marker} {tool:<24} {summary[:180]}")
+
+
+def _print_flows(engine, limit: int) -> None:
+    try:
+        rows = sorted(engine.ws.flows_dir.glob("flow-*.http"),
+                      key=lambda path: path.stat().st_mtime, reverse=True)[:limit]
+    except OSError:
+        rows = []
+    if not rows:
+        print(dim("No captured flows yet."))
+        return
+    print(bold("Recent private captures:"))
+    for path in rows:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        print(f"  {path.stem:<34} {size:>8} bytes")
+    print(dim("  Use `grypton tools --target TARGET flow-read FLOW_ID` for an explicit capture review."))
+
+
+def _print_history(engine, limit: int) -> None:
+    rows = _tail_lines(engine.ws.transcripts_dir / "turns.jsonl", limit)
+    if not rows:
+        print(dim("No completed worker turns yet."))
+        return
+    print(bold("Recent Kraude turns:"))
+    for raw in rows:
+        try:
+            row = json.loads(raw)
+        except ValueError:
+            continue
+        summary = " ".join(_redact_display(row.get("assistant_text")).strip().split())
+        print(f"  turn {row.get('turn', '?'):>3} · tools={len(row.get('tools') or [])} · "
+              f"{summary[-190:] or '(no text summary)'}")
+
+
+def _print_audit(engine) -> None:
+    from .reporting import audit_workspace
+    result = audit_workspace(engine.ws)
+    counts = result.get("counts", {})
+    state = green("PASS") if result.get("ok") else yellow("ATTENTION")
+    print(f"Grypton audit: {state} · tools={counts.get('tool_calls', 0)} · "
+          f"flows={counts.get('flows', 0)} · scope violations={len(result.get('scope_violations', []))} · "
+          f"required validation gaps={len(result.get('unvalidated_findings', []))}")
+
+
+async def interact(engine, renderer: Renderer | None = None) -> None:
+    from . import config
+
+    print(bold(cyan("\n╔══ Grypton operator console ══╗")))
+    print(dim(f"target={engine.target} · type={engine.target_type} · backend={engine.backend}"))
+    print(dim(f"Kraude {config.WORKER_MODEL} · {config.WORKER_EFFORT}  |  "
+              f"Kryptex {config.MANAGER_MODEL} · {config.MANAGER_EFFORT}  |  "
+              f"Astra {config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT}"))
+    print(dim("Type `/summary` for the operating picture or `/help` for console commands.\n"))
     loop_task = asyncio.create_task(engine.run())
-    input_task = asyncio.create_task(_input_loop(engine))
+    if renderer is None:
+        candidate = getattr(engine.emit, "__self__", None)
+        renderer = candidate if isinstance(candidate, Renderer) else Renderer()
+    input_task = asyncio.create_task(_input_loop(engine, renderer))
     try:
         done, _ = await asyncio.wait({loop_task, input_task}, return_when=asyncio.FIRST_COMPLETED)
         if loop_task in done:
@@ -352,7 +535,7 @@ _PASTE_START = "\x1b[200~"
 _PASTE_END = "\x1b[201~"
 
 
-def _route_input(engine, text: str) -> bool:
+def _route_input(engine, renderer: Renderer, text: str) -> bool:
     """Process one complete user message; return True if the input loop should exit."""
     text = _sanitize_input(text).strip()
     if not text:
@@ -365,16 +548,72 @@ def _route_input(engine, text: str) -> bool:
         print(HELP)
         return False
     if text == "/status":
-        m = engine.ws.load_meta()
-        print(cyan(f"◆ turns={engine.turn_index} status={m.status} "
-                   f"findings={len(engine.ws.findings.all())} "
-                   f"surface={len(engine.ws.surface.all())} "
-                   f"P1s={len(engine.ws.confirmed_p1s())}"))
+        _print_status(engine, renderer)
         return False
-    if text in ("/findings", "/surface"):
-        doc = "findings.md" if text == "/findings" else "attack-surface.md"
+    if text == "/summary":
+        _print_summary(engine, renderer)
+        return False
+    if text == "/plan":
+        directive = engine.ws.load_meta().last_directive.strip()
+        print(bold("Kryptex directive:"))
+        print(_wrap(_redact_display(directive) or "No directive has been recorded yet.", "  "))
+        return False
+    if text in ("/findings", "/surface", "/tested"):
+        doc = {"/findings": "findings.md", "/surface": "attack-surface.md",
+               "/tested": "tested-techniques.md"}[text]
         p = engine.ws.root / doc
         print(p.read_text(errors="replace") if p.exists() else "(empty)")
+        return False
+    if text == "/scope":
+        print(engine.ws.load_constraints().to_prompt_block())
+        return False
+    if text == "/models":
+        from . import config
+        print(f"Kraude    {config.WORKER_MODEL} · {config.WORKER_EFFORT}\n"
+              f"Kryptex   {config.MANAGER_MODEL} · {config.MANAGER_EFFORT}\n"
+              f"Validator {config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT} (P1/P2 automatic)")
+        return False
+    if text == "/audit":
+        _print_audit(engine)
+        return False
+    if text == "/clear":
+        if sys.stdout.isatty():
+            print("\033[2J\033[H", end="")
+        else:
+            print("\n" * 3)
+        return False
+    if text.startswith("/note "):
+        note = text[len("/note "):].strip()
+        if not note:
+            print(yellow("Usage: /note <text>"))
+            return False
+        engine.ws.add_standing_instruction(f"[OPERATOR NOTE] {note}")
+        engine.ws.append_progress("Operator note saved for the engagement.")
+        print(green("◆ Note saved. It will remain visible to Kryptex and Kraude without a manager call."))
+        return False
+    if text in ("/activity", "/flows", "/history") or \
+            text.startswith(("/activity ", "/flows ", "/history ")):
+        command, _, argument = text.partition(" ")
+        try:
+            limit = _command_limit(argument, 8 if command != "/history" else 5)
+        except ValueError as exc:
+            print(yellow(f"Usage: {command} [1-50] ({exc})"))
+            return False
+        if command == "/activity":
+            _print_activity(engine, limit)
+        elif command == "/flows":
+            _print_flows(engine, limit)
+        else:
+            _print_history(engine, limit)
+        return False
+    if text == "/view" or text.startswith("/view "):
+        _, _, requested = text.partition(" ")
+        if not requested:
+            print(f"Live stream mode: {renderer.view}. Use `/view quiet`, `/view normal`, or `/view full`.")
+        elif renderer.set_view(requested):
+            print(green(f"◆ Live stream set to {renderer.view}. Evidence capture is unchanged."))
+        else:
+            print(yellow("Usage: /view quiet|normal|full"))
         return False
     if text.startswith("/worker "):
         engine.submit_user(text[len("/worker "):].strip(), to_worker=True)
@@ -433,7 +672,7 @@ class _PasteParser:
                     line = line[j + len(_PASTE_END):]
 
 
-async def _input_loop(engine) -> None:
+async def _input_loop(engine, renderer: Renderer) -> None:
     is_tty = sys.stdin.isatty()
     if is_tty:
         try:
@@ -445,11 +684,14 @@ async def _input_loop(engine) -> None:
         loop = asyncio.get_running_loop()
         parser = _PasteParser()
         while True:
+            if is_tty:
+                sys.stdout.write(cyan("\n grypton› "))
+                sys.stdout.flush()
             raw = await _readline(loop)
             if not raw:
                 return
             for msg in parser.feed(raw):
-                if _route_input(engine, msg):
+                if _route_input(engine, renderer, msg):
                     return
     finally:
         if is_tty:

@@ -30,12 +30,15 @@ cd /root/grypton/bin
 Useful controls:
 
 ```bash
+./grypton plan --target "example.test" --type web -m "Assess the public API"
 ./grypton init --target "example.test" \
   --in-scope "example.test,*.example.test" \
   --out-scope "status.example.test" \
   -m "Assess the web and API surface"
 
 ./grypton status --json
+./grypton overview example-test
+./grypton activity example-test --kind tools --limit 12
 ./grypton show example-test
 ./grypton findings example-test
 ./grypton validate example-test F003
@@ -68,11 +71,19 @@ or the selected target is not listed. The complete normalized brief is saved as
 `program-brief.md` for Kraude and Kryptex; a shortened mission cannot override
 it.
 
-The live terminal shows worker text, every tool request/result, heartbeats,
-manager assessment and directive, findings, and Astra verdicts. Type a message
-to Kryptex during the run, `/worker ...` to relay directly to Kraude, or `/stop`.
-Ctrl-C and `grypton stop` terminate an active provider process instead of waiting
-for its full turn timeout.
+`grypton plan` validates the target, scope, model routes, and relevant playbooks
+without creating an engagement or starting a provider. `overview` is a compact
+decision view for one workspace; `activity` prints sanitized tool, turn, capture,
+or progress summaries without dumping capture bodies.
+
+The live terminal is an operator console. It begins with the exact pinned model
+routes and accepts plain messages for Kryptex, `/worker ...` to relay a concrete
+instruction to Kraude, and `/note ...` to persist context without consuming a
+manager call. During a run, use `/summary`, `/plan`, `/activity`, `/flows`,
+`/history`, `/scope`, `/models`, and `/audit` to inspect state. `/view quiet`,
+`/view normal`, and `/view full` control terminal detail while all evidence stays
+in the private workspace; streamed credential-shaped values are redacted from
+the terminal preview. `/stop`, Ctrl-C, and `grypton stop` request a clean halt.
 
 P1/P2 findings start as `validation-pending` and then follow the independent
 verdict: `confirmed`, `needs-more-evidence`, or `rejected`. P3–P5 findings start
