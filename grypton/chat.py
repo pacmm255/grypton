@@ -11,7 +11,9 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import shlex
 import shutil
+import subprocess
 import sys
 import textwrap
 import time
@@ -126,7 +128,7 @@ def _render_tool(name: str, inp):
     name = name or "tool"
     inp = inp if isinstance(inp, dict) else {}
     disp = name.replace("mcp__grypton__", "grypton.").replace("mcp__krypton__", "grypton.").replace("mcp__", "")
-    head = yellow(f"  ⚙ Kraude → {disp}")
+    head = yellow(f"  ⏺ {disp}")
     body = None
     if name == "Bash" and "command" in inp:
         desc = inp.get("description", "")
@@ -151,7 +153,7 @@ def _render_tool(name: str, inp):
 class Renderer:
     """Engine event sink → terminal. Shows everything, colored."""
 
-    def __init__(self):
+    def __init__(self, view: str = "normal"):
         self._turn = 0
         self._line_open = False     # a streamed line is awaiting its newline
         self._stream_mode = None    # None | 'text' | 'thinking'
@@ -159,6 +161,7 @@ class Renderer:
         # Evidence is always retained in the workspace. This only controls how
         # much of the live stream reaches the terminal.
         self.view = "normal"        # quiet | normal | full
+        self.set_view(view)
 
     def set_view(self, view: str) -> bool:
         value = (view or "").strip().lower()
@@ -203,23 +206,23 @@ class Renderer:
             self._streamed_text = False
             print()
             print(dim("─" * _WIDTH))
-            print(bold(f"▶ Turn {self._turn}") + dim("   · Kraude working…"))
+            print(bold(f"✦ Turn {self._turn}") + dim("  Kraude is working…"))
 
         elif kind == "heartbeat":
-            print(dim(f"  … Kraude still working — {d.get('elapsed', 0)}s, "
+            print(dim(f"  · Kraude is working — {d.get('elapsed', 0)}s, "
                       f"{d.get('tools', 0)} tool call(s) so far"))
 
         elif kind == "worker_system":
             mcp = ", ".join(d.get("mcp") or []) or "—"
-            print(blue(f"  ⚙ session online — model={d.get('model','?')} "
+            print(blue(f"  ◈ session online — model={d.get('model','?')} "
                        f"tools={d.get('tools','?')} mcp=[{mcp}]"))
 
         elif kind == "worker_thinking":
             if self.view != "quiet":
-                self._stream("thinking", dim("  🧠 Kraude (thinking):"), d.get("text", ""), dimmed=True)
+                self._stream("thinking", dim("  · Kraude reasoning"), d.get("text", ""), dimmed=True)
 
         elif kind == "worker_delta":
-            self._stream("text", green("  ▼ Kraude:"), d.get("text", ""))
+            self._stream("text", green("  ✦ Kraude"), d.get("text", ""))
             self._streamed_text = True
 
         elif kind == "worker_tool":
@@ -230,7 +233,7 @@ class Renderer:
 
         elif kind == "worker_tool_result":
             content = _redact_display(d.get("content", ""))
-            label = red("  ↳ result (error):") if d.get("is_error") else dim("  ↳ result:")
+            label = red("  ⎿ error") if d.get("is_error") else dim("  ⎿ result")
             print(label)
             if self.view == "quiet":
                 first = next((line.strip() for line in str(content).splitlines() if line.strip()),
@@ -244,7 +247,7 @@ class Renderer:
         elif kind == "worker_turn":
             txt = (d.get("text") or "").strip()
             if txt and not self._streamed_text:
-                print(green("  ▼ Kraude:"))
+                print(green("  ✦ Kraude"))
                 print(_wrap(txt))
             meta = []
             if d.get("cost"):
@@ -275,9 +278,9 @@ class Renderer:
             if d.get("degraded"):
                 print(yellow("  ⚠ Kryptex degraded — Kraude continuing autonomously"))
             fp = d.get("fallback_provider", "")
-            header = "  ◆ Kryptex (manager):"
+            header = "  ✦ Kryptex"
             if fp:
-                header = f"  ◆ Kryptex (manager · {fp} fallback):"
+                header = f"  ✦ Kryptex ({fp} fallback)"
             print(bmagenta(header))
             if d.get("assessment"):
                 print(magenta("    assessment:"))
@@ -294,11 +297,11 @@ class Renderer:
                 for a in d["new_angles"]:
                     print(_wrap(f"• {a}", "      "))
             if d.get("to_user"):
-                print(yellow(f"  💬 Kryptex → you: {d['to_user']}"))
+                print(yellow(f"  ⎿ {d['to_user']}"))
 
         elif kind == "kryptex_chat":
             print()
-            print(bmagenta("  💬 Kryptex (live reply):"))
+            print(bmagenta("  ✦ Kryptex"))
             print(_wrap(d.get("reply", ""), "      "))
             if d.get("remember"):
                 print(dim(f"      ⟲ remembered: {d['remember']}"))
@@ -308,7 +311,7 @@ class Renderer:
 
         elif kind == "finding":
             f = d.get("finding", {})
-            print(bgreen(f"  ★ FINDING {f.get('id','')}: {f.get('title','')} "
+            print(bgreen(f"  ✦ FINDING {f.get('id','')}: {f.get('title','')} "
                          f"[claimed {f.get('severity','?')}] ({f.get('status','')})"))
 
         elif kind == "validation_start":
@@ -356,16 +359,26 @@ class Renderer:
 
 
 HELP = """\
-Grypton operator console
+Grypton Code commands
 
-  <text>                 message Kryptex; it replies and relays actionable intent
-  /worker <text>         send a concrete instruction to Kraude's next work burst
-  /note <text>           save an operator note without spending a manager call
-  /summary               compact live state: coverage, finding, and next-action view
-  /status                current turn and coverage counters
-  /plan                  show Kryptex's current directive
+  <text>                 send a message to Kryptex
+  @document              attach a current-workspace document to the message
+  !command               run a read-only local inspection command
+
+  /help                  show this command list
+  /clear                 clear the terminal
+  /compact               switch to the compact console view
+  /context               show current context and workspace coverage
+  /cost                  show recorded worker-turn cost and provider calls
+  /config                show model routes, scope mode, and console configuration
+  /status                show current run status
+  /resume                show the persistent engagement identifier to resume later
+  /permissions           show enforced tool and network boundaries
+
+  /summary               compact operator decision view
+  /plan                  show Kryptex's next directive
   /activity [N]          recent audited tool calls (default 8)
-  /flows [N]             recent capture IDs and sizes (default 8; bodies stay private)
+  /flows [N]             recent capture IDs and sizes (default 8)
   /history [N]           recent worker-turn summaries (default 5)
   /findings              findings ledger
   /surface               attack-surface ledger
@@ -373,10 +386,10 @@ Grypton operator console
   /scope                 binding scope and standing instructions
   /models                pinned model routes
   /audit                 evidence, scope, and validator integrity check
-  /view quiet|normal|full control live-stream detail; current mode is shown on /status
-  /clear                 clear the visible terminal buffer
-  /stop                  stop after the active worker step
-  /help                  this help
+  /view quiet|normal|full control stream detail
+  /note <text>           persist an operator note without a manager call
+  /worker <text>         send a direct next-turn instruction to Kraude
+  /stop                  request a clean stop after the active worker step
 """
 
 
@@ -501,19 +514,166 @@ def _print_audit(engine) -> None:
           f"required validation gaps={len(result.get('unvalidated_findings', []))}")
 
 
-async def interact(engine, renderer: Renderer | None = None) -> None:
+def _print_context(engine) -> None:
+    """Claude Code-style context view, grounded in Grypton's durable state."""
+    docs = ("findings.md", "attack-surface.md", "tested-techniques.md", "progress.md", "scope-rules.md")
+    sizes = {}
+    for name in docs:
+        try:
+            sizes[name] = (engine.ws.root / name).stat().st_size
+        except OSError:
+            sizes[name] = 0
+    print(bold("Context"))
+    print(f"  engagement  {engine.ws.slug} · turn {engine.turn_index} · workspace {engine.ws.root}")
+    print(f"  records     surface={len(engine.ws.surface.all())} · tested={len(engine.ws.tested.all())} · "
+          f"findings={len(engine.ws.findings.all())}")
+    print("  documents   " + " · ".join(f"{name.removesuffix('.md')}={size // 1024}k"
+                                       for name, size in sizes.items()))
+    print(dim("  Durable ledgers are supplied to the roles each turn; `/compact` changes terminal detail only."))
+
+
+def _print_cost(engine) -> None:
+    total = 0.0
+    turns = 0
+    for raw in _tail_lines(engine.ws.transcripts_dir / "turns.jsonl", 50):
+        try:
+            row = json.loads(raw)
+        except ValueError:
+            continue
+        turns += 1
+        try:
+            total += float(row.get("cost_usd") or 0.0)
+        except (TypeError, ValueError):
+            pass
+    provider_calls = {"Kraude": 0, "Kryptex": 0, "Astra": 0}
+    for raw in _tail_lines(engine.ws.transcripts_dir / "provider-calls.jsonl", 100):
+        try:
+            role = json.loads(raw).get("role")
+        except ValueError:
+            continue
+        label = {"worker": "Kraude", "manager": "Kryptex", "validator": "Astra"}.get(role)
+        if label:
+            provider_calls[label] += 1
+    print(f"Cost · recorded worker turns={turns} · worker cost=${total:.4f}")
+    print("Provider calls · " + " · ".join(f"{name}={count}" for name, count in provider_calls.items()))
+    print(dim("Manager and validator connectors do not expose a normalized cost field in the local ledger."))
+
+
+def _print_config(engine, renderer: Renderer) -> None:
+    from . import config
+    constraints = engine.ws.load_constraints()
+    print(bold("Configuration"))
+    print(f"  worker       {config.WORKER_MODEL} · {config.WORKER_EFFORT}")
+    print(f"  manager      {config.MANAGER_MODEL} · {config.MANAGER_EFFORT}")
+    print(f"  validator    {config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT} (automatic P1/P2)")
+    print(f"  console      {renderer.view} · scoped captured-tool mode")
+    print(f"  in scope     {', '.join(constraints.in_scope) or '—'}")
+
+
+def _print_permissions(engine) -> None:
+    constraints = engine.ws.load_constraints()
+    print(bold("Permission mode: scoped captured tools"))
+    print(f"  network scope   {', '.join(constraints.in_scope) or '—'}")
+    print(f"  exclusions      {', '.join(constraints.out_of_scope) or 'none recorded'}")
+    print("  worker network actions are scope-checked and written to the engagement ledger.")
+    print("  `!` accepts only read-only local inspection commands; it cannot make network calls.")
+
+
+_WORKSPACE_REFERENCES = {
+    "findings": "findings.md", "findings.md": "findings.md",
+    "surface": "attack-surface.md", "attack-surface.md": "attack-surface.md",
+    "tested": "tested-techniques.md", "tested-techniques.md": "tested-techniques.md",
+    "progress": "progress.md", "progress.md": "progress.md",
+    "scope": "scope-rules.md", "scope-rules.md": "scope-rules.md",
+    "program": "program-brief.md", "program-brief.md": "program-brief.md",
+}
+_WORKSPACE_REFERENCE_RX = re.compile(r"(?<![\w.])@([A-Za-z][A-Za-z0-9._-]*)")
+
+
+def _expand_workspace_references(engine, text: str) -> str:
+    """Resolve Claude-style @mentions to safe, known engagement documents.
+
+    The roles already receive bounded workspace context.  The marker tells them
+    exactly which durable document the operator intended to prioritize without
+    echoing a document body into the terminal or allowing arbitrary filesystem
+    access.
+    """
+    names = _WORKSPACE_REFERENCE_RX.findall(text)
+    if not names:
+        return text
+    resolved = []
+    unknown = []
+    for name in names:
+        document = _WORKSPACE_REFERENCES.get(name.lower())
+        if document:
+            resolved.append(document)
+        else:
+            unknown.append(name)
+    if unknown:
+        allowed = ", ".join(sorted(set(_WORKSPACE_REFERENCES.values())))
+        raise ValueError(f"unknown @ reference: {', '.join(unknown)} (use {allowed})")
+    return text + "\n\n[OPERATOR PRIORITY REFERENCES: " + ", ".join(dict.fromkeys(resolved)) + "]"
+
+
+def _run_local_inspection(engine, command: str) -> None:
+    """Support a useful, constrained subset of Claude Code's ! command."""
+    try:
+        parts = shlex.split(command)
+    except ValueError as exc:
+        print(yellow(f"Could not parse local command: {exc}"))
+        return
+    if not parts:
+        print(yellow("Usage: !pwd, !ls [workspace-path], !git status, or !python --version"))
+        return
+    allowed = False
+    invocation: list[str] = []
+    if parts == ["pwd"]:
+        allowed, invocation = True, ["pwd"]
+    elif parts and parts[0] == "ls":
+        candidate = parts[1:] or ["."]
+        if all(not value.startswith("-") for value in candidate):
+            try:
+                root = engine.ws.root.resolve()
+                paths = [(root / value).resolve() for value in candidate]
+                if all(path.is_relative_to(root) for path in paths):
+                    allowed, invocation = True, ["ls", "-la", *map(str, paths)]
+            except OSError:
+                pass
+    elif parts in (["git", "status"], ["git", "status", "--short"],
+                   ["git", "diff", "--stat"]):
+        allowed, invocation = True, parts
+    elif parts in (["python", "--version"], ["python3", "--version"]):
+        allowed, invocation = True, parts
+    if not allowed:
+        print(yellow("`!` permits only read-only local inspection: pwd, ls [workspace path], "
+                     "git status, git diff --stat, or python --version."))
+        return
+    try:
+        completed = subprocess.run(invocation, cwd=engine.ws.root, text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(red(f"Local inspection failed: {exc}"))
+        return
+    print(dim(f"$ {' '.join(shlex.quote(value) for value in invocation)}"))
+    print(_block(_redact_display(completed.stdout or "(no output)"), maxlen=1800, maxlines=40))
+
+
+async def interact(engine, renderer: Renderer | None = None, *, accept_input: bool = True) -> None:
     from . import config
 
-    print(bold(cyan("\n╔══ Grypton operator console ══╗")))
-    print(dim(f"target={engine.target} · type={engine.target_type} · backend={engine.backend}"))
-    print(dim(f"Kraude {config.WORKER_MODEL} · {config.WORKER_EFFORT}  |  "
-              f"Kryptex {config.MANAGER_MODEL} · {config.MANAGER_EFFORT}  |  "
-              f"Astra {config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT}"))
-    print(dim("Type `/summary` for the operating picture or `/help` for console commands.\n"))
-    loop_task = asyncio.create_task(engine.run())
     if renderer is None:
         candidate = getattr(engine.emit, "__self__", None)
         renderer = candidate if isinstance(candidate, Renderer) else Renderer()
+    print(bold(cyan("\n╭── Grypton Code ─────────────────────────────────────────────")))
+    print(f"│ {engine.target} · {engine.target_type} · {engine.backend}")
+    print(dim(f"│ GLM {config.WORKER_EFFORT} · Spark {config.MANAGER_EFFORT} · "
+              f"Astra {config.VALIDATOR_EFFORT} · console {renderer.view}"))
+    print(dim("╰── Type /help for commands · @findings to prioritize a workspace record"))
+    loop_task = asyncio.create_task(engine.run())
+    if not accept_input:
+        await loop_task
+        return
     input_task = asyncio.create_task(_input_loop(engine, renderer))
     try:
         done, _ = await asyncio.wait({loop_task, input_task}, return_when=asyncio.FIRST_COMPLETED)
@@ -547,6 +707,26 @@ def _route_input(engine, renderer: Renderer, text: str) -> bool:
     if text == "/help":
         print(HELP)
         return False
+    if text == "/compact":
+        renderer.set_view("quiet")
+        engine.ws.append_progress("Operator selected compact terminal view.")
+        print(green("✦ Console compacted. Durable workspace context is unchanged."))
+        return False
+    if text == "/context":
+        _print_context(engine)
+        return False
+    if text == "/cost":
+        _print_cost(engine)
+        return False
+    if text in ("/config", "/settings"):
+        _print_config(engine, renderer)
+        return False
+    if text == "/permissions":
+        _print_permissions(engine)
+        return False
+    if text == "/resume":
+        print(f"Resume this engagement with: grypton resume {engine.ws.slug}")
+        return False
     if text == "/status":
         _print_status(engine, renderer)
         return False
@@ -567,13 +747,13 @@ def _route_input(engine, renderer: Renderer, text: str) -> bool:
     if text == "/scope":
         print(engine.ws.load_constraints().to_prompt_block())
         return False
-    if text == "/models":
+    if text in ("/model", "/models"):
         from . import config
         print(f"Kraude    {config.WORKER_MODEL} · {config.WORKER_EFFORT}\n"
               f"Kryptex   {config.MANAGER_MODEL} · {config.MANAGER_EFFORT}\n"
               f"Validator {config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT} (P1/P2 automatic)")
         return False
-    if text == "/audit":
+    if text in ("/audit", "/review"):
         _print_audit(engine)
         return False
     if text == "/clear":
@@ -618,6 +798,9 @@ def _route_input(engine, renderer: Renderer, text: str) -> bool:
     if text.startswith("/worker "):
         engine.submit_user(text[len("/worker "):].strip(), to_worker=True)
         return False
+    if text.startswith("!"):
+        _run_local_inspection(engine, text[1:].strip())
+        return False
     # Apply stop-intent ONLY to a single-line message; a paste body of HTTP
     # requests / cookies / code might happen to contain "stop" inside it and
     # must not trigger a halt.
@@ -626,6 +809,11 @@ def _route_input(engine, renderer: Renderer, text: str) -> bool:
         print(cyan("◆ Stopping — finishing the current step, then halting. "
                    "(Press Ctrl-C for an immediate stop.)"))
         return True
+    try:
+        text = _expand_workspace_references(engine, text)
+    except ValueError as exc:
+        print(yellow(str(exc)))
+        return False
     engine.submit_user(text, to_worker=False)
     return False
 
@@ -685,7 +873,7 @@ async def _input_loop(engine, renderer: Renderer) -> None:
         parser = _PasteParser()
         while True:
             if is_tty:
-                sys.stdout.write(cyan("\n grypton› "))
+                sys.stdout.write(cyan("\n ❯ "))
                 sys.stdout.flush()
             raw = await _readline(loop)
             if not raw:

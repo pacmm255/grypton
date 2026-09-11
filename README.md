@@ -25,6 +25,12 @@ Both target forms work:
 cd /root/grypton/bin
 ./grypton init --target "go2tr.com"
 ./grypton init "go2tr.com"
+
+# Claude Code-style direct invocation
+./grypton --target "go2tr.com" "Map the public web and API surface"
+./grypton -p --target "go2tr.com" "Run without interactive input"
+./grypton -c                         # continue the most recent engagement
+./grypton -r go2tr-com               # resume a named engagement
 ```
 
 Useful controls:
@@ -76,14 +82,18 @@ without creating an engagement or starting a provider. `overview` is a compact
 decision view for one workspace; `activity` prints sanitized tool, turn, capture,
 or progress summaries without dumping capture bodies.
 
-The live terminal is an operator console. It begins with the exact pinned model
-routes and accepts plain messages for Kryptex, `/worker ...` to relay a concrete
-instruction to Kraude, and `/note ...` to persist context without consuming a
-manager call. During a run, use `/summary`, `/plan`, `/activity`, `/flows`,
-`/history`, `/scope`, `/models`, and `/audit` to inspect state. `/view quiet`,
-`/view normal`, and `/view full` control terminal detail while all evidence stays
-in the private workspace; streamed credential-shaped values are redacted from
-the terminal preview. `/stop`, Ctrl-C, and `grypton stop` request a clean halt.
+The live terminal follows the Claude Code interaction pattern while keeping
+Grypton's exact model routes and assessment boundaries visible. It has a compact
+startup card, a `❯` prompt, direct messages for Kryptex, `@findings`, `@surface`,
+and other durable workspace references, plus a read-only `!` local-inspection
+subset. The familiar `/help`, `/clear`, `/compact`, `/context`, `/cost`,
+`/config`, `/status`, `/resume`, and `/permissions` commands describe the active
+engagement. Grypton-specific `/summary`, `/plan`, `/activity`, `/flows`,
+`/history`, `/scope`, `/models`, `/audit`, `/note`, and `/worker` controls remain
+available. `/view quiet`, `/view normal`, and `/view full` control terminal detail
+while all evidence stays in the private workspace; streamed credential-shaped
+values are redacted from the terminal preview. `/stop`, Ctrl-C, and `grypton stop`
+request a clean halt.
 
 P1/P2 findings start as `validation-pending` and then follow the independent
 verdict: `confirmed`, `needs-more-evidence`, or `rejected`. P3–P5 findings start

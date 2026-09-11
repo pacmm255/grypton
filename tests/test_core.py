@@ -18,9 +18,9 @@ from unittest.mock import AsyncMock, patch
 
 from grypton import config
 from grypton.bugcrowd import analyze_snapshot, matching_scope_rules, out_of_scope_rules
-from grypton.chat import Renderer, _command_limit, _route_input
-from grypton.cli import (_activity_snapshot, _constraints, _validate_requested_findings,
-                         build_parser, main)
+from grypton.chat import Renderer, _command_limit, _expand_workspace_references, _route_input
+from grypton.cli import (_activity_snapshot, _claude_style_arguments, _constraints,
+                         _validate_requested_findings, build_parser, main)
 from grypton.engine import Engine
 from grypton.hard_lab import HardLab, score_workspace
 from grypton.manager import KryptexManager, ManagerContext, _check_schema, _extract_json
@@ -131,6 +131,32 @@ class CliTests(unittest.TestCase):
             self.assertEqual(main(["plan", "--target", "preview.test", "--type", "web"]), 0)
             self.assertFalse((root / ".state" / "engagements" / "preview-test").exists())
 
+    def test_claude_style_direct_invocation_translates_to_scoped_commands(self):
+        self.assertEqual(
+            _claude_style_arguments(["--target", "preview.test", "map the public API", "-p"]),
+            ["init", "--target", "preview.test", "-p", "--brief", "map the public API"],
+        )
+        self.assertEqual(
+            _claude_style_arguments(["-r", "preview-test", "--console", "quiet"]),
+            ["resume", "preview-test", "--console", "quiet"],
+        )
+        parser = build_parser()
+        parsed = parser.parse_args(["init", "--target", "preview.test", "--model", "glm", "-p"])
+        self.assertEqual(parsed.worker_model, "glm")
+        self.assertTrue(parsed.print_mode)
+
+    def test_claude_style_print_mode_runs_without_terminal_input(self):
+        saved = (config.CONFIG.backend, config.CONFIG.max_turns, config.CONFIG.max_run_seconds)
+        try:
+            with isolated_runtime(), redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(main([
+                    "-p", "--target", "http://127.0.0.1:1", "map the local API",
+                    "--backend", "mock", "--max-turns", "1", "--console", "quiet",
+                ]), 0)
+                self.assertIn("Grypton Code", output.getvalue())
+        finally:
+            config.CONFIG.backend, config.CONFIG.max_turns, config.CONFIG.max_run_seconds = saved
+
     def test_operator_console_commands_persist_note_and_change_view(self):
         with isolated_runtime():
             ws = Workspace("operator-console")
@@ -144,6 +170,7 @@ class CliTests(unittest.TestCase):
             renderer = Renderer()
             with redirect_stdout(io.StringIO()):
                 self.assertFalse(_route_input(engine, renderer, "/view quiet"))
+                self.assertFalse(_route_input(engine, renderer, "/compact"))
                 self.assertFalse(_route_input(engine, renderer, "/note prioritize state transitions"))
                 self.assertFalse(_route_input(engine, renderer, "/summary"))
             self.assertEqual(renderer.view, "quiet")
@@ -153,6 +180,17 @@ class CliTests(unittest.TestCase):
             self.assertEqual(_command_limit("4", 8), 4)
             with self.assertRaises(ValueError):
                 _command_limit("0", 8)
+
+    def test_workspace_mentions_are_limited_to_engagement_documents(self):
+        with isolated_runtime():
+            ws = Workspace("workspace-mentions")
+            ws.create("mentions.test", "web")
+            engine = SimpleNamespace(ws=ws)
+            expanded = _expand_workspace_references(engine, "Review @findings and @surface")
+            self.assertIn("findings.md", expanded)
+            self.assertIn("attack-surface.md", expanded)
+            with self.assertRaisesRegex(ValueError, "unknown @ reference"):
+                _expand_workspace_references(engine, "Read @outside")
 
     def test_activity_snapshot_redacts_inline_secrets(self):
         with isolated_runtime():

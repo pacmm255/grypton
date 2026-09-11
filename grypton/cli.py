@@ -110,7 +110,7 @@ def _run_engagement(ws: Workspace, ns, *, brief: str, fresh: bool) -> int:
     from .engine import Engine
 
     _configure_run(ns)
-    renderer = Renderer()
+    renderer = Renderer(getattr(ns, "console", "normal"))
     engine = Engine(ws.slug, backend=config.CONFIG.backend, emit=renderer.emit)
 
     async def execute():
@@ -123,7 +123,7 @@ def _run_engagement(ws: Workspace, ns, *, brief: str, fresh: bool) -> int:
         meta = ws.load_meta()
         await engine.setup(brief=brief, target=meta.target, target_type=meta.target_type,
                            fresh_clone=fresh)
-        await interact(engine, renderer)
+        await interact(engine, renderer, accept_input=not getattr(ns, "print_mode", False))
 
     try:
         asyncio.run(execute())
@@ -837,6 +837,14 @@ def cmd_demo(ns) -> int:
 
 def _run_options(parser) -> None:
     parser.add_argument("-m", "--brief", default="", help="Engagement mission")
+    parser.add_argument("--model", dest="worker_model", choices=["glm", "glm-5.3", "zai-coding-plan/glm-5.3"],
+                        help="Kraude route alias; the worker remains pinned to GLM 5.3")
+    parser.add_argument("--permission-mode", choices=["scoped"], default="scoped",
+                        help="Use Grypton's recorded-scope, captured-tool permission mode")
+    parser.add_argument("-p", "--print", dest="print_mode", action="store_true",
+                        help="Run without interactive console input; retain the event stream")
+    parser.add_argument("--console", choices=["quiet", "normal", "full"], default="normal",
+                        help="Initial terminal detail level (default: normal)")
     parser.add_argument("--backend", choices=["real", "mock"], default="real", help=argparse.SUPPRESS)
     parser.add_argument("--max-seconds", type=int, default=None)
     parser.add_argument("--max-turns", type=int, default=None)
@@ -845,9 +853,13 @@ def _run_options(parser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="grypton",
-        description="Autonomous scoped testing with GLM Kraude, Spark Kryptex, and Astra validation")
-    parser.add_argument("--version", action="version", version="Grypton 3.3.0")
+    parser = argparse.ArgumentParser(
+        prog="grypton", usage="grypton [options] [command] [prompt]",
+        description="Grypton Code: scoped testing with GLM Kraude, Spark Kryptex, and Astra validation.",
+        epilog=("Claude Code-style shortcuts: `grypton --target HOST \"mission\"`, "
+                "`grypton -p --target HOST \"mission\"`, `grypton -c`, and `grypton -r ENGAGEMENT`."),
+    )
+    parser.add_argument("--version", action="version", version="Grypton 3.4.0")
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="Create and immediately run an engagement")
     init.add_argument("target", nargs="?")
@@ -951,6 +963,106 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+_COMMAND_NAMES = {
+    "init", "plan", "resume", "status", "ls", "show", "overview", "inspect", "activity", "tail",
+    "findings", "validate", "surface", "history", "scope", "audit", "report", "stop", "models",
+    "doctor", "tools", "scenarios", "bugcrowd-brief", "lab", "benchmark", "serve", "demo",
+}
+_COMPAT_VALUE_OPTIONS = {
+    "--target", "--type", "--only", "--exclude", "--include", "--in-scope", "--out-scope", "--rule",
+    "--authorization-file", "--bugcrowd-brief", "-m", "--brief", "--max-seconds", "--max-turns",
+    "--auto-stop-time", "--console", "--model", "--permission-mode", "--backend",
+}
+
+
+def _looks_like_target(value: str) -> bool:
+    candidate = (value or "").strip()
+    if not candidate or any(char.isspace() for char in candidate):
+        return False
+    parsed = urlsplit(candidate if "://" in candidate else "//" + candidate)
+    host = parsed.hostname or ""
+    return bool(host and ("." in host or host == "localhost" or ":" in candidate))
+
+
+def _latest_engagement_slug() -> str:
+    rows = []
+    for slug in list_targets():
+        try:
+            rows.append((Workspace(slug).root.stat().st_mtime, slug))
+        except OSError:
+            continue
+    if not rows:
+        raise ValueError("no engagement to continue; start one with `grypton --target HOST \"mission\"`")
+    return max(rows)[1]
+
+
+def _claude_style_arguments(arguments: list[str]) -> list[str]:
+    """Translate familiar direct invocation into the explicit Grypton commands.
+
+    The normal command surface stays available.  This adapter supplies the
+    high-frequency Claude Code forms without weakening target/scope requirements.
+    """
+    if not arguments or arguments[0] in _COMMAND_NAMES or arguments[0] in {"-h", "--help", "--version"}:
+        return arguments
+    passthrough: list[str] = []
+    free: list[str] = []
+    resume_slug = ""
+    continue_requested = False
+    brief_seen = False
+    index = 0
+    while index < len(arguments):
+        value = arguments[index]
+        if value in ("-c", "--continue"):
+            continue_requested = True
+            index += 1
+            continue
+        if value in ("-r", "--resume"):
+            if index + 1 < len(arguments) and not arguments[index + 1].startswith("-"):
+                resume_slug = arguments[index + 1]
+                index += 2
+            else:
+                continue_requested = True
+                index += 1
+            continue
+        if value.startswith("--resume="):
+            resume_slug = value.partition("=")[2]
+            index += 1
+            continue
+        if value in _COMPAT_VALUE_OPTIONS:
+            passthrough.append(value)
+            if index + 1 < len(arguments):
+                passthrough.append(arguments[index + 1])
+                if value in ("-m", "--brief"):
+                    brief_seen = True
+                index += 2
+                continue
+            index += 1
+            continue
+        if value.startswith("--brief="):
+            brief_seen = True
+            passthrough.append(value)
+            index += 1
+            continue
+        if value.startswith("-"):
+            passthrough.append(value)
+        else:
+            free.append(value)
+        index += 1
+
+    if resume_slug or continue_requested:
+        slug = config.slugify(resume_slug) if resume_slug else _latest_engagement_slug()
+        return ["resume", slug, *passthrough]
+
+    has_named_target = any(value == "--target" or value.startswith("--target=") for value in passthrough)
+    if not has_named_target and free and _looks_like_target(free[0]):
+        passthrough.extend(("--target", free.pop(0)))
+        has_named_target = True
+    if has_named_target and free and not brief_seen:
+        passthrough.extend(("--brief", " ".join(free)))
+        free = []
+    return ["init", *passthrough, *free]
+
+
 def main(argv=None) -> int:
     # Keep progress visible when output is piped through tee or a log collector.
     for stream in (sys.stdout, sys.stderr):
@@ -959,7 +1071,7 @@ def main(argv=None) -> int:
         except (AttributeError, OSError):
             pass
     config.ensure_layout()
-    arguments = list(sys.argv[1:] if argv is None else argv)
+    arguments = _claude_style_arguments(list(sys.argv[1:] if argv is None else argv))
     # The tool CLI owns its option namespace. Dispatch it before the outer
     # parser so flags such as `--target` and `--json` reach the tool parser.
     if arguments and arguments[0] == "tools":
