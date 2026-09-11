@@ -52,11 +52,21 @@
   {
     "id": "network-inventory",
     "title": "Bounded network inventory",
-    "target_types": ["network", "cidr"],
+    "target_types": ["network", "cidr", "web", "api", "auto"],
     "moves": [
       "resolve only recorded in-scope hosts",
-      "check a bounded port set and inspect reachable TLS certificates",
-      "record service evidence before deeper protocol-specific work"
+      "check a bounded port set and identify the reachable protocol before deeper work",
+      "use tcp_exchange only after a valid control frame establishes the service grammar"
+    ]
+  },
+  {
+    "id": "mobile-artifact-boundary",
+    "title": "Mobile artifact and trust-boundary analysis",
+    "target_types": ["web", "api", "binary", "auto"],
+    "moves": [
+      "download a published APK with artifact_download and inspect its package, manifest, certificate, and asset inventory",
+      "treat manifest and bytecode behavior as binary evidence; do not inspect application source or evaluator files",
+      "test a mobile-derived credential, protocol claim, or exported-component hypothesis only against the recorded in-scope lab"
     ]
   },
   {

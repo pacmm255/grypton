@@ -1,6 +1,8 @@
 """Scoped, observable tools shared by Grypton's MCP server and CLI."""
 from __future__ import annotations
 
+import base64
+import hashlib
 import ipaddress
 import json
 import os
@@ -15,6 +17,7 @@ import time
 from typing import Iterable, Optional
 from urllib.parse import urlsplit
 import urllib.request
+import zipfile
 
 from . import config
 from .workspace import Workspace
@@ -564,6 +567,172 @@ def port_scan(workspace: Workspace, host: str, ports: Iterable[int], *, timeout_
                {"open": opened})
 
 
+def tcp_exchange(workspace: Workspace, host: str, port: int, payload: str, *, timeout: int = 15) -> dict:
+    """Exchange one newline-delimited frame with a scoped TCP service.
+
+    It intentionally keeps the payload as text instead of parsing JSON.  That
+    makes protocol parser differentials observable while still enforcing the
+    recorded host and port scope and retaining a durable flow capture.
+    """
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return _err("TCP port must be an integer.")
+    allowed, reason = check_port_scope(workspace, host, port)
+    if not allowed:
+        return _err(f"Scope blocked {host}:{port}: {reason}.")
+    if not isinstance(payload, str) or not payload.strip() or "\x00" in payload:
+        return _err("TCP payload must be one non-empty text frame.")
+    if len(payload.encode("utf-8")) > 16_000:
+        return _err("TCP payload exceeds the 16 KB frame limit.")
+    timeout = max(1, min(int(timeout), 60))
+    banner = response = ""
+    status = 0
+    error = ""
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as conn:
+            conn.settimeout(timeout)
+            reader = conn.makefile("rb")
+            banner = reader.readline(16_385).decode("utf-8", "replace").rstrip("\r\n")
+            conn.sendall(payload.encode("utf-8") + b"\n")
+            response = reader.readline(16_385).decode("utf-8", "replace").rstrip("\r\n")
+            if not response:
+                status = 1
+                error = "service closed without a response"
+    except OSError as exc:
+        status, error = 1, str(exc)
+    endpoint = f"tcp://{host}:{port}"
+    capture = f"BANNER\n{banner}\n\nRESPONSE\n{response}"
+    flow = _save_flow(workspace, "TCP", endpoint, {}, payload, capture,
+                      transport="scoped-tcp", returncode=status, stderr=error)
+    data = {"banner": banner, "response": response, "flow": str(flow)}
+    if status:
+        return _err(f"TCP exchange with {host}:{port} failed: {error}; capture saved to {flow.name}.", data)
+    return _ok(f"TCP exchange with {host}:{port} captured in {flow.name}.", data)
+
+
+def _loot_file(workspace: Workspace, artifact: str) -> Optional[Path]:
+    name = Path(str(artifact)).name
+    if not name or name != str(artifact) or name in {".", ".."}:
+        return None
+    candidate = (workspace.loot_dir / name).resolve()
+    try:
+        candidate.relative_to(workspace.loot_dir.resolve())
+    except ValueError:
+        return None
+    return candidate
+
+
+def artifact_download(workspace: Workspace, url: str, filename: str, *, timeout: int = 60) -> dict:
+    """Download a scoped binary artifact into the engagement loot directory."""
+    blocked = _scope_error(workspace, url)
+    if blocked:
+        return blocked
+    destination = _loot_file(workspace, filename)
+    if destination is None:
+        return _err("Artifact filename must be a single safe basename.")
+    curl = config.find_binary("curl")
+    if not curl:
+        return _err("curl is not installed.")
+    timeout = max(1, min(int(timeout), 120))
+    workspace.loot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = workspace.loot_dir / f".{destination.name}.{time.time_ns()}.part"
+    headers = workspace.scratch_dir / f"download-{time.time_ns()}.headers"
+    try:
+        result = subprocess.run(
+            [curl, "--silent", "--show-error", "--fail", "--max-time", str(timeout),
+             "--connect-timeout", str(min(timeout, 15)), "--dump-header", str(headers),
+             "--output", str(temporary), url],
+            capture_output=True, timeout=timeout + 5,
+        )
+        if result.returncode:
+            return _err("Artifact download failed: " + result.stderr.decode("utf-8", "replace")[-2000:])
+        os.replace(temporary, destination)
+        digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+        response_headers = headers.read_text(encoding="utf-8", errors="replace") if headers.exists() else ""
+        flow = _save_flow(workspace, "GET", url, {}, None,
+                          response_headers + f"\n[Binary saved: {destination.name}; sha256={digest}]",
+                          transport="artifact-download", returncode=0)
+        return _ok(f"Saved {destination.name} ({destination.stat().st_size} bytes) and {flow.name}.",
+                   {"path": str(destination), "sha256": digest, "flow": str(flow),
+                    "bytes": destination.stat().st_size})
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _err(f"Artifact download failed: {exc}")
+    finally:
+        temporary.unlink(missing_ok=True)
+        headers.unlink(missing_ok=True)
+
+
+def apk_inspect(workspace: Workspace, artifact: str) -> dict:
+    """Inspect APK metadata, components, certificate status, and asset names.
+
+    This is binary assessment only.  It never decompiles application source.
+    """
+    path = _loot_file(workspace, artifact)
+    if path is None or not path.is_file():
+        return _err("APK artifact is not present in this engagement's loot directory.")
+    if not zipfile.is_zipfile(path):
+        return _err("Artifact is not a ZIP/APK container.")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+            assets = [{"name": name, "bytes": archive.getinfo(name).file_size}
+                      for name in names if name.startswith("assets/") and not name.endswith("/")]
+    except (OSError, zipfile.BadZipFile) as exc:
+        return _err(f"Unable to inspect APK: {exc}")
+    aapt = config.find_binary("aapt")
+    manifest = ""
+    badging = ""
+    signature = {"verified": False, "detail": "apksigner unavailable"}
+    if aapt:
+        for args, slot in (([aapt, "dump", "badging", str(path)], "badging"),
+                           ([aapt, "dump", "xmltree", str(path), "AndroidManifest.xml"], "manifest")):
+            try:
+                result = subprocess.run(args, capture_output=True, timeout=20)
+                value = result.stdout.decode("utf-8", "replace")[:60_000]
+                if slot == "badging":
+                    badging = value
+                else:
+                    manifest = value
+            except (OSError, subprocess.SubprocessError):
+                pass
+    apksigner = config.find_binary("apksigner")
+    if apksigner:
+        try:
+            result = subprocess.run([apksigner, "verify", "--verbose", str(path)],
+                                    capture_output=True, timeout=20)
+            detail = (result.stdout + result.stderr).decode("utf-8", "replace")[-4000:]
+            signature = {"verified": result.returncode == 0, "detail": detail}
+        except (OSError, subprocess.SubprocessError) as exc:
+            signature = {"verified": False, "detail": str(exc)}
+    return _ok(f"Inspected {path.name}: {len(names)} entries and {len(assets)} assets.", {
+        "path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "entries": len(names), "assets": assets, "has_classes_dex": "classes.dex" in names,
+        "badging": badging, "manifest": manifest, "signature": signature,
+    })
+
+
+def apk_extract_asset(workspace: Workspace, artifact: str, asset: str) -> dict:
+    """Extract one named APK asset to loot for local binary analysis."""
+    path = _loot_file(workspace, artifact)
+    safe_asset = str(asset).replace("\\", "/").lstrip("/")
+    if path is None or not path.is_file():
+        return _err("APK artifact is not present in this engagement's loot directory.")
+    if not safe_asset.startswith("assets/") or ".." in safe_asset.split("/"):
+        return _err("Asset must be a safe APK path beneath assets/.")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            data = archive.read(safe_asset)
+    except (KeyError, OSError, zipfile.BadZipFile) as exc:
+        return _err(f"Unable to extract APK asset: {exc}")
+    destination = workspace.loot_dir / f"{path.stem}-{Path(safe_asset).name}"
+    destination.write_bytes(data)
+    return _ok(f"Extracted {safe_asset} to {destination.name} ({len(data)} bytes).", {
+        "path": str(destination), "sha256": hashlib.sha256(data).hexdigest(),
+        "bytes": len(data), "base64": base64.b64encode(data).decode("ascii")[:32_000],
+    })
+
+
 def subdomain_enum(workspace: Workspace, domain: str, *, timeout: int = 180) -> dict:
     allowed, reason = check_host_scope(workspace, domain)
     if not allowed:
@@ -619,7 +788,8 @@ def research(url: str, *, timeout: int = 30) -> dict:
 
 def inventory() -> dict:
     binaries = ["curl", "httpx", "playwright", "google-chrome", "chromium", "subfinder",
-                "nmap", "nuclei", "ffuf", "jq", "openssl", "python3", "node", "go", "cargo"]
+                "nmap", "nuclei", "ffuf", "jq", "openssl", "python3", "node", "go", "cargo",
+                "aapt", "apksigner", "keytool", "unzip", "strings"]
     return _ok("Tool inventory collected.",
                {"binaries": {name: config.find_binary(name) for name in binaries},
                 "goja": Goja.status()["data"]})

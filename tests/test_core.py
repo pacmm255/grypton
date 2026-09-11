@@ -18,12 +18,14 @@ from grypton import config
 from grypton.bugcrowd import analyze_snapshot, matching_scope_rules, out_of_scope_rules
 from grypton.cli import _constraints, _validate_requested_findings, build_parser
 from grypton.engine import Engine
+from grypton.hard_lab import HardLab, score_workspace
 from grypton.manager import KryptexManager, ManagerContext, _check_schema, _extract_json
 from grypton.providers import MCP_TIMEOUT_MS, OpenCodeClient, OpenCodeResult
 from grypton.reporting import audit_workspace, render_report
 from grypton.toolserver import REGISTRY, dispatch
-from grypton.tools import (check_host_scope, check_url_scope, flow_read, flow_replay,
-                           http_request, port_scan)
+from grypton.tools import (apk_extract_asset, apk_inspect, artifact_download, check_host_scope,
+                           check_url_scope, flow_read, flow_replay, http_request, port_scan,
+                           tcp_exchange)
 from grypton.worker import OpenCodeWorker, WorkerSpec
 from grypton.workspace import Constraints, Workspace
 
@@ -106,6 +108,13 @@ class CliTests(unittest.TestCase):
         validate = parser.parse_args(["validate", "example-test", "F003"])
         self.assertEqual(validate.target, "example-test")
         self.assertEqual(validate.finding_ids, ["F003"])
+
+    def test_hard_benchmark_commands_parse(self):
+        parser = build_parser()
+        served = parser.parse_args(["benchmark", "serve", "--out", "/tmp/benchmark"])
+        scored = parser.parse_args(["benchmark", "score", "/tmp/benchmark/manifest.json", "lab-target"])
+        self.assertEqual(served.out, "/tmp/benchmark")
+        self.assertEqual(scored.target, "lab-target")
 
     def test_bugcrowd_brief_preflight_imports_scope_and_blocks_automation(self):
         document = {
@@ -243,6 +252,9 @@ class ToolTests(unittest.TestCase):
         self.assertIn("http_request", REGISTRY)
         self.assertIn("flow_replay", REGISTRY)
         self.assertIn("goja_stop", REGISTRY)
+        self.assertIn("tcp_exchange", REGISTRY)
+        self.assertIn("artifact_download", REGISTRY)
+        self.assertIn("apk_inspect", REGISTRY)
         self.assertNotIn("advise", REGISTRY)
 
     def test_dispatch_writes_audit_event(self):
@@ -299,6 +311,47 @@ class ToolTests(unittest.TestCase):
             result = audit_workspace(ws)
             self.assertTrue(result["ok"], result)
             self.assertIn("# Grypton report", render_report(ws))
+
+
+@unittest.skipUnless(
+    all((Path("/opt/android-sdk/platforms/android-34/android.jar").is_file(),
+         Path("/opt/android-sdk/build-tools/34.0.0/d8").is_file(),
+         bool(config.find_binary("aapt")), bool(config.find_binary("apksigner")),
+         bool(config.find_binary("keytool")))),
+    "Android SDK build tools are required for the APK benchmark fixture",
+)
+class HardBenchmarkTests(unittest.TestCase):
+    def test_loopback_benchmark_exposes_only_public_black_box_material(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "benchmark"
+            with HardLab(output) as lab:
+                manifest = lab.public_manifest()
+                public = json.dumps(manifest, sort_keys=True)
+                self.assertTrue((output / "manifest.json").is_file())
+                self.assertTrue(lab.state.apk_path and lab.state.apk_path.is_file())
+                self.assertNotIn(lab.state.key.hex(), public)
+                self.assertNotIn("score_key", public)
+                self.assertNotIn("receipt", public.lower())
+                self.assertEqual(manifest["scope"]["source_audit"], "out of scope")
+
+                with isolated_runtime():
+                    ws = Workspace("hard-lab")
+                    ws.create(manifest["entrypoints"]["web"], "web")
+                    ws.save_constraints(Constraints(in_scope=manifest["engagement"]["in_scope"]))
+                    artifact = artifact_download(ws, manifest["entrypoints"]["apk"], "courier.apk")
+                    self.assertTrue(artifact["ok"], artifact)
+                    inspected = apk_inspect(ws, "courier.apk")
+                    self.assertTrue(inspected["ok"], inspected)
+                    self.assertTrue(inspected["data"]["has_classes_dex"])
+                    self.assertTrue(inspected["data"]["signature"]["verified"], inspected)
+                    asset = inspected["data"]["assets"][0]["name"]
+                    extracted = apk_extract_asset(ws, "courier.apk", asset)
+                    self.assertTrue(extracted["ok"], extracted)
+                    host, port = manifest["entrypoints"]["network"].rsplit(":", 1)
+                    exchange = tcp_exchange(ws, host, int(port), '{"op":"status"}')
+                    self.assertTrue(exchange["ok"], exchange)
+                    self.assertIn("Courier Relay", exchange["data"]["banner"])
+                    self.assertEqual(score_workspace(output / "manifest.json", ws.root)["score"]["covered"], 0)
 
 
 class ManagerTests(unittest.IsolatedAsyncioTestCase):

@@ -13,7 +13,7 @@ from .providers import append_jsonl
 from .workspace import Workspace
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "grypton", "version": "3.1.0"}
+SERVER_INFO = {"name": "grypton", "version": "3.2.0"}
 
 
 def _workspace() -> Workspace:
@@ -165,6 +165,22 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
                  "ports": {"type": "array", "items": {"type": "integer"}, "maxItems": 128},
                  "timeout_ms": {"type": "integer"}}, ("host", "ports")),
         lambda ws, a: tools.port_scan(ws, a["host"], a["ports"], timeout_ms=a.get("timeout_ms", 350))),
+    "tcp_exchange": ("Send one newline-delimited frame to a scoped TCP endpoint and save the banner and response.",
+        _object({"host": _string("In-scope hostname or IP"), "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+                 "payload": _string("One text protocol frame without its trailing newline"),
+                 "timeout": {"type": "integer", "minimum": 1, "maximum": 60}}, ("host", "port", "payload")),
+        lambda ws, a: tools.tcp_exchange(ws, a["host"], a["port"], a["payload"], timeout=a.get("timeout", 15))),
+    "artifact_download": ("Download one scoped binary artifact into the engagement loot directory.",
+        _object({"url": _string("In-scope HTTP(S) artifact URL"), "filename": _string("Safe destination basename"),
+                 "timeout": {"type": "integer", "minimum": 1, "maximum": 120}}, ("url", "filename")),
+        lambda ws, a: tools.artifact_download(ws, a["url"], a["filename"], timeout=a.get("timeout", 60))),
+    "apk_inspect": ("Inspect an APK's binary metadata, manifest components, signature status, and asset names; no source decompilation.",
+        _object({"artifact": _string("APK basename previously downloaded to loot")}, ("artifact",)),
+        lambda ws, a: tools.apk_inspect(ws, a["artifact"])),
+    "apk_extract_asset": ("Extract one named APK asset into loot for local binary analysis.",
+        _object({"artifact": _string("APK basename previously downloaded to loot"),
+                 "asset": _string("APK asset path beneath assets/")}, ("artifact", "asset")),
+        lambda ws, a: tools.apk_extract_asset(ws, a["artifact"], a["asset"])),
     "subdomain_enum": ("Run passive subfinder enumeration for an in-scope domain.",
         _object({"domain": _string("In-scope base domain"), "timeout": {"type": "integer"}}, ("domain",)),
         lambda ws, a: tools.subdomain_enum(ws, a["domain"], timeout=a.get("timeout", 180))),
@@ -188,7 +204,7 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
 
 def _redacted(value):
     if isinstance(value, dict):
-        return {key: ("[REDACTED]" if key.lower() in {"authorization", "cookie", "proxy-authorization"}
+        return {key: ("[REDACTED]" if key.lower() in {"authorization", "cookie", "proxy-authorization", "x-courier-mac", "x-courier-signature"}
                       else _redacted(item)) for key, item in value.items()}
     if isinstance(value, list):
         return [_redacted(item) for item in value]
@@ -290,6 +306,10 @@ def cli_main(argv=None) -> int:
     dns = sub.add_parser("dns"); dns.add_argument("host")
     tls = sub.add_parser("tls"); tls.add_argument("host"); tls.add_argument("--port", type=int, default=443)
     ports = sub.add_parser("ports"); ports.add_argument("host"); ports.add_argument("ports", help="comma-separated")
+    tcp = sub.add_parser("tcp"); tcp.add_argument("host"); tcp.add_argument("port", type=int); tcp.add_argument("payload")
+    artifact = sub.add_parser("artifact-download"); artifact.add_argument("url"); artifact.add_argument("filename")
+    apk_inspect_parser = sub.add_parser("apk-inspect"); apk_inspect_parser.add_argument("artifact")
+    apk_extract_parser = sub.add_parser("apk-extract-asset"); apk_extract_parser.add_argument("artifact"); apk_extract_parser.add_argument("asset")
     browse = sub.add_parser("browse"); browse.add_argument("url")
     surface = sub.add_parser("surface"); surface.add_argument("item"); surface.add_argument("--kind", default="endpoint")
     surface.add_argument("--detail", default=""); surface.add_argument("--interesting", default="")
@@ -315,6 +335,10 @@ def cli_main(argv=None) -> int:
     elif ns.command == "dns": mapping = {ns.command: ("dns_lookup", {"host": ns.host})}
     elif ns.command == "tls": mapping = {ns.command: ("tls_certificate", {"host": ns.host, "port": ns.port})}
     elif ns.command == "ports": mapping = {ns.command: ("port_scan", {"host": ns.host, "ports": [int(x) for x in ns.ports.split(",")]})}
+    elif ns.command == "tcp": mapping = {ns.command: ("tcp_exchange", {"host": ns.host, "port": ns.port, "payload": ns.payload})}
+    elif ns.command == "artifact-download": mapping = {ns.command: ("artifact_download", {"url": ns.url, "filename": ns.filename})}
+    elif ns.command == "apk-inspect": mapping = {ns.command: ("apk_inspect", {"artifact": ns.artifact})}
+    elif ns.command == "apk-extract-asset": mapping = {ns.command: ("apk_extract_asset", {"artifact": ns.artifact, "asset": ns.asset})}
     elif ns.command == "browse": mapping = {ns.command: ("browse", {"url": ns.url})}
     elif ns.command == "surface": mapping = {ns.command: ("attack_surface_add", {"item": ns.item, "kind": ns.kind, "detail": ns.detail, "interesting": ns.interesting})}
     elif ns.command == "tested": mapping = {ns.command: ("tested_technique_log", {"surface": ns.surface, "technique": ns.technique, "result": ns.result, "evidence": ns.evidence})}

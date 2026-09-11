@@ -49,6 +49,11 @@ The `grypton_*` MCP tools provide the engagement-aware surface:
 - `proxy_flows`, `flow_read`, `flow_replay`: Burp-like capture inspection/replay.
 - `httpx_probe`, `browse`, `dns_lookup`, `tls_certificate`, `port_scan`,
   `subdomain_enum`: bounded reconnaissance that enforces scope.
+- `tcp_exchange`: one newline-delimited frame to a scoped TCP service, with the
+  banner and response captured as evidence.
+- `artifact_download`, `apk_inspect`, `apk_extract_asset`: download and inspect
+  a scoped APK artifact, its manifest/components, and named binary assets. This
+  is binary assessment, never application-source review.
 - `attack_surface_add`, `tested_technique_log`, `prior_attempts`: shared memory.
 - `record_finding`: evidence-backed finding; P1/P2 queue automatically for Astra,
   while P3–P5 remain recorded until the operator explicitly requests validation.
@@ -62,6 +67,10 @@ scope and capture evidence. Do not use Bash, curl, wget, httpx, Python/Ruby/Node
 HTTP libraries, raw sockets, or OpenCode web fetch/search for network access.
 Use native Bash only for local analysis and scripts under `%%WORKSPACE%%/scripts`.
 Never inspect provider credentials or files outside this engagement workspace.
+APK files and extracted resources obtained through the artifact tools are saved
+under the engagement's `loot/` directory. You may analyze those binary files
+locally; do not substitute a checkout, test fixture, evaluator file, or other
+application source for the supplied artifact.
 
 Record concrete observations in `attack-surface.md`, each bounded attempt in
 `tested-techniques.md`, and only reproducible findings in `findings.md`. A finding

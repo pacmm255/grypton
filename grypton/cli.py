@@ -543,6 +543,33 @@ def cmd_lab(ns) -> int:
     return 0
 
 
+def cmd_benchmark_serve(ns) -> int:
+    from .hard_lab import serve
+    try:
+        serve(ns.out, host=ns.host, web_port=ns.web_port, network_port=ns.network_port,
+              log_path=ns.log)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"ERROR: benchmark did not start: {exc}", file=sys.stderr)
+        return 2
+    return 0
+
+
+def cmd_benchmark_score(ns) -> int:
+    from .hard_lab import score_workspace
+    workspace = ns.workspace or str(Workspace(ns.target).root)
+    try:
+        result = score_workspace(ns.manifest, workspace)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        print(f"ERROR: cannot score benchmark: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, ensure_ascii=False) if ns.json else
+          f"Benchmark score: {result['score']['covered']}/{result['score']['total']} "
+          f"({result['score']['percent']}%)\n"
+          f"Covered: {', '.join(result['covered_cases']) or 'none'}\n"
+          f"Observed but not recorded: {', '.join(result['observed_only']) or 'none'}")
+    return 0
+
+
 def cmd_bugcrowd_brief(ns) -> int:
     from .bugcrowd import analyze_snapshot, matching_scope_rules, public_profile
     try:
@@ -613,7 +640,7 @@ def _run_options(parser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="grypton",
         description="Autonomous scoped testing with GLM Kraude, Spark Kryptex, and Astra validation")
-    parser.add_argument("--version", action="version", version="Grypton 3.1.0")
+    parser.add_argument("--version", action="version", version="Grypton 3.2.0")
     sub = parser.add_subparsers(dest="command", required=True)
     init = sub.add_parser("init", help="Create and immediately run an engagement")
     init.add_argument("target", nargs="?")
@@ -673,6 +700,22 @@ def build_parser() -> argparse.ArgumentParser:
     lab = sub.add_parser("lab", help="Run the instrumented loopback integration target")
     lab.add_argument("--host", default="127.0.0.1"); lab.add_argument("--port", type=int, default=0)
     lab.add_argument("--log", default=""); lab.set_defaults(func=cmd_lab)
+    benchmark = sub.add_parser("benchmark", help="Run or score the black-box loopback web, network, and APK lab")
+    benchmark_sub = benchmark.add_subparsers(dest="benchmark_command", required=True)
+    benchmark_serve = benchmark_sub.add_parser("serve", help="Start a new hard loopback benchmark")
+    benchmark_serve.add_argument("--out", default=".state/benchmarks/hard-lab",
+                                 help="Directory for public manifest, APK artifact, logs, and private evaluator state")
+    benchmark_serve.add_argument("--host", default="127.0.0.1")
+    benchmark_serve.add_argument("--web-port", type=int, default=0)
+    benchmark_serve.add_argument("--network-port", type=int, default=0)
+    benchmark_serve.add_argument("--log", default="", help="Sanitized JSONL event log path")
+    benchmark_serve.set_defaults(func=cmd_benchmark_serve)
+    benchmark_score = benchmark_sub.add_parser("score", help="Score one engagement's durable findings")
+    benchmark_score.add_argument("manifest", help="Public manifest.json produced by benchmark serve")
+    benchmark_score.add_argument("target", nargs="?", default="", help="Grypton engagement slug")
+    benchmark_score.add_argument("--workspace", default="", help="Explicit engagement workspace path")
+    benchmark_score.add_argument("--json", action="store_true")
+    benchmark_score.set_defaults(func=cmd_benchmark_score)
     serve = sub.add_parser("serve", help="Run the loopback read-only operations dashboard")
     serve.add_argument("--port", type=int, default=8765); serve.set_defaults(func=cmd_serve)
     demo = sub.add_parser("demo"); demo.add_argument("--turns", type=int, default=5); demo.set_defaults(func=cmd_demo)

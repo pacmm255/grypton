@@ -3,6 +3,14 @@
 Verification covers the autonomous loop, exact model routing, tool transport,
 scope enforcement, evidence integrity, CLI review commands, and dashboard.
 
+These checks do not establish vulnerability-discovery accuracy on a single
+host. The mock integration test inserts predetermined findings and supplies a
+predetermined confirmation. Neither a passing audit nor a zero-finding run
+measures missed findings. Single-host precision, recall, and the accuracy impact
+of the convergence changes remain unmeasured. See
+[`SINGLE_HOST_ACCURACY.md`](SINGLE_HOST_ACCURACY.md) for the source-level review
+and the evidence required to support an accuracy claim.
+
 ## Automated checks
 
 Run from `/root/grypton`:
@@ -32,7 +40,7 @@ The release wheel is also built from a clean packaging tree and installed into
 an isolated virtual environment. Acceptance checks require the packaged prompts,
 JSON schemas, scenarios, skills, and dashboard assets; reject stale legacy
 modules; run one mock orchestration turn; and verify the installed MCP entry
-point exposes all 23 tools.
+point exposes all 27 tools.
 
 ## Live provider checks
 

@@ -88,7 +88,7 @@ imported by the active package.
 
 ## Tool calling
 
-Kraude receives native OpenCode tools and 23 Grypton MCP tools. Structured
+Kraude receives native OpenCode tools and 27 Grypton MCP tools. Structured
 network tools check the recorded host and explicit URL port before writing an
 audit event. Redirects are captured one hop at a time so an unchecked Location
 cannot leave scope. The main
@@ -99,6 +99,9 @@ surface includes:
 - `proxy_flows`, `flow_read`, `flow_replay` for Burp-like capture work;
 - `httpx_probe`, scoped Playwright `browse`, `dns_lookup`, `tls_certificate`, `port_scan`, and
   `subdomain_enum`;
+- `tcp_exchange` for one scoped newline-framed network protocol exchange, plus
+  `artifact_download`, `apk_inspect`, and `apk_extract_asset` for black-box APK
+  artifact assessment;
 - `attack_surface_add`, `tested_technique_log`, `prior_attempts`, and
   `record_finding`;
 - `tool_inventory`, `install_tool`, `research`, `save_research`, and `read_doc`.
@@ -153,6 +156,11 @@ Then exercise the complete live loop in another:
 The lab includes linked JavaScript, robots metadata, a debug route, and a
 synthetic object-authorization differential. It binds to loopback by default
 and records every request without authorization or cookie values.
+
+For a substantially harder black-box benchmark that combines web, network, and
+APK assessment, use [`docs/HARD_LAB_BENCHMARK.md`](docs/HARD_LAB_BENCHMARK.md).
+It is loopback-only, keeps its answer key out of the engagement workspace, and
+scores only durable evidence-backed findings.
 
 The operations dashboard is also loopback-only and read-only:
 
