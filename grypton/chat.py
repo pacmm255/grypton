@@ -150,6 +150,45 @@ def _render_tool(name: str, inp):
     return head, body
 
 
+def _tool_error_summary(content: str) -> str | None:
+    """Turn verbose provider permission dumps into an actionable console line."""
+    value = str(content or "")
+    lowered = value.lower()
+    if "external_directory" in lowered and "prevents you from using" in lowered:
+        return "OpenCode blocked a local path outside the engagement binding."
+    if "permission" in lowered and "denied" in lowered and len(value) > 500:
+        return "OpenCode denied this tool call; use the scoped Grypton tool for the action."
+    return None
+
+
+def _compact_tool_result(content: str) -> str:
+    """Keep normal view legible while durable logs retain full MCP payloads."""
+    try:
+        value = json.loads(content)
+    except (TypeError, ValueError):
+        return str(content or "")
+    if not isinstance(value, dict):
+        return str(content or "")
+    summary = str(value.get("summary") or "").strip()
+    if not summary:
+        return str(content or "")
+    data = value.get("data") if isinstance(value.get("data"), dict) else {}
+    lines = [summary]
+    # The worker already receives the document body.  Reprinting it in the
+    # terminal turns a one-line read into an unreadable JSON wall.
+    if "text" in data:
+        return summary
+    if data.get("status_line"):
+        lines.append(str(data["status_line"]))
+    flow = data.get("flow")
+    if isinstance(flow, str) and flow:
+        lines.append(f"capture: {Path(flow).name}")
+    record = data.get("id")
+    if record:
+        lines.append(f"record: {record}")
+    return "\n".join(lines)
+
+
 class Renderer:
     """Engine event sink → terminal. Shows everything, colored."""
 
@@ -235,6 +274,10 @@ class Renderer:
             content = _redact_display(d.get("content", ""))
             label = red("  ⎿ error") if d.get("is_error") else dim("  ⎿ result")
             print(label)
+            summary = _tool_error_summary(content) if d.get("is_error") else None
+            if summary:
+                print(_wrap(summary, "      "))
+                return
             if self.view == "quiet":
                 first = next((line.strip() for line in str(content).splitlines() if line.strip()),
                              "(empty result)")
@@ -242,7 +285,7 @@ class Renderer:
             elif self.view == "full":
                 print(_block(content, maxlen=3600, maxlines=100))
             else:
-                print(_block(content, maxlen=1400, maxlines=30))
+                print(_block(_compact_tool_result(content), maxlen=1000, maxlines=10))
 
         elif kind == "worker_turn":
             txt = (d.get("text") or "").strip()
@@ -659,17 +702,26 @@ def _run_local_inspection(engine, command: str) -> None:
     print(_block(_redact_display(completed.stdout or "(no output)"), maxlen=1800, maxlines=40))
 
 
-async def interact(engine, renderer: Renderer | None = None, *, accept_input: bool = True) -> None:
+def print_console_header(*, target: str, target_type: str, backend: str,
+                         renderer: Renderer) -> None:
+    """Render the stable shell before providers begin emitting live events."""
     from . import config
 
-    if renderer is None:
-        candidate = getattr(engine.emit, "__self__", None)
-        renderer = candidate if isinstance(candidate, Renderer) else Renderer()
     print(bold(cyan("\n╭── Grypton Code ─────────────────────────────────────────────")))
-    print(f"│ {engine.target} · {engine.target_type} · {engine.backend}")
+    print(f"│ {target} · {target_type} · {backend}")
     print(dim(f"│ GLM {config.WORKER_EFFORT} · Spark {config.MANAGER_EFFORT} · "
               f"Astra {config.VALIDATOR_EFFORT} · console {renderer.view}"))
     print(dim("╰── Type /help for commands · @findings to prioritize a workspace record"))
+
+
+async def interact(engine, renderer: Renderer | None = None, *, accept_input: bool = True,
+                   show_header: bool = True) -> None:
+    if renderer is None:
+        candidate = getattr(engine.emit, "__self__", None)
+        renderer = candidate if isinstance(candidate, Renderer) else Renderer()
+    if show_header:
+        print_console_header(target=engine.target, target_type=engine.target_type,
+                             backend=engine.backend, renderer=renderer)
     loop_task = asyncio.create_task(engine.run())
     if not accept_input:
         await loop_task
@@ -862,6 +914,32 @@ class _PasteParser:
 
 async def _input_loop(engine, renderer: Renderer) -> None:
     is_tty = sys.stdin.isatty()
+    if is_tty:
+        # prompt_toolkit redraws the active line after asynchronous renderer
+        # output.  Without it, streamed tool events overwrite `❯` and make the
+        # console look broken as soon as Kraude starts working.
+        try:
+            from prompt_toolkit import PromptSession
+            from prompt_toolkit.formatted_text import ANSI
+            from prompt_toolkit.patch_stdout import patch_stdout
+        except ImportError:
+            pass
+        else:
+            session = PromptSession()
+            with patch_stdout(raw=True):
+                while True:
+                    try:
+                        raw = await session.prompt_async(ANSI("\x1b[36m❯ \x1b[0m"))
+                    except EOFError:
+                        return
+                    except KeyboardInterrupt:
+                        engine.request_stop("interrupt at console prompt")
+                        return
+                    if _route_input(engine, renderer, raw):
+                        return
+
+    # A non-interactive pipe has no prompt.  Keep the small stdlib fallback for
+    # unusual terminals where prompt_toolkit is not installed.
     if is_tty:
         try:
             sys.stdout.write("\x1b[?2004h")   # enable bracketed paste

@@ -106,7 +106,7 @@ def _configure_run(ns) -> None:
 
 
 def _run_engagement(ws: Workspace, ns, *, brief: str, fresh: bool) -> int:
-    from .chat import Renderer, interact
+    from .chat import Renderer, interact, print_console_header
     from .engine import Engine
 
     _configure_run(ns)
@@ -121,9 +121,15 @@ def _run_engagement(ws: Workspace, ns, *, brief: str, fresh: bool) -> int:
             except (NotImplementedError, RuntimeError):
                 pass
         meta = ws.load_meta()
+        # The terminal shell comes first.  Provider setup emits live status
+        # events, and printing it after setup puts startup lines above the
+        # console frame and looks like a broken interactive session.
+        print_console_header(target=meta.target, target_type=meta.target_type,
+                             backend=config.CONFIG.backend, renderer=renderer)
         await engine.setup(brief=brief, target=meta.target, target_type=meta.target_type,
                            fresh_clone=fresh)
-        await interact(engine, renderer, accept_input=not getattr(ns, "print_mode", False))
+        await interact(engine, renderer, accept_input=not getattr(ns, "print_mode", False),
+                       show_header=False)
 
     try:
         asyncio.run(execute())
@@ -154,13 +160,6 @@ def cmd_init(ns) -> int:
     profile = getattr(ns, "_bugcrowd_profile", None)
     if profile:
         ws.save_program_brief(profile["brief_text"], profile)
-    print(f"Grypton engagement: {slug}\n"
-          f"  target     {target}\n"
-          f"  scope      {', '.join(constraints.in_scope)}\n"
-          f"  Kraude     {config.WORKER_MODEL} · {config.WORKER_EFFORT}\n"
-          f"  Kryptex    {config.MANAGER_MODEL} · {config.MANAGER_EFFORT}\n"
-          f"  validator  {config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT} "
-          f"(automatic for P1/P2 only)\n")
     return _run_engagement(ws, ns, brief=ns.brief or f"Assess {target} within recorded scope.", fresh=True)
 
 

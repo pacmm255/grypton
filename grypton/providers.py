@@ -201,7 +201,8 @@ class OpenCodeClient:
     """One role-specific OpenCode session with isolated, persistent XDG state."""
 
     @staticmethod
-    def _permissions(allow_tools: bool) -> dict:
+    def _permissions(allow_tools: bool, workspace: Path | None = None,
+                     transport_workspace: Path | None = None) -> dict:
         if not allow_tools:
             return {
                 "*": "deny",
@@ -227,6 +228,21 @@ class OpenCodeClient:
         bash["openssl s_client *"] = "deny"
         bash["*/openssl s_client *"] = "deny"
 
+        # OpenCode runs inside a small transport directory rather than the
+        # Grypton checkout.  The engagement itself is deliberately outside
+        # that directory, so a blanket external-directory denial makes even
+        # its own scope file unreadable.  Give the worker access only to the
+        # one engagement and its transport directory; every other external
+        # path remains denied.  Manager sessions have no filesystem tools.
+        external_directory: str | dict = "deny"
+        allowed_external = [path.resolve() for path in (workspace, transport_workspace)
+                            if path is not None]
+        if allowed_external:
+            external_directory = {
+                **{str(path / "*"): "allow" for path in allowed_external},
+                "*": "deny",
+            }
+
         return {
             "*": "allow",
             "bash": bash,
@@ -234,7 +250,7 @@ class OpenCodeClient:
             "websearch": "deny",
             "question": "deny",
             "task": "deny",
-            "external_directory": "deny",
+            "external_directory": external_directory,
         }
 
     def __init__(
@@ -289,7 +305,11 @@ class OpenCodeClient:
             except (OSError, ValueError, KeyError):
                 pass
 
-        permissions = self._permissions(self.allow_tools)
+        permissions = self._permissions(
+            self.allow_tools,
+            self.workspace if self.allow_tools else None,
+            self.transport_workspace if self.allow_tools else None,
+        )
         inline = {
             "$schema": "https://opencode.ai/config.json",
             # Grypton already records immutable request/response flows, append-only
@@ -336,7 +356,11 @@ class OpenCodeClient:
                         "GRYPTON_TARGET": self.target_slug,
                         "KRYPTON_HOME": str(config.GRYPTON_HOME),
                         "KRYPTON_TARGET": self.target_slug,
-                        "PYTHONPATH": str(config.GRYPTON_HOME),
+                        # The state home may be distinct from the checkout or
+                        # installed package root.  The MCP subprocess imports
+                        # Grypton's code from SOURCE_ROOT while it writes
+                        # engagement data under GRYPTON_HOME.
+                        "PYTHONPATH": str(config.SOURCE_ROOT),
                     },
                 }
             }
@@ -378,6 +402,13 @@ class OpenCodeClient:
             "PATH": f"{config.BIN_DIR}:{env.get('PATH', '')}",
             "NO_COLOR": "1",
         })
+        # Preserve importability for the local MCP child even when an operator
+        # directs runtime state to another filesystem location.
+        source_path = str(config.SOURCE_ROOT)
+        inherited_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = source_path + (
+            os.pathsep + inherited_pythonpath if inherited_pythonpath else ""
+        )
         return env, auth["key"]
 
     async def call(

@@ -73,8 +73,8 @@ xhigh) directs each turn; GPT-6 Astra max validates new findings independently.
   hashes, checkpoints, passive holds, and negative attempts in
   `tested_technique_log`; they do not create new attack surface.
 - Goja SOCKS5 proxy: `{config.GOJA_SOCKS}`.
-- Read `findings.md`, `attack-surface.md`, `tested-techniques.md`, `progress.md`
-  here to orient.
+- Use `grypton_read_doc` with `findings`, `surface`, `tested`, `progress`, and
+  `scope` to orient. Do not use native Read with an absolute workspace path.
 
 ## Binding user constraints (obey exactly, never forget)
 ```

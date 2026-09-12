@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, patch
 
 from grypton import config
 from grypton.bugcrowd import analyze_snapshot, matching_scope_rules, out_of_scope_rules
-from grypton.chat import Renderer, _command_limit, _expand_workspace_references, _route_input
+from grypton.chat import Renderer, _command_limit, _compact_tool_result, _expand_workspace_references, _route_input
 from grypton.cli import (_activity_snapshot, _claude_style_arguments, _constraints,
                          _validate_requested_findings, build_parser, main)
 from grypton.engine import Engine
@@ -83,6 +83,17 @@ def local_server():
 
 
 class CliTests(unittest.TestCase):
+    def test_normal_console_compacts_mcp_document_and_capture_payloads(self):
+        document = json.dumps({"summary": "Read scope-rules.md (42 characters).",
+                               "data": {"text": "secretly very long document body"}})
+        capture = json.dumps({"summary": "HTTP 200 · captured flow-1.http",
+                              "data": {"status_line": "HTTP/1.1 200 OK",
+                                       "flow": "/tmp/flows/flow-1.http",
+                                       "response": "very long response"}})
+        self.assertEqual(_compact_tool_result(document), "Read scope-rules.md (42 characters).")
+        self.assertEqual(_compact_tool_result(capture),
+                         "HTTP 200 · captured flow-1.http\nHTTP/1.1 200 OK\ncapture: flow-1.http")
+
     def test_init_accepts_named_and_positional_targets(self):
         parser = build_parser()
         named = parser.parse_args(["init", "--target", "example.test"])
@@ -579,6 +590,32 @@ class WorkerEventTests(unittest.TestCase):
         manager_permissions = OpenCodeClient._permissions(False)
         self.assertEqual(manager_permissions["*"], "deny")
 
+    def test_worker_permissions_bind_only_its_engagement_paths(self):
+        workspace = Path("/tmp/grypton-engagement")
+        transport = Path("/tmp/grypton-transport")
+        permissions = OpenCodeClient._permissions(True, workspace, transport)
+        self.assertEqual(permissions["external_directory"]["/tmp/grypton-engagement/*"], "allow")
+        self.assertEqual(permissions["external_directory"]["/tmp/grypton-transport/*"], "allow")
+        self.assertEqual(permissions["external_directory"]["*"], "deny")
+
+    @patch("grypton.providers.opencode_credential", return_value={"type": "api", "key": "test-key"})
+    def test_mcp_subprocess_imports_from_source_when_state_home_is_elsewhere(self, _credential):
+        with isolated_runtime():
+            workspace = config.ENGAGEMENTS_DIR / "mcp-import"
+            workspace.mkdir(parents=True)
+            client = OpenCodeClient(
+                role="worker", route=config.WORKER_MODEL, effort="max",
+                workspace=workspace, target_slug="mcp-import", allow_tools=True,
+                agent_prompt="test",
+            )
+            env, _ = client._environment()
+            paths = env["PYTHONPATH"].split(os.pathsep)
+            self.assertEqual(paths[0], str(config.SOURCE_ROOT))
+            self.assertEqual(
+                json.loads(env["OPENCODE_CONFIG_CONTENT"])["mcp"]["grypton"]["environment"]["PYTHONPATH"],
+                str(config.SOURCE_ROOT),
+            )
+
     def test_tool_error_text_is_rendered_and_retained(self):
         with isolated_runtime():
             events = []
@@ -607,6 +644,16 @@ class WorkerEventTests(unittest.TestCase):
             ))
             self.assertIn(marker, worker.client.agent_prompt)
             self.assertNotIn(marker, worker._build_prompt("do one bounded check"))
+
+    def test_runtime_prompt_uses_engagement_aware_ledger_reader(self):
+        with isolated_runtime():
+            worker = OpenCodeWorker(WorkerSpec(
+                session_uuid="", cwd=Path(config.ENGAGEMENTS_DIR) / "prompt-reader",
+                system_prompt="test", extra_env={"GRYPTON_TARGET": "prompt-reader"},
+            ))
+            prompt = worker._build_prompt("do one bounded check")
+            self.assertIn("grypton_read_doc", prompt)
+            self.assertIn('{"name": "scope"}', prompt)
 
 
 class EngineTests(unittest.IsolatedAsyncioTestCase):

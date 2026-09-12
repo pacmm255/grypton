@@ -98,9 +98,12 @@ def _read_doc(ws, args):
         "tested": "tested-techniques.md", "progress": "progress.md", "scope": "scope-rules.md",
         "program": "program-brief.md"}
     path = ws.root / mapping.get(args.get("name", "findings"), "findings.md")
-    value = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
+    if not path.is_file():
+        return {"ok": True, "summary": f"{path.name} is not attached to this engagement.",
+                "data": {"text": "", "present": False}}
+    value = path.read_text(encoding="utf-8", errors="replace")
     return {"ok": True, "summary": f"Read {path.name} ({len(value)} characters).",
-            "data": {"text": value[:200_000]}}
+            "data": {"text": value[:200_000], "present": True}}
 
 
 REGISTRY: dict[str, tuple[str, dict, Callable]] = {
@@ -194,7 +197,7 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
     "save_research": ("Save a research note in the engagement workspace.",
         _object({"topic": _string("Topic"), "content": _string("Markdown")}, ("topic", "content")),
         _save_research),
-    "read_doc": ("Read findings, surface, tested, progress, or scope.",
+    "read_doc": ("Read findings, surface, tested, progress, scope, or an attached program brief.",
         _object({"name": {"type": "string", "enum": ["findings", "surface", "tested", "progress", "scope", "program"]}}),
         _read_doc),
     "tool_inventory": ("List available native binaries and Goja state.", _object({}),
@@ -318,7 +321,7 @@ def cli_main(argv=None) -> int:
     finding = sub.add_parser("finding"); finding.add_argument("title"); finding.add_argument("severity")
     finding.add_argument("--class", dest="vuln_class", default=""); finding.add_argument("--surface", default="")
     finding.add_argument("--description", default=""); finding.add_argument("--poc", default=""); finding.add_argument("--evidence", default="")
-    read = sub.add_parser("read"); read.add_argument("name", choices=["findings", "surface", "tested", "progress", "scope"])
+    read = sub.add_parser("read"); read.add_argument("name", choices=["findings", "surface", "tested", "progress", "scope", "program"])
     install = sub.add_parser("install"); install.add_argument("spec"); install.add_argument("--manager", default="auto")
 
     ns = parser.parse_args(argv)

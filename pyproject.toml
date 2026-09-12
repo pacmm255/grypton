@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 license = "LicenseRef-Proprietary"
 license-files = []
 authors = [{name = "Pacman / SecYour"}]
-dependencies = []
+dependencies = ["prompt_toolkit>=3.0"]
 
 [project.scripts]
 grypton = "grypton.cli:main"

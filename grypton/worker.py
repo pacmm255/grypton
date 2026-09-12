@@ -62,7 +62,8 @@ class OpenCodeWorker:
             allow_tools=True,
             agent_prompt=(
                 "You are Kraude, the hands-on worker in a persistent Grypton engagement. "
-                "Use tools and produce observable progress. Obey scope-rules.md exactly. "
+                "Use tools and produce observable progress. Read engagement ledgers through "
+                "the grypton_read_doc MCP tool, then obey scope-rules.md exactly. "
                 "Record surface, tested techniques, and findings with the grypton MCP "
                 "tools. Resolve routine local blockers yourself. Never inspect or reveal "
                 "provider credentials. End with a concise factual summary.\n\n"
@@ -112,9 +113,14 @@ class OpenCodeWorker:
               "Native Bash is only for local analysis; do not use curl, wget, httpx, "
               "language HTTP libraries, sockets, or built-in web fetch/search for "
               "network access. Prefer ledger tools for durable findings, surface "
-              "entries, and tested techniques. Re-read scope-rules.md before network actions. "
-              "Do not inspect files outside this engagement workspace.\n"
-            + f"CLI fallback: `{tool_bin} --target {slug} ...`\n\n"
+              "entries, and tested techniques. Before every network action call "
+              "`grypton_read_doc` with `{\"name\": \"scope\"}`. Use `grypton_read_doc` "
+              "for scope, program, findings, surface, tested, and progress ledgers; do not "
+              "use native Read on absolute engagement paths. Do not inspect files outside "
+              "this engagement workspace.\n"
+            + f"If an MCP tool is unavailable, use the scoped CLI fallback with global options first: "
+              f"`{tool_bin} --json --target {slug} read scope`. The fallback tool, never curl "
+              "or a language HTTP client, is the only permitted network fallback.\n\n"
               "=== KRYPTEX DIRECTIVE ===\n"
             + directive
         )
