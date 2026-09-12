@@ -1,214 +1,622 @@
-# Grypton
+# Grypton Code
 
-Grypton is an autonomous, persistent security-testing orchestrator derived from
-Krypton's working loop. Kraude performs scoped work with real tools, Kryptex
-reviews every turn and supplies the next move, and a separate validator reviews
-P1/P2 findings automatically.
+Grypton Code is a persistent, tool-using security-testing workspace. You give it a target and a clear scope. It keeps the work, captures, decisions, findings, and validation results in one engagement directory.
 
-| Role | Runner and plan | Exact route | Effort |
-| --- | --- | --- | --- |
-| Kraude, worker | OpenCode / Z.AI Coding Plan | `zai-coding-plan/glm-5.3` | `max` |
-| Kryptex, manager | OpenCode / Go | `opencode-go/muse-spark-1.3-contributor` | `xhigh` |
-| Validator | Codex | `gpt-6-astra` | `max` |
-
-Spark never validates its own worker. For each newly recorded P1/P2 finding,
-Grypton collects the explicitly referenced workspace artifacts and starts a
-fresh, ephemeral, tool-disabled Astra process with a strict verdict schema.
-P3–P5 findings remain recorded without an Astra call unless the operator uses
-the explicit `validate` command.
-
-## Start an engagement
-
-Both target forms work:
+Use Grypton only for systems you are allowed to assess.
 
 ```bash
-cd /root/grypton/bin
-./grypton init --target "go2tr.com"
-./grypton init "go2tr.com"
-
-# Claude Code-style direct invocation
-./grypton --target "go2tr.com" "Map the public web and API surface"
-./grypton -p --target "go2tr.com" "Run without interactive input"
-./grypton -c                         # continue the most recent engagement
-./grypton -r go2tr-com               # resume a named engagement
+cd /root/grypton
+./bin/grypton doctor
 ```
 
-Useful controls:
+If `doctor` shows `OK` for the two OpenCode connectors, Codex, and Grypton MCP, you are ready to start.
 
-```bash
-./grypton plan --target "example.test" --type web -m "Assess the public API"
-./grypton init --target "example.test" \
-  --in-scope "example.test,*.example.test" \
-  --out-scope "status.example.test" \
-  -m "Assess the web and API surface"
-
-./grypton status --json
-./grypton overview example-test
-./grypton activity example-test --kind tools --limit 12
-./grypton show example-test
-./grypton findings example-test
-./grypton validate example-test F003
-./grypton validate example-test --all
-./grypton surface example-test
-./grypton history example-test
-./grypton scope example-test
-./grypton audit example-test
-./grypton report example-test --output report.md
-./grypton resume example-test
-./grypton stop example-test
-./grypton models
-./grypton doctor
-./grypton scenarios
+```mermaid
+flowchart LR
+    O[You] --> K[Kryptex\nmanager]
+    K --> W[Kraude\nworker]
+    W --> T[Scoped tools]
+    T --> E[Private evidence workspace]
+    E --> K
+    E --> A[Astra\nindependent validator]
+    A --> F[Confirmed finding]
 ```
 
-For a Bugcrowd program, save the current public engagement JSON and run its
-rules through preflight before starting:
+## What each role does
+
+| Role | What it does | Model route |
+| --- | --- | --- |
+| **Kraude** | Maps the target, uses the scoped tools, records evidence, and writes finding candidates. | `zai-coding-plan/glm-5.3` at `max` |
+| **Kryptex** | Manages Kraude, chooses the next useful step, corrects weak work, and handles ordinary blockers. | `opencode-go/muse-spark-1.3-contributor` at `xhigh` |
+| **Astra** | Independently reviews serious finding evidence. | `gpt-6-astra` at `max` |
+
+Kryptex does not validate its own worker. New P1 and P2 findings go to Astra automatically. P3, P4, and P5 findings stay recorded until you explicitly request validation.
+
+## Five ideas to know first
+
+| Word | Meaning |
+| --- | --- |
+| **Target** | The host, URL, network, artifact, or other thing being assessed. |
+| **Engagement** | One saved assessment. Its name is made from the target. |
+| **Scope** | What Grypton may touch and what it must avoid. |
+| **Flow** | A saved request and response capture. |
+| **Finding** | A candidate issue with a saved proof. It is only confirmed after the required Astra review. |
+
+All engagement data lives under `.state/engagements/`. The top-level `target/` directory stays empty.
+
+---
+
+# Quick start
+
+## Start with the local lab
+
+The local lab is the easiest way to learn the interface. It runs only on your own machine.
+
+In the first terminal:
 
 ```bash
-./grypton bugcrowd-brief /path/to/brief.json --target https://api.example.test/graphql
-./grypton init --target https://api.example.test/graphql \
-  --bugcrowd-brief /path/to/brief.json
+cd /root/grypton
+./bin/grypton lab --port 18767
 ```
 
-Preflight verifies the target against the listed scope, imports matching
-wildcards and exclusions, exposes credential requirements and high-signal
-targets, and returns a nonzero exit status when the brief prohibits automation
-or the selected target is not listed. The complete normalized brief is saved as
-`program-brief.md` for Kraude and Kryptex; a shortened mission cannot override
-it.
-
-`grypton plan` validates the target, scope, model routes, and relevant playbooks
-without creating an engagement or starting a provider. `overview` is a compact
-decision view for one workspace; `activity` prints sanitized tool, turn, capture,
-or progress summaries without dumping capture bodies.
-
-The live terminal follows the Claude Code interaction pattern while keeping
-Grypton's exact model routes and assessment boundaries visible. It has a compact
-startup card, a `❯` prompt, direct messages for Kryptex, `@findings`, `@surface`,
-and other durable workspace references, plus a read-only `!` local-inspection
-subset. The familiar `/help`, `/clear`, `/compact`, `/context`, `/cost`,
-`/config`, `/status`, `/resume`, and `/permissions` commands describe the active
-engagement. Grypton-specific `/summary`, `/plan`, `/activity`, `/flows`,
-`/history`, `/scope`, `/models`, `/audit`, `/note`, and `/worker` controls remain
-available. `/view quiet`, `/view normal`, and `/view full` control terminal detail
-while all evidence stays in the private workspace; streamed credential-shaped
-values are redacted from the terminal preview. `/stop`, Ctrl-C, and `grypton stop`
-request a clean halt.
-
-P1/P2 findings start as `validation-pending` and then follow the independent
-verdict: `confirmed`, `needs-more-evidence`, or `rejected`. P3–P5 findings start
-as `validation-not-requested`; `grypton validate TARGET FINDING` submits one to
-Astra explicitly. The dashboard and CLI show confirmed findings separately from
-recorded candidates. `audit` checks required validator coverage, model routes,
-provider exits, scope, flow references, and the empty `target/` directory.
-
-State is private under `.state/engagements/<slug>/`. The requested top-level
-`target/` directory stays empty, and this fork does not create a `targets/`
-directory. The preserved source snapshot lives under `upstream/` and is not
-imported by the active package.
-
-## Tool calling
-
-Kraude receives native OpenCode tools and 27 Grypton MCP tools. Structured
-network tools check the recorded host and explicit URL port before writing an
-audit event. Redirects are captured one hop at a time so an unchecked Location
-cannot leave scope. The main
-surface includes:
-
-- `http_request`: curl request with bounded output and a full private capture;
-- `goja_start`, `goja_request`, `goja_status`, `goja_stop`;
-- `proxy_flows`, `flow_read`, `flow_replay` for Burp-like capture work;
-- `httpx_probe`, scoped Playwright `browse`, `dns_lookup`, `tls_certificate`, `port_scan`, and
-  `subdomain_enum`;
-- `tcp_exchange` for one scoped newline-framed network protocol exchange, plus
-  `artifact_download`, `apk_inspect`, and `apk_extract_asset` for black-box APK
-  artifact assessment;
-- `attack_surface_add`, `tested_technique_log`, `prior_attempts`, and
-  `record_finding`;
-- `tool_inventory`, `install_tool`, `research`, `save_research`, and `read_doc`.
-
-Use the same surface manually:
+In the second terminal:
 
 ```bash
-./grypton tools --target example-test inventory
-./grypton tools --target example-test http https://example.test/ --method GET
-./grypton tools --target example-test flows
-./grypton tools --target example-test flow-read flow-123456
-./grypton tools --target example-test flow-replay flow-123456 --url https://example.test/control
+cd /root/grypton
+./bin/grypton --target "http://127.0.0.1:18767" \
+  "Map the local web application and verify the profile API"
 ```
 
-OpenCode is configured per role with private XDG directories. Kraude can use
-tools; Kryptex is tool-denied and receives the turn digest. Provider keys are
-copied only into private runtime state for the matching connector and never
-printed. The OpenCode Go connector is checked against `/root/open` when that
-file exists.
+Grypton opens the interactive console, starts Kraude, and shows each turn as it happens.
 
-OpenCode tool failures retain their `state.error` text in the live terminal and
-turn record. MCP calls use a two-minute outer ceiling while individual network
-tools keep their own bounded timeouts. Large responses are previewed to the
-model while the complete response remains in the private flow capture.
+## Start an authorized engagement
 
-Invalid-authentication checks share a cumulative budget across turns. A CAPTCHA,
-429, WAF challenge, temporary block, or lockout ends that probe family and sends
-the worker to passive or unrelated read-only work.
-
-The engine tracks normalized network request shapes and unique surface rows.
-Repeated query values, numbered sentinels, cache hashes, and passive checkpoints
-do not reset exhaustion. Kryptex receives the novelty counters and gets one
-concrete pivot; if the next turn still has no new request shape, surface, or
-finding, the engine closes the converged run instead of consuming the remaining
-time on bookkeeping.
-
-## Local integration target and dashboard
-
-Run the deterministic loopback target in one terminal:
+Start with `plan`. It checks the target, scope, models, and matching playbooks. It does not create an engagement or call a model.
 
 ```bash
-./grypton lab --port 18767 --log ../.state/lab/requests.jsonl
+./bin/grypton plan \
+  --target "https://app.example.test" \
+  --type web \
+  --in-scope "app.example.test,api.example.test" \
+  --out-scope "admin.example.test" \
+  -m "Map the public web and API surface"
 ```
 
-Then exercise the complete live loop in another:
+Start the engagement when the plan looks right:
 
 ```bash
-./grypton init --force --target http://127.0.0.1:18767 \
-  --type web --max-turns 3 -m "Map and verify the local profile API"
+./bin/grypton --target "https://app.example.test" \
+  --type web \
+  --in-scope "app.example.test,api.example.test" \
+  --out-scope "admin.example.test" \
+  "Map the public web and API surface"
 ```
 
-The lab includes linked JavaScript, robots metadata, a debug route, and a
-synthetic object-authorization differential. It binds to loopback by default
-and records every request without authorization or cookie values.
-
-For a substantially harder black-box benchmark that combines web, network, and
-APK assessment, use [`docs/HARD_LAB_BENCHMARK.md`](docs/HARD_LAB_BENCHMARK.md).
-It is loopback-only, keeps its answer key out of the engagement workspace, and
-scores only durable evidence-backed findings.
-
-The operations dashboard is also loopback-only and read-only:
+You can also use the explicit form:
 
 ```bash
-./grypton serve --port 8765
+./bin/grypton init \
+  --target "https://app.example.test" \
+  --type web \
+  -m "Map the public web and API surface"
 ```
 
-It shows pinned model routes, live provider counts, turns, structured tool
-calls, captures, surface records, tested techniques, findings, and Astra state.
+Both forms do the same thing.
 
-## Verification
+---
+
+# Starting, continuing, and stopping
+
+Grypton supports the familiar Code-style shortcuts and the explicit command form.
+
+| Task | Command |
+| --- | --- |
+| Start an interactive engagement | `./bin/grypton --target HOST "mission"` |
+| Start without terminal input | `./bin/grypton -p --target HOST "mission"` |
+| Start with the explicit command | `./bin/grypton init --target HOST -m "mission"` |
+| Continue the newest engagement | `./bin/grypton -c` |
+| Resume one engagement | `./bin/grypton -r ENGAGEMENT` or `./bin/grypton resume ENGAGEMENT` |
+| List engagements | `./bin/grypton status` or `./bin/grypton ls` |
+| Stop an active engagement | `./bin/grypton stop ENGAGEMENT` |
+
+`HOST` can be a hostname or a URL. `ENGAGEMENT` is the saved engagement name shown by `status`. For example, `https://app.example.test` becomes `https-app-example-test`.
+
+## Run options
+
+Add these options to `init`, `resume`, or the direct start form.
+
+| Option | What it means |
+| --- | --- |
+| `--target HOST` | Required target for a direct start. |
+| `--type TYPE` | Target type: `auto`, `web`, `api`, `network`, `cidr`, `binary`, or `contract`. |
+| `-m "mission"` | Short description of the work you want done. |
+| `--in-scope A,B` | Comma-separated targets Grypton may use. |
+| `--out-scope A,B` | Comma-separated targets Grypton must avoid. |
+| `--only P1,P2` | Only keep findings at these severities. |
+| `--include CLASS` | Focus on these vulnerability classes. |
+| `--exclude CLASS` | Avoid these vulnerability classes. |
+| `--rule "text"` | Add a permanent engagement rule. Repeat this option when needed. |
+| `--authorization-file FILE` | Save a hash of an authorization record with the engagement. |
+| `--bugcrowd-brief FILE` | Import scope and automation rules from a saved Bugcrowd brief. |
+| `--model glm` | Accept the worker route alias. Kraude stays pinned to GLM 5.3. |
+| `--permission-mode scoped` | Use Grypton's scope-checked, captured-tool mode. |
+| `-p` or `--print` | Do not wait for console input. Keep the event stream in stdout. |
+| `--console quiet` | Start with compact terminal output. Also accepts `normal` and `full`. |
+| `--max-turns N` | Stop after at most `N` worker turns. |
+| `--max-seconds N` | Stop after at most `N` seconds. |
+| `--auto-stop-time N` | Stop after at most `N` minutes. |
+| `--stop-on-p1` | Stop after a confirmed P1. |
+| `--force` | Reuse the existing engagement name and reset its run state. |
+
+## Useful examples
+
+Start a web assessment with a clear boundary:
 
 ```bash
-python3 -m pytest -q
+./bin/grypton --target "https://app.example.test" \
+  --type web \
+  --in-scope "app.example.test,api.example.test" \
+  --out-scope "status.example.test,admin.example.test" \
+  --rule "Do not test account recovery" \
+  "Map the public attack surface, then test the highest-value in-scope paths"
+```
+
+Start an API assessment with a time limit:
+
+```bash
+./bin/grypton --target "https://api.example.test" \
+  --type api \
+  --max-turns 12 \
+  --auto-stop-time 45 \
+  "Map documented and observed API routes, then verify access boundaries"
+```
+
+Resume quietly and write the stream to a log:
+
+```bash
+./bin/grypton resume https-api-example-test --console quiet -p | tee grypton-run.log
+```
+
+---
+
+# The interactive console
+
+The terminal is designed like a Code-style session. It has a compact startup card, a `❯` prompt, streamed work, and slash commands.
+
+- Type ordinary text to talk to **Kryptex**.
+- Type `/worker ...` to give **Kraude** a direct instruction for its next work burst.
+- Type `/stop` when you want the engagement to end cleanly.
+- Press `Ctrl-C` when you need to interrupt the terminal immediately.
+
+Your messages are saved as standing instructions for the engagement. Kryptex receives them and turns useful instructions into concrete work for Kraude.
+
+## Everyday console commands
+
+| Command | What it does |
+| --- | --- |
+| `/help` | Show the command list. |
+| `/clear` | Clear the visible terminal. |
+| `/compact` | Change the terminal to the compact view. Saved evidence is unchanged. |
+| `/view quiet` | Show short tool results and hide worker reasoning. |
+| `/view normal` | Show the standard amount of detail. |
+| `/view full` | Show longer tool results. |
+| `/status` | Show the current turn, elapsed time, and counts. |
+| `/summary` | Show the target, coverage, latest finding, and next directive. |
+| `/plan` | Show Kryptex's current instruction to Kraude. |
+| `/context` | Show engagement records and document sizes. |
+| `/cost` | Show recorded worker-turn cost and provider-call counts. |
+| `/config` | Show model routes, scope mode, and console mode. |
+| `/permissions` | Show the enforced network and tool boundaries. |
+| `/resume` | Print the command to resume this engagement later. |
+| `/models` or `/model` | Show the three pinned model routes. |
+| `/audit` or `/review` | Run the evidence and scope integrity check. |
+| `/stop` | Request a clean stop after the active worker step. |
+
+## Evidence and workspace commands
+
+| Command | What it does |
+| --- | --- |
+| `/activity [N]` | Show the newest `N` audited tool calls. Default: 8. |
+| `/flows [N]` | Show recent capture IDs and sizes. Default: 8. |
+| `/history [N]` | Show recent worker-turn summaries. Default: 5. |
+| `/findings` | Print the findings ledger. |
+| `/surface` | Print the attack-surface ledger. |
+| `/tested` | Print the tested-techniques ledger. |
+| `/scope` | Print scope and standing instructions. |
+| `/note text` | Save a note without waiting for a manager reply. |
+| `/worker text` | Send a direct next-turn instruction to Kraude. |
+
+## `@` workspace references
+
+Use `@` to tell Kryptex which durable record matters for your message. Grypton does not dump the file contents into the terminal. It marks the selected document as a priority for the current conversation.
+
+| Reference | Document |
+| --- | --- |
+| `@findings` | `findings.md` |
+| `@surface` | `attack-surface.md` |
+| `@tested` | `tested-techniques.md` |
+| `@progress` | `progress.md` |
+| `@scope` | `scope-rules.md` |
+| `@program` | `program-brief.md`, when a Bugcrowd brief was used |
+
+Example:
+
+```text
+❯ Review @findings and focus the next turn on the strongest untested boundary.
+```
+
+## `!` local inspection commands
+
+`!` supports a small, read-only local inspection set. It cannot make network calls and cannot bypass Grypton's scoped tools.
+
+```text
+❯ !pwd
+❯ !ls flows
+❯ !git status
+❯ !git diff --stat
+❯ !python --version
+```
+
+---
+
+# Scope and authorization
+
+Scope is binding. Grypton records it before it starts and applies it to structured network tools.
+
+## How to define scope
+
+Use `--in-scope` for targets that may be assessed and `--out-scope` for targets that must never be touched.
+
+```bash
+./bin/grypton plan \
+  --target "https://api.example.test" \
+  --in-scope "api.example.test,*.example.test" \
+  --out-scope "admin.example.test,https://api.example.test/internal" \
+  -m "Review the public API"
+```
+
+Use `--rule` for instructions that do not fit into a hostname list:
+
+```bash
+./bin/grypton init --target "https://app.example.test" \
+  --rule "Do not test payment flows" \
+  --rule "Stop an authentication probe after the first rate limit" \
+  -m "Assess the public application"
+```
+
+Grypton records every structured tool call. Redirects are checked one hop at a time, and explicit URL ports are part of the scope boundary.
+
+## Bugcrowd brief preflight
+
+Save the current public brief JSON first. Then inspect it:
+
+```bash
+./bin/grypton bugcrowd-brief /path/to/brief.json \
+  --target "https://api.example.test/graphql"
+```
+
+Start with the same brief:
+
+```bash
+./bin/grypton init \
+  --target "https://api.example.test/graphql" \
+  --bugcrowd-brief /path/to/brief.json \
+  -m "Assess the GraphQL API within the imported program rules"
+```
+
+The preflight checks that the target is listed, imports matching scope and exclusions, identifies credential requirements, and stops when the brief prohibits automation.
+
+---
+
+# Findings and Astra validation
+
+A finding must include an affected surface, issue class, impact, reproduction steps, and saved evidence. A guess or an unverified observation belongs in the surface or tested-technique records, not in a finding.
+
+```mermaid
+flowchart TD
+    A[Captured observation] --> B{Enough proof for a finding?}
+    B -- No --> C[Record surface or tested technique]
+    B -- Yes --> D[Record finding candidate]
+    D --> E{Claimed severity}
+    E -- P1 or P2 --> F[Astra validates automatically]
+    E -- P3 to P5 --> G[Keep as validation-not-requested]
+    G --> H[Optional explicit Astra review]
+    F --> I[confirmed, needs-more-evidence, or rejected]
+    H --> I
+```
+
+## Finding states
+
+| State | Meaning |
+| --- | --- |
+| `validation-pending` | A P1 or P2 finding is waiting for Astra. |
+| `confirmed` | Astra accepted the finding and severity. |
+| `needs-more-evidence` | The evidence is incomplete or the impact needs a clearer proof. |
+| `rejected` | Astra did not accept the finding. |
+| `validation-not-requested` | The finding is P3–P5 and no explicit Astra review was requested. |
+
+## Review findings
+
+```bash
+# Short list
+./bin/grypton findings https-app-example-test
+
+# Request Astra for one lower-severity candidate
+./bin/grypton validate https-app-example-test F003
+
+# Request Astra for every recorded candidate
+./bin/grypton validate https-app-example-test --all
+```
+
+Astra reviews the saved evidence snapshot. It does not perform live target actions during validation.
+
+---
+
+# Review an engagement after or during a run
+
+Use these commands from another terminal while an engagement is running, or after it stops.
+
+```bash
+# List every engagement
+./bin/grypton status
+
+# One compact decision view
+./bin/grypton overview https-app-example-test
+
+# Same command under its alias
+./bin/grypton inspect https-app-example-test
+
+# Recent tool activity, worker turns, flows, or progress
+./bin/grypton activity https-app-example-test --kind tools --limit 12
+./bin/grypton activity https-app-example-test --kind turns
+./bin/grypton activity https-app-example-test --kind flows
+./bin/grypton activity https-app-example-test --kind progress
+
+# Detailed records
+./bin/grypton show https-app-example-test
+./bin/grypton surface https-app-example-test
+./bin/grypton history https-app-example-test
+./bin/grypton scope https-app-example-test
+
+# Integrity check
+./bin/grypton audit https-app-example-test
+```
+
+Add `--json` to `status`, `show`, `overview`, `activity`, `findings`, `surface`, `history`, `scope`, `audit`, and selected other review commands when you need machine-readable output.
+
+## Create a report
+
+```bash
+# Print Markdown to the terminal
+./bin/grypton report https-app-example-test
+
+# Write Markdown to a file
+./bin/grypton report https-app-example-test --output report.md
+
+# Write JSON with findings and audit data
+./bin/grypton report https-app-example-test --format json --output report.json
+```
+
+`audit` checks model routes, provider failures, required validation, flow references, scope violations, and the expected empty top-level `target/` directory.
+
+---
+
+# Working with tools manually
+
+Kraude has native OpenCode tools and 27 Grypton MCP tools. The structured Grypton tools are scope-checked and audited. Use the same tools yourself through `grypton tools`.
+
+Start by seeing what is available:
+
+```bash
+./bin/grypton tools --target https-app-example-test inventory
+```
+
+Common manual commands:
+
+```bash
+# Captured HTTP request
+./bin/grypton tools --target https-app-example-test http \
+  https://app.example.test/ --method GET
+
+# List saved flows
+./bin/grypton tools --target https-app-example-test flows
+
+# Read a named flow
+./bin/grypton tools --target https-app-example-test flow-read flow-123456
+
+# Replay a flow against an in-scope URL
+./bin/grypton tools --target https-app-example-test flow-replay flow-123456 \
+  --url https://app.example.test/control
+```
+
+## Tool groups
+
+| Group | Main tools |
+| --- | --- |
+| HTTP and captures | `http_request`, `proxy_flows`, `flow_read`, `flow_replay` |
+| Browser and reconnaissance | `browse`, `httpx_probe`, `dns_lookup`, `tls_certificate`, `port_scan`, `subdomain_enum` |
+| Goja proxy | `goja_start`, `goja_status`, `goja_request`, `goja_stop` |
+| APK and protocol work | `tcp_exchange`, `artifact_download`, `apk_inspect`, `apk_extract_asset` |
+| Engagement records | `attack_surface_add`, `tested_technique_log`, `prior_attempts`, `record_finding` |
+| Local support | `tool_inventory`, `install_tool`, `research`, `save_research`, `read_doc` |
+
+Large responses are shortened in the live terminal. The full response stays in the private flow capture.
+
+---
+
+# Dashboard
+
+The dashboard is read-only and listens only on loopback.
+
+```bash
+./bin/grypton serve --port 8765
+```
+
+Open `http://127.0.0.1:8765` in a browser. The dashboard shows:
+
+- model routes and effort settings;
+- active and stopped engagements;
+- turns, tool calls, flows, and coverage counts;
+- recent tool activity and captures;
+- attack surface, tested techniques, findings, and Astra verdicts.
+
+Use the terminal for control. Use the dashboard for a quick visual review.
+
+---
+
+# Local labs and the hard benchmark
+
+## Simple local lab
+
+```bash
+./bin/grypton lab --host 127.0.0.1 --port 18767 \
+  --log .state/lab/requests.jsonl
+```
+
+The simple lab has a small web application with linked JavaScript, metadata, and a synthetic authorization boundary.
+
+## Hard web, network, and APK benchmark
+
+The hard benchmark is loopback-only. It combines a web application, newline-framed TCP service, and signed Android APK. It does not include source-code audit work.
+
+```bash
+bench=.state/benchmarks/courier-hard-01
+./bin/grypton benchmark serve --out "$bench" \
+  --web-port 18777 --network-port 19001
+```
+
+Read the public manifest, start one scoped engagement, then score the stopped workspace:
+
+```bash
+./bin/grypton benchmark score "$bench/manifest.json" TARGET --json
+```
+
+Read [Hard loopback benchmark](docs/HARD_LAB_BENCHMARK.md) for the complete walkthrough.
+
+## Demo mode
+
+Demo mode uses bundled mock providers. It is useful for checking the interface without calling OpenCode or Codex.
+
+```bash
+./bin/grypton demo --turns 3
+```
+
+---
+
+# Workspace layout
+
+Each engagement has a private directory:
+
+```text
+.state/engagements/<engagement>/
+├── target.json                 saved target and run state
+├── findings.md                 readable finding timeline
+├── attack-surface.md           discovered routes, hosts, and boundaries
+├── tested-techniques.md        attempted techniques and results
+├── progress.md                 turn-by-turn progress
+├── scope-rules.md              scope and standing instructions
+├── flows/                      complete request and response captures
+├── loot/                       downloaded in-scope artifacts
+├── research/                   saved research notes
+├── transcripts/                worker, manager, validator, and turn logs
+└── .ledger/                    structured records used by audit and review
+```
+
+Do not edit the active ledger files while an engagement is running. Use the console or the CLI commands to add instructions and review evidence.
+
+Provider credentials are kept in private runtime state. They are not shown by `doctor`, reports, or normal console output.
+
+---
+
+# Troubleshooting
+
+## `doctor` reports a failure
+
+Run:
+
+```bash
+./bin/grypton doctor
+```
+
+Fix the first failed item. The most common requirements are the `opencode` binary, the Z.AI Coding Plan connector, the OpenCode Go connector, Codex, curl, and the Grypton MCP server.
+
+## `a target is required`
+
+Give a target when using the direct form:
+
+```bash
+./bin/grypton --target "https://app.example.test" "Your mission"
+```
+
+Or use the explicit form:
+
+```bash
+./bin/grypton init --target "https://app.example.test" -m "Your mission"
+```
+
+## `engagement already exists`
+
+Resume it:
+
+```bash
+./bin/grypton resume https-app-example-test
+```
+
+Or intentionally reset that engagement's run state:
+
+```bash
+./bin/grypton init --force --target "https://app.example.test" -m "Start a new pass"
+```
+
+## The console is too busy
+
+Use either command:
+
+```text
+❯ /compact
+❯ /view quiet
+```
+
+Use `/flows` and `/activity` when you want to inspect only the saved evidence names and recent actions.
+
+## A lower-severity finding has no Astra verdict
+
+That is expected for P3–P5. Request it when you want it:
+
+```bash
+./bin/grypton validate ENGAGEMENT FINDING_ID
+```
+
+## An engagement stopped early
+
+Use `/status`, `overview`, `history`, and `audit` to see why. Common reasons are an explicit stop request, a configured time or turn limit, a scope boundary, or repeated work with no new evidence.
+
+## You need exact command help
+
+```bash
+./bin/grypton --help
+./bin/grypton init --help
+./bin/grypton tools --help
+./bin/grypton benchmark --help
+```
+
+---
+
+# Development and verification
+
+Run these checks after changing Grypton:
+
+```bash
+python3 -m unittest discover -s tests -v
 python3 tests/ui_smoke.py
 python3 -m compileall -q grypton tests
 ./bin/grypton doctor
 ```
 
-The unit suite exercises both `init` forms, exact routes, the mock autonomous
-loop, independent validator separation and fair multi-artifact evidence
-snapshots, MCP registry, exact-port scope rejection, redirect protection, HTTP
-capture, replay, preserved OpenCode error text, bounded model previews with
-complete disk captures, report auditing, review-command parsing, and clean CLI
-shutdown. `doctor` checks the exact OpenCode catalogs, both connector
-credentials without displaying them, Codex, curl, httpx, Playwright/Chrome,
-subfinder, Goja, and the MCP handshake. The implementation contract is in
-[`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md).
-Live and offline evidence is summarized in
-[`docs/VERIFICATION.md`](docs/VERIFICATION.md).
+Useful reference documents:
+
+- [Requirement trace](docs/REQUIREMENTS.md)
+- [Hard loopback benchmark](docs/HARD_LAB_BENCHMARK.md)
+- [Single-host accuracy notes](docs/SINGLE_HOST_ACCURACY.md)
+- [Verification notes](docs/VERIFICATION.md)
+- [Architecture](ARCHITECTURE.md)
