@@ -782,6 +782,24 @@ def _engine_argv(slug: str, run_id: str) -> list[str]:
     return [sys.executable, "-m", "grypton.runtime", "engine", slug, run_id]
 
 
+def _advance_health_deadline(
+    scheduled_at: float,
+    observed_at: float,
+    interval: float,
+) -> float:
+    """Return the first scheduled health deadline after ``observed_at``.
+
+    A zero deadline represents the immediate first health check. Later checks
+    stay anchored to their original cadence, and a delayed supervisor skips
+    missed slots instead of permanently shifting every subsequent check.
+    """
+    if scheduled_at <= 0:
+        return observed_at + interval
+    elapsed = max(0.0, observed_at - scheduled_at)
+    slots = math.floor(elapsed / interval) + 1
+    return scheduled_at + (slots * interval)
+
+
 def supervise(slug: str, run_id: str) -> int:
     slug = config.slugify(slug)
     paths = _paths(slug, run_id)
@@ -879,7 +897,11 @@ def supervise(slug: str, run_id: str) -> int:
                     health = _health(slug, child.pid)
                     _state_update(paths["state"], state, last_health=health)
                     _append_event(paths["events"], "health", **health)
-                    next_health = now + interval
+                    next_health = _advance_health_deadline(
+                        next_health,
+                        time.time(),
+                        interval,
+                    )
                 time.sleep(0.5)
 
             if stopped or timed_out:

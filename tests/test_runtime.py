@@ -22,6 +22,7 @@ from grypton.engine import Engine
 from grypton.runtime import (
     _ProcessIdentity,
     _ProcessSnapshot,
+    _advance_health_deadline,
     _descendant_pgids,
     _engine_argv,
     _paths,
@@ -98,6 +99,23 @@ class _HungProcess:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_health_deadline_stays_anchored_and_skips_missed_slots(self):
+        # The first health check is immediate; completing it at t=100 anchors
+        # the ten-minute cadence at 700, 1300, 1900, and so on.
+        scheduled = _advance_health_deadline(0, 100, 600)
+        self.assertEqual(scheduled, 700)
+
+        # A checkpoint delayed by load to t=840 advances from its scheduled
+        # slot (700), rather than drifting ten minutes from the late check.
+        scheduled = _advance_health_deadline(scheduled, 840, 600)
+        self.assertEqual(scheduled, 1300)
+
+        # Longer stalls skip every missed slot in one step and always leave a
+        # deadline strictly in the future.
+        scheduled = _advance_health_deadline(scheduled, 2600, 600)
+        self.assertEqual(scheduled, 3100)
+        self.assertGreater(scheduled, 2600)
+
     def test_duration_and_run_commands_parse(self):
         self.assertEqual(_duration_seconds("12h"), 43_200)
         self.assertEqual(_duration_seconds("10m"), 600)
