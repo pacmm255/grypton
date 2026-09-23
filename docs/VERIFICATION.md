@@ -80,6 +80,25 @@ Transport exceptions, unknown statuses, and non-2xx/3xx responses must also
 restore the exact prior files, including preserving an absent cookie jar. Their
 response remains observable, and a valid 400 verifier contract does not clear
 the established state.
+For a previously proven status-differential browser profile, tests also cover
+the bounded automatic-renewal state machine. A fresh proof performs no browser
+probe. A due proof is considered stale only when the exact configured verifier
+and a fresh anonymous control match the complete anonymous contract; an
+arbitrary endpoint 401 never triggers login. At most one credential-bearing
+request reaches the server for a proof generation, including input-triggered
+auto-submit with a delayed response, concurrent callers, failed proof, profile
+replacement, and a fresh Python process. A successful renewal must repeat the
+complete status-differential proof, replace cookie/token material exactly, and
+advance the generation. A failed or inconclusive proof restores the exact prior
+material and keeps that generation's reservation consumed. Legacy established
+version-one state with two initial attempts remains eligible for one bounded
+renewal. Inconclusive maintenance must not suppress the requested authenticated
+call while the persisted session is still established. Renewal is reached
+through the existing profiled login calls and `authenticated_http_request`;
+profiled login remains alias-only, ordinary authenticated-request arguments are
+unchanged, and no private verification or renewal controls enter the public MCP
+schemas or role prompts. Safe result metadata exposes the maintenance action,
+renewal attempt, and whether a credential-bearing request reached the server.
 Replacing a named credential must wait for an in-flight authenticated
 transaction, then clear cookies, tokens, and attempt state without allowing a
 late rollback or attempt write to resurrect the previous credential's state.

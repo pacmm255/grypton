@@ -509,6 +509,76 @@ class AuthBrokerTests(unittest.TestCase):
                 "credential_browser_login",
             )
 
+    def test_profile_replacement_waits_through_proof_and_revision_recording(self):
+        origin = "https://app.example.test"
+        with isolated_runtime():
+            ws = self._workspace(origin)
+            profile_a = credentials.save_auth_profile(
+                ws.slug, "primary", status_browser_profile(origin)
+            )
+            revision_a = credentials.auth_profile_revision(profile_a)
+            profile_b = status_browser_profile(origin)
+            profile_b["timeout"] = 41
+            entered = threading.Event()
+            release = threading.Event()
+            saved = threading.Event()
+            calls: list[dict] = []
+            results: list[dict] = []
+            errors: list[BaseException] = []
+
+            def delegated(_ws, _url, **kwargs):
+                calls.append(dict(kwargs))
+                entered.set()
+                if not release.wait(5):
+                    raise RuntimeError("timed out waiting for profile replacement")
+                return {"ok": True, "summary": "proof A", "data": {}}
+
+            def authenticate():
+                try:
+                    results.append(dispatch(
+                        ws, "credential_login", {"credential": "primary"}
+                    ))
+                except BaseException as exc:
+                    errors.append(exc)
+
+            def replace():
+                try:
+                    credentials.save_auth_profile(ws.slug, "primary", profile_b)
+                    saved.set()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with patch(
+                "grypton.toolserver.tools.credential_browser_login",
+                side_effect=delegated,
+            ):
+                auth_thread = threading.Thread(target=authenticate, daemon=True)
+                auth_thread.start()
+                self.assertTrue(entered.wait(5))
+                save_thread = threading.Thread(target=replace, daemon=True)
+                save_thread.start()
+                self.assertFalse(saved.wait(0.2))
+                release.set()
+                auth_thread.join(5)
+                save_thread.join(5)
+
+            self.assertFalse(auth_thread.is_alive())
+            self.assertFalse(save_thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0]["timeout"], profile_a["timeout"])
+            self.assertEqual(
+                results[0]["data"]["auth_dispatch"]["profile_revision"],
+                revision_a,
+            )
+            self.assertTrue(saved.is_set())
+            self.assertEqual(
+                credentials.auth_profile_revision(
+                    credentials.load_auth_profile_optional(ws.slug, "primary")
+                ),
+                credentials.auth_profile_revision(profile_b),
+            )
+
     def test_absent_profile_snapshot_holds_lock_through_legacy_delegate(self):
         origin = "https://app.example.test"
         with isolated_runtime():

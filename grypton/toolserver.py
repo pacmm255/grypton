@@ -167,6 +167,13 @@ def _profiled_auth_login(ws: Workspace, requested: str,
 
     if profile["strategy"] == "browser":
         browser = profile["browser"]
+        verification = browser.get("verification")
+        state = credentials.load_attempt_state(ws.slug, str(credential or ""))
+        if isinstance(verification, dict) and state["ever_established"]:
+            result = tools.ensure_browser_status_session(
+                ws, str(credential or "")
+            )
+            return _with_auth_dispatch(result, metadata)
         browser_args = {
             "credential": credential,
             "username_transform": profile["username_transform"],
@@ -178,8 +185,8 @@ def _profiled_auth_login(ws: Workspace, requested: str,
             "verify_headers": browser["verify_headers"],
             "timeout": profile["timeout"],
         }
-        if browser.get("verification") is not None:
-            browser_args["verification"] = browser["verification"]
+        if verification is not None:
+            browser_args["verification"] = verification
         result = tools.credential_browser_login(
             ws, profile["login_url"], **browser_args
         )
@@ -217,6 +224,12 @@ def _auth_login(ws: Workspace, args: dict, *, requested: str) -> dict:
                 return _with_auth_dispatch(result, _auth_dispatch_metadata(
                     requested, requested, configured=False
                 ))
+            if profile is not None:
+                # Keep the canonical profile snapshot stable through routing,
+                # proof, and the revision recorded with that proof.
+                return _profiled_auth_login(
+                    ws, requested, credential, profile
+                )
     except credentials.CredentialError:
         metadata = _auth_dispatch_metadata(
             requested, "", configured=configured
@@ -236,8 +249,6 @@ def _auth_login(ws: Workspace, args: dict, *, requested: str) -> dict:
         }, _auth_dispatch_metadata(
             requested, "", configured=True
         ))
-    if profile is not None:
-        return _profiled_auth_login(ws, requested, credential, profile)
     return _with_auth_dispatch({
         "ok": False,
         "summary": "Configured authentication profile is unavailable; retry later.",
@@ -253,11 +264,72 @@ def _credential_browser_login(ws, args):
 
 
 def _authenticated_http(ws, args):
-    return tools.authenticated_http_request(
-        ws, args["url"], credential=args["credential"],
-        method=args.get("method", "GET"), headers=args.get("headers"),
-        body=args.get("body"), timeout=args.get("timeout", 30),
-    )
+    credential = str(args.get("credential") or "")
+    try:
+        with credentials.auth_profile_lock(ws.slug, credential):
+            with credentials.session_material_lock(ws.slug, credential):
+                profile = credentials.load_auth_profile_optional(
+                    ws.slug, credential
+                )
+                verification = (
+                    profile.get("browser", {}).get("verification")
+                    if isinstance(profile, dict)
+                    and profile.get("strategy") == "browser" else None
+                )
+                maintenance = None
+                request_headers = args.get("headers")
+                accepted_statuses: tuple[int, ...] = ()
+                private_headers = None
+                state = credentials.load_attempt_state(ws.slug, credential)
+                if isinstance(verification, dict) and state["ever_established"]:
+                    ensured = tools.ensure_browser_status_session(
+                        ws, credential
+                    )
+                    ensured_data = (
+                        ensured.get("data")
+                        if isinstance(ensured.get("data"), dict) else {}
+                    )
+                    maintenance = ensured_data.get("session_maintenance")
+                    if not ensured.get("ok"):
+                        state_after = credentials.load_attempt_state(
+                            ws.slug, credential
+                        )
+                        if not state_after["established"]:
+                            return ensured
+                        if not isinstance(maintenance, dict):
+                            maintenance = {
+                                "action": "revalidation-deferred",
+                                "credential_submission": False,
+                            }
+                    if (
+                        str(args.get("method") or "GET").strip().upper() == "GET"
+                        and tools._browser_auth_url_matches(
+                            str(args.get("url") or ""),
+                            str(profile.get("verify_url") or ""),
+                        )
+                    ):
+                        private_headers = profile["browser"]["verify_headers"]
+                        accepted_statuses = (
+                            int(verification["authenticated_status"]),
+                        )
+                result = tools.authenticated_http_request(
+                    ws, args["url"], credential=credential,
+                    method=args.get("method", "GET"),
+                    headers=request_headers, body=args.get("body"),
+                    timeout=args.get("timeout", 30),
+                    _profile_headers=private_headers,
+                    _accepted_statuses=accepted_statuses,
+                )
+                if isinstance(maintenance, dict):
+                    data = (
+                        dict(result.get("data"))
+                        if isinstance(result.get("data"), dict) else {}
+                    )
+                    data["session_maintenance"] = maintenance
+                    result["data"] = data
+                return result
+    except credentials.CredentialError as exc:
+        return {"ok": False, "summary": str(exc)}
 
 
 def _goja_request(ws, args):

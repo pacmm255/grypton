@@ -798,6 +798,139 @@ class CredentialIsolationTests(unittest.TestCase):
             with self.assertRaisesRegex(credentials.CredentialError, "exhausted"):
                 credentials.begin_login_attempt("target", "primary")
 
+    def test_legacy_proven_state_migrates_to_one_refresh_per_generation(self):
+        with isolated_runtime():
+            target, alias = "legacy-refresh", "primary"
+            credentials.save_credential(target, alias, "u", "p")
+            path = credentials.attempt_path(target, alias)
+            credentials._atomic_private_json(path, {
+                "version": 1,
+                "attempts": 2,
+                "established": True,
+                "blocked_reason": "",
+                "origin": "https://app.example.test:443",
+            })
+
+            migrated = credentials.load_attempt_state(target, alias)
+            self.assertTrue(migrated["ever_established"])
+            self.assertEqual(migrated["proof_generation"], 1)
+            self.assertEqual(migrated["refresh_attempted_generation"], 0)
+            credentials.record_session_stale(
+                target, alias, generation=1,
+                profile_revision="0123456789ab",
+            )
+            self.assertEqual(
+                credentials.begin_refresh_attempt(
+                    target, alias, generation=1
+                ),
+                1,
+            )
+            with self.assertRaisesRegex(
+                credentials.CredentialError, "already attempted"
+            ):
+                credentials.begin_refresh_attempt(
+                    target, alias, generation=1
+                )
+            with self.assertRaisesRegex(
+                credentials.CredentialError, "configured session renewal"
+            ):
+                credentials.begin_login_attempt(target, alias)
+            state = credentials.load_attempt_state(target, alias)
+            self.assertEqual(state["attempts"], 2)
+            self.assertEqual(state["refresh_attempted_generation"], 1)
+
+    def test_successful_refresh_advances_proof_and_opens_one_new_slot(self):
+        with isolated_runtime():
+            target, alias = "refresh-generation", "primary"
+            credentials.save_credential(target, alias, "u", "p")
+            credentials.begin_login_attempt(target, alias)
+            credentials.record_login_outcome(
+                target, alias, established=True,
+                origin="https://app.example.test:443",
+                profile_revision="0123456789ab",
+            )
+            credentials.record_session_stale(
+                target, alias, generation=1,
+                profile_revision="0123456789ab",
+            )
+            credentials.begin_refresh_attempt(target, alias, generation=1)
+            credentials.record_refresh_outcome(
+                target, alias, generation=1, established=True,
+                origin="https://app.example.test:443",
+                profile_revision="0123456789ab",
+            )
+            renewed = credentials.load_attempt_state(target, alias)
+            self.assertEqual(renewed["attempts"], 1)
+            self.assertEqual(renewed["proof_generation"], 2)
+            self.assertEqual(renewed["refresh_attempted_generation"], 0)
+
+            credentials.record_session_stale(
+                target, alias, generation=2,
+                profile_revision="0123456789ab",
+            )
+            self.assertEqual(
+                credentials.begin_refresh_attempt(
+                    target, alias, generation=2
+                ),
+                2,
+            )
+
+    def test_failed_refresh_reservation_survives_fresh_interpreter(self):
+        with isolated_runtime() as root:
+            target, alias = "process-refresh", "primary"
+            credentials.save_credential(target, alias, "u", "p")
+            credentials.begin_login_attempt(target, alias)
+            credentials.record_login_outcome(
+                target, alias, established=True,
+                origin="https://app.example.test:443",
+                profile_revision="0123456789ab",
+            )
+            credentials.record_session_stale(
+                target, alias, generation=1,
+                profile_revision="0123456789ab",
+            )
+            credentials.begin_refresh_attempt(target, alias, generation=1)
+            credentials.record_refresh_outcome(
+                target, alias, generation=1,
+            )
+
+            source_root = Path(__file__).resolve().parents[1]
+            environment = dict(os.environ)
+            environment.update({
+                "GRYPTON_HOME": str(root),
+                "GRYPTON_OPENCODE_WORKSPACES_DIR": str(
+                    root / ".opencode-workspaces"
+                ),
+                "PYTHONPATH": str(source_root),
+            })
+            completed = subprocess.run(
+                ["python3", "-c", """
+from grypton import credentials
+try:
+    credentials.begin_refresh_attempt(
+        "process-refresh", "primary", generation=1
+    )
+except credentials.CredentialError as exc:
+    if "already attempted" not in str(exc):
+        raise
+else:
+    raise SystemExit("persisted renewal reservation was reopened")
+"""],
+                cwd=source_root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(
+                completed.returncode, 0,
+                (completed.stdout, completed.stderr),
+            )
+            state = credentials.load_attempt_state(target, alias)
+            self.assertEqual(state["refresh_attempted_generation"], 1)
+            self.assertEqual(state["refresh_submissions"], 1)
+
     def test_new_custom_cookie_is_accepted_only_after_scoped_verification(self):
         with isolated_runtime(), auth_server() as port:
             ws = self._workspace(port)

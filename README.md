@@ -602,6 +602,24 @@ the exact verification URL, point back to that exact URL, and match the ordered
 status list; live and authenticated replay verification remain zero-hop. Any
 mismatch leaves the session unverified.
 
+After a status-differential profile has passed that proof once, ordinary calls
+to either profiled login tool or `authenticated_http_request` keep long runs
+working without another operator or model prompt. The public MCP tools and
+their input schemas do not change; safe result data reports maintenance under
+`data.session_maintenance`. A proof is reused for up to five minutes. Grypton checks
+the exact configured verification URL sooner when reusable material is missing,
+a saved cookie expires within 60 seconds, or the profile revision changes.
+
+That check compares the saved session with a fresh anonymous browser. A complete
+authenticated-versus-anonymous match revalidates the session without submitting
+credentials. Grypton renews the login only when the saved session instead gives
+the exact anonymous outcome and the fresh control confirms the anonymous
+contract. An inconclusive check submits no credential, retains the established
+proof, and lets the requested authenticated call continue. A `401` from any
+other route never starts renewal. Renewal repeats the complete login, live
+verification, saved-session replay, and anonymous-control proof before new
+material is accepted.
+
 `--username-transform iran-e164` handles a stored Iranian mobile identifier.
 `--verify-headers` accepts a JSON object containing static protocol headers such
 as `Accept`, `Origin`, `Referer`, `X-Platform`, or `X-Client-Version`. Origin and
@@ -617,13 +635,13 @@ and `--headers`; the two JSON options accept objects. Remove a saved route with:
 ```
 
 The list shows names such as `primary` and the states `stored`, `authenticated`,
-`exhausted`, or `blocked`, along with the configured strategy, exact origin,
-username representation, and an opaque profile revision. It never prints a
-username, password, cookie, token, selector, marker, static header value, or URL
-path. Running `auth add` again with the same name replaces that credential and
-atomically clears its previous session state after any in-flight authenticated
-transaction finishes. Updating or removing a profile preserves the attempt and
-session state.
+`stale`, `renewal-blocked`, `exhausted`, or `blocked`, along with the configured
+strategy, exact origin, username representation, and an opaque profile revision.
+It never prints a username, password, cookie, token, selector, marker, static
+header value, or URL path. Running `auth add` again with the same name replaces
+that credential and atomically clears its previous session state after any
+in-flight authenticated transaction finishes. Updating or removing a profile
+preserves the attempt and session state.
 
 Kraude receives only the alias. Both login tools remain available with the full
 Grypton tool set. A saved per-alias profile selects the effective HTTP or browser
@@ -669,6 +687,15 @@ denial without clearing the established state and rolls back any cookie or
 token changes made by a denied, failed, or non-2xx/3xx response. The response is
 still returned as an endpoint observation. Only a complete authentication proof
 changes the session state.
+
+Renewal has a separate, private limit: one credential-bearing submission for
+each previously proven session generation. The reservation is written before
+credentials enter the renewal form, survives process restarts and profile
+updates, and is shared by concurrent requests. A failed or inconclusive full
+renewal restores the old cookie and token bytes without reopening that
+generation. A successful full proof advances the generation and permits one
+future renewal if that new session later expires. Replacing the named
+credential clears this renewal state along with its old private material.
 
 Named credentials and session material live under
 `.state/credentials/<engagement>/`, outside the engagement workspace. Private

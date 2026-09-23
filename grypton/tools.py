@@ -30,6 +30,8 @@ from .workspace import Workspace
 
 MAX_RESPONSE_BYTES = 2_000_000
 MAX_INLINE_RESPONSE_CHARS = 12_000
+_AUTH_REVALIDATE_INTERVAL_S = 300
+_AUTH_EXPIRY_SKEW_S = 60
 
 _SENSITIVE_HEADERS = frozenset({
     "authorization", "proxy-authorization", "cookie", "set-cookie",
@@ -1387,10 +1389,23 @@ def _credential_login_locked(workspace: Workspace, url: str, *, credential: str,
 
 def authenticated_http_request(workspace: Workspace, url: str, *, credential: str,
                                method: str = "GET", headers: Optional[dict] = None,
-                               body: Optional[str] = None, timeout: int = 30) -> dict:
+                               body: Optional[str] = None, timeout: int = 30,
+                               _profile_headers: Optional[dict] = None,
+                               _accepted_statuses: Iterable[int] = ()) -> dict:
     """Use a named private session without exposing credential material."""
     try:
         clean_headers = _safe_headers(headers)
+        private_headers = _browser_auth_verify_headers(_profile_headers)
+        normalized = {key.lower() for key in private_headers}
+        clean_headers = {
+            key: value for key, value in clean_headers.items()
+            if key.lower() not in normalized
+        }
+        clean_headers.update(private_headers)
+        accepted_statuses = {
+            int(value) for value in _accepted_statuses
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
     except ValueError as exc:
         return _err(str(exc))
     try:
@@ -1445,7 +1460,8 @@ def authenticated_http_request(workspace: Workspace, url: str, *, credential: st
                         workspace, url, method=method, headers=clean_headers, body=body,
                         timeout=timeout, transport=f"authenticated:{credential}",
                         _secret_values=(
-                            secret["username"], secret["password"], *tokens.values()
+                            secret["username"], secret["password"], *tokens.values(),
+                            *private_headers.values(),
                         ),
                         _cookie_jar=jar, _bearer_token=bearer,
                         _bearer_origin=bound_origin,
@@ -1460,7 +1476,7 @@ def authenticated_http_request(workspace: Workspace, url: str, *, credential: st
                     commit_material = bool(
                         result.get("ok")
                         and not blocker
-                        and 200 <= status < 400
+                        and (200 <= status < 400 or status in accepted_statuses)
                     )
                     if not commit_material:
                         _restore_private_material(jar_storage, cookie_snapshot)
@@ -2172,7 +2188,8 @@ def _launch_scoped_browser_context(playwright, launch_profile: dict,
                                    denied_requests: list[str],
                                    bound_header_origin: str = "",
                                    bound_headers: Optional[dict] = None,
-                                   bound_header_state: Optional[dict] = None):
+                                   bound_header_state: Optional[dict] = None,
+                                   credential_submission_state: Optional[dict] = None):
     """Launch the shared browser boundary and scope-check every network route."""
     context = playwright.chromium.launch_persistent_context(
         user_data_dir=launch_profile["profile"],
@@ -2200,6 +2217,34 @@ def _launch_scoped_browser_context(playwright, launch_profile: dict,
             return
         allowed, _ = check_url_scope(workspace, request_url)
         if allowed:
+            if (
+                credential_submission_state
+                and credential_submission_state.get("active")
+            ):
+                post_data = str(route.request.post_data or "")
+                username_values = tuple(
+                    credential_submission_state.get("username_values") or ()
+                )
+                password_values = tuple(
+                    credential_submission_state.get("password_values") or ()
+                )
+                matches_submission = bool(
+                    post_data
+                    and any(value and value in post_data
+                            for value in username_values)
+                    and any(value and value in post_data
+                            for value in password_values)
+                )
+                if matches_submission:
+                    credential_submission_state["seen"] = int(
+                        credential_submission_state.get("seen") or 0
+                    ) + 1
+                    if credential_submission_state["seen"] > 1:
+                        credential_submission_state["blocked"] = int(
+                            credential_submission_state.get("blocked") or 0
+                        ) + 1
+                        route.abort("blockedbyclient")
+                        return
             request_headers = None
             active_origin = bound_header_origin
             active_headers = bound_headers
@@ -2674,7 +2719,8 @@ def _browser_auth_persistable_cookies(cookies: list[dict], login_url: str) -> li
         domain = str(cookie.get("domain") or "").lower().rstrip(".")
         plain_domain = domain.lstrip(".")
         if not plain_domain or not (
-            host == plain_domain or host.endswith("." + plain_domain)
+            host == plain_domain
+            or (domain.startswith(".") and host.endswith("." + plain_domain))
         ):
             continue
         path = str(cookie.get("path") or "/")
@@ -2969,6 +3015,452 @@ def _browser_auth_fresh_probe(
             context.close()
 
 
+def _browser_auth_persisted_cookies(
+    workspace: Workspace, credential: str, login_url: str,
+) -> list[dict]:
+    """Translate the private curl jar into a fresh-browser cookie set."""
+    host = (urlsplit(login_url).hostname or "").lower().rstrip(".")
+    path = credentials.cookie_jar_storage_path(workspace.slug, credential)
+    now = int(time.time())
+    output: list[dict] = []
+    for columns in credentials._cookie_rows(path):
+        if len(columns) < 7:
+            continue
+        domain = str(columns[0] or "").lower().rstrip(".")
+        plain_domain = domain.lstrip(".")
+        include_subdomains = str(columns[1] or "").upper() == "TRUE"
+        if not plain_domain or not (
+            host == plain_domain
+            or (include_subdomains and host.endswith("." + plain_domain))
+        ):
+            continue
+        try:
+            expires = max(0, int(columns[4] or 0))
+        except (TypeError, ValueError):
+            continue
+        if expires and expires <= now:
+            continue
+        name, value = str(columns[5] or ""), str(columns[6] or "")
+        if (
+            not name or not 8 <= len(value) <= 8192
+            or any("\t" in item or "\r" in item or "\n" in item
+                   for item in (domain, columns[2], name, value))
+        ):
+            continue
+        cookie = {
+            "name": name,
+            "value": value,
+            "domain": domain,
+            "path": str(columns[2] or "/"),
+            "secure": str(columns[3]).upper() == "TRUE",
+        }
+        if expires:
+            cookie["expires"] = expires
+        output.append(cookie)
+    return output
+
+
+def _browser_status_probe_matches(
+    probe: dict, *, status: int, verify_url: str,
+    redirect_statuses: Iterable[int],
+) -> bool:
+    """Match the complete configured GET verifier contract."""
+    return bool(
+        int(probe.get("status") or 0) == int(status)
+        and _browser_auth_redirect_contract_matches(
+            list(probe.get("redirect_chain") or []),
+            tuple(redirect_statuses), verify_url,
+            str(probe.get("method") or "").upper(),
+        )
+        and _browser_auth_url_matches(
+            str(probe.get("response_url") or ""), verify_url
+        )
+        and _browser_auth_url_matches(
+            str(probe.get("final_url") or ""), verify_url
+        )
+    )
+
+
+def _browser_session_revalidation_due(
+    workspace: Workspace, credential: str, state: dict,
+    profile_revision: str,
+) -> bool:
+    """Use time and cookie expiry only to schedule the authoritative proof."""
+    if not state.get("established"):
+        return True
+    if (
+        not _browser_auth_persisted_cookies(
+            workspace, credential, str(state.get("origin") or "")
+        )
+        and not credentials.select_bearer(
+            credentials.load_tokens(workspace.slug, credential)
+        )
+    ):
+        return True
+    if str(state.get("proof_profile_revision") or "") != profile_revision:
+        return True
+    now = time.time()
+    verified_at = float(state.get("verified_at") or 0.0)
+    if verified_at <= 0 or now - verified_at >= _AUTH_REVALIDATE_INTERVAL_S:
+        return True
+    jar = credentials.cookie_jar_storage_path(workspace.slug, credential)
+    for columns in credentials._cookie_rows(jar):
+        try:
+            expires = max(0, int(columns[4] or 0))
+        except (IndexError, TypeError, ValueError):
+            return True
+        if expires and expires <= now + _AUTH_EXPIRY_SKEW_S:
+            return True
+    return False
+
+
+def ensure_browser_status_session(
+    workspace: Workspace, credential: str,
+) -> dict:
+    """Revalidate and, once per proof generation, renew a profiled session."""
+    try:
+        with credentials.auth_profile_lock(workspace.slug, credential):
+            profile = credentials.load_auth_profile_optional(
+                workspace.slug, credential
+            )
+            verification = (
+                profile.get("browser", {}).get("verification")
+                if isinstance(profile, dict)
+                and profile.get("strategy") == "browser" else None
+            )
+            if not isinstance(verification, dict):
+                return _err(
+                    "Automatic renewal is unavailable for this authentication profile."
+                )
+            profile_revision = credentials.auth_profile_revision(profile)
+            for candidate in (
+                profile["login_url"], profile["verify_url"],
+                verification["expected_post_login_url"],
+            ):
+                blocked = _scope_error(workspace, candidate)
+                if blocked:
+                    return blocked
+            login_origin = credentials.normalize_origin(profile["login_url"])
+
+            with credentials.session_material_lock(workspace.slug, credential):
+                state = credentials.load_attempt_state(
+                    workspace.slug, credential
+                )
+                if not state["ever_established"]:
+                    return _err(
+                        f"Named credential {credential!r} has no prior proven session."
+                    )
+                if state["origin"] != login_origin:
+                    return _err(
+                        f"Named credential {credential!r} has no valid private origin "
+                        "binding for its configured authentication profile."
+                    )
+                generation = int(state["proof_generation"])
+                if not _browser_session_revalidation_due(
+                    workspace, credential, state, profile_revision
+                ):
+                    return _ok(
+                        f"Authenticated session {credential!r} is within its "
+                        "private proof freshness window.",
+                        {
+                            "credential": credential,
+                            "session_maintenance": {
+                                "action": "reused",
+                                "credential_submission": False,
+                            },
+                            "session": credentials.session_status(
+                                workspace.slug, credential
+                            ),
+                        },
+                    )
+                jar_path = credentials.cookie_jar_storage_path(
+                    workspace.slug, credential
+                )
+                token_file = credentials.token_path(
+                    workspace.slug, credential
+                )
+                cookie_snapshot = _snapshot_private_material(jar_path)
+                token_snapshot = _snapshot_private_material(token_file)
+                material_committed = False
+                try:
+                    try:
+                        from playwright.sync_api import sync_playwright
+                    except ImportError:
+                        return _err("Python Playwright is not installed.")
+                    executable = _browser_executable()
+                    if not executable:
+                        return _err(
+                            "No Playwright-compatible Chromium or Chrome executable "
+                            "is installed."
+                        )
+                    timeout_seconds = max(5, min(int(profile["timeout"]), 120))
+                    timeout_ms = timeout_seconds * 1000
+                    denied_requests: list[str] = []
+                    console: list[dict] = []
+                    tokens = credentials.load_tokens(
+                        workspace.slug, credential
+                    )
+                    cookies = _browser_auth_persisted_cookies(
+                        workspace, credential, profile["login_url"]
+                    )
+                    with sync_playwright() as playwright:
+                        current = _browser_auth_fresh_probe(
+                            playwright, executable, workspace,
+                            profile["verify_url"], phase="renewal-revalidate",
+                            denied_requests=denied_requests, console=console,
+                            timeout_ms=timeout_ms, cookies=cookies,
+                            bearer_token=credentials.select_bearer(tokens),
+                            verify_headers=profile["browser"]["verify_headers"],
+                        )
+                        control = _browser_auth_fresh_probe(
+                            playwright, executable, workspace,
+                            profile["verify_url"], phase="renewal-control",
+                            denied_requests=denied_requests, console=console,
+                            timeout_ms=timeout_ms,
+                            verify_headers=profile["browser"]["verify_headers"],
+                        )
+
+                    current_source = str(current.get("source") or "")
+                    control_source = str(control.get("source") or "")
+                    challenge = (
+                        _browser_auth_blocker(current_source)
+                        or _browser_auth_blocker(control_source)
+                    )
+                    if challenge.startswith(("MFA/OTP", "CAPTCHA")):
+                        return _err(
+                            "Configured session revalidation was inconclusive; "
+                            "no credential was submitted."
+                        )
+                    current_status = int(current.get("status") or 0)
+                    control_status = int(control.get("status") or 0)
+                    if 429 in {current_status, control_status}:
+                        return _err(
+                            "Configured session revalidation was rate-limited; "
+                            "no credential was submitted."
+                        )
+
+                    control_matches = _browser_status_probe_matches(
+                        control,
+                        status=verification["anonymous_status"],
+                        verify_url=profile["verify_url"],
+                        redirect_statuses=verification.get(
+                            "anonymous_redirect_statuses", ()
+                        ),
+                    )
+                    authenticated = control_matches and _browser_status_probe_matches(
+                        current,
+                        status=verification["authenticated_status"],
+                        verify_url=profile["verify_url"],
+                        redirect_statuses=(),
+                    )
+                    stale_chain = list(current.get("redirect_chain") or [])
+                    # A fresh anonymous client must match the configured redirect
+                    # chain.  The stored session can retain the anonymous edge-gate
+                    # cookie, so an otherwise exact anonymous result may reach the
+                    # same verifier in zero hops.
+                    stale_redirects_match = (
+                        _browser_auth_redirect_contract_matches(
+                            stale_chain, (), profile["verify_url"],
+                            str(current.get("method") or "").upper(),
+                        )
+                        or _browser_auth_redirect_contract_matches(
+                            stale_chain,
+                            verification.get("anonymous_redirect_statuses", ()),
+                            profile["verify_url"],
+                            str(current.get("method") or "").upper(),
+                        )
+                    )
+                    stale = bool(
+                        control_matches
+                        and current_status == verification["anonymous_status"]
+                        and stale_redirects_match
+                        and _browser_auth_url_matches(
+                            str(current.get("response_url") or ""),
+                            profile["verify_url"],
+                        )
+                        and _browser_auth_url_matches(
+                            str(current.get("final_url") or ""),
+                            profile["verify_url"],
+                        )
+                    )
+
+                    if authenticated:
+                        refreshed_cookies = _browser_auth_persistable_cookies(
+                            list(current.get("cookies") or []),
+                            profile["login_url"],
+                        )
+                        refreshed_tokens = dict(tokens)
+                        refreshed_tokens.update(_browser_auth_tokens(
+                            (str(current.get("body") or ""),),
+                            current.get("local_storage")
+                            if isinstance(current.get("local_storage"), dict)
+                            else {},
+                        ))
+                        if not refreshed_cookies and not credentials.select_bearer(
+                            refreshed_tokens
+                        ):
+                            return _err(
+                                "Configured session revalidation produced no reusable "
+                                "private session material; the prior proof was retained.",
+                                {
+                                    "credential": credential,
+                                    "session_maintenance": {
+                                        "action": "inconclusive",
+                                        "credential_submission": False,
+                                    },
+                                    "session": credentials.session_status(
+                                        workspace.slug, credential
+                                    ),
+                                },
+                            )
+                        # Commit the exact resulting jar, including an empty jar
+                        # when the verifier expired its last cookie.
+                        _browser_auth_install_cookies(
+                            workspace, credential, refreshed_cookies,
+                            profile["login_url"],
+                        )
+                        if refreshed_tokens:
+                            credentials.save_tokens(
+                                workspace.slug, credential, refreshed_tokens,
+                                origin=login_origin,
+                            )
+                        credentials.record_session_revalidated(
+                            workspace.slug, credential, generation=generation,
+                            origin=login_origin,
+                            profile_revision=profile_revision,
+                        )
+                        material_committed = True
+                        return _ok(
+                            f"Authenticated session {credential!r} passed its configured "
+                            "status-differential revalidation.",
+                            {
+                                "credential": credential,
+                                "session_maintenance": {
+                                    "action": "revalidated",
+                                    "credential_submission": False,
+                                },
+                                "session": credentials.session_status(
+                                    workspace.slug, credential
+                                ),
+                            },
+                        )
+
+                    if not stale:
+                        return _err(
+                            "Configured session revalidation was inconclusive; "
+                            "no credential was submitted.",
+                            {
+                                "credential": credential,
+                                "session_maintenance": {
+                                    "action": "inconclusive",
+                                    "credential_submission": False,
+                                },
+                                "session": credentials.session_status(
+                                    workspace.slug, credential
+                                ),
+                            },
+                        )
+
+                    credentials.record_session_stale(
+                        workspace.slug, credential, generation=generation,
+                        profile_revision=profile_revision,
+                    )
+                    state = credentials.load_attempt_state(
+                        workspace.slug, credential
+                    )
+                    if state["refresh_attempted_generation"] == generation:
+                        return _err(
+                            "Credential renewal was already attempted for the current "
+                            "session proof; no credential was submitted.",
+                            {
+                                "credential": credential,
+                                "session_maintenance": {
+                                    "action": "renewal-blocked",
+                                    "credential_submission": False,
+                                },
+                                "session": credentials.session_status(
+                                    workspace.slug, credential
+                                ),
+                            },
+                        )
+
+                    browser = profile["browser"]
+                    renewal = _credential_browser_login_locked(
+                        workspace, profile["login_url"], credential=credential,
+                        username_transform=profile["username_transform"],
+                        username_selector=browser["username_selector"],
+                        password_selector=browser["password_selector"],
+                        submit_selector=browser["submit_selector"],
+                        verify_url=profile["verify_url"], success_marker="",
+                        verify_headers=browser["verify_headers"],
+                        verification=verification, timeout=profile["timeout"],
+                        _refresh_generation=generation,
+                        _profile_revision=profile_revision,
+                    )
+                    renewed_state = credentials.load_attempt_state(
+                        workspace.slug, credential
+                    )
+                    proof_committed = bool(
+                        renewed_state["established"]
+                        and renewed_state["proof_generation"] > generation
+                    )
+                    if proof_committed:
+                        # The complete proof and its state transition are
+                        # authoritative.  A later capture-write failure must not
+                        # restore stale material underneath the new generation or
+                        # reopen a credential submission.
+                        material_committed = True
+                    renewed = bool(renewal.get("ok") and proof_committed)
+                    if not renewed:
+                        if proof_committed:
+                            return _ok(
+                                f"Authenticated session {credential!r} was renewed, "
+                                "but its supplemental browser capture was incomplete.",
+                                {
+                                    "credential": credential,
+                                    "session_maintenance": {
+                                        "action": "renewed-capture-incomplete",
+                                        "credential_submission": True,
+                                    },
+                                    "session": credentials.session_status(
+                                        workspace.slug, credential
+                                    ),
+                                },
+                            )
+                        return renewal
+                    renewal_data = (
+                        renewal.get("data")
+                        if isinstance(renewal.get("data"), dict) else {}
+                    )
+                    renewal_data["session_maintenance"] = {
+                        "action": "renewed",
+                        "credential_submission": True,
+                        "credential_submission_requests": int(
+                            renewal_data.get("credential_submission_requests") or 0
+                        ),
+                        "blocked_duplicate_submissions": int(
+                            renewal_data.get("blocked_duplicate_submissions") or 0
+                        ),
+                    }
+                    renewal["data"] = renewal_data
+                    renewal["summary"] = (
+                        f"Authenticated session {credential!r} was renewed and passed "
+                        "the complete configured status-differential proof."
+                    )
+                    return renewal
+                finally:
+                    if not material_committed:
+                        _restore_private_material(jar_path, cookie_snapshot)
+                        _restore_private_material(token_file, token_snapshot)
+    except (OSError, ValueError, credentials.CredentialError) as exc:
+        return _err(str(exc))
+    except Exception:
+        return _err(
+            "Configured session revalidation failed; no credential was submitted "
+            "and private session material was restored."
+        )
+
+
 def credential_browser_login(
     workspace: Workspace,
     url: str,
@@ -2987,6 +3479,12 @@ def credential_browser_login(
     """Serialize one complete browser login proof with other session writers."""
     try:
         with credentials.auth_profile_lock(workspace.slug, credential):
+            profile = credentials.load_auth_profile_optional(
+                workspace.slug, credential
+            )
+            profile_revision = (
+                credentials.auth_profile_revision(profile) if profile else ""
+            )
             with credentials.session_material_lock(workspace.slug, credential):
                 return _credential_browser_login_locked(
                     workspace, url, credential=credential,
@@ -2996,7 +3494,7 @@ def credential_browser_login(
                     submit_selector=submit_selector,
                     verify_url=verify_url, success_marker=success_marker,
                     verify_headers=verify_headers, verification=verification,
-                    timeout=timeout,
+                    timeout=timeout, _profile_revision=profile_revision,
                 )
     except credentials.CredentialError as exc:
         return _err(str(exc))
@@ -3016,6 +3514,8 @@ def _credential_browser_login_locked(
     verify_headers: Optional[dict] = None,
     verification: Optional[dict] = None,
     timeout: int = 45,
+    _refresh_generation: Optional[int] = None,
+    _profile_revision: str = "",
 ) -> dict:
     """Submit one private credential through a scoped rendered login form."""
     verify_url = str(verify_url or "").strip()
@@ -3077,7 +3577,12 @@ def _credential_browser_login_locked(
         login_username = credentials.normalize_login_username(
             secret["username"], username_transform
         )
-        credentials.ensure_login_attempt_available(workspace.slug, credential)
+        if _refresh_generation is None:
+            credentials.ensure_login_attempt_available(workspace.slug, credential)
+        elif status_verification is None:
+            return _err(
+                "Automatic session renewal requires status-differential verification."
+            )
     except (ValueError, credentials.CredentialError) as exc:
         return _err(str(exc))
 
@@ -3159,6 +3664,13 @@ def _credential_browser_login_locked(
         "origin": login_origin,
         "headers": clean_verify_headers,
     }
+    credential_submission_state = {
+        "active": False,
+        "username_values": _serialized_secret_variants(username_redactions),
+        "password_values": _serialized_secret_variants((secret["password"],)),
+        "seen": 0,
+        "blocked": 0,
+    }
 
     def remember_console(message) -> None:
         if len(console) < 100:
@@ -3174,6 +3686,7 @@ def _credential_browser_login_locked(
                 context = _launch_scoped_browser_context(
                     playwright, launch_profile, workspace, denied_requests,
                     bound_header_state=verify_header_state,
+                    credential_submission_state=credential_submission_state,
                 )
                 page = context.new_page()
                 page.on("console", remember_console)
@@ -3202,9 +3715,10 @@ def _credential_browser_login_locked(
                         "credential submission"
                     )
                 if blocker:
-                    credentials.record_login_outcome(
-                        workspace.slug, credential, blocked_reason=blocker
-                    )
+                    if _refresh_generation is None:
+                        credentials.record_login_outcome(
+                            workspace.slug, credential, blocked_reason=blocker
+                        )
                 else:
                     username = _browser_auth_locator(
                         page, username_selector, role="username", timeout_ms=timeout_ms
@@ -3223,22 +3737,54 @@ def _credential_browser_login_locked(
                     observed_cookie_sets.append(baseline_cookies)
                     observed_token_sets.append(baseline_tokens)
                     phase["name"] = "login"
-                    username.fill(login_username, timeout=timeout_ms)
-                    password.fill(secret["password"], timeout=timeout_ms)
-                    _browser_auth_wait_for_submit(page, submit, timeout_ms)
                     capture_session = None
                     try:
-                        capture_session, pending_responses = (
-                            _browser_auth_enable_response_capture(
-                                context, page, workspace, denied_requests,
-                                _serialized_secret_variants(username_redactions),
-                                _serialized_secret_variants((secret["password"],)),
+                        if _refresh_generation is not None:
+                            # Renewal persists its one-submission reservation and
+                            # starts capture before secrets enter the form.  Input
+                            # handlers can submit without a click.
+                            capture_session, pending_responses = (
+                                _browser_auth_enable_response_capture(
+                                    context, page, workspace, denied_requests,
+                                    _serialized_secret_variants(username_redactions),
+                                    _serialized_secret_variants((secret["password"],)),
+                                )
                             )
-                        )
-                        attempt = credentials.begin_login_attempt(
-                            workspace.slug, credential
-                        )
-                        submit.click(timeout=timeout_ms)
+                            attempt = credentials.begin_refresh_attempt(
+                                workspace.slug, credential,
+                                generation=_refresh_generation,
+                            )
+                            credential_submission_state["active"] = True
+                        username.fill(login_username, timeout=timeout_ms)
+                        password.fill(secret["password"], timeout=timeout_ms)
+                        submission_seen = False
+                        if _refresh_generation is not None:
+                            # Let Playwright dispatch any request synchronously
+                            # triggered by the input/change handler.  The route
+                            # guard observes the request before its response,
+                            # so a slow login endpoint cannot make us click and
+                            # send the credentials a second time.
+                            page.wait_for_timeout(100)
+                            submission_seen = bool(
+                                credential_submission_state["seen"]
+                            )
+                        if not submission_seen:
+                            _browser_auth_wait_for_submit(
+                                page, submit, timeout_ms
+                            )
+                            if _refresh_generation is None:
+                                capture_session, pending_responses = (
+                                    _browser_auth_enable_response_capture(
+                                        context, page, workspace, denied_requests,
+                                        _serialized_secret_variants(username_redactions),
+                                        _serialized_secret_variants((secret["password"],)),
+                                    )
+                                )
+                                attempt = credentials.begin_login_attempt(
+                                    workspace.slug, credential
+                                )
+                                credential_submission_state["active"] = True
+                            submit.click(timeout=timeout_ms)
                         deadline = time.monotonic() + timeout_seconds
                         while time.monotonic() < deadline:
                             submission_seen = any(
@@ -3267,6 +3813,7 @@ def _credential_browser_login_locked(
                             "Browser form submission did not complete: " + str(exc)
                         )
                     finally:
+                        credential_submission_state["active"] = False
                         if capture_session is not None:
                             try:
                                 capture_session.send("Fetch.disable")
@@ -3497,6 +4044,8 @@ def _credential_browser_login_locked(
         and not blocker
         and not failure
         and login_material_delta
+        and credential_submission_state["seen"] == 1
+        and credential_submission_state["blocked"] == 0
         and matched_submission_count == 1
         and matched_submission_status == status_verification["login_status"]
         and _browser_auth_url_matches(
@@ -3547,9 +4096,15 @@ def _credential_browser_login_locked(
 
     established = False
     if attempt and blocker:
-        credentials.record_login_outcome(
-            workspace.slug, credential, blocked_reason=blocker
-        )
+        if _refresh_generation is None:
+            credentials.record_login_outcome(
+                workspace.slug, credential, blocked_reason=blocker
+            )
+        else:
+            credentials.record_refresh_outcome(
+                workspace.slug, credential,
+                generation=_refresh_generation, blocked_reason=blocker,
+            )
     elif attempt and not failure and (
         status_proved if status_mode else material_delta and marker_proved
     ):
@@ -3557,20 +4112,44 @@ def _credential_browser_login_locked(
             _browser_auth_install_cookies(
                 workspace, credential, cookies, url
             )
+            if _refresh_generation is not None:
+                # A renewed browser proof is a replacement session.  Keeping a
+                # bearer from the stale generation could override the newly
+                # proven cookie on subsequent HTTP requests.
+                credentials.token_path(
+                    workspace.slug, credential
+                ).unlink(missing_ok=True)
             if tokens:
                 credentials.save_tokens(
                     workspace.slug, credential, tokens, origin=login_origin
                 )
-            credentials.record_login_outcome(
-                workspace.slug, credential, established=True,
-                origin=login_origin,
-            )
+            if _refresh_generation is None:
+                credentials.record_login_outcome(
+                    workspace.slug, credential, established=True,
+                    origin=login_origin, profile_revision=_profile_revision,
+                )
+            else:
+                credentials.record_refresh_outcome(
+                    workspace.slug, credential,
+                    generation=_refresh_generation, established=True,
+                    origin=login_origin, profile_revision=_profile_revision,
+                )
             established = True
         except (OSError, credentials.CredentialError) as exc:
             failure = failure or f"Private browser session could not be saved: {exc}"
-            credentials.record_login_outcome(workspace.slug, credential)
+            if _refresh_generation is None:
+                credentials.record_login_outcome(workspace.slug, credential)
+            else:
+                credentials.record_refresh_outcome(
+                    workspace.slug, credential, generation=_refresh_generation
+                )
     elif attempt:
-        credentials.record_login_outcome(workspace.slug, credential)
+        if _refresh_generation is None:
+            credentials.record_login_outcome(workspace.slug, credential)
+        else:
+            credentials.record_refresh_outcome(
+                workspace.slug, credential, generation=_refresh_generation
+            )
 
     safe_final_url = _browser_redact_identity_text(
         final_url, secret_values, identity_values
@@ -3607,6 +4186,8 @@ def _credential_browser_login_locked(
         "login_status": page_status,
         "final_url": safe_final_url,
         "matched_submission_count": matched_submission_count,
+        "credential_submission_requests": credential_submission_state["seen"],
+        "blocked_duplicate_submissions": credential_submission_state["blocked"],
         "matched_submission_status": matched_submission_status,
         "login_session_material": login_material_delta,
         "login_api_responses": response_rows,
@@ -3687,6 +4268,8 @@ def _credential_browser_login_locked(
             "status-differential" if status_mode else "marker"
         ),
         "matched_submission_count": matched_submission_count,
+        "credential_submission_requests": credential_submission_state["seen"],
+        "blocked_duplicate_submissions": credential_submission_state["blocked"],
         "matched_submission_status": matched_submission_status,
         "login_session_material": login_material_delta,
         "login_api_responses": response_rows,
@@ -3698,6 +4281,11 @@ def _credential_browser_login_locked(
         "browser_identity": browser_identity,
         "session": session,
     }
+    if _refresh_generation is not None:
+        data["session_renewal"] = {
+            "attempted": bool(attempt),
+            "proof_completed": established,
+        }
     if established:
         proof_kind = (
             "status-differential proof" if status_mode
@@ -3726,7 +4314,12 @@ def _credential_browser_login_locked(
             data,
         )
     if status_mode:
-        if matched_submission_count != 1:
+        if (
+            credential_submission_state["seen"] != 1
+            or credential_submission_state["blocked"]
+        ):
+            reason = "exactly one credential submission request was not allowed"
+        elif matched_submission_count != 1:
             reason = "exactly one credential submission response was not observed"
         elif matched_submission_status != status_verification["login_status"]:
             reason = "the credential submission status did not match the profile"

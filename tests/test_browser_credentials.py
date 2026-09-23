@@ -11,10 +11,11 @@ import unittest
 from urllib.parse import quote, quote_plus
 from unittest.mock import patch
 
-from grypton import config, credentials
+from grypton import config, credentials, tools
 from grypton.toolserver import REGISTRY, _handle, dispatch
 from grypton.tools import (
-    _browser_auth_blocker, _browser_auth_redirect_contract_matches,
+    _browser_auth_blocker, _browser_auth_persisted_cookies,
+    _browser_auth_redirect_contract_matches,
 )
 from grypton.workspace import Constraints, Workspace
 
@@ -297,6 +298,211 @@ def spa_auth_server(mode: str):
         thread.join(timeout=2)
 
 
+class _RenewAuthHandler(BaseHTTPRequestHandler):
+    username = "+989123456789"
+    password = "renew-password-never-log"
+    session = "renew-session-never-log"
+    edge = "renew-edge-never-log"
+    login_posts = 0
+    verify_requests = 0
+    resource_requests = 0
+    reject_login = False
+    inconclusive_control = False
+    rotate_on_next_verify = ""
+    block_login_page = False
+    auto_submit_on_input = False
+    delay_login_response = False
+    delete_cookie_on_next_verify = False
+    fail_renewal_verify = False
+    verify_header_values: list[str] = []
+
+    def _send(self, status: int, body: bytes, *, content_type: str,
+              cookies: tuple[str, ...] = ()) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        for cookie in cookies:
+            self.send_header("Set-Cookie", cookie)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, status: int, value: dict,
+              *, cookies: tuple[str, ...] = ()) -> None:
+        self._send(
+            status, json.dumps(value).encode(),
+            content_type="application/json", cookies=cookies,
+        )
+
+    def _authenticated(self) -> bool:
+        return (
+            f"app_session={type(self).session}"
+            in self.headers.get("Cookie", "")
+        )
+
+    def do_GET(self):
+        if self.path == "/login":
+            if type(self).block_login_page:
+                self._json(429, {"error": "rate limited"})
+                return
+            auto_submit = (
+                "document.querySelector('[data-testid=\"login-password\"]')"
+                ".addEventListener('input', () => "
+                "document.getElementById('login-form').requestSubmit(), {once:true});"
+                if type(self).auto_submit_on_input else ""
+            )
+            html = """<!doctype html><html><body>
+            <form id='login-form'>
+              <input data-testid='login-username'>
+              <input data-testid='login-password' type='password'>
+              <button data-testid='login-submit' type='submit'>Sign in</button>
+            </form><script>
+            document.getElementById('login-form').addEventListener('submit', async (event) => {
+              event.preventDefault();
+              const response = await fetch('/api/login', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                  username: document.querySelector('[data-testid="login-username"]').value,
+                  password: document.querySelector('[data-testid="login-password"]').value
+                })
+              });
+              if (response.ok) window.location.assign('/home');
+            });
+            __AUTO_SUBMIT__
+            </script></body></html>""".replace(
+                "__AUTO_SUBMIT__", auto_submit
+            ).encode()
+            self._send(200, html, content_type="text/html; charset=utf-8")
+            return
+        if self.path == "/home":
+            if self._authenticated():
+                self._send(
+                    200, b"<html><body>home</body></html>",
+                    content_type="text/html; charset=utf-8",
+                )
+            else:
+                self.send_response(302)
+                self.send_header("Location", "/login")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            return
+        if self.path == "/verify":
+            type(self).verify_requests += 1
+            type(self).verify_header_values.append(
+                self.headers.get("X-SPA-Client", "")
+            )
+            if self.headers.get("X-SPA-Client") != "milli-web":
+                self._json(418, {"error": "missing protocol header"})
+                return
+            if self._authenticated():
+                if (
+                    type(self).fail_renewal_verify
+                    and type(self).login_posts >= 2
+                ):
+                    self._json(404, {"authenticated": False})
+                    return
+                cookies: tuple[str, ...] = ()
+                if type(self).delete_cookie_on_next_verify:
+                    type(self).delete_cookie_on_next_verify = False
+                    cookies = ("app_session=; Max-Age=0; HttpOnly; Path=/",)
+                elif type(self).rotate_on_next_verify:
+                    type(self).session = type(self).rotate_on_next_verify
+                    type(self).rotate_on_next_verify = ""
+                    cookies = (
+                        f"app_session={type(self).session}; HttpOnly; Path=/",
+                    )
+                self._json(400, {"authenticated": True}, cookies=cookies)
+                return
+            if f"edge_clearance={type(self).edge}" not in self.headers.get(
+                "Cookie", ""
+            ):
+                self.send_response(307)
+                self.send_header("Location", "/verify")
+                self.send_header(
+                    "Set-Cookie",
+                    f"edge_clearance={type(self).edge}; HttpOnly; Path=/",
+                )
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            status = 403 if type(self).inconclusive_control else 401
+            self._json(status, {"authenticated": False})
+            return
+        if self.path == "/resource":
+            type(self).resource_requests += 1
+            self._json(
+                200 if self._authenticated() else 401,
+                {"resource": self._authenticated()},
+            )
+            return
+        if self.path == "/arbitrary-400":
+            self._json(
+                400, {"error": "route-specific"},
+                cookies=("app_session=poison-cookie-never-keep; HttpOnly; Path=/",),
+            )
+            return
+        if self.path == "/arbitrary-401":
+            self._json(401, {"error": "route denied"})
+            return
+        self._json(404, {"error": "not found"})
+
+    def do_POST(self):
+        if self.path != "/api/login":
+            self._json(404, {"error": "not found"})
+            return
+        type(self).login_posts += 1
+        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            value = json.loads(self.rfile.read(length).decode())
+        except ValueError:
+            value = {}
+        if type(self).delay_login_response:
+            # Keep an input-triggered request in flight beyond the point where
+            # the browser flow decides whether it needs to click submit.
+            time.sleep(1)
+        if (
+            type(self).reject_login
+            or value.get("username") != self.username
+            or value.get("password") != self.password
+        ):
+            self._json(401, {"error": "invalid credentials"})
+            return
+        self._json(
+            200, {"authenticated": True},
+            cookies=(
+                f"app_session={type(self).session}; HttpOnly; Path=/",
+            ),
+        )
+
+    def log_message(self, *_args):
+        pass
+
+
+@contextmanager
+def renew_auth_server():
+    _RenewAuthHandler.session = "renew-session-never-log"
+    _RenewAuthHandler.login_posts = 0
+    _RenewAuthHandler.verify_requests = 0
+    _RenewAuthHandler.resource_requests = 0
+    _RenewAuthHandler.reject_login = False
+    _RenewAuthHandler.inconclusive_control = False
+    _RenewAuthHandler.rotate_on_next_verify = ""
+    _RenewAuthHandler.block_login_page = False
+    _RenewAuthHandler.auto_submit_on_input = False
+    _RenewAuthHandler.delay_login_response = False
+    _RenewAuthHandler.delete_cookie_on_next_verify = False
+    _RenewAuthHandler.fail_renewal_verify = False
+    _RenewAuthHandler.verify_header_values = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _RenewAuthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 class BrowserCredentialTests(unittest.TestCase):
     def _workspace(self, port: int) -> Workspace:
         ws = Workspace("browser-credential-test")
@@ -346,6 +552,473 @@ class BrowserCredentialTests(unittest.TestCase):
                 "anonymous_redirect_statuses"
             ] = anonymous_redirect_statuses
         return profile
+
+    def _renew_profile(self, port: int) -> dict:
+        origin = f"http://127.0.0.1:{port}"
+        return {
+            "version": 1,
+            "strategy": "browser",
+            "login_url": origin + "/login",
+            "verify_url": origin + "/verify",
+            "username_transform": "iran-e164",
+            "timeout": 8,
+            "browser": {
+                "username_selector": "[data-testid='login-username']",
+                "password_selector": "[data-testid='login-password']",
+                "submit_selector": "[data-testid='login-submit']",
+                "verify_headers": {"X-SPA-Client": "milli-web"},
+                "verification": {
+                    "mode": "status-differential",
+                    "login_status": 200,
+                    "authenticated_status": 400,
+                    "anonymous_status": 401,
+                    "expected_post_login_url": origin + "/home",
+                    "anonymous_redirect_statuses": [307],
+                },
+            },
+        }
+
+    def _establish_renewable_session(self, ws: Workspace, port: int) -> dict:
+        credentials.save_credential(
+            ws.slug, "primary", "09123456789", _RenewAuthHandler.password
+        )
+        credentials.save_auth_profile(
+            ws.slug, "primary", self._renew_profile(port)
+        )
+        result = dispatch(ws, "credential_login", {"credential": "primary"})
+        self.assertTrue(result["ok"], result)
+        return result
+
+    def _expire_private_cookie(self, ws: Workspace) -> None:
+        jar = credentials.cookie_jar_storage_path(ws.slug, "primary")
+        rows = credentials._cookie_rows(jar)
+        rendered = ["# Netscape HTTP Cookie File"]
+        for row in rows:
+            columns = list(row)
+            if columns[5] == "app_session":
+                columns[4] = str(int(time.time()) - 60)
+            rendered.append("\t".join(columns))
+        jar.write_text("\n".join(rendered) + "\n", encoding="utf-8")
+
+    def test_recent_profile_session_reuses_proof_without_probe_or_submission(self):
+        with isolated_runtime(), renew_auth_server() as port:
+            ws = self._workspace(port)
+            self._establish_renewable_session(ws, port)
+            posts = _RenewAuthHandler.login_posts
+            verifies = _RenewAuthHandler.verify_requests
+
+            result = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/resource",
+                "credential": "primary",
+            })
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts)
+            self.assertEqual(_RenewAuthHandler.verify_requests, verifies)
+            self.assertEqual(_RenewAuthHandler.resource_requests, 1)
+            self.assertEqual(
+                result["data"]["session_maintenance"]["action"], "reused"
+            )
+
+    def test_expired_session_renews_once_and_discards_stale_bearer(self):
+        with isolated_runtime(), renew_auth_server() as port:
+            ws = self._workspace(port)
+            self._establish_renewable_session(ws, port)
+            proven = credentials.load_attempt_state(ws.slug, "primary")
+            credentials._atomic_private_json(
+                credentials.attempt_path(ws.slug, "primary"),
+                {
+                    "version": 1,
+                    "attempts": 2,
+                    "established": True,
+                    "blocked_reason": "",
+                    "origin": proven["origin"],
+                },
+            )
+            initial = credentials.load_attempt_state(ws.slug, "primary")
+            self._expire_private_cookie(ws)
+            credentials.save_tokens(
+                ws.slug, "primary", {"access_token": "stale-bearer-never-send"},
+                origin=f"http://127.0.0.1:{port}",
+            )
+            posts = _RenewAuthHandler.login_posts
+
+            result = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/resource",
+                "credential": "primary",
+            })
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+            self.assertEqual(_RenewAuthHandler.resource_requests, 1)
+            state = credentials.load_attempt_state(ws.slug, "primary")
+            self.assertEqual(state["attempts"], initial["attempts"])
+            self.assertEqual(
+                state["proof_generation"], initial["proof_generation"] + 1
+            )
+            self.assertTrue(state["established"])
+            self.assertFalse(credentials.token_path(
+                ws.slug, "primary"
+            ).exists())
+            self.assertEqual(
+                result["data"]["session_maintenance"]["action"], "renewed"
+            )
+
+            self._expire_private_cookie(ws)
+            second = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/resource",
+                "credential": "primary",
+            })
+            self.assertTrue(second["ok"], second)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 2)
+            second_state = credentials.load_attempt_state(ws.slug, "primary")
+            self.assertEqual(
+                second_state["proof_generation"],
+                initial["proof_generation"] + 2,
+            )
+            self.assertEqual(second_state["attempts"], 2)
+
+    def test_stale_probe_allows_retained_edge_cookie_zero_hop(self):
+        with isolated_runtime(), renew_auth_server() as port:
+            ws = self._workspace(port)
+            self._establish_renewable_session(ws, port)
+            self._expire_private_cookie(ws)
+            jar = credentials.cookie_jar_storage_path(ws.slug, "primary")
+            with jar.open("a", encoding="utf-8") as stream:
+                stream.write("\t".join((
+                    "127.0.0.1", "FALSE", "/", "FALSE",
+                    str(int(time.time()) + 3600),
+                    "edge_clearance", _RenewAuthHandler.edge,
+                )) + "\n")
+            posts = _RenewAuthHandler.login_posts
+
+            result = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/resource",
+                "credential": "primary",
+            })
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+            self.assertEqual(_RenewAuthHandler.resource_requests, 1)
+            self.assertEqual(
+                result["data"]["session_maintenance"]["action"], "renewed"
+            )
+
+    def test_failed_renewal_cannot_repeat_via_restart_or_profile_change(self):
+        with isolated_runtime(), renew_auth_server() as port:
+            ws = self._workspace(port)
+            self._establish_renewable_session(ws, port)
+            self._expire_private_cookie(ws)
+            jar = credentials.cookie_jar_storage_path(ws.slug, "primary")
+            credentials.save_tokens(
+                ws.slug, "primary", {"access_token": "old-bearer-never-keep"},
+                origin=f"http://127.0.0.1:{port}",
+            )
+            token_file = credentials.token_path(ws.slug, "primary")
+            cookie_before, token_before = jar.read_bytes(), token_file.read_bytes()
+            posts = _RenewAuthHandler.login_posts
+            _RenewAuthHandler.reject_login = True
+
+            first = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/resource",
+                "credential": "primary",
+            })
+            self.assertFalse(first["ok"], first)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+            self.assertEqual(_RenewAuthHandler.resource_requests, 0)
+            self.assertEqual(jar.read_bytes(), cookie_before)
+            self.assertEqual(token_file.read_bytes(), token_before)
+
+            restarted = Workspace(ws.slug)
+            second = dispatch(restarted, "credential_login", {
+                "credential": "primary"
+            })
+            self.assertFalse(second["ok"], second)
+            profile = self._renew_profile(port)
+            profile["timeout"] = 9
+            credentials.save_auth_profile(ws.slug, "primary", profile)
+            third = dispatch(ws, "credential_browser_login", {
+                "credential": "primary"
+            })
+            self.assertFalse(third["ok"], third)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+            state = credentials.load_attempt_state(ws.slug, "primary")
+            self.assertEqual(state["attempts"], 1)
+            self.assertEqual(
+                state["refresh_attempted_generation"],
+                state["proof_generation"],
+            )
+            self.assertEqual(state["blocked_reason"], "")
+
+    def test_inconclusive_maintenance_preserves_and_uses_proven_session(self):
+        with isolated_runtime(), renew_auth_server() as port:
+            ws = self._workspace(port)
+            self._establish_renewable_session(ws, port)
+            state = credentials.load_attempt_state(ws.slug, "primary")
+            state["verified_at"] = 0
+            credentials._atomic_private_json(
+                credentials.attempt_path(ws.slug, "primary"),
+                {"version": 2, **state},
+            )
+            posts = _RenewAuthHandler.login_posts
+            _RenewAuthHandler.inconclusive_control = True
+
+            result = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/resource",
+                "credential": "primary",
+            })
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts)
+            self.assertEqual(_RenewAuthHandler.resource_requests, 1)
+            self.assertTrue(credentials.load_attempt_state(
+                ws.slug, "primary"
+            )["established"])
+            self.assertEqual(
+                result["data"]["session_maintenance"]["action"],
+                "inconclusive",
+            )
+
+    def test_expected_verifier_400_commits_rotation_but_arbitrary_400_rolls_back(self):
+        with isolated_runtime(), renew_auth_server() as port:
+            ws = self._workspace(port)
+            self._establish_renewable_session(ws, port)
+            jar = credentials.cookie_jar_storage_path(ws.slug, "primary")
+            _RenewAuthHandler.rotate_on_next_verify = "rotated-session-never-log"
+
+            verifier = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/verify",
+                "credential": "primary",
+            })
+            self.assertTrue(verifier["ok"], verifier)
+            rotated = jar.read_bytes()
+            self.assertIn(b"rotated-session-never-log", rotated)
+            self.assertTrue(all(
+                value == "milli-web"
+                for value in _RenewAuthHandler.verify_header_values
+            ))
+
+            arbitrary = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/arbitrary-400",
+                "credential": "primary",
+            })
+            self.assertTrue(arbitrary["ok"], arbitrary)
+            self.assertEqual(jar.read_bytes(), rotated)
+            self.assertTrue(arbitrary["data"]["session_material_rollback"])
+
+    def test_concurrent_expired_requests_share_one_renewal(self):
+        with isolated_runtime(), renew_auth_server() as port:
+            ws = self._workspace(port)
+            self._establish_renewable_session(ws, port)
+            self._expire_private_cookie(ws)
+            posts = _RenewAuthHandler.login_posts
+            results: list[dict] = []
+            errors: list[BaseException] = []
+
+            def request() -> None:
+                try:
+                    results.append(dispatch(ws, "authenticated_http_request", {
+                        "url": f"http://127.0.0.1:{port}/resource",
+                        "credential": "primary",
+                    }))
+                except BaseException as exc:
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=request) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(30)
+
+            self.assertFalse(any(thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 2)
+            self.assertTrue(all(result["ok"] for result in results), results)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+            self.assertEqual(_RenewAuthHandler.resource_requests, 2)
+
+    def test_arbitrary_401_never_starts_renewal(self):
+        with isolated_runtime(), renew_auth_server() as port:
+            ws = self._workspace(port)
+            self._establish_renewable_session(ws, port)
+            posts = _RenewAuthHandler.login_posts
+
+            result = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/arbitrary-401",
+                "credential": "primary",
+            })
+
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts)
+            self.assertTrue(credentials.load_attempt_state(
+                ws.slug, "primary"
+            )["established"])
+            self.assertEqual(
+                result["data"]["auth_observation"]["kind"],
+                "endpoint-unauthenticated",
+            )
+
+    def test_capture_failure_keeps_completed_renewal_generation_closed(self):
+        with isolated_runtime(), renew_auth_server() as port:
+            ws = self._workspace(port)
+            self._establish_renewable_session(ws, port)
+            self._expire_private_cookie(ws)
+            before = credentials.load_attempt_state(ws.slug, "primary")
+            posts = _RenewAuthHandler.login_posts
+
+            with patch(
+                "grypton.tools._browser_auth_save_capture",
+                side_effect=OSError("synthetic capture failure"),
+            ):
+                result = dispatch(ws, "authenticated_http_request", {
+                    "url": f"http://127.0.0.1:{port}/resource",
+                    "credential": "primary",
+                })
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(
+                result["data"]["session_maintenance"]["action"],
+                "renewed-capture-incomplete",
+            )
+            after = credentials.load_attempt_state(ws.slug, "primary")
+            self.assertTrue(after["established"])
+            self.assertEqual(
+                after["proof_generation"], before["proof_generation"] + 1
+            )
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+
+            again = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/resource",
+                "credential": "primary",
+            })
+            self.assertTrue(again["ok"], again)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+
+    def test_refresh_reservation_precedes_input_autosubmit(self):
+        with isolated_runtime(), renew_auth_server() as port:
+            ws = self._workspace(port)
+            self._establish_renewable_session(ws, port)
+            self._expire_private_cookie(ws)
+            _RenewAuthHandler.auto_submit_on_input = True
+            _RenewAuthHandler.delay_login_response = True
+            posts = _RenewAuthHandler.login_posts
+
+            result = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/resource",
+                "credential": "primary",
+            })
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+            self.assertEqual(
+                result["data"]["session_maintenance"]["action"], "renewed"
+            )
+            self.assertEqual(
+                result["data"]["session_maintenance"][
+                    "credential_submission_requests"
+                ],
+                1,
+            )
+
+    def test_refresh_prelogin_blocker_never_fills_or_submits(self):
+        with isolated_runtime(), renew_auth_server() as port:
+            ws = self._workspace(port)
+            self._establish_renewable_session(ws, port)
+            self._expire_private_cookie(ws)
+            _RenewAuthHandler.block_login_page = True
+            posts = _RenewAuthHandler.login_posts
+
+            result = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/resource",
+                "credential": "primary",
+            })
+
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts)
+            state = credentials.load_attempt_state(ws.slug, "primary")
+            self.assertFalse(state["established"])
+            self.assertEqual(state["refresh_attempted_generation"], 0)
+
+    def test_full_renewal_proof_failure_restores_material_and_closes_slot(self):
+        with isolated_runtime(), renew_auth_server() as port:
+            ws = self._workspace(port)
+            self._establish_renewable_session(ws, port)
+            self._expire_private_cookie(ws)
+            credentials.save_tokens(
+                ws.slug, "primary", {"access_token": "old-proof-bearer"},
+                origin=f"http://127.0.0.1:{port}",
+            )
+            jar = credentials.cookie_jar_storage_path(ws.slug, "primary")
+            token_file = credentials.token_path(ws.slug, "primary")
+            old_cookie, old_token = jar.read_bytes(), token_file.read_bytes()
+            before = credentials.load_attempt_state(ws.slug, "primary")
+            posts = _RenewAuthHandler.login_posts
+            _RenewAuthHandler.fail_renewal_verify = True
+
+            first = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/resource",
+                "credential": "primary",
+            })
+            self.assertFalse(first["ok"], first)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+            self.assertEqual(_RenewAuthHandler.resource_requests, 0)
+            self.assertEqual(jar.read_bytes(), old_cookie)
+            self.assertEqual(token_file.read_bytes(), old_token)
+            failed = credentials.load_attempt_state(ws.slug, "primary")
+            self.assertEqual(failed["attempts"], before["attempts"])
+            self.assertEqual(
+                failed["refresh_attempted_generation"],
+                failed["proof_generation"],
+            )
+
+            second = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/resource",
+                "credential": "primary",
+            })
+            self.assertFalse(second["ok"], second)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+            self.assertEqual(_RenewAuthHandler.resource_requests, 0)
+
+    def test_revalidation_cookie_deletion_does_not_create_empty_fresh_lease(self):
+        with isolated_runtime(), renew_auth_server() as port:
+            ws = self._workspace(port)
+            self._establish_renewable_session(ws, port)
+            state = credentials.load_attempt_state(ws.slug, "primary")
+            state["verified_at"] = 0
+            credentials._atomic_private_json(
+                credentials.attempt_path(ws.slug, "primary"),
+                {"version": 2, **state},
+            )
+            jar = credentials.cookie_jar_storage_path(ws.slug, "primary")
+            before = jar.read_bytes()
+            _RenewAuthHandler.delete_cookie_on_next_verify = True
+
+            result = tools.ensure_browser_status_session(ws, "primary")
+
+            self.assertFalse(result["ok"], result)
+            self.assertIn("no reusable", result["summary"])
+            self.assertEqual(jar.read_bytes(), before)
+            after = credentials.load_attempt_state(ws.slug, "primary")
+            self.assertTrue(after["established"])
+            self.assertEqual(after["verified_at"], 0)
+
+    def test_netscape_host_only_cookie_is_not_widened_to_subdomain(self):
+        with isolated_runtime():
+            ws = Workspace("cookie-domain-flags")
+            ws.create("https://app.example.test", "web")
+            rows = [
+                ("example.test", "FALSE", "/", "TRUE", "0", "host_only", "host-only-value"),
+                ("example.test", "TRUE", "/", "TRUE", "0", "domain_cookie", "domain-cookie-value"),
+                ("app.example.test", "FALSE", "/", "TRUE", "0", "exact_cookie", "exact-cookie-value"),
+            ]
+            with patch("grypton.credentials._cookie_rows", return_value=rows):
+                loaded = _browser_auth_persisted_cookies(
+                    ws, "primary", "https://app.example.test/login"
+                )
+            self.assertEqual(
+                {cookie["name"] for cookie in loaded},
+                {"domain_cookie", "exact_cookie"},
+            )
 
     def test_profile_status_differential_proves_real_browser_session(self):
         with isolated_runtime(), spa_auth_server("success") as port:

@@ -17,6 +17,7 @@ import re
 import secrets
 import stat
 import threading
+import time
 from urllib.parse import urlsplit
 
 from . import config
@@ -735,6 +736,13 @@ def load_attempt_state(target: str, name: str) -> dict:
             "established": False,
             "blocked_reason": "",
             "origin": "",
+            "ever_established": False,
+            "proof_generation": 0,
+            "verified_at": 0.0,
+            "proof_profile_revision": "",
+            "refresh_attempted_generation": 0,
+            "refresh_submissions": 0,
+            "refresh_blocked_reason": "",
         }
     value = _read_private_json(path)
     origin = value.get("origin")
@@ -745,17 +753,51 @@ def load_attempt_state(target: str, name: str) -> dict:
             origin = normalize_origin(origin)
         except CredentialError:
             origin = ""
+    established = bool(value.get("established"))
+    # Version-one state did not distinguish the lifetime proof from the
+    # currently reusable material.  An established legacy session is therefore
+    # a proven generation and remains eligible for a bounded renewal even when
+    # its original two-login budget has been consumed.
+    ever_established = bool(value.get("ever_established", established))
+    proof_generation = max(0, int(value.get("proof_generation") or 0))
+    if ever_established and proof_generation == 0:
+        proof_generation = 1
+    try:
+        verified_at = max(0.0, float(value.get("verified_at") or 0.0))
+    except (TypeError, ValueError):
+        verified_at = 0.0
+    profile_revision = str(value.get("proof_profile_revision") or "")
+    if profile_revision and not re.fullmatch(r"[0-9a-f]{12}", profile_revision):
+        profile_revision = ""
+    refresh_attempted_generation = max(
+        0, int(value.get("refresh_attempted_generation") or 0)
+    )
     return {
         "attempts": max(0, int(value.get("attempts") or 0)),
-        "established": bool(value.get("established")),
+        "established": established,
         "blocked_reason": str(value.get("blocked_reason") or ""),
         "origin": origin,
+        "ever_established": ever_established,
+        "proof_generation": proof_generation,
+        "verified_at": verified_at,
+        "proof_profile_revision": profile_revision,
+        "refresh_attempted_generation": refresh_attempted_generation,
+        "refresh_submissions": max(
+            0, int(value.get("refresh_submissions") or 0)
+        ),
+        "refresh_blocked_reason": str(
+            value.get("refresh_blocked_reason") or ""
+        ),
     }
 
 def _assert_login_attempt_available(state: dict) -> None:
     if state["established"]:
         raise CredentialError(
             "an authenticated session already exists; use authenticated_http_request"
+        )
+    if state["ever_established"]:
+        raise CredentialError(
+            "a previously proven credential must use its configured session renewal"
         )
     if state["blocked_reason"]:
         raise CredentialError(
@@ -788,12 +830,13 @@ def begin_login_attempt(target: str, name: str) -> int:
             state = load_attempt_state(target, name)
             _assert_login_attempt_available(state)
             state["attempts"] += 1
-            _atomic_private_json(attempt_path(target, name), {"version": 1, **state})
+            _atomic_private_json(attempt_path(target, name), {"version": 2, **state})
             return state["attempts"]
 
 
 def record_login_outcome(target: str, name: str, *, established: bool = False,
-                         blocked_reason: str = "", origin: str | None = None) -> None:
+                         blocked_reason: str = "", origin: str | None = None,
+                         profile_revision: str = "") -> None:
     with session_material_lock(target, name):
         lock_path = attempt_path(target, name).with_suffix(".lock")
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -808,7 +851,127 @@ def record_login_outcome(target: str, name: str, *, established: bool = False,
                 raise CredentialError(
                     "an authenticated session requires an exact origin binding"
                 )
-            _atomic_private_json(attempt_path(target, name), {"version": 1, **state})
+            if state["established"]:
+                state["ever_established"] = True
+                if state["proof_generation"] == 0:
+                    state["proof_generation"] = 1
+                state["verified_at"] = time.time()
+                state["refresh_attempted_generation"] = 0
+                state["refresh_blocked_reason"] = ""
+                if profile_revision:
+                    if not re.fullmatch(r"[0-9a-f]{12}", profile_revision):
+                        raise CredentialError("authentication profile revision is invalid")
+                    state["proof_profile_revision"] = profile_revision
+            _atomic_private_json(attempt_path(target, name), {"version": 2, **state})
+
+
+def record_session_stale(target: str, name: str, *, generation: int,
+                         profile_revision: str) -> None:
+    """Mark one exact-probed proof generation stale without opening a retry loop."""
+    with session_material_lock(target, name):
+        lock_path = attempt_path(target, name).with_suffix(".lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "r+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            state = load_attempt_state(target, name)
+            if not state["ever_established"] or state["proof_generation"] != generation:
+                raise CredentialError("authenticated session proof changed during renewal")
+            if not re.fullmatch(r"[0-9a-f]{12}", str(profile_revision or "")):
+                raise CredentialError("authentication profile revision is invalid")
+            state["established"] = False
+            state["blocked_reason"] = ""
+            state["proof_profile_revision"] = str(profile_revision)
+            state["refresh_blocked_reason"] = ""
+            _atomic_private_json(attempt_path(target, name), {"version": 2, **state})
+
+
+def record_session_revalidated(target: str, name: str, *, generation: int,
+                               origin: str, profile_revision: str) -> None:
+    """Record a complete verifier/control proof without credential submission."""
+    with session_material_lock(target, name):
+        lock_path = attempt_path(target, name).with_suffix(".lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "r+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            state = load_attempt_state(target, name)
+            if not state["ever_established"] or state["proof_generation"] != generation:
+                raise CredentialError("authenticated session proof changed during revalidation")
+            if not re.fullmatch(r"[0-9a-f]{12}", str(profile_revision or "")):
+                raise CredentialError("authentication profile revision is invalid")
+            normalized_origin = normalize_origin(origin)
+            if state["origin"] and state["origin"] != normalized_origin:
+                raise CredentialError("authenticated session origin changed during revalidation")
+            # A stale generation that later proves valid has earned a new proof
+            # generation.  This is the only way, short of a successful renewal,
+            # to reopen its one-submission renewal allowance.
+            if not state["established"]:
+                state["proof_generation"] += 1
+            state["established"] = True
+            state["ever_established"] = True
+            state["origin"] = normalized_origin
+            state["blocked_reason"] = ""
+            state["verified_at"] = time.time()
+            state["proof_profile_revision"] = str(profile_revision)
+            state["refresh_attempted_generation"] = 0
+            state["refresh_blocked_reason"] = ""
+            _atomic_private_json(attempt_path(target, name), {"version": 2, **state})
+
+
+def begin_refresh_attempt(target: str, name: str, *, generation: int) -> int:
+    """Reserve the sole credential submission for one proven session generation."""
+    with session_material_lock(target, name):
+        lock_path = attempt_path(target, name).with_suffix(".lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "r+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            state = load_attempt_state(target, name)
+            if not state["ever_established"] or state["proof_generation"] != generation:
+                raise CredentialError("authenticated session proof changed during renewal")
+            if state["established"]:
+                raise CredentialError("authenticated session no longer requires renewal")
+            if state["refresh_attempted_generation"] == generation:
+                raise CredentialError(
+                    "credential renewal was already attempted for this session proof"
+                )
+            state["refresh_attempted_generation"] = generation
+            state["refresh_submissions"] += 1
+            state["refresh_blocked_reason"] = ""
+            _atomic_private_json(attempt_path(target, name), {"version": 2, **state})
+            return state["refresh_submissions"]
+
+
+def record_refresh_outcome(target: str, name: str, *, generation: int,
+                           established: bool = False, blocked_reason: str = "",
+                           origin: str | None = None,
+                           profile_revision: str = "") -> None:
+    """Finish a reserved renewal without changing the initial login budget."""
+    with session_material_lock(target, name):
+        lock_path = attempt_path(target, name).with_suffix(".lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "r+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            state = load_attempt_state(target, name)
+            if (
+                not state["ever_established"]
+                or state["proof_generation"] != generation
+                or state["refresh_attempted_generation"] != generation
+            ):
+                raise CredentialError("credential renewal state changed during submission")
+            state["established"] = bool(established)
+            state["blocked_reason"] = ""
+            state["refresh_blocked_reason"] = str(blocked_reason or "")
+            if state["established"]:
+                if origin is None:
+                    raise CredentialError("renewed session requires an exact origin binding")
+                if not re.fullmatch(r"[0-9a-f]{12}", str(profile_revision or "")):
+                    raise CredentialError("authentication profile revision is invalid")
+                state["origin"] = normalize_origin(origin)
+                state["proof_generation"] += 1
+                state["verified_at"] = time.time()
+                state["proof_profile_revision"] = str(profile_revision)
+                state["refresh_attempted_generation"] = 0
+                state["refresh_blocked_reason"] = ""
+            _atomic_private_json(attempt_path(target, name), {"version": 2, **state})
 
 
 def _cookie_rows(path: Path) -> list[tuple[str, ...]]:
@@ -863,6 +1026,12 @@ def session_status(target: str, name: str) -> dict[str, object]:
     state = (
         "blocked" if attempt["blocked_reason"]
         else "authenticated" if attempt["established"]
+        else "renewal-blocked" if (
+            attempt["ever_established"]
+            and attempt["refresh_attempted_generation"]
+            == attempt["proof_generation"]
+        )
+        else "stale" if attempt["ever_established"]
         else "exhausted" if attempt["attempts"] >= 2
         else "stored"
     )
