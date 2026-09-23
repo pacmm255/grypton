@@ -1937,6 +1937,12 @@ _RESEARCH_DOCUMENTATION_HOSTS = frozenset({
 
 _MAX_LOCAL_ANALYZE_BYTES = 64 * 1024 * 1024
 _MAX_LOCAL_ANALYZE_OUTPUT = 64_000
+_MAX_LOCAL_SEARCH_PATTERN_BYTES = 4096
+_MAX_LOCAL_SEARCH_MATCHES = 50
+_MAX_LOCAL_SEARCH_CONTEXT_BYTES = 2048
+_MAX_LOCAL_SEARCH_RETURN_BYTES = 48_000
+_MAX_LOCAL_SEARCH_MATCH_PREVIEW_BYTES = 512
+_LOCAL_REGEX_TIMEOUT_SECONDS = 10
 
 
 def _minimal_local_environment(*, apt: bool = False) -> dict[str, str]:
@@ -2019,17 +2025,190 @@ def _open_workspace_regular_file(workspace: Workspace, relative_path: str) -> tu
             os.close(directory_fd)
 
 
+def _read_open_file(fd: int, size: int) -> bytes:
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = os.read(fd, min(1024 * 1024, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _literal_search_positions(data: bytes, pattern: bytes, *, ignore_case: bool,
+                              limit: int) -> list[tuple[int, int]]:
+    haystack = data.lower() if ignore_case else data
+    needle = pattern.lower() if ignore_case else pattern
+    positions: list[tuple[int, int]] = []
+    cursor = 0
+    while len(positions) < limit:
+        start = haystack.find(needle, cursor)
+        if start < 0:
+            break
+        end = start + len(needle)
+        positions.append((start, end))
+        cursor = end
+    return positions
+
+
+def _regex_search_positions(fd: int, size: int, pattern: str, *,
+                            ignore_case: bool, limit: int) -> list[tuple[int, int]]:
+    helper = Path(__file__).with_name("_search_helper.py")
+    request = json.dumps({
+        "pattern": pattern,
+        "ignore_case": bool(ignore_case),
+        "limit": limit,
+    }).encode("utf-8")
+    result = subprocess.run(
+        [sys.executable, str(helper), str(fd)], input=request,
+        capture_output=True, timeout=_LOCAL_REGEX_TIMEOUT_SECONDS,
+        pass_fds=(fd,), env=_minimal_local_environment(), umask=0o077,
+    )
+    try:
+        payload = json.loads(result.stdout.decode("utf-8", "replace"))
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError("regular-expression search returned an invalid result") from exc
+    if result.returncode or not payload.get("ok"):
+        detail = str(payload.get("error") or "regular-expression search failed")
+        raise ValueError(detail)
+    positions = payload.get("positions")
+    if not isinstance(positions, list):
+        raise ValueError("regular-expression search returned invalid offsets")
+    output: list[tuple[int, int]] = []
+    previous_start = -1
+    for value in positions:
+        if (not isinstance(value, list) or len(value) != 2
+                or not all(isinstance(item, int) for item in value)):
+            raise ValueError("regular-expression search returned invalid offsets")
+        start, end = value
+        if start < previous_start or start < 0 or end < start or end > size:
+            raise ValueError("regular-expression search returned invalid offsets")
+        output.append((start, end))
+        previous_start = start
+    return output
+
+
+def _match_preview(data: bytes, start: int, end: int) -> tuple[str, bool]:
+    matched = data[start:end]
+    if len(matched) <= _MAX_LOCAL_SEARCH_MATCH_PREVIEW_BYTES:
+        return matched.decode("utf-8", "replace"), False
+    half = _MAX_LOCAL_SEARCH_MATCH_PREVIEW_BYTES // 2
+    omitted = len(matched) - (half * 2)
+    value = (
+        matched[:half].decode("utf-8", "replace")
+        + f"\n... [{omitted} matched bytes omitted] ...\n"
+        + matched[-half:].decode("utf-8", "replace")
+    )
+    return value, True
+
+
+def _render_search_matches(data: bytes, positions: list[tuple[int, int]], *,
+                           context_bytes: int) -> tuple[list[dict], bool]:
+    matches: list[dict] = []
+    returned_bytes = 0
+    line = 1
+    line_start_byte = 0
+    line_cursor = 0
+    truncated = False
+    for start, end in positions:
+        between = data[line_cursor:start]
+        newlines = between.count(b"\n")
+        if newlines:
+            line += newlines
+            line_start_byte = data.rfind(b"\n", line_cursor, start) + 1
+        line_cursor = start
+
+        context_start = max(0, start - context_bytes)
+        context_end = min(len(data), end + context_bytes)
+        preview, match_truncated = _match_preview(data, start, end)
+        before = data[context_start:start].decode("utf-8", "replace")
+        after = data[end:context_end].decode("utf-8", "replace")
+        rendered = before + preview + after
+        rendered_bytes = len(rendered.encode("utf-8"))
+        if matches and returned_bytes + rendered_bytes > _MAX_LOCAL_SEARCH_RETURN_BYTES:
+            truncated = True
+            break
+        returned_bytes += rendered_bytes
+        matches.append({
+            "byte_start": start,
+            "byte_end": end,
+            "match_bytes": end - start,
+            "line_start": line,
+            "line_end": line + data.count(b"\n", start, end),
+            "line_byte_offset": start - line_start_byte,
+            "context_byte_start": context_start,
+            "context_byte_end": context_end,
+            "context": rendered,
+            "match_preview": preview,
+            "match_truncated": match_truncated,
+        })
+    return matches, truncated
+
+
 def local_analyze(workspace: Workspace, path: str, *, analyzer: str = "file",
-                  min_length: int = 6) -> dict:
+                  min_length: int = 6, pattern: str = "",
+                  ignore_case: bool = False, context_bytes: int = 160,
+                  max_matches: int = 20) -> dict:
     """Run one fixed, offline analyzer against one safely opened workspace file."""
     analyzer = str(analyzer or "").lower()
-    if analyzer not in {"file", "strings", "sha256"}:
-        return _err("Analyzer must be one of: file, strings, sha256.")
+    if analyzer not in {"file", "strings", "sha256", "literal", "regex"}:
+        return _err("Analyzer must be one of: file, strings, sha256, literal, regex.")
     try:
         fd, size = _open_workspace_regular_file(workspace, path)
     except (OSError, ValueError) as exc:
         return _err(f"Local analysis input was rejected: {exc}")
     try:
+        if analyzer in {"literal", "regex"}:
+            try:
+                encoded_pattern = str(pattern or "").encode("utf-8")
+                requested_matches = int(max_matches)
+                requested_context = int(context_bytes)
+            except (TypeError, ValueError, UnicodeError):
+                return _err("Search parameters must be valid UTF-8 text and integers.")
+            if not encoded_pattern:
+                return _err("Search pattern must not be empty.")
+            if len(encoded_pattern) > _MAX_LOCAL_SEARCH_PATTERN_BYTES:
+                return _err("Search pattern exceeds the 4096-byte limit.")
+            if not 1 <= requested_matches <= _MAX_LOCAL_SEARCH_MATCHES:
+                return _err("max_matches must be between 1 and 50.")
+            if not 0 <= requested_context <= _MAX_LOCAL_SEARCH_CONTEXT_BYTES:
+                return _err("context_bytes must be between 0 and 2048.")
+            search_limit = requested_matches + 1
+            if analyzer == "literal":
+                data = _read_open_file(fd, size)
+                positions = _literal_search_positions(
+                    data, encoded_pattern, ignore_case=bool(ignore_case),
+                    limit=search_limit,
+                )
+            else:
+                positions = _regex_search_positions(
+                    fd, size, str(pattern), ignore_case=bool(ignore_case),
+                    limit=search_limit,
+                )
+                data = _read_open_file(fd, size)
+            more_matches = len(positions) > requested_matches
+            selected = positions[:requested_matches]
+            matches, response_truncated = _render_search_matches(
+                data, selected, context_bytes=requested_context,
+            )
+            truncated = more_matches or response_truncated or len(matches) < len(selected)
+            qualifier = "; additional matches omitted" if truncated else ""
+            return _ok(
+                f"Found {len(matches)} {analyzer} match(es) in {path}{qualifier}.",
+                {
+                    "analyzer": analyzer,
+                    "path": path,
+                    "bytes": size,
+                    "matches_returned": len(matches),
+                    "truncated": truncated,
+                    "context_bytes": requested_context,
+                    "matches": matches,
+                },
+            )
+
         if analyzer == "sha256":
             digest = hashlib.sha256()
             while block := os.read(fd, 1024 * 1024):

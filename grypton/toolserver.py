@@ -237,13 +237,19 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
     "subdomain_enum": ("Run passive subfinder enumeration for an in-scope domain.",
         _object({"domain": _string("In-scope base domain"), "timeout": {"type": "integer"}}, ("domain",)),
         lambda ws, a: tools.subdomain_enum(ws, a["domain"], timeout=a.get("timeout", 180))),
-    "local_analyze": ("Run a fixed offline analyzer on one regular file inside this engagement.",
+    "local_analyze": ("Inspect or search one regular file inside this engagement with bounded output.",
         _object({"path": _string("Relative engagement file path"),
-                 "analyzer": {"type": "string", "enum": ["file", "strings", "sha256"]},
-                 "min_length": {"type": "integer", "minimum": 4, "maximum": 64}},
+                 "analyzer": {"type": "string", "enum": ["file", "strings", "sha256", "literal", "regex"]},
+                 "min_length": {"type": "integer", "minimum": 4, "maximum": 64},
+                 "pattern": _string("Required literal text or byte-oriented regular expression for search analyzers"),
+                 "ignore_case": {"type": "boolean"},
+                 "context_bytes": {"type": "integer", "minimum": 0, "maximum": 2048},
+                 "max_matches": {"type": "integer", "minimum": 1, "maximum": 50}},
                 ("path", "analyzer")),
         lambda ws, a: tools.local_analyze(
-            ws, a["path"], analyzer=a["analyzer"], min_length=a.get("min_length", 6)
+            ws, a["path"], analyzer=a["analyzer"], min_length=a.get("min_length", 6),
+            pattern=a.get("pattern", ""), ignore_case=a.get("ignore_case", False),
+            context_bytes=a.get("context_bytes", 160), max_matches=a.get("max_matches", 20),
         )),
     "install_tool": ("Install one approved OS package from Grypton's fixed allowlist.",
         _object({"spec": _string("Exact approved OS package name"),
@@ -471,8 +477,12 @@ def cli_main(argv=None) -> int:
     finding.add_argument("--description", default=""); finding.add_argument("--poc", default=""); finding.add_argument("--evidence", default="")
     read = sub.add_parser("read"); read.add_argument("name", choices=["findings", "surface", "tested", "progress", "scope", "program"])
     analyze = sub.add_parser("local-analyze"); analyze.add_argument("path")
-    analyze.add_argument("--analyzer", choices=["file", "strings", "sha256"], default="file")
+    analyze.add_argument("--analyzer", choices=["file", "strings", "sha256", "literal", "regex"], default="file")
     analyze.add_argument("--min-length", type=int, default=6)
+    analyze.add_argument("--pattern", default="")
+    analyze.add_argument("--ignore-case", action="store_true")
+    analyze.add_argument("--context-bytes", type=int, default=160)
+    analyze.add_argument("--max-matches", type=int, default=20)
     install = sub.add_parser("install"); install.add_argument("spec")
     install.add_argument("--manager", choices=["auto", "apt"], default="auto")
 
@@ -501,6 +511,8 @@ def cli_main(argv=None) -> int:
     elif ns.command == "read": mapping = {ns.command: ("read_doc", {"name": ns.name})}
     elif ns.command == "local-analyze": mapping = {ns.command: ("local_analyze", {
         "path": ns.path, "analyzer": ns.analyzer, "min_length": ns.min_length,
+        "pattern": ns.pattern, "ignore_case": ns.ignore_case,
+        "context_bytes": ns.context_bytes, "max_matches": ns.max_matches,
     })}
     elif ns.command == "install": mapping = {ns.command: ("install_tool", {"spec": ns.spec, "manager": ns.manager})}
     tool_name, args = mapping[ns.command]
