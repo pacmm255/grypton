@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import codecs
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -30,6 +31,11 @@ from .workspace import Workspace
 
 MAX_RESPONSE_BYTES = 2_000_000
 MAX_INLINE_RESPONSE_CHARS = 12_000
+DEFAULT_FLOW_READ_CHARS = 16_384
+MAX_FLOW_READ_CHARS = 32_768
+_FLOW_LIST_LINE_CHARS = 64 * 1024
+_FLOW_LIST_FIELD_CHARS = 4096
+_MAX_FLOW_QUERY_CHARS = 4096
 _AUTH_REVALIDATE_INTERVAL_S = 300
 _AUTH_EXPIRY_SKEW_S = 60
 
@@ -1937,16 +1943,67 @@ class Goja:
                             insecure=not cls.CA.is_file(), **kwargs)
 
 
+def _flow_contains_text(path: Path, query: str) -> bool:
+    """Search a flow without materializing its potentially large body."""
+    needle = query.casefold()
+    overlap = ""
+    overlap_chars = max(16, len(query) * 4)
+    with path.open("r", encoding="utf-8", errors="replace") as stream:
+        while chunk := stream.read(_FLOW_LIST_LINE_CHARS):
+            value = overlap + chunk
+            if needle in value.casefold():
+                return True
+            overlap = value[-overlap_chars:]
+    return False
+
+
+def _flow_listing_metadata(path: Path) -> tuple[str, str]:
+    """Read request/status lines with bounded memory."""
+    request = path.name
+    status = ""
+    request_found = False
+    at_line_start = True
+    with path.open("r", encoding="utf-8", errors="replace") as stream:
+        while True:
+            piece = stream.readline(_FLOW_LIST_LINE_CHARS)
+            if not piece:
+                break
+            if at_line_start:
+                if not request_found and re.match(r"^[A-Z]+ https?://", piece):
+                    request = piece.rstrip("\r\n")
+                    if len(request) > _FLOW_LIST_FIELD_CHARS:
+                        request = request[:_FLOW_LIST_FIELD_CHARS - 3] + "..."
+                    request_found = True
+                if not status and piece.startswith("HTTP/"):
+                    status = piece.rstrip("\r\n")[:_FLOW_LIST_FIELD_CHARS]
+            at_line_start = piece.endswith("\n")
+            if request_found and status:
+                break
+    return request, status
+
+
 def proxy_flows(workspace: Workspace, *, query: str = "", limit: int = 20) -> dict:
+    query = str(query or "")
+    if len(query) > _MAX_FLOW_QUERY_CHARS:
+        return _err("Flow query exceeds the 4096-character limit.")
+    try:
+        row_limit = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        return _err("Flow limit must be an integer between 1 and 200.")
     rows = []
-    for path in sorted(workspace.flows_dir.glob("flow-*.http"), reverse=True):
-        text = path.read_text(encoding="utf-8", errors="replace")
-        if query and query.lower() not in text.lower():
+    for listed_path in sorted(workspace.flows_dir.glob("flow-*.http"), reverse=True):
+        # Apply the same containment check used by flow_read/flow_replay before
+        # opening a listing candidate. This skips a flow-shaped symlink whose
+        # target is outside the private engagement flow directory.
+        path = _flow_path(workspace, listed_path.stem)
+        if path is None:
             continue
-        request = next((line for line in text.splitlines() if re.match(r"^[A-Z]+ https?://", line)), path.name)
-        status = next((line for line in text.splitlines() if line.startswith("HTTP/")), "")
-        rows.append({"id": path.stem, "file": str(path), "request": request, "status": status})
-        if len(rows) >= max(1, min(int(limit), 200)):
+        if query and not _flow_contains_text(path, query):
+            continue
+        request, status = _flow_listing_metadata(path)
+        rows.append({"id": listed_path.stem, "file": str(path), "request": request,
+                     "status": status, "bytes": path.stat().st_size})
+        if len(rows) >= row_limit:
             break
     return _ok(f"{len(rows)} captured flow(s).", rows)
 
@@ -1964,22 +2021,86 @@ def _flow_path(workspace: Workspace, flow_id: str) -> Optional[Path]:
     return candidate if candidate.is_file() else None
 
 
-def flow_read(workspace: Workspace, flow_id: str, *, max_chars: int = 100_000) -> dict:
+def flow_read(workspace: Workspace, flow_id: str, *, offset: int = 0,
+              max_chars: int = DEFAULT_FLOW_READ_CHARS) -> dict:
+    """Read one bounded UTF-8 window from a capture.
+
+    ``offset`` and the returned continuation offsets are byte offsets. Captures
+    are written as UTF-8, so an incremental decoder keeps sequential windows
+    from splitting a trailing multibyte character.
+    """
     path = _flow_path(workspace, flow_id)
     if path is None:
         return _err(f"Unknown flow {flow_id!r}.")
-    value = path.read_text(encoding="utf-8", errors="replace")
-    return _ok(f"Read {path.name} ({len(value)} characters).",
-               {"id": path.stem, "file": str(path),
-                "text": value[:max(1000, min(int(max_chars), 500_000))]})
+    try:
+        byte_offset = int(offset)
+        requested_chars = int(max_chars)
+    except (TypeError, ValueError):
+        return _err("Flow offset and max_chars must be integers.")
+    if byte_offset < 0:
+        return _err("Flow offset must be zero or greater.")
+    if requested_chars < 256:
+        return _err("Flow max_chars must be at least 256.")
+    window_bytes = min(requested_chars, MAX_FLOW_READ_CHARS)
+    total_bytes = path.stat().st_size
+    if byte_offset > total_bytes:
+        return _err(
+            f"Flow offset {byte_offset} is beyond the {total_bytes}-byte capture."
+        )
+    with path.open("rb") as stream:
+        stream.seek(byte_offset)
+        raw = stream.read(window_bytes)
+    at_eof = byte_offset + len(raw) >= total_bytes
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    value = decoder.decode(raw, final=at_eof)
+    pending = b"" if at_eof else decoder.getstate()[0]
+    consumed_bytes = len(raw) - len(pending)
+    byte_end = byte_offset + consumed_bytes
+    next_offset = byte_end if byte_end < total_bytes else None
+    capped = requested_chars > MAX_FLOW_READ_CHARS
+    return _ok(
+        f"Read bytes {byte_offset}-{byte_end} of {total_bytes} from {path.name}.",
+        {
+            "id": path.stem,
+            "file": str(path),
+            "text": value,
+            "byte_start": byte_offset,
+            "byte_end": byte_end,
+            "total_bytes": total_bytes,
+            "next_offset": next_offset,
+            "has_more": next_offset is not None,
+            "requested_max_chars": requested_chars,
+            "max_chars_applied": window_bytes,
+            "request_capped": capped,
+        },
+    )
+
+
+def _flow_replay_source(path: Path) -> str:
+    """Read only the request side needed by replay, with the historic cap."""
+    marker = b"\n### RESPONSE"
+    captured = bytearray()
+    with path.open("rb") as stream:
+        while len(captured) < 2_000_000:
+            chunk = stream.read(min(64 * 1024, 2_000_000 - len(captured)))
+            if not chunk:
+                break
+            captured.extend(chunk)
+            marker_at = captured.find(marker)
+            if marker_at >= 0:
+                return bytes(captured[:marker_at + len(marker)]).decode(
+                    "utf-8", "replace"
+                )[:500_000]
+    return bytes(captured).decode("utf-8", "replace")[:500_000]
 
 
 def flow_replay(workspace: Workspace, flow_id: str, *, url: str = "", method: str = "",
                 headers: Optional[dict] = None, body: Optional[str] = None) -> dict:
-    read = flow_read(workspace, flow_id, max_chars=500_000)
-    if not read["ok"]:
-        return read
-    split = read["data"]["text"].split("### RESPONSE", 1)[0].split("### REQUEST\n", 1)
+    path = _flow_path(workspace, flow_id)
+    if path is None:
+        return _err(f"Unknown flow {flow_id!r}.")
+    source = _flow_replay_source(path)
+    split = source.split("### RESPONSE", 1)[0].split("### REQUEST\n", 1)
     if len(split) != 2:
         return _err("The capture does not contain a replayable request.")
     lines = split[1].splitlines()

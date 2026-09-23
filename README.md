@@ -839,6 +839,10 @@ Common manual commands:
 # Read a named flow
 ./bin/grypton tools --target https-app-example-test flow-read flow-123456
 
+# Continue from the returned next_offset without loading the whole capture
+./bin/grypton tools --target https-app-example-test flow-read flow-123456 \
+  --offset 16384 --max-chars 16384
+
 # Replay a flow against an in-scope URL
 ./bin/grypton tools --target https-app-example-test flow-replay flow-123456 \
   --url https://app.example.test/control
@@ -870,7 +874,11 @@ Common manual commands:
 
 Large responses are shortened in the live terminal. Private flow capture is
 bounded to 2 MB. Its metadata records the original byte count and whether the
-capture was truncated.
+capture was truncated. `flow_read` returns at most 32 KiB at a time and reports
+`byte_start`, `byte_end`, `total_bytes`, and `next_offset`; pass `next_offset`
+back as `offset` to continue. Flow listing and substring filtering stream
+captures in bounded chunks, so a minified response does not become one large
+in-memory line or one oversized model result.
 
 `local_analyze` performs `file`, `strings`, SHA-256, literal search, or
 byte-oriented regular-expression search. Its input

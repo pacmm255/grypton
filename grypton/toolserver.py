@@ -466,9 +466,25 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
     "proxy_flows": ("List and grep Burp-like captured request/response flows.",
         _object({"query": _string("Substring filter"), "limit": {"type": "integer"}}),
         lambda ws, a: tools.proxy_flows(ws, query=a.get("query", ""), limit=a.get("limit", 20))),
-    "flow_read": ("Read a captured request/response flow by ID.",
-        _object({"flow_id": _string("flow-... ID"), "max_chars": {"type": "integer"}}, ("flow_id",)),
-        lambda ws, a: tools.flow_read(ws, a["flow_id"], max_chars=a.get("max_chars", 100000))),
+    "flow_read": ("Read one bounded byte window from a captured request/response flow.",
+        _object({
+            "flow_id": _string("flow-... ID"),
+            "offset": {
+                "type": "integer", "minimum": 0,
+                "description": "Byte offset; continue with next_offset from the prior result",
+            },
+            "max_chars": {
+                "type": "integer", "minimum": 256,
+                "description": (
+                    "Requested text window; requests above 32768 are accepted "
+                    "but capped, with next_offset returned for continuation"
+                ),
+            },
+        }, ("flow_id",)),
+        lambda ws, a: tools.flow_read(
+            ws, a["flow_id"], offset=a.get("offset", 0),
+            max_chars=a.get("max_chars", tools.DEFAULT_FLOW_READ_CHARS),
+        )),
     "flow_replay": ("Replay a captured scoped request with optional URL/method/header/body overrides.",
         _object({"flow_id": _string("flow-... ID"), "url": _string("Optional scoped URL"),
                  "method": _string("Optional method"),
@@ -775,6 +791,8 @@ def cli_main(argv=None) -> int:
         sub.add_parser(name)
     flows = sub.add_parser("flows"); flows.add_argument("--query", default=""); flows.add_argument("--limit", type=int, default=20)
     flow_read_parser = sub.add_parser("flow-read"); flow_read_parser.add_argument("flow_id")
+    flow_read_parser.add_argument("--offset", type=int, default=0)
+    flow_read_parser.add_argument("--max-chars", type=int, default=tools.DEFAULT_FLOW_READ_CHARS)
     replay = sub.add_parser("flow-replay"); replay.add_argument("flow_id"); replay.add_argument("--url", default="")
     replay.add_argument("--method", default=""); replay.add_argument("--headers", type=_headers, default={}); replay.add_argument("--body")
     httpx = sub.add_parser("httpx"); httpx.add_argument("targets")
@@ -812,7 +830,9 @@ def cli_main(argv=None) -> int:
     elif ns.command in {"goja-start", "goja-status", "goja-stop"}: mapping = {ns.command: (ns.command.replace("-", "_"), {})}
     elif ns.command == "inventory": mapping = {ns.command: ("tool_inventory", {})}
     elif ns.command == "flows": mapping = {ns.command: ("proxy_flows", {"query": ns.query, "limit": ns.limit})}
-    elif ns.command == "flow-read": mapping = {ns.command: ("flow_read", {"flow_id": ns.flow_id})}
+    elif ns.command == "flow-read": mapping = {ns.command: ("flow_read", {
+        "flow_id": ns.flow_id, "offset": ns.offset, "max_chars": ns.max_chars,
+    })}
     elif ns.command == "flow-replay": mapping = {ns.command: ("flow_replay", {"flow_id": ns.flow_id, "url": ns.url, "method": ns.method, "headers": ns.headers, "body": ns.body})}
     elif ns.command == "httpx": mapping = {ns.command: ("httpx_probe", {"targets": ns.targets})}
     elif ns.command == "dns": mapping = {ns.command: ("dns_lookup", {"host": ns.host})}
