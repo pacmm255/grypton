@@ -2033,10 +2033,12 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(engine.manager.direct.await_count, 3)
                 self.assertEqual(worker_directives[0], "check authentication")
                 self.assertEqual(worker_directives[1:], [
-                    "Use the most relevant available tool on the least-tested "
-                    "in-scope surface and record the observed result.",
-                    "Use the most relevant available tool on the least-tested "
-                    "in-scope surface and record the observed result.",
+                    "Use the most relevant available tool to test the highest-impact "
+                    "unresolved lead in the recorded attack surface and record the "
+                    "observed result.",
+                    "Use the most relevant available tool to test the highest-impact "
+                    "unresolved lead in the recorded attack surface and record the "
+                    "observed result.",
                 ])
                 self.assertTrue(any(
                     kind == "status" and "attempted a soft stop" in payload.get("text", "")

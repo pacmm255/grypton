@@ -330,7 +330,7 @@ class KryptexManager:
             }
 
     def _fallback_directive(self, ctx: ManagerContext, reason: str) -> Directive:
-        surface = "the least-tested in-scope surface item"
+        surface = "the highest-impact unresolved lead in the recorded attack surface"
         if ctx.worker_was_idle:
             action = (
                 f"The last turn made no tool call. Select {surface}; issue one bounded "

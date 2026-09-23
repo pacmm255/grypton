@@ -42,7 +42,7 @@ A direct background `init` or `resume` must include `--duration`,
 For a detached finite run, the deadline is the normal completion boundary.
 Repeated convergence sends Kraude back through another Kryptex-directed pivot
 instead of ending the run early. The opening mission remains verbatim; later
-soft-stop recovery selects a positive least-tested in-scope action rather than
+soft-stop recovery selects a positive highest-impact unresolved action rather than
 replaying a completed login or setup task. An operator stop or a binding
 scope/program stop can still end it before the deadline.
 

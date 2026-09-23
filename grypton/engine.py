@@ -99,8 +99,8 @@ def _looks_like_soft_retreat_directive(text: str) -> bool:
 
 
 _RECOVERY_ACTION = (
-    "Use the most relevant available tool on the least-tested in-scope surface "
-    "and record the observed result."
+    "Use the most relevant available tool to test the highest-impact unresolved "
+    "lead in the recorded attack surface and record the observed result."
 )
 
 
