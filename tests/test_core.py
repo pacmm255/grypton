@@ -40,7 +40,7 @@ from grypton.tools import (_browser_executable, _isolated_browser_profile,
                            check_research_scope, check_url_scope, flow_read, flow_replay,
                            http_request, httpx_probe, install_tool, local_analyze, port_scan,
                            research, tcp_exchange, MAX_RESPONSE_BYTES)
-from grypton.worker import OpenCodeWorker, WorkerSpec
+from grypton.worker import OpenCodeWorker, WorkerError, WorkerSpec
 from grypton.workspace import Constraints, Workspace
 
 
@@ -1513,6 +1513,108 @@ class WorkerEventTests(unittest.TestCase):
 
 
 class EngineTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _worker_pool_exhausted(status: int = 429) -> ProviderError:
+        return ProviderError(
+            f"worker OpenClaude credential pool exhausted (upstream HTTP {status}).",
+            metadata={
+                "source": "openclaude",
+                "type": "openclaude_terminal",
+                "role": "worker",
+                "reason": "credential_pool_exhausted",
+                "upstream_status": status,
+                "pool_size": 1,
+            },
+        )
+
+    async def test_worker_uses_one_fresh_session_after_429_pool_exhaustion(self):
+        with isolated_runtime():
+            worker = OpenCodeWorker(WorkerSpec(
+                session_uuid="ses-heavy", cwd=config.ENGAGEMENTS_DIR / "worker-429",
+                system_prompt="scope projection", extra_env={"GRYPTON_TARGET": "worker-429"},
+            ))
+            worker.client.call = AsyncMock(side_effect=[
+                self._worker_pool_exhausted(), self._worker_pool_exhausted(),
+            ])
+            directive = "Credential alias: primary. Check whether it can authenticate."
+
+            with self.assertRaises(WorkerError) as first:
+                await worker.run_turn(directive)
+            self.assertEqual(first.exception.metadata["upstream_status"], 429)
+            self.assertEqual(worker.session_id, "")
+            self.assertEqual(worker.spec.session_uuid, "")
+
+            # If the failed fresh transport exposes a partial session later,
+            # another identical terminal event must not start a reset loop.
+            worker.session_id = "ses-fresh-attempt"
+            worker.spec.session_uuid = "ses-fresh-attempt"
+            with self.assertRaises(WorkerError):
+                await worker.run_turn(directive)
+            self.assertEqual(worker.session_id, "ses-fresh-attempt")
+            self.assertEqual(
+                [call.kwargs["session_id"] for call in worker.client.call.await_args_list],
+                ["ses-heavy", "ses-fresh-attempt"],
+            )
+            self.assertTrue(all(
+                call.args[0] == directive
+                for call in worker.client.call.await_args_list
+            ))
+
+    async def test_worker_does_not_reset_session_for_other_terminal_failures(self):
+        with isolated_runtime():
+            cases = [
+                self._worker_pool_exhausted(401),
+                self._worker_pool_exhausted(402),
+                self._worker_pool_exhausted(403),
+                ProviderError("unrelated HTTP 429", metadata={
+                    "source": "openclaude", "type": "openclaude_terminal",
+                    "role": "worker", "reason": "provider_terminal",
+                    "upstream_status": 429,
+                }),
+                ProviderError("provider-wide HTTP 429"),
+            ]
+            for index, failure in enumerate(cases):
+                worker = OpenCodeWorker(WorkerSpec(
+                    session_uuid=f"ses-{index}",
+                    cwd=config.ENGAGEMENTS_DIR / f"worker-non429-{index}",
+                    system_prompt="scope projection",
+                    extra_env={"GRYPTON_TARGET": f"worker-non429-{index}"},
+                ))
+                worker.client.call = AsyncMock(side_effect=failure)
+                with self.assertRaises(WorkerError):
+                    await worker.run_turn("same directive")
+                self.assertEqual(worker.session_id, f"ses-{index}")
+                self.assertEqual(worker.spec.session_uuid, f"ses-{index}")
+
+    async def test_engine_retries_429_pool_exhaustion_once_with_same_directive_fresh(self):
+        with isolated_runtime():
+            engine = Engine("engine-worker-429", backend="mock")
+            directive = "Credential alias: primary. Check whether it can authenticate."
+            await engine.setup(brief=directive, target="https://example.test", fresh_clone=True)
+            worker = OpenCodeWorker(WorkerSpec(
+                session_uuid="ses-heavy", cwd=engine.ws.root,
+                system_prompt="scope projection",
+                extra_env={"GRYPTON_TARGET": engine.slug},
+            ))
+            worker.client.call = AsyncMock(side_effect=[
+                self._worker_pool_exhausted(), self._worker_pool_exhausted(),
+            ])
+            engine.worker = worker
+            previous_turns = config.CONFIG.max_turns
+            config.CONFIG.max_turns = 2
+            try:
+                with patch("grypton.engine.asyncio.sleep", new=AsyncMock()):
+                    await engine.run()
+            finally:
+                config.CONFIG.max_turns = previous_turns
+
+            self.assertEqual(worker.client.call.await_count, 2)
+            calls = worker.client.call.await_args_list
+            self.assertEqual([call.args[0] for call in calls], [directive, directive])
+            self.assertEqual([call.kwargs["session_id"] for call in calls],
+                             ["ses-heavy", ""])
+            self.assertIn("max_turns safety ceiling", engine.stop_reason)
+
     async def test_explicit_operator_brief_is_opening_directive_verbatim(self):
         with isolated_runtime():
             ws = Workspace("verbatim-brief")

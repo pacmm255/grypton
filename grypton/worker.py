@@ -14,7 +14,11 @@ EventCb = Optional[Callable[[dict], None]]
 
 
 class WorkerError(RuntimeError):
-    pass
+    """Worker failure retaining sanitized provider classification metadata."""
+
+    def __init__(self, message: str, *, metadata: Optional[dict] = None):
+        super().__init__(message)
+        self.metadata = dict(metadata or {})
 
 
 @dataclass
@@ -48,6 +52,7 @@ class OpenCodeWorker:
         self.on_event = on_event
         self.session_id = spec.session_uuid or ""
         self._started = False
+        self._pool_exhaustion_reset_used = False
         self.client = self._new_client()
 
     def _new_client(self) -> OpenCodeClient:
@@ -82,6 +87,7 @@ class OpenCodeWorker:
         self.spec.session_uuid = ""
         self.client = self._new_client()
         self._started = False
+        self._pool_exhaustion_reset_used = False
 
     async def start(self) -> None:
         if self._started:
@@ -130,7 +136,24 @@ class OpenCodeWorker:
                 title=f"Grypton Kraude {self.spec.cwd.name}",
             )
         except ProviderError as exc:
-            raise WorkerError(str(exc)) from exc
+            metadata = exc.metadata
+            if (
+                not self._pool_exhaustion_reset_used
+                and metadata.get("source") == "openclaude"
+                and metadata.get("type") == "openclaude_terminal"
+                and metadata.get("role") == "worker"
+                and metadata.get("reason") == "credential_pool_exhausted"
+                and metadata.get("upstream_status") == 429
+            ):
+                # OpenCode sessions can retain provider-specific conversation
+                # state across calls. Consume one fresh-session recovery for a
+                # consecutive 429 exhaustion burst; the engine already retries
+                # the unchanged directive from durable workspace state.
+                self.session_id = ""
+                self.spec.session_uuid = ""
+                self._pool_exhaustion_reset_used = True
+            raise WorkerError(str(exc), metadata=metadata) from exc
+        self._pool_exhaustion_reset_used = False
         self.session_id = result.session_id
         self.spec.session_uuid = result.session_id
         tools = [{

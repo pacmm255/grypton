@@ -244,9 +244,17 @@ class ProviderOutputTests(unittest.TestCase):
                     })
                     with self.assertRaisesRegex(
                         ProviderError, r"credential pool exhausted \(upstream HTTP 402\)"
-                    ):
+                    ) as raised:
                         await asyncio.wait_for(call, timeout=1)
                     stop.assert_awaited_once_with(process)
+                    self.assertEqual(raised.exception.metadata, {
+                        "source": "openclaude",
+                        "type": "openclaude_terminal",
+                        "role": "manager",
+                        "reason": "credential_pool_exhausted",
+                        "upstream_status": 402,
+                        "pool_size": 5,
+                    })
 
                 transcript = (
                     workspace / "transcripts/openclaude.events.jsonl"

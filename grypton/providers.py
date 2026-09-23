@@ -54,7 +54,11 @@ _TEXT_TRUNCATION_MARKER = "\n\n[... normalized response truncated ...]\n\n"
 
 
 class ProviderError(RuntimeError):
-    pass
+    """Provider failure with optional sanitized machine-readable context."""
+
+    def __init__(self, message: str, *, metadata: Optional[dict] = None):
+        super().__init__(message)
+        self.metadata = dict(metadata or {})
 
 
 def tool_state_text(state: dict) -> str:
@@ -451,6 +455,7 @@ class OpenCodeClient:
         self.gateway: OpenClaudeGateway | None = None
         self._terminal_signal: asyncio.Event | None = None
         self._terminal_error = ""
+        self._terminal_metadata: dict = {}
 
     def _on_gateway_event(self, event: dict) -> None:
         """Retain sanitized OpenClaude notices and expose them to the live UI."""
@@ -458,11 +463,30 @@ class OpenCodeClient:
             "at": time.time(), "role": self.role, **event,
         })
         if event.get("type") == "openclaude_terminal":
-            status = event.get("upstream_status")
+            try:
+                status = int(event.get("upstream_status") or 0)
+            except (TypeError, ValueError):
+                status = 0
             suffix = f" (upstream HTTP {status})" if status else ""
             self._terminal_error = (
                 f"{self.role} OpenClaude credential pool exhausted{suffix}."
             )
+            self._terminal_metadata = {
+                "source": "openclaude",
+                "type": "openclaude_terminal",
+                "role": self.role,
+                "reason": (
+                    "credential_pool_exhausted"
+                    if event.get("reason") == "credential_pool_exhausted"
+                    else "provider_terminal"
+                ),
+                "upstream_status": status if 100 <= status <= 599 else 0,
+                "pool_size": (
+                    event.get("pool_size")
+                    if isinstance(event.get("pool_size"), int)
+                    and 0 < event["pool_size"] <= 1000 else 0
+                ),
+            }
             if self._terminal_signal is not None:
                 self._terminal_signal.set()
         if self.event_callback:
@@ -632,6 +656,7 @@ class OpenCodeClient:
         )
         self._terminal_signal = asyncio.Event()
         self._terminal_error = ""
+        self._terminal_metadata = {}
         assert self.proc.stdin and self.proc.stdout and self.proc.stderr
         self.proc.stdin.write(prompt.encode("utf-8"))
         await self.proc.stdin.drain()
@@ -709,7 +734,8 @@ class OpenCodeClient:
                 await asyncio.gather(io_task, return_exceptions=True)
                 raise ProviderError(
                     self._terminal_error
-                    or f"{self.role} OpenClaude provider became terminal."
+                    or f"{self.role} OpenClaude provider became terminal.",
+                    metadata=self._terminal_metadata,
                 )
             cleaned_stdout, stderr, returncode = await io_task
         except ProviderError:
@@ -731,6 +757,7 @@ class OpenCodeClient:
             await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
             self._terminal_signal = None
             self._terminal_error = ""
+            self._terminal_metadata = {}
 
         cleaned_stderr = clean(stderr.decode("utf-8", errors="replace"), (secret,))
         if cleaned_stderr:
