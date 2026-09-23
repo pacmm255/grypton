@@ -309,6 +309,10 @@ class Workspace:
 
     def save_constraints(self, c: Constraints) -> None:
         _atomic_write(self.constraints_path, json.dumps(asdict(c), indent=2))
+        self.render_scope_document()
+
+    def render_scope_document(self) -> None:
+        """Refresh the worker-readable scope projection from durable constraints."""
         self._render_scope()
 
     def save_program_brief(self, text: str, profile: dict) -> None:
@@ -604,7 +608,7 @@ class Workspace:
         c = self.load_constraints()
         out = [f"# Scope Rules — {self.slug}", "",
                "```",
-               c.to_prompt_block(), "```", ""]
+               c.to_worker_prompt_block(), "```", ""]
         _atomic_write(self.root / "scope-rules.md", "\n".join(out) + "\n")
 
 

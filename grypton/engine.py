@@ -214,7 +214,8 @@ class Engine:
     # ---------------------------------------------------------------- setup
 
     async def setup(self, *, brief: str, target: str, target_type: str = "auto",
-                    fresh_clone: bool = True) -> None:
+                    fresh_clone: bool = True,
+                    fresh_worker_session: bool = False) -> None:
         config.ensure_layout()
         self.brief = brief
         self.target = target
@@ -226,8 +227,11 @@ class Engine:
             self.ws.update_meta(target=target, target_type=target_type)
 
         constraints = self.ws.load_constraints()
-        cblock = constraints.to_prompt_block()
         worker_cblock = constraints.to_worker_prompt_block()
+        # This document is visible to Kraude. Refresh it on every start so an
+        # engagement created by an older release cannot retain manager-only or
+        # free-form fields in the worker workspace.
+        self.ws.render_scope_document()
 
         wsys = prompts.worker_system(
             target=target, target_type=target_type, workspace=self.ws.root,
@@ -259,14 +263,23 @@ class Engine:
         # ---- backend wiring ----
         if self.backend == "mock":
             from .mockbackends import MockManager, MockWorker
-            worker_uuid = meta.worker_uuid or "mock-session"
+            worker_uuid = (
+                "" if (fresh_clone or fresh_worker_session)
+                else (meta.worker_uuid or "mock-session")
+            )
             self.ws.update_meta(worker_uuid=worker_uuid, worker_project_dir="mock")
             self.worker = MockWorker(self.ws, on_event=self._on_worker_event)
             self.manager = MockManager(self.ws, msys, on_event=self._on_manager_event)
         else:
             from .manager import KryptexManager
             from .worker import KraudeWorker, WorkerSpec
-            worker_uuid = "" if fresh_clone else (meta.worker_uuid or "")
+            # A normal resume retains Kraude's OpenCode conversation. A fresh
+            # engagement and the explicit one-shot option reject an inherited
+            # worker session; neither path resets Kryptex's saved session.
+            worker_uuid = (
+                "" if (fresh_clone or fresh_worker_session)
+                else (meta.worker_uuid or "")
+            )
             self.ws.update_meta(
                 worker_uuid=worker_uuid,
                 worker_kind="opencode+openclaude",
@@ -312,7 +325,10 @@ class Engine:
                     "role": role,
                     "route": route,
                     "effort": effort,
-                    "source": "run-start" if fresh_clone else "resume",
+                    "source": (
+                        "fresh-worker-session" if fresh_worker_session
+                        else ("run-start" if fresh_clone else "resume")
+                    ),
                 })
 
         self.ws.update_meta(status="running")

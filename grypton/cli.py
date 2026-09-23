@@ -279,6 +279,9 @@ def _run_engagement_unlocked(ws: Workspace, ns, *, brief: str, fresh: bool) -> i
                 worker_effort=models["worker"]["effort"],
                 manager_model=models["manager"]["route"],
                 manager_effort=models["manager"]["effort"],
+                fresh_worker_session=bool(
+                    getattr(ns, "fresh_worker_session", False)
+                ),
                 health_interval_seconds=getattr(ns, "health_interval", 600),
                 restart_limit=getattr(ns, "restart_limit", 3),
             )
@@ -318,7 +321,10 @@ def _run_engagement_unlocked(ws: Workspace, ns, *, brief: str, fresh: bool) -> i
                              models=engine.current_models())
         try:
             await engine.setup(brief=brief, target=meta.target,
-                               target_type=meta.target_type, fresh_clone=fresh)
+                               target_type=meta.target_type, fresh_clone=fresh,
+                               fresh_worker_session=bool(
+                                   getattr(ns, "fresh_worker_session", False)
+                               ))
             await interact(
                 engine, renderer,
                 accept_input=not getattr(ns, "print_mode", False),
@@ -1496,6 +1502,15 @@ def _run_options(parser) -> None:
                         help=argparse.SUPPRESS)
 
 
+def _fresh_worker_session_option(parser) -> None:
+    parser.add_argument(
+        "--fresh-worker-session",
+        action="store_true",
+        help=("Start Kraude in a new OpenCode conversation while retaining the "
+              "engagement workspace, ledgers, and Kryptex session"),
+    )
+
+
 def _supervised_run_options(parser) -> None:
     """Options that affect a detached resume; omit forced or ignored flags."""
     parser.add_argument("-m", "--brief", default="", help="Engagement mission")
@@ -1513,6 +1528,7 @@ def _supervised_run_options(parser) -> None:
                         metavar="DURATION", help="Supervisor health interval (default: 10m)")
     parser.add_argument("--restart-limit", type=int, default=3, metavar="N",
                         help="Maximum abnormal-exit restarts (default: 3)")
+    _fresh_worker_session_option(parser)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1547,7 +1563,8 @@ def build_parser() -> argparse.ArgumentParser:
     _model_options(plan)
     plan.add_argument("--json", action="store_true"); plan.set_defaults(func=cmd_plan)
     resume = sub.add_parser("resume", help="Resume a persistent engagement")
-    resume.add_argument("target"); _run_options(resume); resume.set_defaults(func=cmd_resume)
+    resume.add_argument("target"); _run_options(resume); _fresh_worker_session_option(resume)
+    resume.set_defaults(func=cmd_resume)
     status = sub.add_parser("status", aliases=["ls"], help="List engagements and current run counters")
     status.add_argument("target", nargs="?")
     status.add_argument("--json", action="store_true"); status.set_defaults(func=cmd_status)

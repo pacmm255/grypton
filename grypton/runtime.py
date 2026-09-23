@@ -297,6 +297,7 @@ def _start_background_locked(
     worker_effort: str,
     manager_model: str,
     manager_effort: str,
+    fresh_worker_session: bool = False,
     health_interval_seconds: int = 600,
     restart_limit: int = 3,
 ) -> dict[str, Any]:
@@ -341,6 +342,11 @@ def _start_background_locked(
         "worker_effort": str(worker_effort),
         "manager_model": str(manager_model),
         "manager_effort": str(manager_effort),
+        # This is private one-shot launch state. It is consumed by the first
+        # engine child so a supervisor restart resumes the replacement worker
+        # conversation instead of repeatedly discarding it.
+        "fresh_worker_session": bool(fresh_worker_session),
+        "fresh_worker_session_consumed": False,
         "health_interval_seconds": interval,
         "restart_limit": retries,
         # This private engine mode makes the finite detached deadline the
@@ -972,6 +978,17 @@ def run_engine(slug: str, run_id: str) -> int:
     if spec.get("slug") != slug or spec.get("run_id") != run_id:
         return 2
     remaining = max(1, int(math.ceil(float(spec["deadline_at"]) - time.time())))
+    fresh_worker_session = (
+        spec.get("fresh_worker_session") is True
+        and spec.get("fresh_worker_session_consumed") is not True
+    )
+    if fresh_worker_session:
+        # Clear the inherited worker UUID before consuming the one-shot bit.
+        # Both writes are idempotent: a crash between them retries the clear,
+        # while a crash after them cannot resume the pre-run conversation.
+        Workspace(slug).update_meta(worker_uuid="")
+        spec["fresh_worker_session_consumed"] = True
+        _write_json(_paths(slug, run_id)["spec"], spec)
     arguments = [
         "resume", slug, "-p", "--console", "quiet",
         "--max-seconds", str(remaining),
@@ -989,6 +1006,8 @@ def run_engine(slug: str, run_id: str) -> int:
         arguments.append("--stop-on-p1")
     if spec.get("run_until_deadline"):
         arguments.append("--run-until-deadline")
+    if fresh_worker_session:
+        arguments.append("--fresh-worker-session")
     from .cli import main
     return int(main(arguments))
 

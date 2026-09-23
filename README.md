@@ -164,6 +164,7 @@ Grypton supports the familiar Code-style shortcuts and the explicit command form
 | Start a finite background run | `./bin/grypton init --target HOST --background --duration 12h -m "mission"` |
 | Continue the newest engagement | `./bin/grypton -c` |
 | Resume one engagement | `./bin/grypton -r ENGAGEMENT` or `./bin/grypton resume ENGAGEMENT` |
+| Resume with a new Kraude conversation | `./bin/grypton resume ENGAGEMENT --fresh-worker-session` |
 | Supervise an existing engagement that is not running | `./bin/grypton run start ENGAGEMENT` |
 | Check a background run | `./bin/grypton run status ENGAGEMENT` |
 | Read supervisor events | `./bin/grypton run logs ENGAGEMENT` |
@@ -208,6 +209,7 @@ subset; it always runs detached with quiet, non-interactive output.
 | `--background` | Run under the detached private supervisor. A finite time limit is required. |
 | `--health-interval DURATION` | Record background health counters at this interval. Default: `10m`. |
 | `--restart-limit N` | Allow at most `N` safe supervisor restarts after an abnormal exit. Default: `3`. |
+| `--fresh-worker-session` | On `resume` or `run start`, start a new Kraude conversation while keeping the workspace, ledgers, and Kryptex session. |
 | `--stop-on-p1` | Stop after a confirmed P1. |
 | `--force` | Reuse the existing engagement name and reset its run state. |
 
@@ -238,6 +240,12 @@ Resume quietly and write the stream to a log:
 
 ```bash
 ./bin/grypton resume https-api-example-test --console quiet -p | tee grypton-run.log
+```
+
+Resume the same evidence and Kryptex context with a clean Kraude conversation:
+
+```bash
+./bin/grypton resume https-api-example-test --fresh-worker-session
 ```
 
 ## Run for hours without keeping a terminal open
@@ -1001,7 +1009,7 @@ Each engagement has a private directory:
 ├── attack-surface.md           discovered routes, hosts, and boundaries
 ├── tested-techniques.md        attempted techniques and results
 ├── progress.md                 turn-by-turn progress
-├── scope-rules.md              scope and standing instructions
+├── scope-rules.md              worker-visible URLs, severities, and finding exclusions
 ├── flows/                      bounded request and response captures
 ├── loot/                       downloaded in-scope artifacts
 ├── research/                   saved research notes

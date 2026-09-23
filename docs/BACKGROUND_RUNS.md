@@ -19,6 +19,23 @@ To supervise an existing engagement that is not currently running, use `run star
   --duration 12h --health-interval 10m --restart-limit 3
 ```
 
+When Kraude needs a clean OpenCode conversation but the engagement evidence and
+Kryptex context should continue, add `--fresh-worker-session`:
+
+```bash
+./bin/grypton run start https-app-example-test \
+  --fresh-worker-session --duration 12h
+```
+
+The same option works with foreground `resume`. It starts Kraude with the
+current scope projection and the mission supplied to that resume. Findings,
+attack-surface and tested-technique ledgers, workspace files, turn counters,
+and Kryptex's saved session remain in place. In a detached run the option is a
+private one-shot setting: an engine restart resumes the replacement Kraude
+session after its ID reaches durable metadata. If the process fails before the
+first replacement turn completes, no resumable session ID exists and the next
+engine child starts another clean Kraude conversation.
+
 A direct background `init` or `resume` must include `--duration`,
 `--max-seconds`, or `--auto-stop-time`.
 
