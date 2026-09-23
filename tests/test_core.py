@@ -1179,6 +1179,19 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("CORRECTIONS", message)
         self.assertNotIn("Never", message)
 
+    def test_worker_handoff_removes_embedded_negative_clauses(self):
+        samples = {
+            "Use credential_login and do not retry after an error.":
+                "Use credential_login",
+            "Inspect the profile endpoint; never call the login route again.":
+                "Inspect the profile endpoint",
+            "Use one control request, but avoid repeating it.":
+                "Use one control request",
+        }
+        for directive, expected in samples.items():
+            with self.subTest(directive=directive):
+                self.assertEqual(Directive(directive=directive).worker_message(), expected)
+
     async def test_static_manager_prompt_is_not_reinjected_each_turn(self):
         with isolated_runtime():
             ws = Workspace("manager-prompt")
@@ -1471,8 +1484,8 @@ class WorkerEventTests(unittest.TestCase):
         for generated_rule in ("do not", "never", "must", "hard rules",
                                "embedded operating skills"):
             self.assertNotIn(generated_rule, combined)
-        self.assertIn("use any available tool", worker.lower())
-        self.assertIn("scope data", worker.lower())
+        self.assertEqual(worker.strip(), "SCOPE DATA")
+        self.assertEqual(workspace.strip(), "SCOPE DATA")
 
     def test_explicit_mission_reaches_kraude_runtime_prompt_verbatim(self):
         with isolated_runtime():
@@ -1506,6 +1519,68 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                 "Minimum severity: Critical."
             )
             self.assertEqual(await engine._opening_directive(), engine.brief)
+
+    async def test_explicit_operator_brief_is_exact_recovery_directive(self):
+        with isolated_runtime():
+            ws = Workspace("recovery-brief")
+            ws.create("https://example.test/app", "web")
+            engine = Engine("recovery-brief", backend="mock")
+            mission = "Credential alias: primary. Check whether it can authenticate."
+            engine.brief = mission
+            self.assertEqual(engine._recovery_directive(), mission)
+            self.assertEqual(engine._forced_action_directive_with_user_intent(), mission)
+            self.assertEqual(await engine._opening_directive(), mission)
+
+    async def test_default_opening_directive_is_short_affirmative_action(self):
+        with isolated_runtime():
+            ws = Workspace("default-opening")
+            ws.create("https://example.test/app", "web")
+            engine = Engine("default-opening", backend="mock")
+            prompt = await engine._opening_directive()
+            self.assertEqual(prompt, engine._recovery_directive())
+            self.assertNotIn("PLAYBOOK", prompt)
+            self.assertNotIn("Never", prompt)
+            self.assertNotIn("Do not", prompt)
+
+    def test_direct_worker_message_reaches_worker_without_wrapper(self):
+        with isolated_runtime():
+            ws = Workspace("direct-worker-message")
+            ws.create("https://example.test/app", "web")
+            engine = Engine("direct-worker-message", backend="mock")
+            message = "Credential alias: primary. Check whether it can authenticate."
+            engine.submit_user(message, to_worker=True)
+            self.assertEqual(engine._prepend_user_to_worker("manager action"), message)
+            self.assertEqual(ws.load_constraints().standing_instructions, [message])
+            self.assertNotIn(message, ws.load_constraints().to_worker_prompt_block())
+
+    async def test_kryptex_remember_text_is_not_persisted_or_wrapped(self):
+        with isolated_runtime():
+            ws = Workspace("manager-relay")
+            ws.create("https://example.test/app", "web")
+            engine = Engine("manager-relay", backend="mock")
+            engine.manager = SimpleNamespace(chat=AsyncMock(return_value={
+                "reply": "Working.",
+                "remember": "Manager-generated standing rule.",
+                "disposition": "apply-now",
+                "worker_note": "Use credential_status and do not retry.",
+                "degraded": False,
+            }))
+            engine._user_to_manager.put_nowait("Check authentication.")
+            task = asyncio.create_task(engine._user_chat_loop())
+            for _ in range(100):
+                if engine.manager.chat.await_count:
+                    break
+                await asyncio.sleep(0.01)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+            instructions = ws.load_constraints().standing_instructions
+            self.assertEqual(instructions, ["[USER, turn ~0] Check authentication."])
+            self.assertNotIn("Manager-generated", "\n".join(instructions))
+            self.assertEqual(
+                engine._prepend_user_to_worker("manager action"),
+                "Use credential_status",
+            )
 
     def test_automatic_validation_candidates_are_only_p1_and_p2(self):
         findings = [

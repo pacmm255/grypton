@@ -24,15 +24,22 @@ _PROHIBITIVE_DIRECTIVE = re.compile(
     r"no\s+(?:retry|retries|brute|bruteforce|brute-force|probing|testing|request|requests))\b",
     re.IGNORECASE,
 )
+_PROHIBITIVE_CLAUSE_BOUNDARY = re.compile(
+    r"\s*(?:;|—|–|,?\s+\b(?:and|but)\b)\s*"
+    r"(?=(?:do\s+not|don't|never|avoid|refrain\s+from|must\s+not|"
+    r"no\s+(?:retry|retries|brute|bruteforce|brute-force|probing|testing|request|requests))\b)",
+    re.IGNORECASE,
+)
 
 
 def _affirmative_directive(text: str) -> str:
     """Keep Kryptex's executable action without forwarding generated prohibitions."""
     parts = []
     for value in _DIRECTIVE_SENTENCE.split(str(text or "")):
-        value = value.strip()
-        if value and not _PROHIBITIVE_DIRECTIVE.match(value):
-            parts.append(value)
+        for clause in _PROHIBITIVE_CLAUSE_BOUNDARY.split(value):
+            clause = clause.strip()
+            if clause and not _PROHIBITIVE_DIRECTIVE.match(clause):
+                parts.append(clause)
     return " ".join(parts).strip()
 
 
