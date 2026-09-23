@@ -21,11 +21,36 @@ from .openclaude import OpenClaudeError, OpenClaudeGateway
 
 MAX_STREAM_BYTES = 16_000_000
 MCP_TIMEOUT_MS = 120_000
+MAX_ASSISTANT_TEXT_CHARS = 12_000
 _OPENCODE_VERSION: Optional[str] = None
 _CONTROL = re.compile(
     r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|"
     r"[\x00-\x08\x0b-\x1f\x7f-\x9f]"
 )
+
+_STATUS_GLYPH = r"(?:\u2705|\u2611\ufe0f?|\u2714\ufe0f?|\U0001f3c1|\U0001f680|\U0001faf0|\U0001f3ac|\U0001f389|\U0001f44d|\u2728)"
+_STATUS_GLYPH_RUN = re.compile(rf"(?:{_STATUS_GLYPH}[\s,.;:!\-]*){{2,}}")
+_ONLY_STATUS_GLYPHS = re.compile(rf"^(?:{_STATUS_GLYPH}|[\s,.;:!\-_*#])+$")
+_META_CHATTER = re.compile(
+    r"(?:"
+    r"\b(?:now|time\s+to|let\s+me|i\s+(?:will|should|must|can|'ll))\b"
+    r".{0,60}\b(?:provide|emit|write|deliver|send|give)\b"
+    r".{0,40}\b(?:final|answer|response)\b"
+    r"|\b(?:final\s+(?:answer|response))\s+(?:follows|below|now|next)\b"
+    r"|\bno\s+more\s+(?:delays?|thinking|analysis)\b"
+    r"|\b(?:end|stop)\s+(?:of\s+)?(?:thinking|analysis)\b"
+    r"|\b(?:just|simply)\s+(?:answer|emit|respond)\b"
+    r")",
+    re.IGNORECASE,
+)
+_VACUOUS_LINE = re.compile(
+    r"^(?:ok(?:ay)?|sure|understood|done|finished|ready|goodbye|"
+    r"let(?:'s| us)\s+(?:go|proceed|finish)|final(?:\s+(?:answer|response))?|"
+    r"answer\s+follows)[\s.!:;-]*$",
+    re.IGNORECASE,
+)
+_SENTENCE_BREAK = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9])")
+_TEXT_TRUNCATION_MARKER = "\n\n[... normalized response truncated ...]\n\n"
 
 
 class ProviderError(RuntimeError):
@@ -79,6 +104,120 @@ def clean(text: str, secrets=()) -> str:
     text = re.sub(r"(?i)(bearer\s+)[\w.\-]+", r"\1[REDACTED]", text)
     text = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}", "[REDACTED]", text)
     return _CONTROL.sub("", text)
+
+
+def _bounded_assistant_text(text: str) -> tuple[str, bool]:
+    """Bound model prose while retaining useful context at both ends."""
+    if len(text) <= MAX_ASSISTANT_TEXT_CHARS:
+        return text, False
+    available = MAX_ASSISTANT_TEXT_CHARS - len(_TEXT_TRUNCATION_MARKER)
+    head_size = available // 2
+    tail_size = available - head_size
+    bounded = (
+        text[:head_size].rstrip()
+        + _TEXT_TRUNCATION_MARKER
+        + text[-tail_size:].lstrip()
+    )
+    return bounded[:MAX_ASSISTANT_TEXT_CHARS], True
+
+
+def _assistant_text_segments(text: str) -> list[str]:
+    """Split prose enough to isolate runaway meta chatter without rewriting it."""
+    segments: list[str] = []
+    for raw_line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw_line.rstrip()
+        if not line.strip():
+            segments.append("")
+            continue
+        # Degenerate responses sometimes put hundreds of short status
+        # sentences on one physical line. Ordinary prose and code retain their
+        # original line boundaries.
+        if len(line) > 500 and _META_CHATTER.search(line):
+            segments.extend(piece.strip() for piece in _SENTENCE_BREAK.split(line))
+        else:
+            segments.append(line)
+    return segments
+
+
+def _normalize_assistant_text(text: str) -> str:
+    """Remove transport-level output degeneration while preserving evidence prose."""
+    kept: list[str] = []
+    seen: set[str] = set()
+    pending_blank = False
+    for segment in _assistant_text_segments(text):
+        if not segment:
+            pending_blank = bool(kept)
+            continue
+        original = segment
+        segment = _STATUS_GLYPH_RUN.sub("", segment).rstrip()
+        stripped = segment.strip()
+        if not stripped or _ONLY_STATUS_GLYPHS.fullmatch(stripped):
+            continue
+        classification = re.sub(
+            rf"^(?:{_STATUS_GLYPH}\s*)+", "", stripped
+        ).strip()
+        if (_VACUOUS_LINE.fullmatch(classification)
+                or _META_CHATTER.search(classification)):
+            continue
+
+        # Ignore Markdown decoration and whitespace when detecting repeated
+        # prose, but retain the first occurrence exactly as written.
+        identity = re.sub(r"\s+", " ", classification).strip().casefold()
+        identity = re.sub(rf"^(?:[-*#>\s]|{_STATUS_GLYPH})+", "", identity)
+        if not identity or identity in seen:
+            continue
+        seen.add(identity)
+        if pending_blank and kept and kept[-1] != "":
+            kept.append("")
+        pending_blank = False
+        kept.append(original if segment == original else segment.strip())
+
+    normalized = "\n".join(kept).strip()
+    return _bounded_assistant_text(normalized)[0] if normalized else ""
+
+
+def _select_assistant_text(parts: list[str]) -> tuple[str, dict]:
+    """Select the last substantive OpenCode text part and describe filtering.
+
+    The caller keeps the streamed events verbatim in the event transcript.
+    This helper only derives the bounded text returned to the orchestrator.
+    """
+    raw_parts = [part for part in parts if isinstance(part, str) and part.strip()]
+    if not raw_parts:
+        return "", {
+            "raw_text_part_count": 0,
+            "raw_text_chars": 0,
+            "raw_final_text_chars": 0,
+            "normalized_text_chars": 0,
+            "selected_text_part_index": None,
+            "text_filtered": False,
+            "text_truncated": False,
+        }
+
+    raw_final_source = raw_parts[-1]
+    raw_final = raw_final_source.strip()
+    selected = ""
+    selected_index: int | None = None
+    for index in range(len(raw_parts) - 1, -1, -1):
+        candidate = _normalize_assistant_text(raw_parts[index])
+        if candidate:
+            selected = candidate
+            selected_index = index
+            break
+
+    if not selected:
+        selected = "[OpenCode completed without a substantive final response.]"
+    truncated = _TEXT_TRUNCATION_MARKER.strip() in selected
+    metadata = {
+        "raw_text_part_count": len(raw_parts),
+        "raw_text_chars": sum(len(part) for part in raw_parts),
+        "raw_final_text_chars": len(raw_final_source),
+        "normalized_text_chars": len(selected),
+        "selected_text_part_index": selected_index,
+        "text_filtered": selected_index != len(raw_parts) - 1 or selected != raw_final,
+        "text_truncated": truncated,
+    }
+    return selected, metadata
 
 
 def _minimal_child_environment() -> dict[str, str]:
@@ -598,6 +737,7 @@ class OpenCodeClient:
             elif event_type == "error":
                 errors.append(str(event.get("error") or event.get("message") or event)[:1000])
 
+        assistant_text, text_metadata = _select_assistant_text(texts)
         duration = time.time() - started
         call_record = {
             "at": time.time(),
@@ -619,6 +759,7 @@ class OpenCodeClient:
             "stdout_sha256": hashlib.sha256(cleaned_stdout.encode("utf-8")).hexdigest(),
             "stderr_present": bool(cleaned_stderr),
             "ok": not returncode and not errors and bool(texts),
+            **text_metadata,
         }
         gateway_events = gateway.drain_events()
         call_record["failover_count"] = sum(
@@ -635,7 +776,7 @@ class OpenCodeClient:
         if not texts:
             raise ProviderError(f"{self.role} OpenCode returned no final text.")
         return OpenCodeResult(
-            text="\n".join(texts).strip(),
+            text=assistant_text,
             session_id=result_session,
             events=events,
             tools=tools,
