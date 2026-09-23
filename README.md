@@ -560,35 +560,53 @@ The list shows names such as `primary` and the states `stored`, `authenticated`,
 token. Running `auth add` again with the same name replaces that credential and
 clears its previous session state.
 
-Kraude receives only the alias. Its credential tools follow this sequence:
+Kraude receives only the alias. It can use either login tool without receiving
+the saved username or password:
 
 1. `credential_status` checks which aliases and safe session states exist.
-2. `credential_login` makes one scoped login request. It requires a scoped
-   verification URL and exact, non-secret text that must appear in a successful
-   verification response.
-3. `authenticated_http_request` uses the verified cookie or bearer session for
+2. `credential_login` sends one scoped HTTP login request. Use it for an API or
+   a form that does not need browser JavaScript.
+3. `credential_browser_login` opens a scoped login page in Chromium, renders
+   the application, fills the named credential, and submits the form once. Use
+   it for a single-page application or another JavaScript-driven form.
+4. `authenticated_http_request` uses the verified cookie or bearer session for
    later scoped requests.
 
-The login tool does not guess that a `200` response means authentication
-succeeded. It requires newly issued cookie or recognized bearer material, then
-proves that session on the scoped endpoint and exact marker you specified.
-Custom session-cookie names are supported; unrelated pre-existing tracking
-cookies and unrelated JSON tokens are rejected. A second request without the
-session must not receive the marker, which prevents a public page plus a new
-tracking cookie from looking authenticated. It does not retry
-automatically, and it stops on MFA, OTP, CAPTCHA, rejection, or rate limiting.
-Each named credential has a two-attempt limit so an autonomous run cannot keep
-trying a login. A later authenticated request that receives a 401, 403, MFA,
-CAPTCHA, or 429 response invalidates the successful state and records the
-blocker.
+Both login tools require a scoped verification URL and exact, non-secret text
+that appears only after a successful login. They do not treat an HTTP `200` as
+proof by itself. `credential_login` requires a newly issued session cookie or
+recognized bearer token, then checks that material on the verification URL.
+Custom session-cookie names are supported; unrelated tracking cookies and
+unrelated JSON tokens are rejected.
+
+`credential_browser_login` performs the same proof for a rendered application.
+It collects the reusable cookie or recognized bearer material created by the
+form, opens a fresh browser with only that material, and checks the verification
+URL for the exact success marker. It also opens a separate fresh browser with
+no session. The marker must appear with the saved material and be absent from
+the anonymous control before Grypton records the session as authenticated.
+The login and verification URLs use the same recorded origin. Custom CSS
+selectors are available when the form does not use Grypton's defaults, and the
+optional `iran-e164` username transform can render a stored Iranian phone
+number in the format expected by the application.
+
+Each call reserves at most one login attempt and submits once; it does not
+retry the form internally. Each named credential has a two-attempt limit so an
+autonomous run cannot keep trying a login. MFA, OTP, CAPTCHA, rejection, and
+rate limiting are recorded as the observed result. A later authenticated
+request that receives a 401, 403, MFA, CAPTCHA, or 429 response invalidates the
+successful state and records the blocker.
 
 Named credentials and session material live under
 `.state/credentials/<engagement>/`, outside the engagement workspace. Private
 directories use mode `0700`; credential, cookie, token, and attempt-state files
 use mode `0600`. The tool inserts secrets only at transport time and removes
 them from returned results, captures, ledgers, prompts, normal logs, and
-reports. Every authenticated URL still has to pass the engagement's scope
-rules.
+reports. Browser captures also redact the stored and transformed username,
+password, cookies, bearer tokens, and encoded forms of those values from the
+rendered DOM, relevant application responses, console messages, blocked-route
+records, tool results, and audit rows. Every authenticated URL still has to
+pass the engagement's scope rules.
 
 ---
 
@@ -735,7 +753,7 @@ Common manual commands:
 | Group | Main tools |
 | --- | --- |
 | HTTP and captures | `http_request`, `proxy_flows`, `flow_read`, `flow_replay` |
-| Private authentication | `credential_status`, `credential_login`, `authenticated_http_request` |
+| Private authentication | `credential_status`, `credential_login`, `credential_browser_login`, `authenticated_http_request` |
 | Browser and reconnaissance | `browse`, `httpx_probe`, `dns_lookup`, `tls_certificate`, `port_scan`, `subdomain_enum` |
 | Goja proxy | `goja_start`, `goja_status`, `goja_request`, `goja_stop` |
 | APK and protocol work | `tcp_exchange`, `artifact_download`, `apk_inspect`, `apk_extract_asset` |

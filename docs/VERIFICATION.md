@@ -46,8 +46,19 @@ validation gate, explicit lower-severity review, the mock
 worker-manager-validator loop, multi-flow evidence handoff, OpenCode error
 rendering, the 120-second MCP ceiling, scoped captures and replay, canonical URL
 path subtrees and exclusions, explicit scheme/port binding, redirect blocking,
-non-URL transport separation, large-response preview limits, complete disk
-captures, report auditing, and CLI review commands.
+non-URL transport separation, direct and rendered credential login, large-response
+preview limits, complete disk captures, report auditing, and CLI review
+commands.
+
+The rendered-login tests use a loopback single-page application and fake
+credentials. Acceptance requires one form submission for one reserved attempt,
+a required same-origin verification URL and exact non-secret success marker,
+and reusable cookie or bearer material. A fresh browser containing only that
+material must receive the marker while a separate fresh anonymous browser does
+not. The verified material must work through `authenticated_http_request`.
+Tool results, captures, rendered HTML, response bodies, console messages, and
+audit rows must omit the stored username, transformed username, password,
+cookie, bearer token, and their encoded forms.
 
 OpenClaude-facing tests must use fake routes, fake key sentinels, and loopback
 upstreams. They must verify that provider configuration points only to the
