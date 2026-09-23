@@ -528,7 +528,7 @@ class Engine:
                     f"Kryptex attempted a soft stop "
                     f"({(directive.stop_reason or 'unspecified')[:140]}) — continuing per "
                     f"the engagement instructions with a new in-scope angle."))
-                directive.directive = self._recovery_directive()
+                directive.directive = self._continuation_directive()
 
             if convergence_reason:
                 self._convergence_alerted = True
@@ -537,9 +537,9 @@ class Engine:
             self._handle_p1s()
 
             directive_text = (
-                self._recovery_directive()
+                self._continuation_directive()
                 if getattr(directive, "degraded", False)
-                else (directive.worker_message() or self._recovery_directive())
+                else (directive.worker_message() or self._continuation_directive())
             )
 
             # Structural override: refuse to forward a directive that itself tells
@@ -551,7 +551,7 @@ class Engine:
                 self.emit("status", text=(
                     "Manager directive was an idle/standby instruction — engine "
                     "OVERRODE it with a forced-action directive. Refusal not accepted."))
-                directive_text = self._recovery_directive()
+                directive_text = self._continuation_directive()
 
             # If a verified engagement is active, documentation-only retreat is
             # replaced with another action inside the recorded boundary.
@@ -560,7 +560,7 @@ class Engine:
                     "Manager directive was a SOFT-RETREAT (draft-report / "
                     "halt-testing / wait-for-authorization) — engine OVERRODE "
                     "it with an in-scope action."))
-                directive_text = self._recovery_directive()
+                directive_text = self._continuation_directive()
 
             # If Kraude refused/idled this turn, DEEP-rewind the entire idle tail
             # out of the worker's session history before sending the reframed
@@ -1189,6 +1189,17 @@ class Engine:
     def _recovery_directive(self) -> str:
         """Reuse an explicit mission exactly; otherwise supply one positive action."""
         return self.brief if self.brief else _RECOVERY_ACTION
+
+    def _continuation_directive(self) -> str:
+        """Advance a timed run without replaying an already-completed mission.
+
+        The operator's brief is still delivered verbatim on the opening turn.
+        A detached deadline run can outlive that one-shot task, so a manager
+        soft stop, idle response, or provider fallback advances to the generic
+        positive action instead of repeatedly submitting credentials or
+        replaying another completed setup step.
+        """
+        return _RECOVERY_ACTION if self.run_until_deadline else self._recovery_directive()
 
     def _forced_action_directive_with_user_intent(self) -> str:
         """Compatibility wrapper for the former forced-action helper."""

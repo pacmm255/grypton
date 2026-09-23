@@ -1980,6 +1980,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
             config.CONFIG.repetitive_probe_turn_limit = 99
             config.CONFIG.exhaustion_threshold = 99
             events = []
+            worker_directives = []
             try:
                 ws = Workspace("deadline-manager-auth-stop")
                 ws.create("https://app.example.test", "web")
@@ -1996,7 +1997,11 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                     brief="check authentication", target="https://app.example.test",
                     target_type="web",
                 )
-                engine.worker.script = lambda _worker, _directive: "Authentication still blocked."
+                def worker_script(_worker, directive):
+                    worker_directives.append(directive)
+                    return "Authentication still blocked."
+
+                engine.worker.script = worker_script
                 engine.manager.direct = AsyncMock(return_value=Directive(
                     assessment="Activation gate is still closed.",
                     directive="Try the next in-scope authentication path.",
@@ -2012,6 +2017,13 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(engine.turn_index, 3)
                 self.assertIn("max_turns safety ceiling", engine.stop_reason)
                 self.assertEqual(engine.manager.direct.await_count, 3)
+                self.assertEqual(worker_directives[0], "check authentication")
+                self.assertEqual(worker_directives[1:], [
+                    "Use the most relevant available tool on the least-tested "
+                    "in-scope surface and record the observed result.",
+                    "Use the most relevant available tool on the least-tested "
+                    "in-scope surface and record the observed result.",
+                ])
                 self.assertTrue(any(
                     kind == "status" and "attempted a soft stop" in payload.get("text", "")
                     for kind, payload in events

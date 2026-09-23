@@ -276,6 +276,9 @@ background `init` or `resume` must include `--duration`, `--max-seconds`, or
 
 A detached finite run keeps requesting new Kryptex-directed pivots when its
 current leads converge, using the deadline as its normal completion boundary.
+The opening mission still reaches Kraude verbatim. After that one-shot mission
+is complete, a soft stop advances to a positive least-tested in-scope action
+instead of replaying setup or credential submission for the rest of the run.
 An operator stop or a binding scope/program stop can still end it sooner.
 
 The lifecycle log contains timestamps, process state, exit codes, and workspace
