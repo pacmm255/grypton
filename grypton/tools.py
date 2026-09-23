@@ -48,6 +48,28 @@ _SENSITIVE_ASSIGNMENT_RE = re.compile(
     """
 )
 
+_BROWSER_IDENTITY_KEYS = frozenset({
+    "username", "identifier", "identity",
+    "email", "emailaddress", "phone", "phonenumber", "telephone",
+    "mobile", "mobilenumber", "firstname", "lastname", "fullname",
+    "displayname", "legalname", "birthdate", "dateofbirth",
+    "nationalid", "nationalcode", "customerid", "accountid", "userid",
+    "useruuid", "invitationcode", "invitecode",
+    "postalcode", "zipcode", "address",
+})
+_BROWSER_IDENTITY_ASSIGNMENT_RE = re.compile(
+    r'''(?ix)
+    ((?:["']?(?:user[_-]?name|identifier|identity|email(?:[_-]?address)?|
+       phone(?:[_-]?number)?|telephone|mobile(?:[_-]?number)?|first[_-]?name|
+       last[_-]?name|full[_-]?name|display[_-]?name|legal[_-]?name|birth[_-]?date|
+       date[_-]?of[_-]?birth|national[_-]?(?:id|code)|customer[_-]?id|
+       account[_-]?id|user[_-]?(?:id|uuid)|invitation[_-]?code|invite[_-]?code|
+       postal[_-]?code|zip[_-]?code|address)["']?)
+       \s*[:=]\s*)
+    (?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^&\s,;}\]<>]+)
+    '''
+)
+
 
 def redact_sensitive_text(value: object, secret_values: Iterable[str] = ()) -> str:
     """Remove credentials, cookies, and login tokens from observable text."""
@@ -87,6 +109,126 @@ def _serialized_secret_variants(secret_values: Iterable[str]) -> tuple[str, ...]
             rendered = json.dumps(secret, ensure_ascii=ensure_ascii)
             output.add(rendered[1:-1])
     return tuple(sorted(output, key=len, reverse=True))
+
+
+def _login_username_redaction_values(username: str,
+                                     selected_transform: str = "stored") -> tuple[str, ...]:
+    """Return plausible app-side forms of a private login identifier."""
+    raw = str(username)
+    output = {raw}
+    compact = re.sub(r"[\s()\-]+", "", raw.strip())
+    if len(compact) >= 4:
+        output.add(compact)
+    if "@" in raw:
+        output.add(raw.strip().lower())
+    for transform in dict.fromkeys((selected_transform, "stored", "iran-e164")):
+        try:
+            transformed = credentials.normalize_login_username(raw, transform)
+        except credentials.CredentialError:
+            continue
+        output.add(transformed)
+        if transformed.startswith("+98") and len(transformed) > 3:
+            national = transformed[3:]
+            output.update({"0" + national, "98" + national, "0098" + national})
+    return tuple(sorted((item for item in output if item), key=len, reverse=True))
+
+
+def _browser_identity_values(texts: Iterable[str]) -> tuple[str, ...]:
+    """Extract bounded identity values so echoes can be removed across artifacts."""
+    output: set[str] = set()
+
+    def remember(value) -> None:
+        if isinstance(value, bool) or value is None:
+            return
+        if not isinstance(value, (str, int, float)):
+            return
+        rendered = str(value).strip()
+        if (not rendered or len(rendered) > 4096
+                or any(ord(char) < 0x20 for char in rendered)):
+            return
+        output.add(rendered)
+
+    def walk(value, depth: int = 0) -> None:
+        if depth > 8:
+            return
+        if isinstance(value, dict):
+            for key, child in value.items():
+                normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+                if normalized in _BROWSER_IDENTITY_KEYS:
+                    if isinstance(child, list):
+                        for item in child[:50]:
+                            remember(item)
+                    else:
+                        remember(child)
+                if isinstance(child, (dict, list)):
+                    walk(child, depth + 1)
+        elif isinstance(value, list):
+            for child in value[:100]:
+                walk(child, depth + 1)
+
+    for text in texts:
+        try:
+            parsed = json.loads(str(text))
+        except (TypeError, ValueError):
+            continue
+        walk(parsed)
+    return tuple(sorted(output, key=len, reverse=True))
+
+
+def _browser_redact_identity_text(value: object,
+                                  secret_values: Iterable[str] = (),
+                                  identity_values: Iterable[str] = ()) -> str:
+    """Redact identity echoes in browser-auth artifacts only."""
+    text = redact_sensitive_text(value, secret_values)
+    for identity in sorted({str(item) for item in identity_values if str(item)},
+                           key=len, reverse=True):
+        if len(identity) >= 2 and re.fullmatch(r"[\w]+", identity):
+            text = re.sub(
+                rf"(?<![\w]){re.escape(identity)}(?![\w])",
+                "[REDACTED]", text,
+            )
+        elif len(identity) >= 2:
+            text = text.replace(identity, "[REDACTED]")
+    return _BROWSER_IDENTITY_ASSIGNMENT_RE.sub(r"\1[REDACTED]", text)
+
+
+def _browser_redacted_capture_value(value, secret_values: Iterable[str],
+                                    identity_values: Iterable[str] = ()):
+    """Recursively sanitize browser-auth data without changing generic captures."""
+    secrets = tuple(str(item) for item in secret_values if str(item))
+    identities = tuple(str(item) for item in identity_values if str(item))
+    if isinstance(value, dict):
+        output = {}
+        for key, child in value.items():
+            safe_key = _browser_redact_identity_text(key, secrets, identities)
+            normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            output[safe_key] = (
+                "[REDACTED]" if normalized in _BROWSER_IDENTITY_KEYS
+                else _browser_redacted_capture_value(child, secrets, identities)
+            )
+        return output
+    if isinstance(value, list):
+        return [
+            _browser_redacted_capture_value(child, secrets, identities)
+            for child in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(
+            _browser_redacted_capture_value(child, secrets, identities)
+            for child in value
+        )
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return _browser_redact_identity_text(value, secrets, identities)
+        if isinstance(parsed, (dict, list)):
+            return json.dumps(
+                _browser_redacted_capture_value(parsed, secrets, identities),
+                ensure_ascii=False, separators=(",", ":"),
+            )
+        return _browser_redact_identity_text(value, secrets, identities)
+    return value
 
 
 def _redacted_capture_value(value, secret_values: Iterable[str]):
@@ -419,6 +561,39 @@ def _safe_headers(headers: Optional[dict]) -> dict[str, str]:
             )
         if key and re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", key):
             output[key] = value
+    return output
+
+
+def _browser_auth_verify_headers(headers: Optional[dict]) -> dict[str, str]:
+    """Validate non-secret protocol headers for an exact-origin proof request."""
+    if headers is None:
+        return {}
+    if not isinstance(headers, dict):
+        raise ValueError("Browser verification headers must be an object.")
+    if len(headers) > 32:
+        raise ValueError("Browser verification accepts at most 32 protocol headers.")
+    for raw_key, raw_value in headers.items():
+        key, value = str(raw_key), str(raw_value)
+        if (not key or len(key) > 128
+                or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", key)):
+            raise ValueError("Browser verification contains an invalid header name.")
+        if (len(value) > 8192 or "\r" in value or "\n" in value
+                or any(ord(char) < 0x20 and char != "\t" for char in value)
+                or "\x7f" in value):
+            raise ValueError(
+                f"Browser verification header {key!r} contains an invalid value."
+            )
+    output = _safe_headers(headers)
+    forbidden = _SENSITIVE_HEADERS | {
+        "connection", "content-length", "host", "proxy-connection",
+        "te", "trailer", "transfer-encoding", "upgrade",
+    }
+    rejected = sorted(key for key in output if key.lower() in forbidden)
+    if rejected:
+        raise ValueError(
+            "Browser verification headers cannot contain authentication, session, "
+            "destination, or hop-by-hop headers: " + ", ".join(rejected)
+        )
     return output
 
 
@@ -1773,7 +1948,8 @@ def _launch_scoped_browser_context(playwright, launch_profile: dict,
                                    workspace: Workspace,
                                    denied_requests: list[str],
                                    bound_header_origin: str = "",
-                                   bound_headers: Optional[dict] = None):
+                                   bound_headers: Optional[dict] = None,
+                                   bound_header_state: Optional[dict] = None):
     """Launch the shared browser boundary and scope-check every network route."""
     context = playwright.chromium.launch_persistent_context(
         user_data_dir=launch_profile["profile"],
@@ -1802,17 +1978,23 @@ def _launch_scoped_browser_context(playwright, launch_profile: dict,
         allowed, _ = check_url_scope(workspace, request_url)
         if allowed:
             request_headers = None
-            if bound_header_origin and bound_headers:
+            active_origin = bound_header_origin
+            active_headers = bound_headers
+            if bound_header_state and bound_header_state.get("active"):
+                active_origin = str(bound_header_state.get("origin") or "")
+                state_headers = bound_header_state.get("headers")
+                active_headers = state_headers if isinstance(state_headers, dict) else None
+            if active_origin and active_headers:
                 try:
                     same_origin = (
                         credentials.normalize_origin(request_url)
-                        == bound_header_origin
+                        == active_origin
                     )
                 except credentials.CredentialError:
                     same_origin = False
                 if same_origin:
                     request_headers = dict(route.request.headers)
-                    request_headers.update(bound_headers)
+                    request_headers.update(active_headers)
             if request_headers is None:
                 route.continue_()
             else:
@@ -2109,9 +2291,9 @@ def _browser_auth_collect_responses(responses: list[dict],
                 "phase": str(observed.get("phase") or "login"),
                 "method": str(observed.get("method") or "").upper(),
                 "resource_type": str(observed.get("resource_type") or ""),
-                "url": redact_sensitive_text(response_url, secrets),
+                "url": response_url,
                 "status": status,
-                "body": redact_sensitive_text(body, secrets)[:MAX_INLINE_RESPONSE_CHARS],
+                "body": body[:MAX_INLINE_RESPONSE_CHARS],
                 "body_truncated": bool(
                     observed.get("body_truncated")
                     or len(body) > MAX_INLINE_RESPONSE_CHARS
@@ -2359,10 +2541,16 @@ def _browser_auth_install_cookies(workspace: Workspace, credential: str,
 
 def _browser_auth_save_capture(workspace: Workspace, url: str, capture: dict,
                                rendered_dom: str,
-                               secret_values: Iterable[str]) -> tuple[Path, Path]:
+                               secret_values: Iterable[str],
+                               identity_values: Iterable[str] = ()) -> tuple[Path, Path]:
     secrets = tuple(secret_values)
-    safe_capture = _redacted_capture_value(capture, secrets)
-    safe_dom = redact_sensitive_text(rendered_dom, secrets)[:MAX_RESPONSE_BYTES]
+    identities = tuple(identity_values)
+    safe_capture = _browser_redacted_capture_value(
+        capture, secrets, identities
+    )
+    safe_dom = _browser_redact_identity_text(
+        rendered_dom, secrets, identities
+    )[:MAX_RESPONSE_BYTES]
     workspace.scratch_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     output = workspace.scratch_dir / f"browser-auth-{time.time_ns()}.html"
     fd = os.open(
@@ -2375,7 +2563,9 @@ def _browser_auth_save_capture(workspace: Workspace, url: str, capture: dict,
         ensure_ascii=False, separators=(",", ":"),
     )
     flow = _save_flow(
-        workspace, "BROWSER", url, {}, None, flow_body,
+        workspace, "BROWSER",
+        _browser_redact_identity_text(url, secrets, identities),
+        {}, None, flow_body,
         transport="credential-playwright-chromium", returncode=0,
         secret_values=secrets,
     )
@@ -2394,14 +2584,17 @@ def _browser_auth_fresh_probe(
     timeout_ms: int,
     cookies: Optional[list[dict]] = None,
     bearer_token: str = "",
+    verify_headers: Optional[dict] = None,
 ) -> dict:
     """Load one proof URL in a fresh browser with only supplied session material."""
     with _isolated_browser_profile(executable) as launch_profile:
+        proof_headers = dict(verify_headers or {})
+        if bearer_token:
+            proof_headers["Authorization"] = f"Bearer {bearer_token}"
         context = _launch_scoped_browser_context(
             playwright, launch_profile, workspace, denied_requests,
-            credentials.normalize_origin(url) if bearer_token else "",
-            {"Authorization": f"Bearer {bearer_token}"}
-            if bearer_token else None,
+            credentials.normalize_origin(url) if proof_headers else "",
+            proof_headers or None,
         )
         try:
             if cookies:
@@ -2452,6 +2645,7 @@ def credential_browser_login(
     submit_selector: str = _BROWSER_SUBMIT_SELECTOR,
     verify_url: str = "",
     success_marker: str = "",
+    verify_headers: Optional[dict] = None,
     timeout: int = 45,
 ) -> dict:
     """Submit one private credential through a scoped rendered login form."""
@@ -2476,6 +2670,7 @@ def credential_browser_login(
             )
         if username_transform not in {"stored", "iran-e164"}:
             return _err("Username transform must be stored or iran-e164.")
+        clean_verify_headers = _browser_auth_verify_headers(verify_headers)
         username_selector = _browser_auth_selector(
             username_selector, label="Username", default=_BROWSER_USERNAME_SELECTOR
         )
@@ -2510,8 +2705,11 @@ def credential_browser_login(
 
     timeout_seconds = max(5, min(int(timeout), 120))
     timeout_ms = timeout_seconds * 1000
+    username_redactions = _login_username_redaction_values(
+        secret["username"], username_transform
+    )
     secret_values = _serialized_secret_variants((
-        secret["username"], login_username, secret["password"],
+        *username_redactions, secret["password"],
     ))
     denied_requests: list[str] = []
     console: list[dict] = []
@@ -2537,6 +2735,9 @@ def credential_browser_login(
     local_storage: dict = {}
     observed_token_sets: list[dict[str, str]] = []
     tokens: dict[str, str] = {}
+    identity_sources: list[str] = []
+    replay_body = ""
+    control_body = ""
     material_delta = False
     browser_identity = ""
     attempt = 0
@@ -2544,6 +2745,11 @@ def credential_browser_login(
     failure = ""
     phase = {"name": "initial"}
     context = None
+    verify_header_state = {
+        "active": False,
+        "origin": login_origin,
+        "headers": clean_verify_headers,
+    }
 
     def remember_console(message) -> None:
         if len(console) < 100:
@@ -2557,7 +2763,8 @@ def credential_browser_login(
             browser_identity = str(launch_profile["identity"])
             with sync_playwright() as playwright:
                 context = _launch_scoped_browser_context(
-                    playwright, launch_profile, workspace, denied_requests
+                    playwright, launch_profile, workspace, denied_requests,
+                    bound_header_state=verify_header_state,
                 )
                 page = context.new_page()
                 page.on("console", remember_console)
@@ -2615,9 +2822,7 @@ def credential_browser_login(
                         capture_session, pending_responses = (
                             _browser_auth_enable_response_capture(
                                 context, page, workspace, denied_requests,
-                                _serialized_secret_variants((
-                                    secret["username"], login_username,
-                                )),
+                                _serialized_secret_variants(username_redactions),
                                 _serialized_secret_variants((secret["password"],)),
                             )
                         )
@@ -2660,6 +2865,11 @@ def credential_browser_login(
                             pending_responses, workspace, secret_values
                         )
                     )
+                    identity_sources.extend(
+                        str(item.get("body") or "")
+                        for item in pending_responses
+                        if isinstance(item, dict) and not item.get("error")
+                    )
                     if not raw_response_bodies and not response_statuses and not failure:
                         failure = (
                             "No credential submission response was captured before "
@@ -2679,6 +2889,7 @@ def credential_browser_login(
                     observed_token_sets.append(tokens)
                     if not blocker:
                         phase["name"] = "verify"
+                        verify_header_state["active"] = True
                         verify_response = page.goto(
                             verify_url, wait_until="domcontentloaded", timeout=timeout_ms
                         )
@@ -2701,6 +2912,7 @@ def credential_browser_login(
                         verify_source = "\n".join(
                             (verify_body, verify_visible, verify_dom)
                         )
+                        identity_sources.append(verify_body)
                         # Verification can rotate cookies or refresh a bearer.
                         # Snapshot only after it completes so persisted state is current.
                         cookies = _browser_auth_persistable_cookies(
@@ -2733,16 +2945,19 @@ def credential_browser_login(
                             console=console, timeout_ms=timeout_ms,
                             cookies=cookies,
                             bearer_token=credentials.select_bearer(tokens),
+                            verify_headers=clean_verify_headers,
                         )
                         replay_status = int(replay.get("status") or 0)
                         replay_source = str(replay.get("source") or "")
+                        replay_body = str(replay.get("body") or "")
+                        identity_sources.append(replay_body)
                         replay_final_url = str(replay.get("final_url") or "")
                         replay_cookies = _browser_auth_persistable_cookies(
                             list(replay.get("cookies") or []), url
                         )
                         replay_tokens = dict(tokens)
                         replay_tokens.update(_browser_auth_tokens(
-                            (str(replay.get("body") or ""),),
+                            (replay_body,),
                             replay.get("local_storage")
                             if isinstance(replay.get("local_storage"), dict) else {},
                         ))
@@ -2756,9 +2971,12 @@ def credential_browser_login(
                             playwright, executable, workspace, verify_url,
                             phase="control", denied_requests=denied_requests,
                             console=console, timeout_ms=timeout_ms,
+                            verify_headers=clean_verify_headers,
                         )
                         control_status = int(control.get("status") or 0)
                         control_source = str(control.get("source") or "")
+                        control_body = str(control.get("body") or "")
+                        identity_sources.append(control_body)
                         control_final_url = str(control.get("final_url") or "")
                         observed_cookie_sets.append(
                             _browser_auth_persistable_cookies(
@@ -2766,7 +2984,7 @@ def credential_browser_login(
                             )
                         )
                         observed_token_sets.append(_browser_auth_tokens(
-                            (str(control.get("body") or ""),),
+                            (control_body,),
                             control.get("local_storage")
                             if isinstance(control.get("local_storage"), dict) else {},
                         ))
@@ -2792,6 +3010,11 @@ def credential_browser_login(
         and control_conclusive
     )
 
+    raw_identity_values = _browser_identity_values(identity_sources)
+    identity_values = tuple(sorted({
+        *raw_identity_values,
+        *_serialized_secret_variants(raw_identity_values),
+    }, key=len, reverse=True))
     runtime_secrets = [*secret_values]
     for observed_tokens in observed_token_sets:
         runtime_secrets.extend(observed_tokens.values())
@@ -2804,7 +3027,9 @@ def credential_browser_login(
         *secret_values,
         *_serialized_secret_variants(runtime_secrets),
     }, key=len, reverse=True))
-    response_rows = _redacted_capture_value(response_rows, secret_values)
+    response_rows = _browser_redacted_capture_value(
+        response_rows, secret_values, identity_values
+    )
 
     established = False
     if attempt and blocker:
@@ -2831,19 +3056,33 @@ def credential_browser_login(
     elif attempt:
         credentials.record_login_outcome(workspace.slug, credential)
 
-    safe_final_url = redact_sensitive_text(final_url, secret_values)
-    safe_replay_url = redact_sensitive_text(replay_final_url, secret_values)
-    safe_control_url = redact_sensitive_text(control_final_url, secret_values)
-    safe_console = _redacted_capture_value(console, secret_values)
+    safe_final_url = _browser_redact_identity_text(
+        final_url, secret_values, identity_values
+    )
+    safe_replay_url = _browser_redact_identity_text(
+        replay_final_url, secret_values, identity_values
+    )
+    safe_control_url = _browser_redact_identity_text(
+        control_final_url, secret_values, identity_values
+    )
+    safe_console = _browser_redacted_capture_value(
+        console, secret_values, identity_values
+    )
     safe_denied = [
-        redact_sensitive_text(value, secret_values) for value in denied_requests
+        _browser_redact_identity_text(value, secret_values, identity_values)
+        for value in denied_requests
     ]
     capture = {
         "login_status": page_status,
         "final_url": safe_final_url,
         "login_api_responses": response_rows,
         "verification": {
-            "url": redact_sensitive_text(verify_url, secret_values),
+            "url": _browser_redact_identity_text(
+                verify_url, secret_values, identity_values
+            ),
+            "headers": _browser_redacted_capture_value(
+                clean_verify_headers, secret_values, identity_values
+            ),
             "status": verify_status,
             "marker_present": bool(success_marker and success_marker in verify_source),
         },
@@ -2861,16 +3100,21 @@ def credential_browser_login(
         "console": safe_console,
         "blocked_requests": safe_denied,
         "auth_blocker": blocker,
-        "failure": redact_sensitive_text(failure, secret_values),
+        "failure": _browser_redact_identity_text(
+            failure, secret_values, identity_values
+        ),
     }
     try:
         html_path, flow = _browser_auth_save_capture(
-            workspace, url, capture, rendered_dom, secret_values
+            workspace, url, capture, rendered_dom, secret_values,
+            identity_values,
         )
     except OSError as exc:
         return _err(
             "Browser authentication capture could not be saved: "
-            + redact_sensitive_text(str(exc), secret_values)
+            + _browser_redact_identity_text(
+                str(exc), secret_values, identity_values
+            )
         )
 
     session = credentials.session_status(workspace.slug, credential)
@@ -2908,7 +3152,9 @@ def credential_browser_login(
         )
     if failure:
         return _err(
-            redact_sensitive_text(failure, secret_values)
+            _browser_redact_identity_text(
+                failure, secret_values, identity_values
+            )
             + f" Capture saved to {flow.name}.",
             data,
         )

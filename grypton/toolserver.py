@@ -108,6 +108,7 @@ def _credential_browser_login(ws, args):
         ),
         verify_url=args.get("verify_url", ""),
         success_marker=args.get("success_marker", ""),
+        verify_headers=args.get("verify_headers"),
         timeout=args.get("timeout", 45),
     )
 
@@ -223,6 +224,11 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
             "success_marker": _string(
                 "Exact non-secret text used for independent session proof"
             ),
+            "verify_headers": {
+                "type": "object",
+                "additionalProperties": {"type": "string"},
+                "description": "Same-origin protocol headers for session proof",
+            },
             "timeout": {"type": "integer", "minimum": 5, "maximum": 120},
         }, ("url", "credential", "verify_url", "success_marker")),
         _credential_browser_login),
@@ -413,15 +419,10 @@ def _audit_secret_values(workspace: Workspace, name: str, args: dict) -> tuple[s
         )
     except credentials.CredentialError:
         return ()
-    values = [secret["username"], secret["password"]]
-    try:
-        transformed = credentials.normalize_login_username(
-            secret["username"], str(args.get("username_transform") or "stored")
-        )
-    except credentials.CredentialError:
-        pass
-    else:
-        values.append(transformed)
+    values = [secret["password"]]
+    values.extend(tools._login_username_redaction_values(
+        secret["username"], str(args.get("username_transform") or "stored")
+    ))
     return tools._serialized_secret_variants(values)
 
 

@@ -44,6 +44,7 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
     token = "browser-token-never-log"
     mode = "success"
     login_posts = 0
+    verify_header_values = []
 
     def _send(self, status: int, body: bytes, *, content_type: str,
               cookie: str = "") -> None:
@@ -88,6 +89,20 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
             loginPassword.addEventListener('input', updateSubmit);
             </script>
             """ if type(self).mode == "disabled-submit" else ""
+            username_expression = (
+                """(() => { const value = document.querySelector(
+                '[data-testid="login-username"]').value;
+                const compact = value.replace(/[\\s()\\-]/g, '');
+                return compact.startsWith('09')
+                  ? '+98' + compact.slice(1) : value; })()"""
+                if type(self).mode == "client-normalizes" else
+                "document.querySelector('[data-testid=\"login-username\"]')"
+                ".value"
+            )
+            identity_console = (
+                "console.log(JSON.stringify(value));"
+                if type(self).mode == "client-normalizes" else ""
+            )
             html = f"""<!doctype html><html><body>
             {challenge}
             <form id="login-form">
@@ -102,12 +117,13 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
               const response = await fetch('/api/login', {{
                 method: 'POST', headers: {{'Content-Type': 'application/json'}},
                 body: JSON.stringify({{
-                  username: document.querySelector('[data-testid="login-username"]').value,
+                  username: {username_expression},
                   password: document.querySelector('[data-testid="login-password"]').value
                 }})
               }});
               const value = await response.json();
               document.getElementById('result').textContent = JSON.stringify(value);
+              {identity_console}
               if (value.access_token) console.log(value.access_token);
               if (response.ok && !value.otp_required) window.location.assign('/dashboard');
             }});
@@ -132,6 +148,12 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                 self.end_headers()
             return
         if self.path == "/me":
+            if type(self).mode == "verify-header":
+                header = self.headers.get("X-SPA-Client", "")
+                type(self).verify_header_values.append(header)
+                if header != "milli-web":
+                    self._json(400, {"code": "bad_request"})
+                    return
             authenticated = (
                 f"app_session={self.session}" in self.headers.get("Cookie", "")
                 or self.headers.get("Authorization") == f"Bearer {self.token}"
@@ -168,17 +190,25 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
         ):
             self._json(401, {"error": "invalid credentials"})
             return
-        self._json(
-            200,
-            {
-                "authenticated": True,
-                "otp_required": False,
-                "captcha": None,
-                "username": value.get("username"),
-                "access_token": self.token,
-            },
-            cookie=self.session,
-        )
+        response = {
+            "authenticated": True,
+            "otp_required": False,
+            "captcha": None,
+            "username": value.get("username"),
+            "access_token": self.token,
+        }
+        if type(self).mode == "client-normalizes":
+            response.update({
+                "firstName": "Nika",
+                "email": "private-person@example.test",
+                "nationalCode": "0012345678",
+                "data": {"user": {
+                    "userUuid": "private-user-uuid-1234",
+                    "invitationCode": "private-invitation-9876",
+                    "inviteCode": "private-invite-4567",
+                }},
+            })
+        self._json(200, response, cookie=self.session)
 
     def log_message(self, *_args):
         pass
@@ -188,6 +218,7 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
 def spa_auth_server(mode: str):
     _SpaAuthHandler.mode = mode
     _SpaAuthHandler.login_posts = 0
+    _SpaAuthHandler.verify_header_values = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _SpaAuthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -286,6 +317,82 @@ class BrowserCredentialTests(unittest.TestCase):
                 row.get("status") == 200
                 for row in result["data"]["login_api_responses"]
             ))
+
+    def test_stored_phone_normalized_by_spa_and_identity_echoes_are_redacted(self):
+        stored_username = "09123456789"
+        pii_values = (
+            stored_username, _SpaAuthHandler.username, "Nika",
+            "private-person@example.test", "0012345678",
+            "private-user-uuid-1234", "private-invitation-9876",
+            "private-invite-4567",
+        )
+        with isolated_runtime(), spa_auth_server("client-normalizes") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", stored_username, _SpaAuthHandler.password
+            )
+            request = self._request(port)
+            request["username_transform"] = "stored"
+
+            result = dispatch(ws, "credential_browser_login", request)
+
+            self.assertTrue(result["ok"], result)
+            response_text = json.dumps(
+                result["data"]["login_api_responses"], ensure_ascii=False
+            )
+            self.assertIn("[REDACTED]", response_text)
+            observable = json.dumps(result, ensure_ascii=False)
+            observable += (ws.root / ".ledger/tool-calls.jsonl").read_text()
+            observable += "".join(
+                path.read_text(errors="replace")
+                for path in ws.flows_dir.glob("*.http")
+            )
+            observable += "".join(
+                path.read_text(errors="replace")
+                for path in ws.scratch_dir.glob("browser-auth-*.html")
+            )
+            for value in pii_values:
+                self.assertNotIn(value, observable)
+                self.assertNotIn(quote(value, safe=""), observable)
+                self.assertNotIn(quote_plus(value, safe=""), observable)
+
+    def test_verify_protocol_header_is_shared_by_live_replay_and_control(self):
+        with isolated_runtime(), spa_auth_server("verify-header") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            request = self._request(port)
+            request["verify_headers"] = {"X-SPA-Client": "milli-web"}
+
+            result = dispatch(ws, "credential_browser_login", request)
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["data"]["verify_status"], 200)
+            self.assertEqual(result["data"]["replay_status"], 200)
+            self.assertEqual(result["data"]["control_status"], 401)
+            self.assertEqual(
+                _SpaAuthHandler.verify_header_values,
+                ["milli-web", "milli-web", "milli-web"],
+            )
+
+    def test_sensitive_verify_header_is_rejected_before_attempt(self):
+        with isolated_runtime(), spa_auth_server("success") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            request = self._request(port)
+            request["verify_headers"] = {"Authorization": "secret"}
+
+            result = dispatch(ws, "credential_browser_login", request)
+
+            self.assertFalse(result["ok"], result)
+            self.assertIn("cannot contain", result["summary"])
+            self.assertEqual(_SpaAuthHandler.login_posts, 0)
+            self.assertEqual(
+                credentials.session_status(ws.slug, "primary")["attempts"], 0
+            )
 
     def test_initially_disabled_submit_enables_after_playwright_fill(self):
         with isolated_runtime(), spa_auth_server("disabled-submit") as port:
@@ -436,6 +543,10 @@ class BrowserCredentialTests(unittest.TestCase):
         self.assertEqual(
             schema["properties"]["username_transform"]["enum"],
             ["stored", "iran-e164"],
+        )
+        self.assertEqual(
+            schema["properties"]["verify_headers"]["additionalProperties"],
+            {"type": "string"},
         )
         with isolated_runtime():
             ws = Workspace("browser-schema")
