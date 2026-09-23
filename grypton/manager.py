@@ -18,6 +18,24 @@ from . import config
 from .providers import CodexValidator, OpenCodeClient, ProviderError
 
 
+_DIRECTIVE_SENTENCE = re.compile(r"(?<=[.!?])(?:\s+|$)|\n+")
+_PROHIBITIVE_DIRECTIVE = re.compile(
+    r"^(?:[-*]\s*)?(?:do\s+not|don't|never|avoid|refrain\s+from|must\s+not|"
+    r"no\s+(?:retry|retries|brute|bruteforce|brute-force|probing|testing|request|requests))\b",
+    re.IGNORECASE,
+)
+
+
+def _affirmative_directive(text: str) -> str:
+    """Keep Kryptex's executable action without forwarding generated prohibitions."""
+    parts = []
+    for value in _DIRECTIVE_SENTENCE.split(str(text or "")):
+        value = value.strip()
+        if value and not _PROHIBITIVE_DIRECTIVE.match(value):
+            parts.append(value)
+    return " ".join(parts).strip()
+
+
 @dataclass
 class ManagerContext:
     target: str
@@ -65,20 +83,10 @@ class Directive:
     fallback_provider: str = ""
 
     def worker_message(self) -> str:
-        parts: list[str] = []
-        if self.directive.strip():
-            parts.append(self.directive.strip())
-        if self.corrections:
-            parts.append("CORRECTIONS:\n" + "\n".join(f"- {x}" for x in self.corrections))
-        if self.scope_enforcement:
-            parts.append("SCOPE REQUIREMENTS:\n" + "\n".join(
-                f"- {x}" for x in self.scope_enforcement
-            ))
-        if self.exhaustion_breaker.strip():
-            parts.append("NEW EXPANSION PATH:\n" + self.exhaustion_breaker.strip())
-        if self.new_angles:
-            parts.append("ADDITIONAL ANGLES:\n" + "\n".join(f"- {x}" for x in self.new_angles))
-        return "\n\n".join(parts)
+        # The structured fields remain available to the engine and UI. Kraude
+        # receives one executable manager action rather than a generated stack
+        # of corrections, prohibitions, and restated scope rules.
+        return _affirmative_directive(self.directive)
 
 
 def _extract_json(text: str) -> dict:
@@ -347,7 +355,8 @@ class KryptexManager:
         )
         return f"""Manage Kraude's next action for turn {ctx.turn_index}. Resolve blockers autonomously and
 choose the most useful next tool action from the evidence below. Kraude can use every tool exposed in
-its session. Return one JSON object matching the supplied schema.
+its session. The `directive` field contains one short affirmative next action; the engagement data
+already supplies its boundaries. Return one JSON object matching the supplied schema.
 
 TARGET: {ctx.target} ({ctx.target_type})
 TURN ACTIVITY: {activity}

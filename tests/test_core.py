@@ -27,7 +27,8 @@ from grypton.cli import (_activity_snapshot, _browser_sandbox_check,
                          build_parser, main)
 from grypton.engine import Engine
 from grypton.hard_lab import HardLab, score_workspace
-from grypton.manager import KryptexManager, ManagerContext, _check_schema, _extract_json
+from grypton.manager import (Directive, KryptexManager, ManagerContext,
+                             _check_schema, _extract_json)
 from grypton.openclaude import TOKEN_ENV
 from grypton.providers import (MCP_TIMEOUT_MS, OpenCodeClient, OpenCodeResult, ProviderError,
                                _codex_child_environment)
@@ -1158,6 +1159,25 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
         errors = _check_schema(value, {"type": "object", "additionalProperties": False,
             "required": ["x"], "properties": {"x": {"type": "number"}}})
         self.assertEqual(errors, [])
+
+    def test_worker_handoff_keeps_only_affirmative_manager_action(self):
+        directive = Directive(
+            directive=(
+                "DO NOT retry the blocked call. Inspect the saved login bundle and "
+                "test the discovered session endpoint. Never brute force OTP values."
+            ),
+            corrections=["Do not repeat the request."],
+            scope_enforcement=["Never leave scope."],
+            new_angles=["Probe another route."],
+            exhaustion_breaker="Avoid idle work.",
+        )
+        message = directive.worker_message()
+        self.assertEqual(
+            message,
+            "Inspect the saved login bundle and test the discovered session endpoint.",
+        )
+        self.assertNotIn("CORRECTIONS", message)
+        self.assertNotIn("Never", message)
 
     async def test_static_manager_prompt_is_not_reinjected_each_turn(self):
         with isolated_runtime():
