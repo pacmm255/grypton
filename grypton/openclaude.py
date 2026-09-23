@@ -19,6 +19,7 @@ import re
 import secrets
 import shutil
 import subprocess
+import time
 from typing import Any, Callable, Mapping, Optional
 
 
@@ -34,6 +35,10 @@ _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ENV_REFERENCE = re.compile(r"^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$")
 _MAX_CONFIG_BYTES = 2 * 1024 * 1024
+# A catalog read is filesystem-only unless ``refresh`` is explicitly true.
+# OpenCode can replace its model cache while Grypton is launching, so an exact
+# route miss gets two short, fresh local reads before it is considered unknown.
+_CATALOG_ROUTE_MISS_RETRY_DELAYS = (0.15, 0.35)
 
 # OpenClaude needs ordinary process context plus the locations of its own and
 # OpenCode's state. Provider secrets are added separately, and only when an
@@ -415,6 +420,22 @@ def list_models(search: str = "") -> list[OpenClaudeModel]:
     ]
 
 
+def _matching_model(
+    models: list[OpenClaudeModel] | tuple[OpenClaudeModel, ...],
+    route: str,
+) -> OpenClaudeModel | None:
+    return next((
+        model for model in models
+        if route == model.route_id or route in model.aliases
+    ), None)
+
+
+def _reload_models(search: str = "") -> list[OpenClaudeModel]:
+    """Discard the process snapshot and read the local catalog again."""
+    _discover_models.cache_clear()
+    return list_models(search)
+
+
 def resolve_model(
     route: str,
     effort: str | None = None,
@@ -424,11 +445,16 @@ def resolve_model(
     requested = resolve_openclaude_route(route)
     if not requested:
         raise OpenClaudeError("An OpenClaude model route is required.")
-    models = list_models(requested)
-    model = next((
-        item for item in models
-        if requested == item.route_id or requested in item.aliases
-    ), None)
+    model = _matching_model(list_models(requested), requested)
+    if model is None:
+        # Retry only the ambiguous exact-route-missing result. A matching route
+        # that is unavailable, lacks tools, or rejects the requested effort is
+        # authoritative and proceeds directly to the strict checks below.
+        for delay in _CATALOG_ROUTE_MISS_RETRY_DELAYS:
+            time.sleep(delay)
+            model = _matching_model(_reload_models(requested), requested)
+            if model is not None:
+                break
     if model is None:
         raise OpenClaudeError(f"Unknown OpenClaude route {requested!r}.")
     if model.status != "available":
@@ -613,13 +639,8 @@ class OpenClaudeGateway:
             if int(ping.get("protocol") or 0) != _PROTOCOL_VERSION:
                 raise OpenClaudeError("OpenClaude sidecar protocol mismatch.")
             catalog = await self._request("catalog", {"refresh": False}, timeout=30)
-            values = catalog.get("models") if isinstance(catalog, Mapping) else []
-            self._catalog = tuple(
-                OpenClaudeModel.from_payload(value)
-                for value in values or []
-                if isinstance(value, Mapping)
-            )
-            self._model = self._select_model(self.route)
+            self._replace_catalog(catalog)
+            self._model = await self._select_model_with_retry(self.route)
             if self._model.status != "available":
                 detail = f": {self._model.reason}" if self._model.reason else ""
                 raise OpenClaudeError(
@@ -666,13 +687,38 @@ class OpenClaudeGateway:
             )
 
     def _select_model(self, route: str) -> OpenClaudeModel:
-        for model in self._catalog:
-            if route == model.route_id or route in model.aliases:
-                self.route = model.route_id
-                return model
+        model = _matching_model(self._catalog, route)
+        if model is not None:
+            self.route = model.route_id
+            return model
         raise OpenClaudeError(
             f"Unknown OpenClaude route {route!r}; inspect the local catalog before starting."
         )
+
+    def _replace_catalog(self, catalog: Mapping[str, Any]) -> None:
+        values = catalog.get("models") if isinstance(catalog, Mapping) else []
+        self._catalog = tuple(
+            OpenClaudeModel.from_payload(value)
+            for value in values or []
+            if isinstance(value, Mapping)
+        )
+
+    async def _select_model_with_retry(self, route: str) -> OpenClaudeModel:
+        """Resolve an exact route, retrying only a transient local miss."""
+        model = _matching_model(self._catalog, route)
+        if model is None:
+            for delay in _CATALOG_ROUTE_MISS_RETRY_DELAYS:
+                await asyncio.sleep(delay)
+                # ``refresh: false`` deliberately re-reads local files without
+                # a provider metadata fetch or any model inference.
+                catalog = await self._request(
+                    "catalog", {"refresh": False}, timeout=30
+                )
+                self._replace_catalog(catalog)
+                model = _matching_model(self._catalog, route)
+                if model is not None:
+                    break
+        return self._select_model(route)
 
     async def _request(
         self,

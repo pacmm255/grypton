@@ -1077,6 +1077,11 @@ also needs a model with tool support. The old route prefix `opencode-go/` is
 accepted, but status, reports, and saved metadata show its canonical `go/`
 form.
 
+At launch, an exact route miss receives two short filesystem-only catalog
+retries. This covers a model-cache replacement that briefly exposes an
+incomplete local snapshot. The retry does not refresh provider metadata,
+choose another route, or relax availability, tool, or effort checks.
+
 ## OpenClaude reports no usable credential
 
 Do not paste a key into the Grypton console. Check only the files and their

@@ -250,6 +250,28 @@ class OpenClaudeAdapterTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "does not support tool calls"):
                 resolve_model(without_tools.route_id, require_tools=True)
 
+    def test_exact_route_miss_reloads_catalog_then_keeps_strict_tool_validation(self):
+        other = catalog_model(route="fixture/other")
+        selected = catalog_model(route="fixture/requested", tools=False)
+        with patch(
+            "grypton.openclaude.list_models",
+            side_effect=[[other], [selected]],
+        ) as models, patch("grypton.openclaude.time.sleep") as pause:
+            with self.assertRaisesRegex(RuntimeError, "does not support tool calls"):
+                resolve_model(selected.route_id, effort="xhigh", require_tools=True)
+        self.assertEqual(models.call_count, 2)
+        pause.assert_called_once()
+
+    def test_exact_route_miss_retry_is_bounded_and_never_selects_another_route(self):
+        other = catalog_model(route="fixture/other")
+        with patch(
+            "grypton.openclaude.list_models", return_value=[other]
+        ) as models, patch("grypton.openclaude.time.sleep") as pause:
+            with self.assertRaisesRegex(RuntimeError, "Unknown OpenClaude route"):
+                resolve_model("fixture/requested", effort="xhigh")
+        self.assertEqual(models.call_count, 3)
+        self.assertEqual(pause.call_count, 2)
+
     def test_provider_config_uses_loopback_placeholder_and_redacts_gateway_token(self):
         model = catalog_model(route="fixture/selectable")
         with tempfile.TemporaryDirectory() as directory:
@@ -383,6 +405,54 @@ class OpenClaudeAdapterTests(unittest.TestCase):
                     self.assertNotIn(name, child)
 
         asyncio.run(exercise())
+
+
+class OpenClaudeCatalogRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_sidecar_reloads_local_catalog_after_exact_route_miss(self):
+        other = catalog_model(route="fixture/other")
+        selected = catalog_model(route="fixture/requested")
+        with tempfile.TemporaryDirectory() as directory:
+            gateway = OpenClaudeGateway(
+                selected.route_id,
+                "xhigh",
+                "worker",
+                Path(directory) / "transport",
+                node_binary=sys.executable,
+            )
+            gateway._catalog = (other,)
+            gateway._request = AsyncMock(return_value={"models": [selected.raw]})
+            with patch(
+                "grypton.openclaude.asyncio.sleep", new=AsyncMock()
+            ) as pause:
+                resolved = await gateway._select_model_with_retry(selected.route_id)
+            self.assertEqual(resolved.route_id, selected.route_id)
+            self.assertEqual(gateway.route, selected.route_id)
+            gateway._request.assert_awaited_once_with(
+                "catalog", {"refresh": False}, timeout=30
+            )
+            pause.assert_awaited_once()
+
+    async def test_sidecar_catalog_retry_is_bounded_and_has_no_fallback(self):
+        other = catalog_model(route="fixture/other")
+        with tempfile.TemporaryDirectory() as directory:
+            gateway = OpenClaudeGateway(
+                "fixture/requested",
+                "xhigh",
+                "worker",
+                Path(directory) / "transport",
+                node_binary=sys.executable,
+            )
+            gateway._catalog = (other,)
+            gateway._request = AsyncMock(return_value={"models": [other.raw]})
+            with patch(
+                "grypton.openclaude.asyncio.sleep", new=AsyncMock()
+            ) as pause, self.assertRaisesRegex(
+                RuntimeError, "Unknown OpenClaude route"
+            ):
+                await gateway._select_model_with_retry("fixture/requested")
+            self.assertEqual(gateway._request.await_count, 2)
+            self.assertEqual(pause.await_count, 2)
+            self.assertEqual(gateway.route, "fixture/requested")
 
 
 class ModelSelectionTests(unittest.IsolatedAsyncioTestCase):

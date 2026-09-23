@@ -149,6 +149,10 @@ inference:
 Acceptance requires the chosen public routes and efforts to appear exactly as
 selected. Kraude must be rejected if its route lacks tool support. The plan
 must leave Astra at `gpt-6-astra` with `max` effort and automatic P1/P2 only.
+The plan and provider-sidecar launch paths each retry an exact missing route
+against at most two fresh filesystem-only catalog snapshots. They must never
+retry a matching unavailable route or substitute a different route, and all
+tool and effort checks remain authoritative after a retry.
 
 ### No-request gateway lifecycle
 
