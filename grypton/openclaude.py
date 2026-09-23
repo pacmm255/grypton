@@ -31,6 +31,26 @@ _ROUTE_ALIASES = {
     "opencode/": "zen/",
 }
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_ENV_REFERENCE = re.compile(r"^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$")
+_MAX_CONFIG_BYTES = 2 * 1024 * 1024
+
+# OpenClaude needs ordinary process context plus the locations of its own and
+# OpenCode's state. Provider secrets are added separately, and only when an
+# active local configuration explicitly names their environment variable.
+_PROCESS_ENV = (
+    "HOME", "USER", "LOGNAME", "SHELL", "PATH", "TMPDIR", "LANG",
+    "LC_ALL", "LC_CTYPE", "TZ", "TERM", "COLORTERM", "SSL_CERT_FILE",
+    "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+)
+_OPENCLAUDE_STATE_ENV = (
+    "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME",
+    "OPENCLAUDE_AUTH_FILE", "OPENCLAUDE_PRIVATE_STORE",
+    "OPENCLAUDE_ANTHROPIC_AUTH", "OPENCLAUDE_CLAUDE_CONFIG_DIR",
+    "OPENCLAUDE_CLAUDE_BIN", "OPENCLAUDE_OPENCODE_BIN", "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME", "OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR",
+    "OPENCODE_CONFIG_CONTENT",
+)
 
 
 class OpenClaudeError(RuntimeError):
@@ -42,6 +62,178 @@ def _clean(value: object, limit: int = 2000) -> str:
     text = re.sub(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]+", r"\1[REDACTED]", text)
     text = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}\b", "[REDACTED]", text)
     return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _parse_jsonc(source: str) -> dict[str, Any]:
+    """Parse the JSON-with-comments subset used by OpenCode configuration."""
+    clean: list[str] = []
+    quoted = escaped = line_comment = block_comment = False
+    index = 0
+    while index < len(source):
+        char = source[index]
+        following = source[index + 1] if index + 1 < len(source) else ""
+        if line_comment:
+            clean.append("\n" if char == "\n" else " ")
+            line_comment = char != "\n"
+        elif block_comment:
+            if char == "*" and following == "/":
+                clean.extend((" ", " "))
+                block_comment = False
+                index += 1
+            else:
+                clean.append("\n" if char == "\n" else " ")
+        elif quoted:
+            clean.append(char)
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+            clean.append(char)
+        elif char == "/" and following == "/":
+            clean.extend((" ", " "))
+            line_comment = True
+            index += 1
+        elif char == "/" and following == "*":
+            clean.extend((" ", " "))
+            block_comment = True
+            index += 1
+        else:
+            clean.append(char)
+        index += 1
+    if block_comment or quoted:
+        return {}
+    without_comments = "".join(clean)
+    without_trailing = re.sub(r",(?=\s*[}\]])", "", without_comments)
+    try:
+        value = json.loads(without_trailing)
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _read_config(path: Path, *, jsonc: bool = False) -> dict[str, Any]:
+    try:
+        if path.stat().st_size > _MAX_CONFIG_BYTES:
+            return {}
+        source = path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    if jsonc:
+        return _parse_jsonc(source)
+    try:
+        value = json.loads(source)
+    except (TypeError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _merge_config(left: Mapping[str, Any], right: Mapping[str, Any]) -> dict[str, Any]:
+    merged = dict(left) if isinstance(left, Mapping) else {}
+    for key, value in right.items() if isinstance(right, Mapping) else ():
+        if isinstance(value, Mapping) and isinstance(merged.get(key), Mapping):
+            merged[key] = _merge_config(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _opencode_config(cwd: Path, environ: Mapping[str, str]) -> dict[str, Any]:
+    """Load only local OpenCode configuration needed to find credential refs."""
+    home = Path(environ.get("HOME") or str(Path.home())).expanduser()
+    config_home = Path(environ.get("XDG_CONFIG_HOME") or home / ".config").expanduser()
+    paths = [
+        config_home / "opencode/opencode.json",
+        config_home / "opencode/opencode.jsonc",
+    ]
+    if environ.get("OPENCODE_CONFIG"):
+        candidate = Path(environ["OPENCODE_CONFIG"]).expanduser()
+        paths.append(candidate if candidate.is_absolute() else cwd / candidate)
+    ancestors = list(reversed((cwd.resolve(), *cwd.resolve().parents)))
+    for directory in ancestors:
+        paths.extend((
+            directory / "opencode.json", directory / "opencode.jsonc",
+            directory / ".opencode/opencode.json",
+            directory / ".opencode/opencode.jsonc",
+        ))
+    if environ.get("OPENCODE_CONFIG_DIR"):
+        directory = Path(environ["OPENCODE_CONFIG_DIR"]).expanduser()
+        paths.extend((directory / "opencode.json", directory / "opencode.jsonc"))
+    merged: dict[str, Any] = {}
+    seen: set[Path] = set()
+    for path in paths:
+        path = path.resolve()
+        if path in seen:
+            continue
+        seen.add(path)
+        merged = _merge_config(merged, _read_config(path, jsonc=path.suffix == ".jsonc"))
+    if environ.get("OPENCODE_CONFIG_CONTENT"):
+        merged = _merge_config(merged, _parse_jsonc(environ["OPENCODE_CONFIG_CONTENT"]))
+    return merged
+
+
+def _credential_env_names(
+    config_path: Path,
+    cwd: Path,
+    environ: Mapping[str, str],
+) -> set[str]:
+    """Return credential variables explicitly selected by local model config."""
+    names: set[str] = set()
+    config = _read_config(config_path)
+    providers = config.get("providers") if isinstance(config.get("providers"), Mapping) else {}
+    for provider in providers.values():
+        credential = provider.get("credential") if isinstance(provider, Mapping) else None
+        if not isinstance(credential, Mapping):
+            continue
+        name = credential.get("env")
+        if isinstance(name, str) and _ENV_NAME.fullmatch(name):
+            names.add(name)
+        if credential.get("openclaude") == "anthropic":
+            names.add("ANTHROPIC_API_KEY")
+
+    opencode = _opencode_config(cwd, environ)
+    providers = opencode.get("provider") if isinstance(opencode.get("provider"), Mapping) else {}
+    for provider in providers.values():
+        if not isinstance(provider, Mapping):
+            continue
+        options = provider.get("options") if isinstance(provider.get("options"), Mapping) else {}
+        match = _ENV_REFERENCE.fullmatch(str(options.get("apiKey") or ""))
+        if match:
+            names.add(match.group(1))
+            continue
+        candidates = provider.get("env") if isinstance(provider.get("env"), list) else []
+        for name in candidates:
+            if (isinstance(name, str) and _ENV_NAME.fullmatch(name)
+                    and str(environ.get(name) or "").strip()):
+                names.add(name)
+                break
+    return names
+
+
+def _openclaude_child_environment(
+    config_path: Path,
+    cwd: Path,
+    *,
+    auth_file: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Build a bounded environment for discovery and the provider sidecar."""
+    source = os.environ if environ is None else environ
+    allowed = (*_PROCESS_ENV, *_OPENCLAUDE_STATE_ENV)
+    env = {name: source[name] for name in allowed if source.get(name)}
+    env.setdefault("HOME", str(Path.home()))
+    env.setdefault("PATH", os.defpath)
+    env.setdefault("LANG", "C.UTF-8")
+    for name in _credential_env_names(config_path, cwd, source):
+        if source.get(name):
+            env[name] = source[name]
+    if auth_file is not None:
+        env["OPENCLAUDE_AUTH_FILE"] = str(auth_file)
+    env["NO_COLOR"] = "1"
+    return env
 
 
 def resolve_openclaude_route(route: str) -> str:
@@ -171,7 +363,7 @@ def _discover_models() -> tuple[OpenClaudeModel, ...]:
         result = subprocess.run(
             [node, str(cli), "--config", str(config), "models", "--all", "--json"],
             cwd=str(root),
-            env={**os.environ, "NO_COLOR": "1"},
+            env=_openclaude_child_environment(config, root),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
@@ -394,11 +586,12 @@ class OpenClaudeGateway:
         if self._closed:
             raise OpenClaudeError("A closed OpenClaude gateway cannot be restarted.")
         self._validate_installation()
-        env = dict(os.environ)
+        env = _openclaude_child_environment(
+            self.config_path,
+            self.workspace,
+            auth_file=self.auth_file,
+        )
         env[TOKEN_ENV] = self._token
-        env["NO_COLOR"] = "1"
-        if self.auth_file is not None:
-            env["OPENCLAUDE_AUTH_FILE"] = str(self.auth_file)
         self.workspace.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._proc = await asyncio.create_subprocess_exec(
             self.node_binary,

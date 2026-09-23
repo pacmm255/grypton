@@ -81,6 +81,53 @@ def clean(text: str, secrets=()) -> str:
     return _CONTROL.sub("", text)
 
 
+def _minimal_child_environment() -> dict[str, str]:
+    """Return the non-secret process context needed by OpenCode and MCP tools.
+
+    OpenCode can launch model-selected tools, so copying the operator's complete
+    environment into it would expose unrelated cloud, source-control, and
+    service credentials. Provider authentication belongs to the separate
+    OpenClaude sidecar; the only secret OpenCode receives is that sidecar's
+    short-lived loopback token, added later by the provider environment.
+    """
+    allowed = (
+        "HOME", "USER", "LOGNAME", "SHELL", "PATH", "TMPDIR", "LANG",
+        "LC_ALL", "LC_CTYPE", "TZ", "TERM", "COLORTERM", "SSL_CERT_FILE",
+        "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE",
+    )
+    env = {key: os.environ[key] for key in allowed if os.environ.get(key)}
+    env.setdefault("HOME", str(Path.home()))
+    env.setdefault("PATH", os.defpath)
+    env.setdefault("LANG", "C.UTF-8")
+    # The model provider is a loopback gateway. Never allow an inherited proxy
+    # setting to divert that authenticated local connection elsewhere.
+    env["NO_PROXY"] = "127.0.0.1,localhost"
+    env["no_proxy"] = env["NO_PROXY"]
+    return env
+
+
+def _codex_child_environment() -> dict[str, str]:
+    """Return only the process state needed for direct Codex authentication.
+
+    The validator has every interactive/tool feature disabled, but inheriting
+    unrelated deployment, source-control, and cloud credentials still expands
+    the blast radius of a provider or subprocess defect. Codex can authenticate
+    from `$CODEX_HOME`/`$HOME/.codex` or the explicitly supported OpenAI
+    environment variables below. Endpoint-routing variables are deliberately
+    omitted so the fixed Astra route cannot be redirected by ambient process
+    configuration.
+    """
+    env = _minimal_child_environment()
+    for key in (
+        "CODEX_HOME", "OPENAI_API_KEY",
+        "OPENAI_ORGANIZATION", "OPENAI_ORG_ID",
+        "OPENAI_PROJECT", "OPENAI_PROJECT_ID",
+    ):
+        if os.environ.get(key):
+            env[key] = os.environ[key]
+    return env
+
+
 def _host_xdg(kind: str, default: str) -> Path:
     return Path(os.environ.get(f"XDG_{kind}_HOME", str(Path.home() / default)))
 
@@ -144,28 +191,6 @@ def _seed_opencode_dependencies(destination: Path) -> None:
         shutil.copy2(source / name, destination / name)
 
 
-def opencode_credential(provider: str) -> dict:
-    path = _host_xdg("DATA", ".local/share") / "opencode/auth.json"
-    try:
-        value = json.loads(path.read_text(encoding="utf-8")).get(provider, {})
-    except (OSError, ValueError, AttributeError) as exc:
-        raise ProviderError(
-            f"OpenCode connector {provider!r} is unavailable; connect it in OpenCode."
-        ) from exc
-    if value.get("type") != "api" or not isinstance(value.get("key"), str) or not value["key"]:
-        raise ProviderError(f"OpenCode connector {provider!r} has no API credential.")
-    if provider == "opencode-go" and Path("/root/open").is_file():
-        try:
-            supplied = {
-                line.strip()
-                for line in Path("/root/open").read_text(encoding="utf-8").splitlines()
-                if re.fullmatch(r"[A-Za-z0-9._-]{20,}", line.strip())
-            }
-        except OSError as exc:
-            raise ProviderError("The supplied OpenCode Go key file cannot be read.") from exc
-        if value["key"] not in supplied:
-            raise ProviderError("The OpenCode Go connector does not match a key in /root/open.")
-    return {"type": "api", "key": value["key"]}
 
 
 async def _terminate(proc: asyncio.subprocess.Process) -> None:
@@ -212,22 +237,12 @@ class OpenCodeClient:
                 "external_directory": "deny",
             }
 
-        # Kraude needs a shell for local parsing and evidence work, but native
-        # network clients bypass Grypton's scope guard and immutable flow
-        # capture. OpenCode evaluates Bash permissions per parsed command, so
-        # deny the network executables while retaining ordinary local shell
-        # commands. The corresponding operations remain available through the
-        # scoped grypton_* MCP tools.
-        bash = {"*": "allow"}
-        for executable in (
-            "curl", "wget", "httpx", "nmap", "subfinder", "dnsx",
-            "naabu", "masscan", "nc", "ncat", "netcat", "telnet",
-            "ftp", "sftp", "scp", "ssh",
-        ):
-            bash[f"{executable} *"] = "deny"
-            bash[f"*/{executable} *"] = "deny"
-        bash["openssl s_client *"] = "deny"
-        bash["*/openssl s_client *"] = "deny"
+        # A command-name blacklist cannot contain a native shell: Python,
+        # Node, /dev/tcp, copied binaries, and package hooks can all perform
+        # unscoped I/O or read private credentials. Local documents remain
+        # available through OpenCode's bounded file tools; every network and
+        # protocol action must cross the observable grypton_* MCP boundary.
+        bash = "deny"
 
         # OpenCode runs inside a small transport directory rather than the
         # Grypton checkout.  The engagement itself is deliberately outside
@@ -239,14 +254,18 @@ class OpenCodeClient:
         allowed_external = [path.resolve() for path in (workspace, transport_workspace)
                             if path is not None]
         if allowed_external:
+            # OpenCode permission patterns are evaluated in insertion order
+            # with the last matching rule winning. Put the catch-all first so
+            # the two narrow workspace grants can override it.
             external_directory = {
-                **{str(path / "*"): "allow" for path in allowed_external},
                 "*": "deny",
+                **{str(path / "*"): "allow" for path in allowed_external},
             }
 
         return {
             "*": "allow",
             "bash": bash,
+            "edit": "deny",
             "webfetch": "deny",
             "websearch": "deny",
             "question": "deny",
@@ -396,13 +415,7 @@ class OpenCodeClient:
                 }
             }
 
-        env = {
-            key: value
-            for key, value in os.environ.items()
-            if not key.startswith((
-                "OPENCODE_", "OPENAI_", "ANTHROPIC_", "ZAI_", "ZHIPU_"
-            ))
-        }
+        env = _minimal_child_environment()
         env.update({
             "XDG_CONFIG_HOME": str(self.runtime / "config"),
             "XDG_DATA_HOME": str(self.runtime / "data"),
@@ -679,7 +692,7 @@ class CodexValidator:
         self.proc = await asyncio.create_subprocess_exec(
             *argv,
             cwd=str(runtime),
-            env={key: value for key, value in os.environ.items() if not key.startswith("OPENCODE_")},
+            env=_codex_child_environment(),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,

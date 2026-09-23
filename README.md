@@ -13,8 +13,10 @@ cd /root/grypton
 ./bin/grypton doctor
 ```
 
-If `doctor` shows `OK` for OpenClaude, the selected routes, OpenCode, Codex,
-and Grypton MCP, you are ready to start.
+If `doctor` shows `OK`, the local binaries, route metadata, key-pool shape, and
+MCP wiring are ready. `doctor` does not make a paid inference or prove that a
+provider account is currently authenticated; use the local smoke test described
+below before a long run.
 
 ```mermaid
 flowchart LR
@@ -48,7 +50,8 @@ Before a real run, Grypton expects:
   `openclaude.config.json`;
 - the OpenClaude `go` provider configured to use the OpenCode Go credential
   and `/root/open` as its `keyFile`;
-- one API key per non-empty line in `/root/open`, with private file permissions;
+- at least two unique API keys in `/root/open`, one per non-empty line, with
+  private file permissions;
 - Codex configured for the independent Astra validator.
 
 Never put a literal API key in Grypton configuration, a command, a report, or
@@ -151,16 +154,25 @@ Grypton supports the familiar Code-style shortcuts and the explicit command form
 | Start an interactive engagement | `./bin/grypton --target HOST "mission"` |
 | Start without terminal input | `./bin/grypton -p --target HOST "mission"` |
 | Start with the explicit command | `./bin/grypton init --target HOST -m "mission"` |
+| Start a finite background run | `./bin/grypton init --target HOST --background --duration 12h -m "mission"` |
 | Continue the newest engagement | `./bin/grypton -c` |
 | Resume one engagement | `./bin/grypton -r ENGAGEMENT` or `./bin/grypton resume ENGAGEMENT` |
+| Supervise an existing engagement that is not running | `./bin/grypton run start ENGAGEMENT` |
+| Check a background run | `./bin/grypton run status ENGAGEMENT` |
+| Read supervisor events | `./bin/grypton run logs ENGAGEMENT` |
 | List engagements | `./bin/grypton status` or `./bin/grypton ls` |
-| Stop an active engagement | `./bin/grypton stop ENGAGEMENT` |
+| Stop a background run | `./bin/grypton run stop ENGAGEMENT` |
+| Request a normal engagement stop | `./bin/grypton stop ENGAGEMENT` |
 
 `HOST` can be a hostname or a URL. `ENGAGEMENT` is the saved engagement name shown by `status`. For example, `https://app.example.test` becomes `https-app-example-test`.
 
 ## Run options
 
-Add these options to `init`, `resume`, or the direct start form.
+Creation and execution options are listed together below. `--target`, `--type`,
+the scope and program options, and `--force` apply only when creating an
+engagement with `init` or the direct start form. A resume uses the scope already
+saved in that engagement. `run start --help` shows its smaller supervisor-safe
+subset; it always runs detached with quiet, non-interactive output.
 
 | Option | What it means |
 | --- | --- |
@@ -169,7 +181,7 @@ Add these options to `init`, `resume`, or the direct start form.
 | `-m "mission"` | Short description of the work you want done. |
 | `--in-scope A,B` | Comma-separated targets Grypton may use. |
 | `--out-scope A,B` | Comma-separated targets Grypton must avoid. |
-| `--only P1,P2` | Only keep findings at these severities. |
+| `--only P1,P2` | Suppress other severities from confirmed and headline results while retaining their audit records. |
 | `--include CLASS` | Focus on these vulnerability classes. |
 | `--exclude CLASS` | Avoid these vulnerability classes. |
 | `--rule "text"` | Add a permanent engagement rule. Repeat this option when needed. |
@@ -185,6 +197,10 @@ Add these options to `init`, `resume`, or the direct start form.
 | `--max-turns N` | Stop after at most `N` worker turns. |
 | `--max-seconds N` | Stop after at most `N` seconds. |
 | `--auto-stop-time N` | Stop after at most `N` minutes. |
+| `--duration DURATION` | Set a finite duration such as `90m` or `12h`. |
+| `--background` | Run under the detached private supervisor. A finite time limit is required. |
+| `--health-interval DURATION` | Record background health counters at this interval. Default: `10m`. |
+| `--restart-limit N` | Allow at most `N` safe supervisor restarts after an abnormal exit. Default: `3`. |
 | `--stop-on-p1` | Stop after a confirmed P1. |
 | `--force` | Reuse the existing engagement name and reset its run state. |
 
@@ -216,6 +232,55 @@ Resume quietly and write the stream to a log:
 ```bash
 ./bin/grypton resume https-api-example-test --console quiet -p | tee grypton-run.log
 ```
+
+## Run for hours without keeping a terminal open
+
+Start a new engagement directly under Grypton's private supervisor:
+
+```bash
+./bin/grypton init \
+  --target "https://app.example.test" \
+  --type web \
+  --background \
+  --duration 12h \
+  --health-interval 10m \
+  --restart-limit 3 \
+  -m "Map the authorized surface and verify the strongest evidence"
+```
+
+Use these commands from another terminal:
+
+```bash
+./bin/grypton run status https-app-example-test
+./bin/grypton run logs https-app-example-test --limit 30
+./bin/grypton run stop https-app-example-test
+```
+
+To supervise an existing engagement that is not currently running, run:
+
+```bash
+./bin/grypton run start https-app-example-test \
+  --duration 12h --health-interval 10m --restart-limit 3
+```
+
+`run start` uses a 12-hour limit when you omit every time-limit option. A
+background `init` or `resume` must include `--duration`, `--max-seconds`, or
+`--auto-stop-time`.
+
+A detached finite run keeps requesting new Kryptex-directed pivots when its
+current leads converge, using the deadline as its normal completion boundary.
+An operator stop or a binding scope/program stop can still end it sooner.
+
+The lifecycle log contains timestamps, process state, exit codes, and workspace
+counters. It does not contain the mission, prompts, tool arguments, evidence,
+or credentials. Before a network, process, installer, or workspace-mutating MCP
+handler begins, Grypton durably records an argument-free restart-safety marker.
+A supervisor restarts the engine only after an abnormal exit that happened
+before any such handler began. Completed private read-only calls do not disable
+a safe restart. It does not restart a clean exit, a policy or scope stop, an
+operator stop, or a run that has started an effectful tool. Background startup
+also rejects an engagement whose shared engine lock is held by a foreground
+run.
 
 ---
 
@@ -429,7 +494,20 @@ Use `--rule` for instructions that do not fit into a hostname list:
   -m "Assess the public application"
 ```
 
-Grypton records every structured tool call. Redirects are checked one hop at a time, and explicit URL ports are part of the scope boundary.
+Grypton records every structured tool call. A URL rule with a path authorizes
+that exact path and its descendants. For example,
+`https://api.example.test/app` allows `/app` and `/app/users`, but not `/`,
+`/application`, or a dot-segment escape. A scheme-less rule such as
+`api.example.test/app` applies to that subtree on HTTP and HTTPS. Path-specific
+exclusions use the same subtree boundary and always win; query strings are
+allowed within a scoped path and fragments do not affect the request scope.
+
+Redirect destinations are checked one hop at a time, and explicit URL ports
+and schemes are part of the scope boundary. Browser requests, downloads, Goja
+requests, public-research redirects onto a target host, and captured-flow
+replays use the same URL check. A path-limited URL rule does not authorize DNS,
+TLS, port scanning, raw TCP, or a bare-host HTTP probe because those operations
+cannot preserve the recorded path boundary.
 
 ## Bugcrowd brief preflight
 
@@ -450,6 +528,60 @@ Start with the same brief:
 ```
 
 The preflight checks that the target is listed, imports matching scope and exclusions, identifies credential requirements, and stops when the brief prohibits automation.
+
+---
+
+# Use a private login
+
+Save a login under a short name instead of typing it into a prompt, mission, or
+console message. Use the engagement name shown by `status`:
+
+```bash
+./bin/grypton auth add https-app-example-test --name primary
+```
+
+Grypton asks for the username and asks for the password twice. The password is
+read without echo. To see aliases and safe session state:
+
+```bash
+./bin/grypton auth list https-app-example-test
+./bin/grypton auth list https-app-example-test --json
+```
+
+The list shows names such as `primary` and the states `stored`, `authenticated`,
+`exhausted`, or `blocked`. It never prints a username, password, cookie, or
+token. Running `auth add` again with the same name replaces that credential and
+clears its previous session state.
+
+Kraude receives only the alias. Its credential tools follow this sequence:
+
+1. `credential_status` checks which aliases and safe session states exist.
+2. `credential_login` makes one scoped login request. It requires a scoped
+   verification URL and exact, non-secret text that must appear in a successful
+   verification response.
+3. `authenticated_http_request` uses the verified cookie or bearer session for
+   later scoped requests.
+
+The login tool does not guess that a `200` response means authentication
+succeeded. It requires newly issued cookie or recognized bearer material, then
+proves that session on the scoped endpoint and exact marker you specified.
+Custom session-cookie names are supported; unrelated pre-existing tracking
+cookies and unrelated JSON tokens are rejected. A second request without the
+session must not receive the marker, which prevents a public page plus a new
+tracking cookie from looking authenticated. It does not retry
+automatically, and it stops on MFA, OTP, CAPTCHA, rejection, or rate limiting.
+Each named credential has a two-attempt limit so an autonomous run cannot keep
+trying a login. A later authenticated request that receives a 401, 403, MFA,
+CAPTCHA, or 429 response invalidates the successful state and records the
+blocker.
+
+Named credentials and session material live under
+`.state/credentials/<engagement>/`, outside the engagement workspace. Private
+directories use mode `0700`; credential, cookie, token, and attempt-state files
+use mode `0600`. The tool inserts secrets only at transport time and removes
+them from returned results, captures, ledgers, prompts, normal logs, and
+reports. Every authenticated URL still has to pass the engagement's scope
+rules.
 
 ---
 
@@ -548,7 +680,12 @@ Add `--json` to `status`, `show`, `overview`, `activity`, `findings`, `surface`,
 
 # Working with tools manually
 
-Kraude has native OpenCode tools and 27 Grypton MCP tools. The structured Grypton tools are scope-checked and audited. Use the same tools yourself through `grypton tools`.
+Kraude has OpenCode read/search tools and Grypton's structured MCP tools.
+Native Bash, native file mutation, and native web access are disabled. Network
+activity goes through Grypton's scope-checked, captured, and audited tools. A
+safe manual subset is available through `grypton tools`; use its help for the
+exact public subcommands. The tool-group table below describes the full MCP
+surface available to Kraude, including tools that are intentionally MCP-only.
 
 Start by seeing what is available:
 
@@ -572,6 +709,9 @@ Common manual commands:
 # Replay a flow against an in-scope URL
 ./bin/grypton tools --target https-app-example-test flow-replay flow-123456 \
   --url https://app.example.test/control
+
+# Install one exact package from the reviewed apt allowlist
+./bin/grypton tools --target https-app-example-test install jq
 ```
 
 ## Tool groups
@@ -579,13 +719,47 @@ Common manual commands:
 | Group | Main tools |
 | --- | --- |
 | HTTP and captures | `http_request`, `proxy_flows`, `flow_read`, `flow_replay` |
+| Private authentication | `credential_status`, `credential_login`, `authenticated_http_request` |
 | Browser and reconnaissance | `browse`, `httpx_probe`, `dns_lookup`, `tls_certificate`, `port_scan`, `subdomain_enum` |
 | Goja proxy | `goja_start`, `goja_status`, `goja_request`, `goja_stop` |
 | APK and protocol work | `tcp_exchange`, `artifact_download`, `apk_inspect`, `apk_extract_asset` |
 | Engagement records | `attack_surface_add`, `tested_technique_log`, `prior_attempts`, `record_finding` |
-| Local support | `tool_inventory`, `install_tool`, `research`, `save_research`, `read_doc` |
+| Local and reference support | `local_analyze`, `tool_inventory`, `install_tool`, `research`, `save_research`, `read_doc` |
 
-Large responses are shortened in the live terminal. The full response stays in the private flow capture.
+Large responses are shortened in the live terminal. Private flow capture is
+bounded to 2 MB. Its metadata records the original byte count and whether the
+capture was truncated.
+
+`local_analyze` performs only `file`, `strings`, or SHA-256 analysis. Its input
+must be a regular file of at most 64 MB inside the engagement workspace. It
+rejects absolute paths, path traversal, symlinks, unsupported analyzers, and
+oversized output. This gives Kraude bounded offline inspection without a shell.
+
+`install_tool` accepts only an exact package name from Grypton's reviewed apt
+allowlist: `aapt`, `android-sdk-build-tools`, `apksigner`, `binutils`,
+`ca-certificates`, `chromium`, `curl`, `default-jre-headless`, `dnsutils`,
+`file`, `jq`, `nmap`, `openssl`, `unzip`, `whois`, or `zip`. It rejects package
+URLs, repositories, versions, options, language-package managers, and arbitrary
+install scripts.
+
+## Browser sandbox identity
+
+The `browse` tool never starts Chromium as root and never disables Chromium's
+sandbox. If Grypton runs under a normal unprivileged OS account, no extra setup
+is needed. If the main Grypton service must run as root, provision one fixed,
+no-login account for the browser process:
+
+```bash
+useradd --system --no-create-home --home-dir /nonexistent \
+  --shell /usr/sbin/nologin grypton-browser
+./bin/grypton doctor
+```
+
+Grypton gives that account a fresh private browser profile for each call and
+drops supplementary groups, gid, and uid before Chromium starts. It does not
+reuse `nobody` or another service identity. Until the dedicated account exists,
+`browse` fails closed with setup instructions and `grypton doctor` reports the
+browser sandbox boundary as `FAIL`. Grypton never creates the account itself.
 
 ---
 
@@ -660,7 +834,7 @@ Each engagement has a private directory:
 ├── tested-techniques.md        attempted techniques and results
 ├── progress.md                 turn-by-turn progress
 ├── scope-rules.md              scope and standing instructions
-├── flows/                      complete request and response captures
+├── flows/                      bounded request and response captures
 ├── loot/                       downloaded in-scope artifacts
 ├── research/                   saved research notes
 ├── transcripts/                worker, manager, validator, and turn logs
@@ -673,6 +847,11 @@ Provider credentials stay inside OpenClaude's credential loader and private
 runtime state. The local gateway token is passed through the child process
 environment. Keys are not placed in OpenCode configuration, engagement
 metadata, `doctor` output, reports, or normal console output.
+
+Named target logins are separate from provider credentials. They stay under
+`.state/credentials/<engagement>/` and are addressed only by alias from an
+engagement. Detached supervisor state stays under `.state/runtime/` with
+private directory and file permissions.
 
 ---
 
@@ -733,8 +912,9 @@ chmod 600 /root/open
 ./bin/grypton doctor
 ```
 
-The Go key pool expects one key per non-empty line. Blank lines and lines
-starting with `#` are ignored. OpenClaude also includes the primary OpenCode Go
+The doctor check requires at least two unique plausible keys and mode `0600` or
+stricter. The Go key pool expects one key per non-empty line. Blank lines and
+lines starting with `#` are ignored. OpenClaude also includes the primary OpenCode Go
 credential and removes duplicates. If a provider uses another credential
 source, fix that source in `openclaude.config.json` or OpenCode's own supported
 connection flow.
@@ -788,6 +968,43 @@ Or intentionally reset that engagement's run state:
 ./bin/grypton init --force --target "https://app.example.test" -m "Start a new pass"
 ```
 
+## A background run will not start
+
+A direct background `init` or `resume` needs a finite stop condition. Add one
+of these options:
+
+```bash
+--duration 12h
+--max-seconds 43200
+--auto-stop-time 720
+```
+
+For a saved engagement, `run start ENGAGEMENT` defaults to 12 hours. Use
+`run status` to check whether its verified supervisor is already active, and
+use `run logs` for the secret-free lifecycle reason when it has stopped.
+
+## A named login is stored but not authenticated
+
+Check only the safe session state:
+
+```bash
+./bin/grypton auth list ENGAGEMENT
+```
+
+The worker must call `credential_login` with the correct scoped login endpoint,
+field names, encoding, verification endpoint, and a non-secret success marker.
+A login response alone is not proof. If the alias is blocked by MFA, CAPTCHA,
+rate limiting, rejection, or its two-attempt limit, Grypton waits for operator
+action instead of retrying. Re-run `auth add ENGAGEMENT --name ALIAS` when you
+intend to replace the login and reset its saved session.
+
+## A local analyzer or install request is rejected
+
+`local_analyze` accepts only `file`, `strings`, and `sha256` on a regular file
+inside the engagement. `install_tool` accepts only the exact reviewed apt
+packages listed in the tool section. These boundaries are fixed; changing the
+spelling, package manager, path, or command does not bypass them.
+
 ## The console is too busy
 
 Use either command:
@@ -816,6 +1033,9 @@ Use `/status`, `overview`, `history`, and `audit` to see why. Common reasons are
 ```bash
 ./bin/grypton --help
 ./bin/grypton init --help
+./bin/grypton run --help
+./bin/grypton run start --help
+./bin/grypton auth --help
 ./bin/grypton tools --help
 ./bin/grypton benchmark --help
 ```

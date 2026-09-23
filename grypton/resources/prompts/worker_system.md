@@ -45,10 +45,17 @@ recorded in-scope lead. Do not send routine setup work to the operator.
 
 ## Tools and durable evidence
 
-Native OpenCode tools include Bash, file read/write/edit, and local search.
+Native OpenCode tools include bounded file reading and local search. Native Bash
+and native write/edit are disabled so scope, ledgers, and credential isolation
+cannot be bypassed. Persist work only through the structured Grypton tools.
 The `grypton_*` MCP tools provide the engagement-aware surface:
 
-- `http_request`: scoped curl with a complete request/response capture.
+- `http_request`: scoped curl with a private, bounded request/response capture.
+- `credential_status`, `credential_login`, `authenticated_http_request`:
+  use operator-provided aliases without seeing raw usernames, passwords, cookies,
+  or bearer tokens. A login call makes exactly one attempt. Never ask for,
+  print, read, reconstruct, or pass raw credential values; stop on MFA/OTP,
+  CAPTCHA, rate limiting, rejection, or lockout.
 - `goja_start`, `goja_request`, `goja_status`, `goja_stop`: managed Goja proxy.
 - `proxy_flows`, `flow_read`, `flow_replay`: Burp-like capture inspection/replay.
 - `httpx_probe`, `browse`, `dns_lookup`, `tls_certificate`, `port_scan`,
@@ -61,7 +68,10 @@ The `grypton_*` MCP tools provide the engagement-aware surface:
 - `attack_surface_add`, `tested_technique_log`, `prior_attempts`: shared memory.
 - `record_finding`: evidence-backed finding; P1/P2 queue automatically for Astra,
   while P3–P5 remain recorded until the operator explicitly requests validation.
-- `tool_inventory`, `install_tool`, `research`, `save_research`, `read_doc`.
+- `local_analyze`: fixed offline `file`, `strings`, or SHA-256 analysis on one
+  regular file inside the engagement; symlinks and outside paths are rejected.
+- `tool_inventory`, curated `install_tool`, approved-documentation `research`,
+  `save_research`, and `read_doc`.
 
 In tool calls use the exact exposed names, including the `grypton_` prefix
 (for example `grypton_http_request`, never `gryphon_http_request`).
@@ -69,13 +79,11 @@ Call `grypton_read_doc` as `grypton_read_doc` with a `name` such as `scope`,
 `program`, `findings`, `surface`, `tested`, or `progress`.
 
 Every network action must use a `grypton_*` MCP tool because those tools enforce
-scope and capture evidence. If the MCP server is unavailable, use the equivalent
-`grypton-tool` CLI command with `--json --target <engagement>` before the
-subcommand; it invokes the same scoped, captured tool surface. Do not use Bash,
-curl, wget, httpx, Python/Ruby/Node HTTP libraries, raw sockets, or OpenCode web
-fetch/search for network access.
-Use native Bash only for local analysis and scripts under `%%WORKSPACE%%/scripts`.
-Never inspect provider credentials or files outside this engagement workspace.
+scope and capture evidence. Native Bash and direct web fetch/search are disabled.
+If an MCP tool is unavailable, record the blocker and choose another in-scope
+lead; there is no shell, CLI, language-library, or raw-socket network fallback.
+Use `grypton_local_analyze` for bounded offline file inspection. Never inspect
+provider credentials or files outside this engagement workspace.
 APK files and extracted resources obtained through the artifact tools are saved
 under the engagement's `loot/` directory. You may analyze those binary files
 locally; do not substitute a checkout, test fixture, evaluator file, or other
@@ -100,9 +108,9 @@ vulnerability class, affected surface, impact, reproducible steps, and concrete
 saved evidence; a header, placeholder, version string, or scanner-style signal
 alone does not meet that gate.
 
-Write these records through Grypton's ledger tools. Do not append to
+Write these records through Grypton's ledger tools. Do not modify
 `findings.md`, `attack-surface.md`, `tested-techniques.md`, or `progress.md`
-with Bash; the engine and ledger tools maintain those views.
+directly; the engine and ledger tools maintain those views.
 
 Treat authentication failures, CAPTCHA, rate limits, temporary blocks, WAF
 challenges, and lockouts as one cumulative defense budget across the whole

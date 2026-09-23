@@ -139,7 +139,8 @@ class Engine:
     def __init__(self, slug: str, *, backend: str = "real",
                  emit: Optional[Callable[..., None]] = None,
                  worker_model: str = "", worker_effort: str = "",
-                 manager_model: str = "", manager_effort: str = ""):
+                 manager_model: str = "", manager_effort: str = "",
+                 run_until_deadline: bool = False):
         self._worker_model_explicit = bool(worker_model)
         self._manager_model_explicit = bool(manager_model)
         self._worker_effort_explicit = bool(worker_effort)
@@ -152,6 +153,10 @@ class Engine:
         self.worker_effort = worker_effort or config.CONFIG.worker_effort
         self.manager_model = manager_model or config.CONFIG.manager_model
         self.manager_effort = manager_effort or config.CONFIG.manager_effort
+        # A detached finite run uses its supervisor deadline as its completion
+        # boundary. Convergence still forces a new Kryptex-directed pivot, but
+        # it must not quietly turn a requested long run into a short one.
+        self.run_until_deadline = bool(run_until_deadline)
 
         self.worker = None
         self.manager = None
@@ -169,6 +174,8 @@ class Engine:
         self._mgr_lock = asyncio.Lock()        # serialize all Codex calls (one session)
         self._model_switches: asyncio.Queue = asyncio.Queue()
         self._user_chat_task = None
+        self._teardown_lock = asyncio.Lock()
+        self._teardown_complete = False
         self._exhaustion_streak = 0
         self._idle_streak = 0          # consecutive 0-tool-call worker turns
         self._counts = (0, 0)          # (findings, surface) snapshot
@@ -304,6 +311,16 @@ class Engine:
     # ----------------------------------------------------------- main loop
 
     async def run(self) -> None:
+        teardown_status = "stopped"
+        try:
+            await self._run_loop()
+        except BaseException:
+            teardown_status = "failed"
+            raise
+        finally:
+            await self._teardown(status=teardown_status)
+
+    async def _run_loop(self) -> None:
         self.running = True
         self._start_time = time.time()
         self._counts = (len(self.ws.findings.all()), len(self.ws.surface.all()))
@@ -411,11 +428,16 @@ class Engine:
             # discovered surface.  If the following turn is still converged,
             # stop rather than pay for hours of sentinel/checkpoint churn.
             if convergence_reason and self._convergence_alerted:
-                self.ws.append_progress(
-                    f"Convergence guard stopped the run after the directed pivot "
-                    f"also stagnated: {convergence_reason}.")
-                self._stop(f"convergence guard: {convergence_reason}")
-                break
+                if self.run_until_deadline:
+                    self.ws.append_progress(
+                        "Convergence guard requested another manager-directed pivot "
+                        f"because this detached run remains active: {convergence_reason}.")
+                else:
+                    self.ws.append_progress(
+                        f"Convergence guard stopped the run after the directed pivot "
+                        f"also stagnated: {convergence_reason}.")
+                    self._stop(f"convergence guard: {convergence_reason}")
+                    break
             if not convergence_reason:
                 self._convergence_alerted = False
 
@@ -479,7 +501,9 @@ class Engine:
             if not directive.cont:
                 if self._is_hard_stop(
                     directive.stop_reason,
-                    convergence_allowed=bool(convergence_reason),
+                    convergence_allowed=(
+                        bool(convergence_reason) and not self.run_until_deadline
+                    ),
                 ):
                     self._stop(directive.stop_reason or "scope or authorization boundary")
                     break
@@ -550,21 +574,24 @@ class Engine:
                                 worker_uuid=getattr(self.worker, "session_id", "") or "",
                                 manager_session_id=getattr(self.manager, "session_id", "") or "")
 
-        await self._teardown()
-
     # ------------------------------------------------------- loop helpers
 
     async def _opening_directive(self) -> str:
-        """Opening move. We start the worker IMMEDIATELY with a strong built-in
-        recon directive (instant visible activity, no blocking manager call), then
-        Kryptex takes the wheel from turn 2 — with real recon data to direct from,
-        which is better than directing into a vacuum."""
+        """Return the operator's mission verbatim when one was supplied.
+
+        Scope, tooling, and durable-record guidance already live in the static
+        worker prompt and the engagement documents.  Wrapping an explicit
+        mission in an additional generated playbook can silently change what
+        the operator asked the first turn to do.
+        """
         meta = self.ws.load_meta()
         if meta.last_directive and not self.brief:
             return meta.last_directive
+        if self.brief:
+            return self.brief
         return (
             f"Begin the engagement NOW. TARGET: {self.target} (type: {self.target_type}).\n"
-            f"MISSION: {self.brief or 'find high-impact vulnerabilities, non-stop.'}\n\n"
+            "MISSION: find high-impact vulnerabilities, non-stop.\n\n"
             f"TARGET-TYPE PLAYBOOK OPTIONS:\n{scenarios.guidance(self.target_type)}\n\n"
             "This is turn 1 — bounded reconnaissance within the recorded scope. Map the attack "
             "surface (endpoints, params, JS bundles, API routes, auth boundaries, tech "
@@ -1005,33 +1032,52 @@ class Engine:
         self.stop_reason = reason
         self.emit("status", text=f"STOPPING: {reason}")
 
-    async def _teardown(self) -> None:
-        self.running = False
-        if self._user_chat_task and not self._user_chat_task.done():
-            self._user_chat_task.cancel()
-        try:
-            (self.ws.root / ".ledger" / "STOP").unlink(missing_ok=True)
-        except OSError:
-            pass
-        self.ws.update_meta(
-            status="stopped", turn_index=self.turn_index,
-            worker_uuid=getattr(self.worker, "session_id", "") or "",
-            manager_session_id=getattr(self.manager, "session_id", "") or "",
-            worker_model=self.worker_model, worker_effort=self.worker_effort,
-            manager_model=self.manager_model, manager_effort=self.manager_effort,
-        )
-        try:
-            if self.worker:
-                await self.worker.aclose()
-        except Exception:
-            pass
-        try:
-            if self.manager and hasattr(self.manager, "aclose"):
-                await self.manager.aclose()
-        except Exception:
-            pass
-        self.emit("status", text=f"Engine stopped after {self.turn_index} turn(s). "
-                  f"Reason: {self.stop_reason or 'n/a'}")
+    async def _teardown(self, *, status: str = "stopped") -> None:
+        """Close every provider even when metadata or chat cleanup fails."""
+        async with self._teardown_lock:
+            if self._teardown_complete:
+                return
+            self.running = False
+            chat_task = self._user_chat_task
+            if chat_task and not chat_task.done():
+                chat_task.cancel()
+                try:
+                    await asyncio.gather(chat_task, return_exceptions=True)
+                except BaseException:
+                    pass
+            try:
+                (self.ws.root / ".ledger" / "STOP").unlink(missing_ok=True)
+            except OSError:
+                pass
+
+            # Provider teardown comes before bookkeeping: a corrupt/unwritable
+            # workspace must never leave authenticated sidecars running.
+            try:
+                if self.worker:
+                    await self.worker.aclose()
+            except BaseException:
+                pass
+            try:
+                if self.manager and hasattr(self.manager, "aclose"):
+                    await self.manager.aclose()
+            except BaseException:
+                pass
+            try:
+                self.ws.update_meta(
+                    status=status, turn_index=self.turn_index,
+                    worker_uuid=getattr(self.worker, "session_id", "") or "",
+                    manager_session_id=getattr(self.manager, "session_id", "") or "",
+                    worker_model=self.worker_model, worker_effort=self.worker_effort,
+                    manager_model=self.manager_model, manager_effort=self.manager_effort,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError):
+                pass
+            self._teardown_complete = True
+            try:
+                self.emit("status", text=f"Engine stopped after {self.turn_index} turn(s). "
+                          f"Reason: {self.stop_reason or 'n/a'}")
+            except Exception:
+                pass
 
     # ------------------------------------------------------------- events
 

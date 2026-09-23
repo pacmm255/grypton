@@ -25,6 +25,7 @@ from grypton.openclaude import (
     OpenClaudeGateway,
     OpenClaudeModel,
     TOKEN_ENV,
+    _openclaude_child_environment,
     resolve_model,
     resolve_openclaude_route,
 )
@@ -186,6 +187,94 @@ class OpenClaudeAdapterTests(unittest.TestCase):
                 "message": "Bearer " + gateway.token,
             })
             self.assertNotIn(gateway.token, json.dumps(sanitized))
+
+
+    def test_child_environment_keeps_configured_credentials_and_drops_ambient_secrets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "openclaude.config.json"
+            config_path.write_text(json.dumps({
+                "providers": {
+                    "fixture": {"credential": {"env": "FIXTURE_PROVIDER_KEY"}},
+                    "anthropic": {"credential": {"openclaude": "anthropic"}},
+                },
+            }), encoding="utf-8")
+            opencode_path = root / "opencode.jsonc"
+            opencode_path.write_text(r'''{
+              // An exact apiKey reference wins over the provider fallback list.
+              "provider": {
+                "direct": {"options": {"apiKey": "{env:OPENCODE_DIRECT_KEY}"}},
+                "fallback": {"env": ["OPENCODE_MISSING_KEY", "OPENCODE_FALLBACK_KEY",],},
+                "inline": {"options": {"apiKey": "inline-is-not-forwarded"}}
+              },
+            }''', encoding="utf-8")
+            auth_file = root / "auth.json"
+            environ = {
+                "HOME": str(root / "home"),
+                "PATH": "/usr/bin",
+                "XDG_DATA_HOME": str(root / "data"),
+                "OPENCODE_CONFIG": str(opencode_path),
+                "FIXTURE_PROVIDER_KEY": "fixture-configured-key",
+                "ANTHROPIC_API_KEY": "fixture-anthropic-key",
+                "OPENCODE_DIRECT_KEY": "fixture-direct-key",
+                "OPENCODE_FALLBACK_KEY": "fixture-fallback-key",
+                "AWS_SECRET_ACCESS_KEY": "fixture-cloud-secret",
+                "GITHUB_TOKEN": "fixture-source-secret",
+                "OPENAI_API_KEY": "fixture-unconfigured-provider-secret",
+                "HTTPS_PROXY": "http://fixture-proxy.invalid:8080",
+                "NODE_OPTIONS": "--require=/tmp/fixture-secret-hook.js",
+            }
+            child = _openclaude_child_environment(
+                config_path, root, auth_file=auth_file, environ=environ
+            )
+
+            for name in (
+                "FIXTURE_PROVIDER_KEY", "ANTHROPIC_API_KEY",
+                "OPENCODE_DIRECT_KEY", "OPENCODE_FALLBACK_KEY",
+            ):
+                self.assertEqual(child[name], environ[name])
+            self.assertEqual(child["OPENCLAUDE_AUTH_FILE"], str(auth_file))
+            self.assertEqual(child["OPENCODE_CONFIG"], str(opencode_path))
+            self.assertEqual(child["NO_COLOR"], "1")
+            for name in (
+                "OPENCODE_MISSING_KEY", "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN",
+                "OPENAI_API_KEY", "HTTPS_PROXY", "NODE_OPTIONS",
+            ):
+                self.assertNotIn(name, child)
+
+    def test_sidecar_launch_receives_only_bounded_environment(self):
+        async def exercise():
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config_path = root / "openclaude.config.json"
+                config_path.write_text(json.dumps({
+                    "providers": {
+                        "fixture": {"credential": {"env": "FIXTURE_PROVIDER_KEY"}},
+                    },
+                }), encoding="utf-8")
+                gateway = OpenClaudeGateway(
+                    "fixture/model", "auto", "worker", root / "transport",
+                    openclaude_root=root, config_path=config_path,
+                    node_binary=sys.executable,
+                )
+                with patch.dict(os.environ, {
+                    "FIXTURE_PROVIDER_KEY": "fixture-configured-key",
+                    "AWS_SECRET_ACCESS_KEY": "fixture-cloud-secret",
+                    "GITHUB_TOKEN": "fixture-source-secret",
+                    "HTTPS_PROXY": "http://fixture-proxy.invalid:8080",
+                }), patch.object(gateway, "_validate_installation"), patch(
+                    "grypton.openclaude.asyncio.create_subprocess_exec",
+                    new=AsyncMock(side_effect=OSError("fixture spawn stop")),
+                ) as spawn:
+                    with self.assertRaisesRegex(OSError, "fixture spawn stop"):
+                        await gateway.start()
+                child = spawn.await_args.kwargs["env"]
+                self.assertEqual(child["FIXTURE_PROVIDER_KEY"], "fixture-configured-key")
+                self.assertEqual(child[TOKEN_ENV], gateway._token)
+                for name in ("AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "HTTPS_PROXY"):
+                    self.assertNotIn(name, child)
+
+        asyncio.run(exercise())
 
 
 class ModelSelectionTests(unittest.IsolatedAsyncioTestCase):

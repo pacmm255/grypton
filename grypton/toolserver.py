@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import sys
@@ -77,6 +78,28 @@ def _http(ws, args):
         follow_redirects=args.get("follow_redirects", False), insecure=args.get("insecure", False))
 
 
+def _credential_status(ws, args):
+    return tools.credential_status(ws, args.get("credential", ""))
+
+
+def _credential_login(ws, args):
+    return tools.credential_login(
+        ws, args["url"], credential=args["credential"], verify_url=args["verify_url"], success_marker=args["success_marker"],
+        username_field=args.get("username_field", "username"),
+        password_field=args.get("password_field", "password"),
+        encoding=args.get("encoding", "json"), fields=args.get("fields"),
+        headers=args.get("headers"), timeout=args.get("timeout", 30),
+    )
+
+
+def _authenticated_http(ws, args):
+    return tools.authenticated_http_request(
+        ws, args["url"], credential=args["credential"],
+        method=args.get("method", "GET"), headers=args.get("headers"),
+        body=args.get("body"), timeout=args.get("timeout", 30),
+    )
+
+
 def _goja_request(ws, args):
     return tools.Goja.request(ws, args["url"], method=args.get("method", "GET"),
         headers=args.get("headers"), body=args.get("body"), timeout=args.get("timeout", 30),
@@ -131,6 +154,33 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
                  "headers": {"type": "object", "additionalProperties": {"type": "string"}},
                  "body": _string("Request body"), "timeout": {"type": "integer", "minimum": 1, "maximum": 120},
                  "follow_redirects": {"type": "boolean"}, "insecure": {"type": "boolean"}}, ("url",)), _http),
+    "credential_status": (
+        "List named credentials and safe session state; never returns usernames or secrets.",
+        _object({"credential": _string("Optional credential alias")}), _credential_status),
+    "credential_login": (
+        "Perform exactly one scoped login with a named private credential. No retries, MFA/OTP solving, or secret output.",
+        _object({
+            "url": _string("In-scope login endpoint"),
+            "credential": _string("Credential alias"),
+            "verify_url": _string("Scoped endpoint that proves the session"),
+            "success_marker": _string("Exact non-secret text required in verification response body"),
+            "username_field": _string("Login username/mobile field name"),
+            "password_field": _string("Login password field name"),
+            "encoding": {"type": "string", "enum": ["json", "form"]},
+            "fields": {"type": "object", "additionalProperties": {"type": "string"}},
+            "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+            "timeout": {"type": "integer", "minimum": 1, "maximum": 120},
+        }, ("url", "credential", "verify_url", "success_marker")), _credential_login),
+    "authenticated_http_request": (
+        "Send one scoped request with a named private cookie/bearer session and a sanitized capture.",
+        _object({
+            "url": _string("In-scope HTTP(S) URL"),
+            "credential": _string("Credential alias"),
+            "method": _string("HTTP method"),
+            "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+            "body": _string("Optional non-secret request body"),
+            "timeout": {"type": "integer", "minimum": 1, "maximum": 120},
+        }, ("url", "credential")), _authenticated_http),
     "goja_start": ("Start Grypton's managed Goja SOCKS5 TLS-fingerprint proxy.", _object({}),
         lambda ws, args: tools.Goja.start()),
     "goja_status": ("Read managed Goja status.", _object({}), lambda ws, args: tools.Goja.status()),
@@ -187,13 +237,21 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
     "subdomain_enum": ("Run passive subfinder enumeration for an in-scope domain.",
         _object({"domain": _string("In-scope base domain"), "timeout": {"type": "integer"}}, ("domain",)),
         lambda ws, a: tools.subdomain_enum(ws, a["domain"], timeout=a.get("timeout", 180))),
-    "install_tool": ("Install a local dependency needed to clear an operational blocker.",
-        _object({"spec": _string("Single package specification"),
-                 "manager": {"type": "string", "enum": ["auto", "apt", "pip", "npm", "cargo", "go"]}},
+    "local_analyze": ("Run a fixed offline analyzer on one regular file inside this engagement.",
+        _object({"path": _string("Relative engagement file path"),
+                 "analyzer": {"type": "string", "enum": ["file", "strings", "sha256"]},
+                 "min_length": {"type": "integer", "minimum": 4, "maximum": 64}},
+                ("path", "analyzer")),
+        lambda ws, a: tools.local_analyze(
+            ws, a["path"], analyzer=a["analyzer"], min_length=a.get("min_length", 6)
+        )),
+    "install_tool": ("Install one approved OS package from Grypton's fixed allowlist.",
+        _object({"spec": _string("Exact approved OS package name"),
+                 "manager": {"type": "string", "enum": ["auto", "apt"]}},
                 ("spec",)), lambda ws, a: tools.install_tool(a["spec"], manager=a.get("manager", "auto"))),
-    "research": ("Fetch public documentation or research material without treating it as target evidence.",
+    "research": ("Fetch target-scoped material or approved public security/tool documentation.",
         _object({"url": _string("HTTP(S) URL"), "timeout": {"type": "integer"}}, ("url",)),
-        lambda ws, a: tools.research(a["url"], timeout=a.get("timeout", 30))),
+        lambda ws, a: tools.research(ws, a["url"], timeout=a.get("timeout", 30))),
     "save_research": ("Save a research note in the engagement workspace.",
         _object({"topic": _string("Topic"), "content": _string("Markdown")}, ("topic", "content")),
         _save_research),
@@ -205,12 +263,83 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
 }
 
 
+_SENSITIVE_AUDIT_KEYS = {
+    "authorization", "cookie", "set-cookie", "proxy-authorization",
+    "password", "passwd", "secret", "token", "access_token", "refresh_token",
+    "id_token", "api_key", "x-api-key", "x-auth-token", "x-courier-mac",
+    "x-courier-signature",
+}
+
+
+# These handlers only inspect private engagement state or local artifacts. An
+# engine crash after one of them returns can safely be retried because the call
+# cannot send traffic, change a process, install software, or mutate engagement
+# state. New tools default to guarded so a later side-effecting handler cannot
+# accidentally reopen the supervisor replay race.
+_RESTART_SAFE_READ_ONLY_TOOLS = frozenset({
+    "prior_attempts",
+    "credential_status",
+    "goja_status",
+    "proxy_flows",
+    "flow_read",
+    "apk_inspect",
+    "local_analyze",
+    "read_doc",
+    "tool_inventory",
+})
+
+
+def _record_effectful_tool_start(workspace: Workspace, name: str) -> None:
+    """Durably mark a potentially effectful call before invoking its handler.
+
+    The completed-call audit is necessarily written after dispatch and cannot
+    distinguish a pre-call crash from a crash after an external side effect.
+    This small argument-free ledger closes that gap. A partial final record is
+    still counted conservatively by the supervisor.
+    """
+    path = workspace.root / ".ledger" / "effectful-tool-starts.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    flags = os.O_CREAT | os.O_WRONLY | os.O_APPEND
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        payload = (json.dumps({
+            "at": time.time(),
+            "tool": name,
+        }, ensure_ascii=False) + "\n").encode("utf-8")
+        remaining = memoryview(payload)
+        while remaining:
+            written = os.write(fd, remaining)
+            if written <= 0:
+                raise OSError("short write while recording effectful tool start")
+            remaining = remaining[written:]
+        os.fsync(fd)
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
 def _redacted(value):
     if isinstance(value, dict):
-        return {key: ("[REDACTED]" if key.lower() in {"authorization", "cookie", "proxy-authorization", "x-courier-mac", "x-courier-signature"}
-                      else _redacted(item)) for key, item in value.items()}
+        return {
+            key: (
+                "[REDACTED]" if str(key).lower() in _SENSITIVE_AUDIT_KEYS
+                else _redacted(item)
+            )
+            for key, item in value.items()
+        }
     if isinstance(value, list):
         return [_redacted(item) for item in value]
+    if isinstance(value, str):
+        return tools.redact_sensitive_text(value)
     return value
 
 
@@ -221,10 +350,29 @@ def dispatch(workspace: Workspace, name: str, args: dict) -> dict:
     elif not workspace.exists():
         result = {"ok": False, "summary": "The engagement workspace is not initialized."}
     else:
-        try:
-            result = REGISTRY[name][2](workspace, args or {})
-        except Exception as exc:
-            result = {"ok": False, "summary": f"{name} failed: {exc}"}
+        guarded = name not in _RESTART_SAFE_READ_ONLY_TOOLS
+        marker_error = False
+        if guarded:
+            try:
+                # This must complete before the handler can perform an external
+                # or persistent action. Failure is closed: do not dispatch a
+                # call the supervisor could later replay unknowingly.
+                _record_effectful_tool_start(workspace, name)
+            except OSError:
+                marker_error = True
+        if marker_error:
+            result = {
+                "ok": False,
+                "summary": (
+                    f"{name} was not started because its restart-safety "
+                    "marker could not be persisted."
+                ),
+            }
+        else:
+            try:
+                result = REGISTRY[name][2](workspace, args or {})
+            except Exception as exc:
+                result = {"ok": False, "summary": f"{name} failed: {exc}"}
     try:
         append_jsonl(workspace.root / ".ledger" / "tool-calls.jsonl", {
             "at": time.time(), "tool": name, "args": _redacted(args or {}),
@@ -322,7 +470,11 @@ def cli_main(argv=None) -> int:
     finding.add_argument("--class", dest="vuln_class", default=""); finding.add_argument("--surface", default="")
     finding.add_argument("--description", default=""); finding.add_argument("--poc", default=""); finding.add_argument("--evidence", default="")
     read = sub.add_parser("read"); read.add_argument("name", choices=["findings", "surface", "tested", "progress", "scope", "program"])
-    install = sub.add_parser("install"); install.add_argument("spec"); install.add_argument("--manager", default="auto")
+    analyze = sub.add_parser("local-analyze"); analyze.add_argument("path")
+    analyze.add_argument("--analyzer", choices=["file", "strings", "sha256"], default="file")
+    analyze.add_argument("--min-length", type=int, default=6)
+    install = sub.add_parser("install"); install.add_argument("spec")
+    install.add_argument("--manager", choices=["auto", "apt"], default="auto")
 
     ns = parser.parse_args(argv)
     os.environ["GRYPTON_TARGET"] = ns.target
@@ -347,6 +499,9 @@ def cli_main(argv=None) -> int:
     elif ns.command == "tested": mapping = {ns.command: ("tested_technique_log", {"surface": ns.surface, "technique": ns.technique, "result": ns.result, "evidence": ns.evidence})}
     elif ns.command == "finding": mapping = {ns.command: ("record_finding", {"title": ns.title, "severity": ns.severity, "vuln_class": ns.vuln_class, "surface": ns.surface, "description": ns.description, "poc": ns.poc, "evidence": ns.evidence})}
     elif ns.command == "read": mapping = {ns.command: ("read_doc", {"name": ns.name})}
+    elif ns.command == "local-analyze": mapping = {ns.command: ("local_analyze", {
+        "path": ns.path, "analyzer": ns.analyzer, "min_length": ns.min_length,
+    })}
     elif ns.command == "install": mapping = {ns.command: ("install_tool", {"spec": ns.spec, "manager": ns.manager})}
     tool_name, args = mapping[ns.command]
     result = dispatch(Workspace(ns.target), tool_name, args)

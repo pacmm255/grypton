@@ -8,13 +8,15 @@ import re
 from urllib.parse import urlsplit
 
 from . import config
-from .tools import check_host_scope, check_url_scope
+from .tools import (check_host_scope, check_port_scope, check_raw_tcp_scope,
+                    check_research_scope, check_url_scope)
 
 
 FLOW_RE = re.compile(r"flow-\d+\.http")
 NETWORK_TOOLS = {
     "http_request", "httpx_probe", "browse", "dns_lookup", "tls_certificate",
-    "port_scan", "subdomain_enum", "goja_request", "flow_replay",
+    "port_scan", "subdomain_enum", "goja_request", "flow_replay", "artifact_download",
+    "tcp_exchange", "research", "credential_login", "authenticated_http_request",
 }
 
 
@@ -162,17 +164,54 @@ def audit_workspace(ws) -> dict:
         network_calls += 1
         args = row.get("args") if isinstance(row.get("args"), dict) else {}
         for url in _urls(args):
-            allowed, reason = check_url_scope(ws, url)
+            if row.get("tool") == "research":
+                allowed, reason = check_research_scope(ws, url)
+            else:
+                allowed, reason = check_url_scope(ws, url)
             if not allowed:
                 scope_violations.append({"tool": row.get("tool"), "value": url,
                                          "reason": reason})
+        tool_name = row.get("tool")
+        host_value = args.get("host")
+        host = (
+            urlsplit("//" + host_value).hostname or host_value
+            if isinstance(host_value, str) and host_value and "://" not in host_value
+            else ""
+        )
+        if host and tool_name == "port_scan":
+            ports = args.get("ports") if isinstance(args.get("ports"), list) else []
+            for port in ports:
+                try:
+                    allowed, reason = check_port_scope(ws, host, int(port))
+                except (TypeError, ValueError):
+                    allowed, reason = False, "port is invalid"
+                if not allowed:
+                    scope_violations.append({
+                        "tool": tool_name, "value": f"{host}:{port}", "reason": reason,
+                    })
+        elif host and tool_name in {"tls_certificate", "tcp_exchange"}:
+            try:
+                port = int(args.get("port", 443))
+                checker = check_raw_tcp_scope if tool_name == "tcp_exchange" else check_port_scope
+                allowed, reason = checker(ws, host, port)
+            except (TypeError, ValueError):
+                allowed, reason = False, "port is invalid"
+            if not allowed:
+                scope_violations.append({
+                    "tool": tool_name, "value": f"{host}:{args.get('port', 443)}",
+                    "reason": reason,
+                })
         for key in ("host", "domain"):
             value = args.get(key)
             if isinstance(value, str) and value and "://" not in value:
                 host = urlsplit("//" + value).hostname or value
+                if key == "host" and tool_name in {
+                    "port_scan", "tls_certificate", "tcp_exchange",
+                }:
+                    continue
                 allowed, reason = check_host_scope(ws, host)
                 if not allowed:
-                    scope_violations.append({"tool": row.get("tool"), "value": value,
+                    scope_violations.append({"tool": tool_name, "value": value,
                                              "reason": reason})
 
     event_failures = []
@@ -237,7 +276,7 @@ def render_report(ws) -> str:
         "## Activity", "",
         f"- {audit['counts']['tool_calls']} structured tool events, "
         f"{audit['counts']['network_tool_calls']} network tool calls",
-        f"- {audit['counts']['flows']} complete request/response flows",
+        f"- {audit['counts']['flows']} bounded request/response flows",
         f"- {audit['counts']['surface']} surface records and "
         f"{audit['counts']['tested']} tested techniques", "",
         "## Findings", "",

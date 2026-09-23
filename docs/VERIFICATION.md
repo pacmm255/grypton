@@ -44,8 +44,9 @@ model persistence, safe live-switch boundaries, fresh worker and manager
 sessions after a switch, the immutable Astra route, the P1/P2-only automatic
 validation gate, explicit lower-severity review, the mock
 worker-manager-validator loop, multi-flow evidence handoff, OpenCode error
-rendering, the 120-second MCP ceiling, scoped captures and replay, explicit port
-binding, redirect blocking, large-response preview limits, complete disk
+rendering, the 120-second MCP ceiling, scoped captures and replay, canonical URL
+path subtrees and exclusions, explicit scheme/port binding, redirect blocking,
+non-URL transport separation, large-response preview limits, complete disk
 captures, report auditing, and CLI review commands.
 
 OpenClaude-facing tests must use fake routes, fake key sentinels, and loopback

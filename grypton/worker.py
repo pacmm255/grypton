@@ -103,7 +103,7 @@ class OpenCodeWorker:
             "subtype": "init",
             "cwd": str(self.spec.cwd),
             "session_id": self.session_id,
-            "tools": ["bash", "read", "write", "edit", "grypton MCP"],
+            "tools": ["read", "grep", "glob", "grypton MCP"],
             "mcp_servers": [{"name": "grypton", "status": "configured"}],
             "model": self.spec.model,
             "permissionMode": "auto",
@@ -124,24 +124,20 @@ class OpenCodeWorker:
         self._started = False
 
     def _build_prompt(self, directive: str) -> str:
-        tool_bin = config.find_binary("grypton-tool") or str(config.BIN_DIR / "grypton-tool")
-        slug = self.spec.extra_env.get("GRYPTON_TARGET", self.spec.cwd.name)
         return (
             "=== GRYPTON KRAUDE WORKER RUNTIME ===\n"
-              "Native Bash/read/write/edit tools and `grypton_*` MCP tools are "
-              "available. Every network action MUST use a `grypton_*` MCP tool so "
-              "scope checks and Burp-like request/response capture cannot be bypassed. "
-              "Native Bash is only for local analysis; do not use curl, wget, httpx, "
-              "language HTTP libraries, sockets, or built-in web fetch/search for "
-              "network access. Prefer ledger tools for durable findings, surface "
-              "entries, and tested techniques. Before every network action call "
-              "`grypton_read_doc` with `{\"name\": \"scope\"}`. Use `grypton_read_doc` "
-              "for scope, program, findings, surface, tested, and progress ledgers; do not "
-              "use native Read on absolute engagement paths. Do not inspect files outside "
-              "this engagement workspace.\n"
-            + f"If an MCP tool is unavailable, use the scoped CLI fallback with global options first: "
-              f"`{tool_bin} --json --target {slug} read scope`. The fallback tool, never curl "
-              "or a language HTTP client, is the only permitted network fallback.\n\n"
+              "Native read/search tools and `grypton_*` MCP tools are "
+              "available; native Bash is disabled. Every network action MUST use a "
+              "`grypton_*` MCP tool so scope checks and Burp-like request/response "
+              "capture cannot be bypassed. Use `grypton_local_analyze` for bounded "
+              "offline file inspection. If an MCP tool is unavailable, record the "
+              "blocker and choose another in-scope lead; no shell or direct network "
+              "fallback is permitted. Prefer ledger tools for durable findings, "
+              "surface entries, and tested techniques. Before every network action "
+              "call `grypton_read_doc` with `{\"name\": \"scope\"}`. Use "
+              "`grypton_read_doc` for scope, program, findings, surface, tested, and "
+              "progress ledgers; do not use native Read on absolute engagement paths. "
+              "Do not inspect files outside this engagement workspace.\n\n"
               "=== KRYPTEX DIRECTIVE ===\n"
             + directive
         )

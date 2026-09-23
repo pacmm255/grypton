@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 import os
 from pathlib import Path
+import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -19,18 +21,23 @@ from unittest.mock import AsyncMock, patch
 from grypton import config
 from grypton.bugcrowd import analyze_snapshot, matching_scope_rules, out_of_scope_rules
 from grypton.chat import Renderer, _command_limit, _compact_tool_result, _expand_workspace_references, _route_input
-from grypton.cli import (_activity_snapshot, _claude_style_arguments, _constraints,
-                         _validate_requested_findings, build_parser, main)
+from grypton.cli import (_activity_snapshot, _browser_sandbox_check,
+                         _claude_style_arguments, _constraints,
+                         _opencode_go_key_pool, _validate_requested_findings,
+                         build_parser, main)
 from grypton.engine import Engine
 from grypton.hard_lab import HardLab, score_workspace
 from grypton.manager import KryptexManager, ManagerContext, _check_schema, _extract_json
 from grypton.openclaude import TOKEN_ENV
-from grypton.providers import MCP_TIMEOUT_MS, OpenCodeClient, OpenCodeResult
+from grypton.providers import (MCP_TIMEOUT_MS, OpenCodeClient, OpenCodeResult,
+                               _codex_child_environment)
 from grypton.reporting import audit_workspace, render_report
 from grypton.toolserver import REGISTRY, dispatch
-from grypton.tools import (apk_extract_asset, apk_inspect, artifact_download, check_host_scope,
-                           check_url_scope, flow_read, flow_replay, http_request, port_scan,
-                           tcp_exchange)
+from grypton.tools import (_isolated_browser_profile, apk_extract_asset, apk_inspect,
+                           artifact_download, browse, check_host_scope, check_port_scope,
+                           check_research_scope, check_url_scope, flow_read, flow_replay,
+                           http_request, httpx_probe, install_tool, local_analyze, port_scan,
+                           research, tcp_exchange, MAX_RESPONSE_BYTES)
 from grypton.worker import OpenCodeWorker, WorkerSpec
 from grypton.workspace import Constraints, Workspace
 
@@ -56,7 +63,19 @@ def isolated_runtime():
 
 class _Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/large":
+        if self.path == "/scoped/redirect-in":
+            self.send_response(302)
+            self.send_header("Location", "/scoped/final")
+            self.end_headers()
+            return
+        if self.path == "/scoped/redirect-out":
+            self.send_response(302)
+            self.send_header("Location", "/outside")
+            self.end_headers()
+            return
+        if self.path == "/huge":
+            payload = b"H" * (MAX_RESPONSE_BYTES + 4096)
+        elif self.path == "/large":
             payload = ("A" * 20_000 + "END-MARKER").encode()
         else:
             payload = json.dumps({"path": self.path, "marker": "local-lab"}).encode()
@@ -116,6 +135,42 @@ class CliTests(unittest.TestCase):
         self.assertEqual(config.PROMPTS_DIR, config.PACKAGE_DIR / "resources" / "prompts")
         self.assertTrue((config.PROMPTS_DIR / "worker_system.md").is_file())
 
+    def test_astra_route_ignores_environment_and_saved_config_overrides(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "grypton.json").write_text(json.dumps({
+                "validator_model": "fixture/not-astra",
+                "validator_effort": "low",
+            }), encoding="utf-8")
+            env = dict(os.environ)
+            env.update({
+                "GRYPTON_HOME": str(root),
+                "GRYPTON_VALIDATOR_MODEL": "fixture/environment-model",
+                "GRYPTON_VALIDATOR_EFFORT": "minimal",
+                "PYTHONPATH": str(config.SOURCE_ROOT),
+            })
+            result = subprocess.run(
+                [sys.executable, "-c", (
+                    "import json; from dataclasses import asdict; "
+                    "from grypton import config; "
+                    "print(json.dumps({"
+                    "'model': config.VALIDATOR_MODEL, "
+                    "'effort': config.VALIDATOR_EFFORT, "
+                    "'effective': config.effective_role_models()['validator'], "
+                    "'saved': asdict(config.CONFIG)}))"
+                )],
+                cwd=str(config.SOURCE_ROOT), env=env, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+            )
+            value = json.loads(result.stdout)
+        self.assertEqual(value["model"], "gpt-6-astra")
+        self.assertEqual(value["effort"], "max")
+        self.assertEqual(value["effective"], {
+            "route": "gpt-6-astra", "effort": "max",
+        })
+        self.assertNotIn("validator_model", value["saved"])
+        self.assertNotIn("validator_effort", value["saved"])
+
     def test_review_commands_parse(self):
         parser = build_parser()
         for command in ("show", "findings", "surface", "history", "scope", "audit", "report"):
@@ -139,9 +194,50 @@ class CliTests(unittest.TestCase):
         self.assertEqual(plan.target_option, "preview.test")
         self.assertEqual(activity.kind, "flows")
         self.assertEqual(activity.limit, 3)
-        with isolated_runtime() as root, redirect_stdout(io.StringIO()):
-            self.assertEqual(main(["plan", "--target", "preview.test", "--type", "web"]), 0)
+        def resolve(route, effort, *, require_tools):
+            return {"route": route, "effort": effort}
+
+        with isolated_runtime() as root, redirect_stdout(io.StringIO()) as output, \
+                patch("grypton.cli._resolve_role_selection", side_effect=resolve) as resolver:
+            self.assertEqual(main([
+                "plan", "--target", "preview.test", "--type", "web",
+                "--in-scope", "preview.test/api", "--out-scope", "preview.test/admin",
+                "--only", "P1,P2", "--include", "access-control", "--exclude", "dos",
+                "--rule", "no account recovery",
+            ]), 0)
             self.assertFalse((root / ".state" / "engagements" / "preview-test").exists())
+            rendered = output.getvalue()
+            for value in (
+                "--in-scope preview.test/api", "--out-scope preview.test/admin",
+                "--only P1,P2", "--include access-control", "--exclude dos",
+                "--rule 'no account recovery'",
+            ):
+                self.assertIn(value, rendered)
+            self.assertEqual(resolver.call_count, 2)
+
+        with redirect_stderr(io.StringIO()) as error, \
+                patch("grypton.cli._resolve_role_selection", side_effect=ValueError("unknown route")):
+            self.assertEqual(main(["plan", "--target", "preview.test"]), 2)
+        self.assertIn("invalid model selection", error.getvalue())
+
+    def test_explicit_scope_prompt_adds_no_generated_behavior_rules(self):
+        parser = build_parser()
+        ns = parser.parse_args([
+            "init", "--target", "https://example.test/app",
+            "--in-scope", "https://example.test/app,https://example.test/main",
+            "--exclude", "clickjacking,open-redirect",
+            "--rule", "Minimum accepted severity: /app Medium; /main Critical.",
+        ])
+        constraints = _constraints(ns, "https://example.test/app")
+        self.assertEqual(constraints.hard_rules, [
+            "Minimum accepted severity: /app Medium; /main Critical."
+        ])
+        self.assertEqual(constraints.notes, "")
+        rendered = constraints.to_prompt_block()
+        self.assertIn("In-scope URLs/hosts:", rendered)
+        self.assertIn("Out-of-scope finding categories:", rendered)
+        self.assertNotIn("Network actions must", rendered)
+        self.assertNotIn("NEVER test", rendered)
 
     def test_claude_style_direct_invocation_translates_to_scoped_commands(self):
         self.assertEqual(
@@ -300,6 +396,162 @@ class ToolTests(unittest.TestCase):
                 ["--target", "example.test", "--json", "inventory"]
             )
 
+    def test_go_key_pool_doctor_check_is_private_and_non_disclosing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pool = root / "open"
+            key_one = "fixture_key_A_12345678901234567890"
+            key_two = "fixture_key_B_12345678901234567890"
+            pool.write_text(f"{key_one}\n{key_two}\n{key_one}\n", encoding="utf-8")
+            pool.chmod(0o600)
+            ok, detail = _opencode_go_key_pool(pool)
+            self.assertTrue(ok, detail)
+            self.assertEqual(detail, "count=2; mode=0600")
+            self.assertNotIn(key_one, detail)
+            self.assertNotIn(key_two, detail)
+            pool.chmod(0o644)
+            self.assertFalse(_opencode_go_key_pool(pool)[0])
+            link = root / "open-link"
+            link.symlink_to(pool)
+            self.assertFalse(_opencode_go_key_pool(link)[0])
+
+    def test_browser_boundary_fails_closed_for_root_without_dedicated_account(self):
+        with patch("grypton.cli.os.geteuid", return_value=0), \
+                patch("grypton.cli.pwd.getpwnam", side_effect=KeyError):
+            ok, detail = _browser_sandbox_check()
+        self.assertFalse(ok)
+        self.assertIn("grypton-browser", detail)
+
+        with patch("grypton.tools.os.geteuid", return_value=0), \
+                patch("grypton.tools.pwd.getpwnam", side_effect=KeyError):
+            with self.assertRaisesRegex(RuntimeError, "Run Grypton as an unprivileged"):
+                with _isolated_browser_profile("/bin/true"):
+                    pass
+
+    def test_root_browser_profile_uses_private_drop_launcher(self):
+        account = SimpleNamespace(pw_uid=23456, pw_gid=23456)
+        with patch.dict(os.environ, {
+            "AWS_SECRET_ACCESS_KEY": "fixture-cloud-secret",
+            "HTTPS_PROXY": "http://fixture-proxy.invalid:8080",
+        }), patch("grypton.tools.os.geteuid", return_value=0), \
+                patch("grypton.tools.pwd.getpwnam", return_value=account), \
+                patch("grypton.tools.os.chown") as chown:
+            with _isolated_browser_profile("/bin/true") as profile:
+                launcher = Path(profile["executable"])
+                profile_dir = Path(profile["profile"])
+                data_root = profile_dir.parent
+                launcher_root = launcher.parent
+                script = launcher.read_text(encoding="utf-8")
+                self.assertEqual(profile["identity"], "grypton-browser")
+                self.assertEqual(launcher.stat().st_mode & 0o777, 0o500)
+                self.assertIn("os.setgroups([])", script)
+                self.assertIn("os.setgid(23456)", script)
+                self.assertIn("os.setuid(23456)", script)
+                self.assertNotIn("AWS_SECRET_ACCESS_KEY", profile["environment"])
+                self.assertNotIn("HTTPS_PROXY", profile["environment"])
+                self.assertEqual(Path(profile["environment"]["HOME"]).parent, data_root)
+                self.assertGreaterEqual(chown.call_count, 7)
+            self.assertFalse(data_root.exists())
+            self.assertFalse(launcher_root.exists())
+
+    def test_browse_enables_chromium_sandbox_and_keeps_scope_interception(self):
+        with isolated_runtime():
+            ws = Workspace("browser-sandbox")
+            ws.create("https://example.test", "web")
+            ws.save_constraints(Constraints(in_scope=["example.test"]))
+            observed = {}
+
+            class FakePage:
+                url = "https://example.test/"
+
+                def on(self, *_args):
+                    return None
+
+                def goto(self, *_args, **_kwargs):
+                    return SimpleNamespace(status=200)
+
+                def wait_for_timeout(self, _timeout):
+                    return None
+
+                def content(self):
+                    return "<html>scoped</html>"
+
+            class FakeContext:
+                def __init__(self):
+                    self.routes = []
+
+                def route_web_socket(self, *_args):
+                    return None
+
+                def route(self, pattern, handler):
+                    self.routes.append((pattern, handler))
+
+                def new_page(self):
+                    return FakePage()
+
+                def close(self):
+                    return None
+
+            context = FakeContext()
+
+            class FakeChromium:
+                def launch_persistent_context(self, **kwargs):
+                    observed.update(kwargs)
+                    return context
+
+            @contextmanager
+            def fake_playwright():
+                yield SimpleNamespace(chromium=FakeChromium())
+
+            @contextmanager
+            def fake_profile(_executable):
+                yield {
+                    "executable": "/safe/launcher",
+                    "profile": "/safe/profile",
+                    "environment": {"HOME": "/safe/home"},
+                    "identity": "grypton-browser",
+                }
+
+            with patch("grypton.tools.config.find_binary", return_value="/bin/true"), \
+                    patch("grypton.tools._isolated_browser_profile", fake_profile), \
+                    patch("playwright.sync_api.sync_playwright", fake_playwright):
+                result = browse(ws, "https://example.test/")
+
+            self.assertTrue(result["ok"], result)
+            self.assertTrue(observed["chromium_sandbox"])
+            self.assertEqual(observed["executable_path"], "/safe/launcher")
+            self.assertEqual(observed["user_data_dir"], "/safe/profile")
+            unsafe = {"--no-sandbox", "--disable-setuid-sandbox",
+                      "--disable-seccomp-filter-sandbox", "--no-zygote",
+                      "--single-process"}
+            self.assertFalse(unsafe.intersection(observed["args"]))
+            self.assertEqual(context.routes[0][0], "**/*")
+            self.assertEqual(result["data"]["browser_identity"], "grypton-browser")
+
+    def test_curl_ignores_user_config_proxy_and_unrelated_environment(self):
+        with isolated_runtime():
+            ws = Workspace("curl-environment")
+            ws.create("https://example.test", "web")
+            ws.save_constraints(Constraints(in_scope=["example.test"]))
+
+            def fake_run(argv, **kwargs):
+                kwargs["stdout"].write(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nok")
+                return SimpleNamespace(returncode=0, stderr=b"")
+
+            with patch.dict(os.environ, {
+                "AWS_SECRET_ACCESS_KEY": "fixture-cloud-secret",
+                "HTTPS_PROXY": "http://fixture-proxy.invalid:8080",
+            }), patch("grypton.tools.config.find_binary", return_value="/usr/bin/curl"), \
+                    patch("grypton.tools.subprocess.run", side_effect=fake_run) as run:
+                result = http_request(ws, "https://example.test/")
+            self.assertTrue(result["ok"], result)
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[:2], ["/usr/bin/curl", "--disable"])
+            child_env = run.call_args.kwargs["env"]
+            self.assertNotIn("AWS_SECRET_ACCESS_KEY", child_env)
+            self.assertNotIn("HTTPS_PROXY", child_env)
+            self.assertEqual(run.call_args.kwargs["umask"], 0o077)
+
     def test_scope_capture_and_replay(self):
         with isolated_runtime(), local_server() as port:
             ws = Workspace("local-tools")
@@ -324,6 +576,82 @@ class ToolTests(unittest.TestCase):
             self.assertFalse(blocked["ok"])
             self.assertIn("Scope blocked", blocked["summary"])
 
+    def test_http_and_replay_reject_destination_and_proxy_routing_headers(self):
+        with isolated_runtime(), local_server() as port:
+            ws = Workspace("routing-headers")
+            target = f"http://127.0.0.1:{port}"
+            ws.create(target, "web")
+            ws.save_constraints(Constraints(in_scope=[target]))
+            first = http_request(ws, target + "/first")
+            self.assertTrue(first["ok"], first)
+            flow_id = Path(first["data"]["flow"]).stem
+
+            for header in ("Host", "hOsT", "Proxy-Authorization", "Proxy-Connection"):
+                with self.subTest(tool="http_request", header=header):
+                    result = http_request(ws, target + "/blocked", headers={header: "x"})
+                    self.assertFalse(result["ok"], result)
+                    self.assertIn("not allowed", result["summary"])
+                with self.subTest(tool="flow_replay", header=header):
+                    result = flow_replay(ws, flow_id, headers={header: "x"})
+                    self.assertFalse(result["ok"], result)
+                    self.assertIn("not allowed", result["summary"])
+
+            captured = Path(first["data"]["flow"])
+            text = captured.read_text()
+            request_line = f"GET {target}/first\n"
+            captured.write_text(text.replace(
+                request_line, request_line + "Host: injected.invalid\n", 1
+            ))
+            stored = flow_replay(ws, flow_id)
+            self.assertFalse(stored["ok"], stored)
+            self.assertIn("not allowed", stored["summary"])
+
+    def test_httpx_requires_full_url_for_url_scoped_target(self):
+        with isolated_runtime():
+            ws = Workspace("httpx-scheme")
+            ws.create("https://api.example.test/", "web")
+            ws.save_constraints(Constraints(in_scope=["https://api.example.test/"]))
+            with patch("grypton.tools.config.find_binary", return_value="/usr/bin/httpx"), \
+                    patch("grypton.tools.subprocess.run", return_value=SimpleNamespace(
+                        stdout=b"https://api.example.test [200]", returncode=0
+                    )) as run:
+                full = httpx_probe(ws, "https://api.example.test/")
+                bare = httpx_probe(ws, "api.example.test")
+            self.assertTrue(full["ok"], full)
+            self.assertFalse(bare["ok"])
+            self.assertIn("full scoped URL", bare["summary"])
+            self.assertEqual(run.call_count, 1)
+
+    def test_artifact_download_disables_config_proxy_and_bounds_size(self):
+        with isolated_runtime():
+            ws = Workspace("artifact-environment")
+            ws.create("https://example.test", "web")
+            ws.save_constraints(Constraints(in_scope=["example.test"]))
+
+            def fake_run(argv, **kwargs):
+                Path(argv[argv.index("--output") + 1]).write_bytes(b"fixture-apk")
+                Path(argv[argv.index("--dump-header") + 1]).write_text(
+                    "HTTP/1.1 200 OK\n", encoding="utf-8"
+                )
+                return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+            with patch.dict(os.environ, {
+                "AWS_SECRET_ACCESS_KEY": "fixture-cloud-secret",
+                "HTTPS_PROXY": "http://fixture-proxy.invalid:8080",
+            }), patch("grypton.tools.config.find_binary", return_value="/usr/bin/curl"), \
+                    patch("grypton.tools.subprocess.run", side_effect=fake_run) as run:
+                result = artifact_download(
+                    ws, "https://example.test/app.apk", "app.apk"
+                )
+            self.assertTrue(result["ok"], result)
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[:2], ["/usr/bin/curl", "--disable"])
+            self.assertIn("--max-filesize", argv)
+            self.assertNotIn("--location", argv)
+            self.assertNotIn("HTTPS_PROXY", run.call_args.kwargs["env"])
+            self.assertNotIn("AWS_SECRET_ACCESS_KEY", run.call_args.kwargs["env"])
+            self.assertEqual(run.call_args.kwargs["umask"], 0o077)
+
     def test_url_scope_binds_explicit_port_and_blocks_automatic_redirects(self):
         with isolated_runtime(), local_server() as port:
             ws = Workspace("exact-port")
@@ -337,6 +665,244 @@ class ToolTests(unittest.TestCase):
             self.assertFalse(redirect["ok"])
             self.assertIn("scope-check its Location", redirect["summary"])
 
+    def test_url_scope_enforces_canonical_path_subtrees_and_scheme(self):
+        with isolated_runtime():
+            ws = Workspace("path-scope")
+            ws.create("https://api.example.test/app", "web")
+            ws.save_constraints(Constraints(in_scope=["https://api.example.test/app"]))
+
+            for url in (
+                "https://api.example.test/app",
+                "https://api.example.test/app/",
+                "https://api.example.test/app/users?id=1#ignored",
+                "https://api.example.test/app%2Fusers",
+            ):
+                self.assertTrue(check_url_scope(ws, url)[0], url)
+            for url in (
+                "https://api.example.test/",
+                "https://api.example.test/apple",
+                "https://api.example.test/app/../admin",
+                "https://api.example.test/app/%2e%2e/admin",
+                "https://api.example.test/app%2f..%2fadmin",
+                "https://api.example.test/app/%255c../admin",
+                "https://api.example.test/app/%zz",
+                "http://api.example.test:443/app",
+            ):
+                self.assertFalse(check_url_scope(ws, url)[0], url)
+
+            self.assertFalse(check_host_scope(ws, "api.example.test")[0])
+            self.assertFalse(check_port_scope(ws, "api.example.test", 443)[0])
+            raw = tcp_exchange(ws, "api.example.test", 443, "GET /app HTTP/1.0")
+            self.assertFalse(raw["ok"])
+            self.assertIn("recorded URL path", raw["summary"])
+
+    def test_scheme_less_host_path_rule_applies_to_both_web_schemes_only(self):
+        with isolated_runtime():
+            ws = Workspace("scheme-less-path")
+            ws.create("milli.gold/app", "web")
+            ws.save_constraints(Constraints(in_scope=["milli.gold/app"]))
+            self.assertTrue(check_url_scope(ws, "https://milli.gold/app")[0])
+            self.assertTrue(check_url_scope(ws, "http://milli.gold/app/child?x=1")[0])
+            self.assertFalse(check_url_scope(ws, "https://milli.gold/")[0])
+            self.assertFalse(check_url_scope(ws, "https://milli.gold/apple")[0])
+            self.assertFalse(check_host_scope(ws, "milli.gold")[0])
+            self.assertFalse(check_port_scope(ws, "milli.gold", 443)[0])
+
+            ws.save_constraints(Constraints(in_scope=["10.0.0.0/24"]))
+            self.assertTrue(check_host_scope(ws, "10.0.0.7")[0])
+            self.assertTrue(check_port_scope(ws, "10.0.0.7", 8443)[0])
+
+    def test_url_path_exclusions_have_boundary_and_raw_tcp_precedence(self):
+        with isolated_runtime():
+            ws = Workspace("path-deny")
+            ws.create("https://api.example.test", "web")
+            ws.save_constraints(Constraints(
+                in_scope=["api.example.test"],
+                out_of_scope=["https://api.example.test/private"],
+            ))
+            self.assertFalse(check_url_scope(ws, "https://api.example.test/private")[0])
+            self.assertFalse(check_url_scope(ws, "https://api.example.test/private/key")[0])
+            self.assertTrue(check_url_scope(ws, "https://api.example.test/privateer")[0])
+            self.assertTrue(check_host_scope(ws, "api.example.test")[0])
+            self.assertTrue(check_port_scope(ws, "api.example.test", 443)[0])
+            raw = tcp_exchange(ws, "api.example.test", 443, "GET / HTTP/1.0")
+            self.assertFalse(raw["ok"])
+            self.assertIn("cannot enforce", raw["summary"])
+
+    def test_path_scope_covers_http_replay_download_httpx_and_research_redirects(self):
+        with isolated_runtime(), local_server() as port:
+            ws = Workspace("path-transports")
+            root = f"http://127.0.0.1:{port}"
+            scoped = root + "/scoped"
+            ws.create(scoped, "web")
+            ws.save_constraints(Constraints(in_scope=[scoped]))
+
+            first = http_request(ws, scoped + "/first")
+            self.assertTrue(first["ok"], first)
+            flow_id = Path(first["data"]["flow"]).stem
+            replay = flow_replay(ws, flow_id, url=root + "/outside")
+            self.assertFalse(replay["ok"])
+            self.assertFalse(artifact_download(ws, root + "/outside", "outside.bin")["ok"])
+
+            with patch("grypton.tools.config.find_binary", return_value="/fake/httpx"), \
+                    patch("grypton.tools.subprocess.run",
+                          return_value=SimpleNamespace(stdout=b"", returncode=0)):
+                self.assertTrue(httpx_probe(ws, scoped + "/probe")["ok"])
+                bare = httpx_probe(ws, f"127.0.0.1:{port}")
+                self.assertFalse(bare["ok"])
+
+            self.assertTrue(check_research_scope(ws, scoped + "/guide")[0])
+            self.assertFalse(check_research_scope(ws, root + "/outside")[0])
+            inside = research(ws, scoped + "/redirect-in")
+            self.assertTrue(inside["ok"], inside)
+            outside = research(ws, scoped + "/redirect-out")
+            self.assertFalse(outside["ok"])
+            self.assertIn("Scope blocked research URL", outside["summary"])
+
+    def test_research_does_not_treat_target_domain_relatives_as_public_docs(self):
+        with isolated_runtime():
+            ws = Workspace("research-relatives")
+            ws.create("https://app.milli.gold/app", "web")
+            ws.save_constraints(Constraints(in_scope=["https://app.milli.gold/app"]))
+            self.assertFalse(check_research_scope(ws, "https://api.milli.gold/docs")[0])
+            self.assertFalse(check_research_scope(ws, "https://milli.gold/docs")[0])
+            self.assertFalse(check_research_scope(ws, "https://child.app.milli.gold/docs")[0])
+            self.assertFalse(check_research_scope(ws, "https://docs.example.org/guide")[0])
+            self.assertTrue(check_research_scope(ws, "https://developer.mozilla.org/docs/Web")[0])
+
+    def test_research_rejects_unapproved_hosts_queries_and_private_resolution(self):
+        with isolated_runtime():
+            ws = Workspace("research-egress")
+            ws.create("https://target.example", "web")
+            ws.save_constraints(Constraints(in_scope=["target.example"]))
+            self.assertFalse(check_research_scope(ws, "https://example.org/guide")[0])
+            self.assertFalse(check_research_scope(
+                ws, "https://developer.mozilla.org/docs?token=fixture-secret"
+            )[0])
+            self.assertFalse(check_research_scope(ws, "http://127.0.0.1/metadata")[0])
+            self.assertFalse(check_research_scope(ws, "http://[::1]/metadata")[0])
+            with patch("grypton.tools.socket.getaddrinfo", return_value=[
+                (2, 1, 6, "", ("169.254.169.254", 443)),
+            ]), patch("grypton.tools.http.client.HTTPSConnection") as connection:
+                result = research(ws, "https://developer.mozilla.org/docs/Web")
+            self.assertFalse(result["ok"])
+            self.assertIn("private", result["summary"])
+            connection.assert_not_called()
+
+    def test_research_connects_to_checked_ip_and_keeps_tls_hostname(self):
+        class FakeSocket:
+            def __init__(self):
+                self.connected_to = None
+                self.timeout = None
+
+            def settimeout(self, timeout):
+                self.timeout = timeout
+
+            def bind(self, source_address):
+                raise AssertionError(f"unexpected source bind: {source_address}")
+
+            def connect(self, socket_address):
+                self.connected_to = socket_address
+
+            def close(self):
+                pass
+
+        sockets = []
+        connections = []
+
+        class FakeResponse:
+            status = 200
+            reason = "OK"
+
+            @staticmethod
+            def getheader(_name):
+                return None
+
+            @staticmethod
+            def read(_limit):
+                return b"official documentation"
+
+        class FakeHTTPSConnection:
+            def __init__(self, host, port, *, timeout, context):
+                self.host = host
+                self.port = port
+                self.timeout = timeout
+                self.context = context
+                self._create_connection = None
+                self.path = None
+                connections.append(self)
+
+            def request(self, method, path, *, headers):
+                self.path = path
+                self.socket = self._create_connection(
+                    (self.host, self.port), self.timeout, None
+                )
+
+            @staticmethod
+            def getresponse():
+                return FakeResponse()
+
+            def close(self):
+                pass
+
+        def fake_socket(*_args):
+            instance = FakeSocket()
+            sockets.append(instance)
+            return instance
+
+        resolved = ("93.184.216.34", 443)
+        with isolated_runtime():
+            ws = Workspace("research-pinning")
+            ws.create("https://target.example", "web")
+            ws.save_constraints(Constraints(in_scope=["target.example"]))
+            with patch("grypton.tools.socket.getaddrinfo", return_value=[
+                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", resolved),
+            ]) as resolver, patch("grypton.tools.socket.socket", side_effect=fake_socket), \
+                    patch("grypton.tools.http.client.HTTPSConnection",
+                          FakeHTTPSConnection):
+                result = research(ws, "https://developer.mozilla.org/docs/Web")
+
+        self.assertTrue(result["ok"], result)
+        resolver.assert_called_once_with(
+            "developer.mozilla.org", 443, type=socket.SOCK_STREAM
+        )
+        self.assertEqual(len(sockets), 1)
+        self.assertEqual(sockets[0].connected_to, resolved)
+        self.assertEqual(connections[0].host, "developer.mozilla.org")
+        self.assertEqual(connections[0].path, "/docs/Web")
+        self.assertTrue(connections[0].context.check_hostname)
+        self.assertEqual(connections[0].context.verify_mode, ssl.CERT_REQUIRED)
+
+    def test_installer_is_curated_and_local_analysis_rejects_outside_or_symlink(self):
+        denied = install_tool("requests", manager="pip")
+        self.assertFalse(denied["ok"])
+        self.assertIn("curated apt", denied["summary"])
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "fixture-source-secret"}), \
+                patch("grypton.tools.config.find_binary", return_value="/usr/bin/apt-get"), \
+                patch("grypton.tools.subprocess.run", return_value=SimpleNamespace(
+                    returncode=0, stdout=b"", stderr=b""
+                )) as run:
+            installed = install_tool("jq")
+        self.assertTrue(installed["ok"], installed)
+        self.assertEqual(run.call_args.args[0], [
+            "/usr/bin/apt-get", "install", "-y", "--no-install-recommends", "jq",
+        ])
+        self.assertNotIn("GITHUB_TOKEN", run.call_args.kwargs["env"])
+        self.assertEqual(run.call_args.kwargs["umask"], 0o077)
+
+        with isolated_runtime():
+            ws = Workspace("local-analysis")
+            ws.create("analysis.test", "web")
+            artifact = ws.loot_dir / "sample.bin"
+            artifact.write_bytes(b"offline fixture data")
+            hashed = local_analyze(ws, "loot/sample.bin", analyzer="sha256")
+            self.assertTrue(hashed["ok"], hashed)
+            self.assertEqual(len(hashed["data"]["sha256"]), 64)
+            self.assertFalse(local_analyze(ws, "../outside", analyzer="sha256")["ok"])
+            link = ws.loot_dir / "link.bin"
+            link.symlink_to(artifact)
+            self.assertFalse(local_analyze(ws, "loot/link.bin", analyzer="sha256")["ok"])
+
     def test_large_http_capture_is_bounded_for_model_but_complete_on_disk(self):
         with isolated_runtime(), local_server() as port:
             ws = Workspace("large-capture")
@@ -349,6 +915,23 @@ class ToolTests(unittest.TestCase):
             self.assertNotIn("END-MARKER", result["data"]["response"])
             self.assertIn("END-MARKER", Path(result["data"]["flow"]).read_text())
 
+    def test_flow_capture_persists_byte_limit_and_truncation_metadata(self):
+        with isolated_runtime(), local_server() as port:
+            ws = Workspace("bounded-capture")
+            target = f"http://127.0.0.1:{port}"
+            ws.create(target, "web")
+            ws.save_constraints(Constraints(in_scope=[target]))
+            result = http_request(ws, target + "/huge")
+            self.assertTrue(result["ok"], result)
+            flow = Path(result["data"]["flow"]).read_text(
+                encoding="utf-8", errors="replace"
+            )
+            first = flow.splitlines()[0]
+            metadata = json.loads(first.removeprefix("### GRYPTON FLOW "))
+            self.assertGreater(metadata["response_bytes"], MAX_RESPONSE_BYTES)
+            self.assertLessEqual(metadata["captured_response_bytes"], MAX_RESPONSE_BYTES)
+            self.assertTrue(metadata["response_truncated"])
+
     def test_mcp_registry_has_no_claude_advisor(self):
         self.assertGreaterEqual(len(REGISTRY), 20)
         self.assertIn("http_request", REGISTRY)
@@ -357,6 +940,7 @@ class ToolTests(unittest.TestCase):
         self.assertIn("tcp_exchange", REGISTRY)
         self.assertIn("artifact_download", REGISTRY)
         self.assertIn("apk_inspect", REGISTRY)
+        self.assertIn("local_analyze", REGISTRY)
         self.assertNotIn("advise", REGISTRY)
 
     def test_dispatch_writes_audit_event(self):
@@ -367,6 +951,65 @@ class ToolTests(unittest.TestCase):
             self.assertTrue(result["ok"])
             log = ws.root / ".ledger/tool-calls.jsonl"
             self.assertEqual(json.loads(log.read_text().splitlines()[0])["tool"], "tool_inventory")
+
+    def test_effectful_dispatch_is_marked_before_handler_runs(self):
+        with isolated_runtime():
+            ws = Workspace("dispatch-guard")
+            ws.create("127.0.0.1", "web")
+            original = REGISTRY["http_request"]
+            observed = []
+
+            def handler(_workspace, _args):
+                guard = ws.root / ".ledger/effectful-tool-starts.jsonl"
+                observed.append([
+                    json.loads(line) for line in guard.read_text().splitlines()
+                ])
+                return {"ok": True, "summary": "synthetic handler"}
+
+            with patch.dict(REGISTRY, {
+                "http_request": (original[0], original[1], handler),
+            }):
+                result = dispatch(
+                    ws, "http_request", {"url": "http://127.0.0.1/"}
+                )
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(observed[0][0]["tool"], "http_request")
+
+    def test_private_read_only_dispatch_does_not_disable_safe_restart(self):
+        with isolated_runtime():
+            ws = Workspace("dispatch-read-only")
+            ws.create("127.0.0.1", "web")
+            result = dispatch(ws, "read_doc", {"name": "scope"})
+            self.assertTrue(result["ok"], result)
+            self.assertFalse(
+                (ws.root / ".ledger/effectful-tool-starts.jsonl").exists()
+            )
+            self.assertTrue((ws.root / ".ledger/tool-calls.jsonl").exists())
+
+    def test_effectful_dispatch_fails_closed_when_guard_cannot_be_written(self):
+        with isolated_runtime():
+            ws = Workspace("dispatch-guard-failure")
+            ws.create("127.0.0.1", "web")
+            called = []
+            original = REGISTRY["http_request"]
+
+            def handler(_workspace, _args):
+                called.append(True)
+                return {"ok": True, "summary": "ran"}
+
+            with patch.dict(REGISTRY, {
+                "http_request": (original[0], original[1], handler),
+            }), patch(
+                "grypton.toolserver._record_effectful_tool_start",
+                side_effect=OSError("synthetic marker failure"),
+            ):
+                result = dispatch(
+                    ws, "http_request", {"url": "http://127.0.0.1/"}
+                )
+            self.assertFalse(result["ok"])
+            self.assertIn("restart-safety marker", result["summary"])
+            self.assertEqual(called, [])
 
     def test_record_finding_summary_matches_astra_threshold(self):
         with isolated_runtime():
@@ -388,6 +1031,33 @@ class ToolTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertIn("quality gate", result["summary"])
             self.assertEqual(ws.findings.all(), [])
+
+    def test_audit_checks_auth_urls_and_raw_transport_ports(self):
+        with isolated_runtime() as root, patch.object(config, "GRYPTON_HOME", root):
+            ws = Workspace("audit-auth-scope")
+            ws.create("https://api.example.test/app", "web")
+            ws.save_constraints(Constraints(in_scope=["https://api.example.test/app"]))
+            rows = [
+                {"tool": "credential_login", "args": {
+                    "url": "https://api.example.test/app/login",
+                    "verify_url": "https://api.example.test/outside",
+                }, "ok": False},
+                {"tool": "authenticated_http_request", "args": {
+                    "url": "https://api.example.test/app/account",
+                }, "ok": True},
+                {"tool": "tcp_exchange", "args": {
+                    "host": "api.example.test", "port": 443, "payload": "status",
+                }, "ok": False},
+            ]
+            ledger = ws.root / ".ledger" / "tool-calls.jsonl"
+            ledger.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+            )
+            result = audit_workspace(ws)
+            self.assertEqual(result["counts"]["network_tool_calls"], 3)
+            violations = result["scope_violations"]
+            self.assertTrue(any(row["tool"] == "credential_login" for row in violations))
+            self.assertTrue(any(row["tool"] == "tcp_exchange" for row in violations))
 
     def test_read_only_engagement_audit_and_report(self):
         with isolated_runtime() as root, patch.object(config, "GRYPTON_HOME", root):
@@ -580,13 +1250,31 @@ class WorkerEventTests(unittest.TestCase):
             )
             self.assertEqual(client.transcripts, workspace / "transcripts")
 
+    def test_codex_validator_environment_keeps_only_explicit_auth(self):
+        with patch.dict(os.environ, {
+            "OPENAI_API_KEY": "fixture-openai-key",
+            "OPENAI_BASE_URL": "https://redirect.invalid/v1",
+            "OPENAI_API_BASE": "https://redirect.invalid/legacy",
+            "AZURE_OPENAI_ENDPOINT": "https://redirect.invalid/azure",
+            "AWS_SECRET_ACCESS_KEY": "fixture-cloud-secret",
+            "GITHUB_TOKEN": "fixture-source-secret",
+            "HTTPS_PROXY": "http://fixture-proxy.invalid:8080",
+        }):
+            env = _codex_child_environment()
+        self.assertEqual(env["OPENAI_API_KEY"], "fixture-openai-key")
+        self.assertNotIn("OPENAI_BASE_URL", env)
+        self.assertNotIn("OPENAI_API_BASE", env)
+        self.assertNotIn("AZURE_OPENAI_ENDPOINT", env)
+        self.assertNotIn("AWS_SECRET_ACCESS_KEY", env)
+        self.assertNotIn("GITHUB_TOKEN", env)
+        self.assertNotIn("HTTPS_PROXY", env)
+
     def test_worker_permissions_force_network_through_captured_tools(self):
         permissions = OpenCodeClient._permissions(True)
         self.assertEqual(permissions["webfetch"], "deny")
         self.assertEqual(permissions["websearch"], "deny")
-        self.assertEqual(permissions["bash"]["*"], "allow")
-        for command in ("curl *", "*/curl *", "httpx *", "*/nmap *"):
-            self.assertEqual(permissions["bash"][command], "deny")
+        self.assertEqual(permissions["bash"], "deny")
+        self.assertEqual(permissions["edit"], "deny")
 
         manager_permissions = OpenCodeClient._permissions(False)
         self.assertEqual(manager_permissions["*"], "deny")
@@ -598,6 +1286,7 @@ class WorkerEventTests(unittest.TestCase):
         self.assertEqual(permissions["external_directory"]["/tmp/grypton-engagement/*"], "allow")
         self.assertEqual(permissions["external_directory"]["/tmp/grypton-transport/*"], "allow")
         self.assertEqual(permissions["external_directory"]["*"], "deny")
+        self.assertEqual(next(iter(permissions["external_directory"])), "*")
 
     def test_mcp_subprocess_imports_from_source_when_state_home_is_elsewhere(self):
         with isolated_runtime():
@@ -639,6 +1328,13 @@ class WorkerEventTests(unittest.TestCase):
             self.assertEqual(env[TOKEN_ENV], gateway_token)
             self.assertEqual(secret, gateway_token)
             self.assertNotIn(gateway_token, env["OPENCODE_CONFIG_CONTENT"])
+            with patch.dict(os.environ, {
+                "AWS_SECRET_ACCESS_KEY": "fixture-cloud-secret",
+                "GITHUB_TOKEN": "fixture-source-secret",
+            }):
+                isolated_env, _ = client._environment()
+            self.assertNotIn("AWS_SECRET_ACCESS_KEY", isolated_env)
+            self.assertNotIn("GITHUB_TOKEN", isolated_env)
 
     def test_tool_error_text_is_rendered_and_retained(self):
         with isolated_runtime():
@@ -679,8 +1375,39 @@ class WorkerEventTests(unittest.TestCase):
             self.assertIn("grypton_read_doc", prompt)
             self.assertIn('{"name": "scope"}', prompt)
 
+    def test_explicit_mission_reaches_kraude_runtime_prompt_verbatim(self):
+        with isolated_runtime():
+            worker = OpenCodeWorker(WorkerSpec(
+                session_uuid="", cwd=Path(config.ENGAGEMENTS_DIR) / "mission-verbatim",
+                system_prompt="static role and tool guidance",
+                extra_env={"GRYPTON_TARGET": "mission-verbatim"},
+            ))
+            mission = (
+                "Credential alias: primary; check whether authentication succeeds.\n"
+                "Scope URLs: https://example.test/app, https://example.test/main.\n"
+                "Severity: /app Medium; /main Critical.\n"
+                "Out of scope: clickjacking, open redirect."
+            )
+            prompt = worker._build_prompt(mission)
+            self.assertTrue(prompt.endswith(mission))
+            self.assertEqual(prompt.count(mission), 1)
+            self.assertNotIn("TARGET-TYPE PLAYBOOK OPTIONS", prompt)
+
 
 class EngineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_explicit_operator_brief_is_opening_directive_verbatim(self):
+        with isolated_runtime():
+            ws = Workspace("verbatim-brief")
+            ws.create("https://example.test/app", "web")
+            engine = Engine("verbatim-brief", backend="mock")
+            engine.target = "https://example.test/app"
+            engine.target_type = "web"
+            engine.brief = (
+                "Credential alias: primary. Scope: https://example.test/app. "
+                "Minimum severity: Critical."
+            )
+            self.assertEqual(await engine._opening_directive(), engine.brief)
+
     def test_automatic_validation_candidates_are_only_p1_and_p2(self):
         findings = [
             {"id": "F001", "severity": "P1", "status": "validation-pending"},
@@ -772,6 +1499,34 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                 await engine.run()
                 self.assertEqual(engine.turn_index, 3)
                 self.assertIn("convergence guard", engine.stop_reason)
+            finally:
+                for field, value in old.items():
+                    setattr(config.CONFIG, field, value)
+
+    async def test_detached_deadline_mode_continues_after_convergence(self):
+        with isolated_runtime():
+            fields = ("max_turns", "max_run_seconds", "passive_stagnation_limit",
+                      "repetitive_probe_turn_limit", "exhaustion_threshold")
+            old = {field: getattr(config.CONFIG, field) for field in fields}
+            config.CONFIG.max_turns = 5
+            config.CONFIG.max_run_seconds = 0
+            config.CONFIG.passive_stagnation_limit = 2
+            config.CONFIG.repetitive_probe_turn_limit = 99
+            config.CONFIG.exhaustion_threshold = 99
+            try:
+                ws = Workspace("deadline-loop")
+                ws.create("127.0.0.1", "web")
+                ws.save_constraints(Constraints(in_scope=["127.0.0.1"]))
+                engine = Engine(
+                    "deadline-loop", backend="mock", run_until_deadline=True
+                )
+                await engine.setup(brief="deadline regression", target="127.0.0.1",
+                                   target_type="web")
+                engine.worker.script = lambda _worker, _directive: "No new evidence."
+                await engine.run()
+                self.assertEqual(engine.turn_index, 5)
+                self.assertIn("max_turns safety ceiling", engine.stop_reason)
+                self.assertNotIn("convergence guard", engine.stop_reason)
             finally:
                 for field, value in old.items():
                     setattr(config.CONFIG, field, value)

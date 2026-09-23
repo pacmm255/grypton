@@ -89,6 +89,15 @@ route, protocol, message and tool counts, effective effort, safe notices, and
 short key fingerprints in `transcripts/openclaude.events.jsonl`. It never
 records a key.
 
+Target login credentials use a separate local broker in `credentials.py`.
+Engagement prompts and MCP arguments contain only a short alias. The broker
+loads the username and password at transport time, keeps cookies and bearer
+tokens under `.state/credentials/` with private permissions, and redacts them
+from flows, tool results, ledgers, and process arguments. A login has a
+two-attempt budget and stops on MFA, CAPTCHA, rejection, or rate limiting. A
+new session is accepted only when a scoped verification marker appears with
+the session and is absent from a control request without it.
+
 ## Engine loop
 
 The engine starts Kraude with a target-specific prompt, current scope, embedded
@@ -140,20 +149,36 @@ automatic P1/P2 gate.
 `scope-rules.json` is the source of truth. Host matching supports exact hosts,
 explicit wildcard subdomains, and CIDRs. A bare domain does not silently permit
 every subdomain. Structured HTTP, Goja, browser, DNS, TLS, port, httpx, and
-subfinder tools enforce these rules before action. Goja has a managed PID and
-Grypton stops only the process it started.
+subfinder tools enforce these rules before action. Goja records its exact
+command line and `/proc` start time, verifies ownership of the configured
+listener, serializes lifecycle changes, and signals only a revalidated pidfd.
 
 Each structured call appends `.ledger/tool-calls.jsonl`. HTTP tools also create
 private `flows/flow-*.http` request and response captures. Provider transports
 append redacted raw event streams and per-call metadata to `transcripts/`,
 including public route, effort, session ID, timing, usage, cost, prompt and
 output hashes, transport `openclaude` route, and whether the call completed.
+Before any network, process, installer, or workspace-mutating handler begins,
+the MCP dispatcher fsyncs an argument-free record to
+`.ledger/effectful-tool-starts.jsonl`. A failure to write that record prevents
+the handler from running.
 
 OpenCode success payloads use `state.output`; rejected and timed-out calls use
 `state.error`. The worker normalizes both into visible tool results. The MCP
 transport has a 120-second outer ceiling, while network tools retain smaller
-operation-specific limits. Full HTTP captures are never trimmed; only the
-model-facing response preview is bounded.
+operation-specific limits. The model-facing response preview is small and the
+private response section is bounded to 2 MB. Flow metadata records original
+bytes, captured bytes, and whether that private capture was truncated.
+
+## Durable background runs
+
+`runtime.py` supervises finite detached runs. One advisory engine lock per
+engagement prevents foreground and background engines from overlapping. The
+supervisor emits counter-only health events, enforces the deadline, tracks and
+reaps provider process groups, and never puts the mission in process arguments
+or public status. It can restart an abnormal engine exit only when no effectful
+tool-start marker was added; after an external action begins, replay is
+suppressed even if the engine dies before the normal completed-call audit row.
 
 `grypton stop` writes a stop marker. The engine checks it every second during a
 worker turn, terminates the provider process group, closes the OpenClaude
@@ -180,7 +205,9 @@ treating every recorded candidate as confirmed.
 | `worker.py` | selectable Kraude turn adapter and streamed tool events |
 | `manager.py` | selectable Kryptex direction, chat, and Astra handoff |
 | `engine.py` | persistent autonomous loop, safe model switching, and stop/recovery logic |
+| `runtime.py` | finite detached supervision, engine locking, health counters, and process-tree cleanup |
 | `workspace.py` | private ledgers, rendered documents, constraints, and model persistence |
+| `credentials.py` | private named target credentials, session material, and attempt state |
 | `tools.py` | scoped HTTP, Goja, captures, recon, and installation |
 | `toolserver.py` | MCP registry, audit dispatch, and matching CLI |
 | `scenarios.py` | target-type kickoff playbooks |

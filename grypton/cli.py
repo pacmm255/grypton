@@ -2,14 +2,19 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import asyncio
+import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
+import pwd
 import re
 import signal
 import shlex
+import stat
 import subprocess
 import sys
 import time
@@ -21,6 +26,24 @@ from .workspace import Constraints, Workspace, list_targets
 
 def _csv(value: str) -> list[str]:
     return [item.strip() for item in (value or "").split(",") if item.strip()]
+
+
+_DURATION_RX = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*$", re.I)
+
+
+def _duration_seconds(value: str) -> int:
+    """Parse a compact duration such as 30s, 10m, 1.5h, or 1d."""
+    match = _DURATION_RX.fullmatch(str(value or ""))
+    if not match:
+        raise argparse.ArgumentTypeError("use a duration such as 30s, 10m, 12h, or 1d")
+    amount = float(match.group(1))
+    multiplier = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2).lower()]
+    if not math.isfinite(amount) or amount > (2 ** 63 - 1) / multiplier:
+        raise argparse.ArgumentTypeError("duration is too large")
+    seconds = int(amount * multiplier)
+    if seconds <= 0:
+        raise argparse.ArgumentTypeError("duration must be greater than zero")
+    return seconds
 
 
 def _target_value(ns) -> str:
@@ -75,7 +98,6 @@ def _constraints(ns, target: str) -> Constraints:
             )
     for rule in getattr(ns, "rule", []) or []:
         value.add_rule(rule)
-    value.add_rule("Network actions must match an in-scope host and avoid every out-of-scope rule.")
     authorization = getattr(ns, "authorization_file", None)
     notes = []
     if authorization:
@@ -83,8 +105,6 @@ def _constraints(ns, target: str) -> Constraints:
         data = path.read_bytes()
         notes.append(f"Authorization record: {path.name}; sha256="
                      f"{hashlib.sha256(data).hexdigest()}; recorded={int(time.time())}")
-    else:
-        notes.append("The operator started this engagement explicitly from the CLI.")
     if program_profile:
         notes.append(
             f"Bugcrowd brief: {Path(program_profile['source']).name}; "
@@ -148,7 +168,9 @@ def _requested_role_models(ns, meta=None, *, validate: bool = False) -> dict[str
 
 
 def _configure_run(ns, ws: Workspace | None = None, *, fresh: bool = False) -> dict[str, dict[str, str]]:
-    if getattr(ns, "auto_stop_time", None) is not None:
+    if getattr(ns, "duration_seconds", None) is not None:
+        config.CONFIG.max_run_seconds = int(ns.duration_seconds)
+    elif getattr(ns, "auto_stop_time", None) is not None:
         config.CONFIG.max_run_seconds = int(ns.auto_stop_time) * 60
     elif getattr(ns, "max_seconds", None) is not None:
         config.CONFIG.max_run_seconds = int(ns.max_seconds)
@@ -171,7 +193,60 @@ def _configure_run(ns, ws: Workspace | None = None, *, fresh: bool = False) -> d
     return models
 
 
+def _acquire_engine_lock(ws: Workspace) -> int:
+    """Hold the one-engine-per-engagement lock until the returned fd closes."""
+    from .runtime import engine_lock_path
+
+    path = engine_lock_path(ws)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_CREAT | os.O_RDWR
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    os.fchmod(fd, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
 def _run_engagement(ws: Workspace, ns, *, brief: str, fresh: bool) -> int:
+    if getattr(ns, "background", False):
+        return _run_engagement_unlocked(ws, ns, brief=brief, fresh=fresh)
+
+    # A verified supervisor owns this engagement even during the short window
+    # before its engine child acquires engine.lock. Supervised children bypass
+    # this check and acquire the same lock themselves.
+    if os.environ.get("GRYPTON_SUPERVISED") != "1":
+        from .runtime import public_status
+        if public_status(ws.slug).get("alive"):
+            print(f"ERROR: a background supervisor is already running for {ws.slug}.",
+                  file=sys.stderr)
+            return 2
+    try:
+        lock_fd = _acquire_engine_lock(ws)
+    except BlockingIOError:
+        print(f"ERROR: an engagement engine is already running for {ws.slug}.",
+              file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"ERROR: could not acquire the engagement engine lock: {exc}",
+              file=sys.stderr)
+        return 2
+    try:
+        # A previous foreground `grypton stop` must not poison a later resume.
+        (ws.root / ".ledger" / "STOP").unlink(missing_ok=True)
+        return _run_engagement_unlocked(ws, ns, brief=brief, fresh=fresh)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+
+def _run_engagement_unlocked(ws: Workspace, ns, *, brief: str, fresh: bool) -> int:
     from .chat import Renderer, interact, print_console_header
     from .engine import Engine
 
@@ -180,6 +255,31 @@ def _run_engagement(ws: Workspace, ns, *, brief: str, fresh: bool) -> int:
     except (ValueError, RuntimeError, OSError) as exc:
         print(f"ERROR: invalid model selection: {exc}", file=sys.stderr)
         return 2
+    if getattr(ns, "background", False):
+        from .runtime import start_background
+        try:
+            state = start_background(
+                ws,
+                brief=brief,
+                backend=config.CONFIG.backend,
+                max_run_seconds=config.CONFIG.max_run_seconds,
+                max_turns=config.CONFIG.max_turns,
+                stop_on_p1=config.CONFIG.stop_on_p1,
+                worker_model=models["worker"]["route"],
+                worker_effort=models["worker"]["effort"],
+                manager_model=models["manager"]["route"],
+                manager_effort=models["manager"]["effort"],
+                health_interval_seconds=getattr(ns, "health_interval", 600),
+                restart_limit=getattr(ns, "restart_limit", 3),
+            )
+        except (ValueError, RuntimeError, OSError) as exc:
+            print(f"ERROR: could not start background run: {exc}", file=sys.stderr)
+            return 2
+        print(f"Background run started for {ws.slug} (supervisor {state.get('supervisor_pid')}).")
+        print(f"  status  grypton run status {ws.slug}")
+        print(f"  logs    grypton run logs {ws.slug}")
+        print(f"  stop    grypton run stop {ws.slug}")
+        return 0
     renderer = Renderer(getattr(ns, "console", "normal"))
     engine = Engine(
         ws.slug,
@@ -189,6 +289,7 @@ def _run_engagement(ws: Workspace, ns, *, brief: str, fresh: bool) -> int:
         worker_effort=models["worker"]["effort"],
         manager_model=models["manager"]["route"],
         manager_effort=models["manager"]["effort"],
+        run_until_deadline=bool(getattr(ns, "run_until_deadline", False)),
     )
 
     async def execute():
@@ -205,10 +306,20 @@ def _run_engagement(ws: Workspace, ns, *, brief: str, fresh: bool) -> int:
         print_console_header(target=meta.target, target_type=meta.target_type,
                              backend=config.CONFIG.backend, renderer=renderer,
                              models=engine.current_models())
-        await engine.setup(brief=brief, target=meta.target, target_type=meta.target_type,
-                           fresh_clone=fresh)
-        await interact(engine, renderer, accept_input=not getattr(ns, "print_mode", False),
-                       show_header=False)
+        try:
+            await engine.setup(brief=brief, target=meta.target,
+                               target_type=meta.target_type, fresh_clone=fresh)
+            await interact(
+                engine, renderer,
+                accept_input=not getattr(ns, "print_mode", False),
+                show_header=False,
+            )
+        except BaseException:
+            # setup can fail after starting one provider but before Engine.run
+            # owns its normal finally block. Teardown is idempotent, so this
+            # also safely covers cancellation during console startup.
+            await engine._teardown(status="failed")
+            raise
 
     try:
         asyncio.run(execute())
@@ -511,7 +622,11 @@ def cmd_plan(ns) -> int:
     selected_type = ns.type
     scenarios = [row["id"] for row in load_scenarios()
                  if selected_type == "auto" or selected_type in row.get("target_types", [])]
-    models = _requested_role_models(ns)
+    try:
+        models = _requested_role_models(ns, validate=True)
+    except (ValueError, RuntimeError, OSError) as exc:
+        print(f"ERROR: invalid model selection: {exc}", file=sys.stderr)
+        return 2
     models["validator"]["automatic_severities"] = sorted(config.ASTRA_AUTO_SEVERITIES)
     output = {
         "target": target,
@@ -520,6 +635,9 @@ def cmd_plan(ns) -> int:
         "workspace": str(Workspace(config.slugify(target)).root),
         "scope": constraints.in_scope,
         "out_of_scope": constraints.out_of_scope,
+        "accepted_severities": constraints.included_severities,
+        "included_finding_categories": constraints.included_classes,
+        "out_of_scope_finding_categories": constraints.excluded_classes,
         "hard_rules": constraints.hard_rules,
         "models": models,
         "scenario_ids": scenarios,
@@ -529,6 +647,19 @@ def cmd_plan(ns) -> int:
         print(json.dumps(output, ensure_ascii=False, indent=2))
         return 0
     command = f"grypton init --target {shlex.quote(target)} --type {shlex.quote(selected_type)}"
+    for flag, value in (
+        ("--only", ns.only),
+        ("--exclude", ns.exclude),
+        ("--include", ns.include),
+        ("--in-scope", ns.in_scope),
+        ("--out-scope", ns.out_scope),
+        ("--authorization-file", ns.authorization_file),
+        ("--bugcrowd-brief", ns.bugcrowd_brief),
+    ):
+        if value:
+            command += f" {flag} {shlex.quote(str(value))}"
+    for rule in ns.rule:
+        command += f" --rule {shlex.quote(rule)}"
     if ns.brief:
         command += f" --brief {shlex.quote(ns.brief)}"
     if getattr(ns, "worker_model", None):
@@ -750,7 +881,65 @@ def cmd_stop(ns) -> int:
     path = ws.root / ".ledger" / "STOP"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"requested {time.time()}\n", encoding="utf-8")
-    print(f"Stop requested for {ws.slug}; active provider processes are interrupted within one second.")
+    from .runtime import request_background_stop
+    supervisor_signaled = request_background_stop(ws.slug)
+    suffix = " The verified background supervisor was also signaled." if supervisor_signaled else ""
+    print(f"Stop requested for {ws.slug}; the engine will stop at its next cancellation boundary.{suffix}")
+    return 0
+
+
+def cmd_run_start(ns) -> int:
+    ns.background = True
+    if (getattr(ns, "duration_seconds", None) is None and
+            getattr(ns, "max_seconds", None) is None and
+            getattr(ns, "auto_stop_time", None) is None):
+        ns.duration_seconds = 12 * 60 * 60
+    return cmd_resume(ns)
+
+
+def cmd_run_status(ns) -> int:
+    from .runtime import public_status
+    state = public_status(ns.target)
+    if ns.json:
+        print(json.dumps(state, ensure_ascii=False, indent=2))
+        return 0
+    print(f"{state.get('slug')}: {state.get('status')} · alive={state.get('alive', False)} · "
+          f"restarts={state.get('restarts', 0)}/{state.get('restart_limit', 0)}")
+    health = state.get("last_health") or {}
+    if health:
+        print(f"  health  turns={health.get('turns', 0)} tools={health.get('tool_calls', 0)} "
+              f"surface={health.get('surface', 0)} tested={health.get('tested', 0)} "
+              f"findings={health.get('findings', 0)}")
+    if state.get("events"):
+        print(f"  logs    {state['events']}")
+    return 0
+
+
+def cmd_run_logs(ns) -> int:
+    from .runtime import read_events
+    rows = read_events(ns.target, ns.limit)
+    if ns.json:
+        print(json.dumps(rows, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        print("No supervisor events recorded.")
+        return 0
+    for row in rows:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(float(row.get("at") or 0)))
+        details = " ".join(
+            f"{key}={value}" for key, value in row.items() if key not in {"at", "event"}
+        )
+        print(f"{stamp}Z  {row.get('event', '?')}{('  ' + details) if details else ''}")
+    return 0
+
+
+def cmd_run_stop(ns) -> int:
+    from .runtime import request_background_stop
+    if not request_background_stop(config.slugify(ns.target)):
+        print(f"ERROR: no verified background supervisor is running for {ns.target!r}.",
+              file=sys.stderr)
+        return 2
+    print(f"Stop requested for background run {config.slugify(ns.target)}.")
     return 0
 
 
@@ -868,6 +1057,55 @@ def _mcp_probe() -> tuple[bool, str]:
         return False, str(exc)
 
 
+def _opencode_go_key_pool(path: Path = Path("/root/open")) -> tuple[bool, str]:
+    """Validate the Go failover pool without returning any key material."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return False, "count=0; mode=missing"
+    mode = stat.S_IMODE(info.st_mode)
+    detail = f"count=0; mode={mode:04o}"
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        return False, detail
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+        current = os.fstat(fd)
+        mode = stat.S_IMODE(current.st_mode)
+        detail = f"count=0; mode={mode:04o}"
+        if not stat.S_ISREG(current.st_mode):
+            os.close(fd)
+            return False, detail
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as stream:
+            keys = {
+                line.strip() for line in stream
+                if re.fullmatch(r"[A-Za-z0-9._-]{20,}", line.strip())
+            }
+    except OSError:
+        return False, detail
+    detail = f"count={len(keys)}; mode={mode:04o}"
+    return len(keys) >= 2 and mode & 0o077 == 0, detail
+
+
+def _browser_sandbox_check() -> tuple[bool, str]:
+    """Report whether browse can run without a root Chromium process."""
+    if os.geteuid() != 0:
+        return True, f"unprivileged uid={os.geteuid()}; Chromium sandbox enabled"
+    try:
+        account = pwd.getpwnam("grypton-browser")
+    except KeyError:
+        return False, (
+            "running as root; dedicated grypton-browser account is missing "
+            "(run Grypton unprivileged or provision the fixed no-login account)"
+        )
+    if account.pw_uid == 0 or account.pw_gid == 0:
+        return False, "grypton-browser must have a non-root uid and gid"
+    return True, (
+        f"root launcher drops to grypton-browser uid={account.pw_uid}; "
+        "Chromium sandbox enabled"
+    )
+
+
 def cmd_doctor(ns) -> int:
     checks = []
     for binary in ("node", "opencode", "codex", "curl", "httpx", "playwright",
@@ -878,6 +1116,8 @@ def cmd_doctor(ns) -> int:
                    str(config.OPENCLAUDE_BIN)))
     checks.append(("OpenClaude config", (config.OPENCLAUDE_HOME / "openclaude.config.json").is_file(),
                    str(config.OPENCLAUDE_HOME / "openclaude.config.json")))
+    key_pool_ok, key_pool_detail = _opencode_go_key_pool()
+    checks.append(("OpenCode Go failover key pool", key_pool_ok, key_pool_detail))
     defaults = config.effective_role_models()
     try:
         rows = _catalog_rows()
@@ -903,10 +1143,51 @@ def cmd_doctor(ns) -> int:
     checks.append(("Grypton MCP", mcp_ok, mcp_detail))
     checks.append(("Goja", (config.GOJA_DIR / "bin/goja-proxy").is_file(),
                    str(config.GOJA_DIR / "bin/goja-proxy")))
+    browser_ok, browser_detail = _browser_sandbox_check()
+    checks.append(("Browser sandbox boundary", browser_ok, browser_detail))
     print("Grypton doctor")
     for name, passed, detail in checks:
         print(f"  {'OK' if passed else 'FAIL':4}  {name:45} {detail}")
     return 0 if all(passed for _, passed, _ in checks) else 1
+
+def cmd_auth(ns) -> int:
+    from . import credentials
+
+    target = config.slugify(ns.target)
+    if ns.auth_command == "list":
+        aliases = credentials.list_credentials(target)
+        if ns.json:
+            print(json.dumps({
+                "target": target,
+                "credentials": [
+                    credentials.session_status(target, alias) for alias in aliases
+                ],
+            }, indent=2, ensure_ascii=False))
+        else:
+            if not aliases:
+                print(f"No named credentials for {target}.")
+            for alias in aliases:
+                status = credentials.session_status(target, alias)
+                print(f"{alias}: {status['state']}")
+        return 0
+    try:
+        username = input("Username: ")
+        password = getpass.getpass("Password: ")
+        confirmation = getpass.getpass("Confirm password: ")
+        if password != confirmation:
+            raise credentials.CredentialError("password confirmation does not match")
+        alias = credentials.save_credential(
+            target, ns.name, username, password
+        )
+    except (EOFError, KeyboardInterrupt, credentials.CredentialError) as exc:
+        print(f"ERROR: credential was not saved: {exc}", file=sys.stderr)
+        return 2
+    print(
+        f"Saved named credential {alias!r} for {target}. "
+        "The username and password were not written to engagement state or output."
+    )
+    return 0
+
 
 
 def cmd_tools(ns) -> int:
@@ -1042,12 +1323,42 @@ def _run_options(parser) -> None:
     parser.add_argument("--max-seconds", type=int, default=None)
     parser.add_argument("--max-turns", type=int, default=None)
     parser.add_argument("--auto-stop-time", type=int, metavar="MINUTES", default=None)
+    parser.add_argument("--duration", dest="duration_seconds", type=_duration_seconds,
+                        default=None, metavar="DURATION",
+                        help="Finite run duration such as 90m or 12h")
     parser.add_argument("--stop-on-p1", action="store_true")
+    parser.add_argument("--background", action="store_true",
+                        help="Run under the detached private supervisor")
+    parser.add_argument("--health-interval", type=_duration_seconds, default=600,
+                        metavar="DURATION", help="Supervisor health interval (default: 10m)")
+    parser.add_argument("--restart-limit", type=int, default=3, metavar="N",
+                        help="Maximum abnormal-exit restarts (default: 3)")
+    parser.add_argument("--run-until-deadline", action="store_true",
+                        help=argparse.SUPPRESS)
+
+
+def _supervised_run_options(parser) -> None:
+    """Options that affect a detached resume; omit forced or ignored flags."""
+    parser.add_argument("-m", "--brief", default="", help="Engagement mission")
+    _model_options(parser)
+    parser.add_argument("--backend", choices=["real", "mock"], default="real",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--max-seconds", type=int, default=None)
+    parser.add_argument("--max-turns", type=int, default=None)
+    parser.add_argument("--auto-stop-time", type=int, metavar="MINUTES", default=None)
+    parser.add_argument("--duration", dest="duration_seconds", type=_duration_seconds,
+                        default=None, metavar="DURATION",
+                        help="Finite run duration such as 90m or 12h")
+    parser.add_argument("--stop-on-p1", action="store_true")
+    parser.add_argument("--health-interval", type=_duration_seconds, default=600,
+                        metavar="DURATION", help="Supervisor health interval (default: 10m)")
+    parser.add_argument("--restart-limit", type=int, default=3, metavar="N",
+                        help="Maximum abnormal-exit restarts (default: 3)")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="grypton", usage="grypton [options] [command] [prompt]",
+        prog="grypton",
         description="Grypton Code: scoped testing with GLM Kraude, Spark Kryptex, and Astra validation.",
         epilog=("Claude Code-style shortcuts: `grypton --target HOST \"mission\"`, "
                 "`grypton -p --target HOST \"mission\"`, `grypton -c`, and `grypton -r ENGAGEMENT`."),
@@ -1123,6 +1434,34 @@ def build_parser() -> argparse.ArgumentParser:
                                                         default="markdown")
     report.add_argument("--output"); report.set_defaults(func=cmd_report)
     stop = sub.add_parser("stop"); stop.add_argument("target"); stop.set_defaults(func=cmd_stop)
+    run = sub.add_parser("run", help="Manage a durable detached engagement")
+    run_sub = run.add_subparsers(dest="run_command", required=True)
+    run_start = run_sub.add_parser("start", help="Resume under the private supervisor")
+    run_start.add_argument("target", help="Existing engagement name")
+    _supervised_run_options(run_start)
+    run_start.set_defaults(func=cmd_run_start, background=True, print_mode=True)
+    run_status = run_sub.add_parser("status", help="Show supervisor and latest health state")
+    run_status.add_argument("target")
+    run_status.add_argument("--json", action="store_true")
+    run_status.set_defaults(func=cmd_run_status)
+    run_stop = run_sub.add_parser("stop", help="Stop a verified supervisor and its engine group")
+    run_stop.add_argument("target")
+    run_stop.set_defaults(func=cmd_run_stop)
+    run_logs = run_sub.add_parser("logs", help="Show secret-free supervisor lifecycle events")
+    run_logs.add_argument("target")
+    run_logs.add_argument("--limit", type=int, default=20)
+    run_logs.add_argument("--json", action="store_true")
+    run_logs.set_defaults(func=cmd_run_logs)
+    auth = sub.add_parser("auth", help="Manage private named target credentials")
+    auth_sub = auth.add_subparsers(dest="auth_command", required=True)
+    auth_add = auth_sub.add_parser("add", help="Prompt privately for a username and password")
+    auth_add.add_argument("target", help="Engagement slug or target")
+    auth_add.add_argument("--name", default="primary", help="Credential alias")
+    auth_add.set_defaults(func=cmd_auth)
+    auth_list = auth_sub.add_parser("list", help="List aliases and safe session state")
+    auth_list.add_argument("target", help="Engagement slug or target")
+    auth_list.add_argument("--json", action="store_true")
+    auth_list.set_defaults(func=cmd_auth)
     models = sub.add_parser("models", help="Browse OpenClaude routes or set global role defaults")
     models.add_argument("search", nargs="?", default="", help="Filter route, provider, model, or status")
     models.add_argument("--json", action="store_true")
@@ -1167,13 +1506,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 _COMMAND_NAMES = {
     "init", "plan", "resume", "status", "ls", "show", "overview", "inspect", "activity", "tail",
-    "findings", "validate", "surface", "history", "scope", "audit", "report", "stop", "models",
-    "doctor", "tools", "scenarios", "bugcrowd-brief", "lab", "benchmark", "serve", "demo",
+    "findings", "validate", "auth", "surface", "history", "scope", "audit", "report", "stop", "models",
+    "run", "doctor", "tools", "scenarios", "bugcrowd-brief", "lab", "benchmark", "serve", "demo",
 }
 _COMPAT_VALUE_OPTIONS = {
     "--target", "--type", "--only", "--exclude", "--include", "--in-scope", "--out-scope", "--rule",
     "--authorization-file", "--bugcrowd-brief", "-m", "--brief", "--max-seconds", "--max-turns",
-    "--auto-stop-time", "--console", "--model", "--kraude-model", "--kraude-effort",
+    "--auto-stop-time", "--duration", "--health-interval", "--restart-limit",
+    "--console", "--model", "--kraude-model", "--kraude-effort",
     "--kryptex-model", "--kryptex-effort", "--permission-mode", "--backend",
 }
 

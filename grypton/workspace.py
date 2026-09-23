@@ -160,18 +160,17 @@ class Constraints:
                 lines.append(f"  →  {s}")
             lines.append("═" * 72)
             lines.append("")
-        lines.append("=== USER CONSTRAINTS (BINDING — obey exactly, never forget) ===")
+        lines.append("=== ENGAGEMENT SCOPE AND ACCEPTANCE DATA ===")
         if self.included_severities:
-            lines.append(f"- ONLY report these severities: {', '.join(self.included_severities)}. "
-                         f"Do NOT surface anything outside this set as a finding.")
+            lines.append(f"- Accepted severities: {', '.join(self.included_severities)}")
         if self.included_classes:
-            lines.append(f"- Focus ONLY on these vulnerability classes: {', '.join(self.included_classes)}.")
+            lines.append(f"- Included finding categories: {', '.join(self.included_classes)}")
         if self.excluded_classes:
-            lines.append(f"- NEVER test or report these classes: {', '.join(self.excluded_classes)}.")
+            lines.append(f"- Out-of-scope finding categories: {', '.join(self.excluded_classes)}")
         if self.in_scope:
-            lines.append(f"- In scope: {', '.join(self.in_scope)}.")
+            lines.append(f"- In-scope URLs/hosts: {', '.join(self.in_scope)}")
         if self.out_of_scope:
-            lines.append(f"- OUT of scope (do not touch): {', '.join(self.out_of_scope)}.")
+            lines.append(f"- Out-of-scope URLs/hosts: {', '.join(self.out_of_scope)}")
         for r in self.hard_rules:
             lines.append(f"- {r}")
         if self.notes:
@@ -179,7 +178,7 @@ class Constraints:
         if not (self.standing_instructions or self.included_severities or
                 self.included_classes or self.excluded_classes or self.in_scope or
                 self.out_of_scope or self.hard_rules or self.notes):
-            lines.append("- (No special constraints set; full-scope hunting permitted.)")
+            lines.append("- No additional engagement parameters were supplied.")
         return "\n".join(lines)
 
 
@@ -197,7 +196,7 @@ class TargetMeta:
     target: str                      # raw target spec (URL/host/cidr/file/contract…)
     target_type: str = "auto"        # web|apk|network|cidr|binary|contract|auto
     created_at: float = field(default_factory=time.time)
-    status: str = "initialized"      # initialized|running|paused|stopped
+    status: str = "initialized"      # initialized|running|paused|stopped|failed
     worker_uuid: str = ""
     worker_project_dir: str = ""
     worker_kind: str = ""            # opencode+openclaude

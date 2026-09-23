@@ -37,6 +37,10 @@ TARGETS_DIR = ENGAGEMENTS_DIR                    # compatibility alias for core 
 RUNTIME_DIR = STATE_DIR / "runtime"
 LOG_DIR = RUNTIME_DIR / "logs"
 PROVIDER_DIR = STATE_DIR / "providers"
+# Operator-supplied target credentials and authenticated session material live
+# outside model-visible engagement workspaces. Only local credential tools
+# resolve names from this directory; prompts and MCP arguments contain aliases.
+CREDENTIALS_DIR = STATE_DIR / "credentials"
 # OpenCode's project discovery walks above engagement directories even when
 # Git's ceiling variables are set. Keep its tiny execution workspaces outside
 # the Grypton source checkout while evidence stays under ENGAGEMENTS_DIR.
@@ -71,8 +75,11 @@ MANAGER_MODEL = os.environ.get(
     "GRYPTON_MANAGER_MODEL", "go/muse-spark-1.3-contributor")
 MANAGER_EFFORT = os.environ.get("GRYPTON_MANAGER_EFFORT", "xhigh")
 VALIDATOR_PROVIDER = "openai"
-VALIDATOR_MODEL = os.environ.get("GRYPTON_VALIDATOR_MODEL", "gpt-6-astra")
-VALIDATOR_EFFORT = os.environ.get("GRYPTON_VALIDATOR_EFFORT", "max")
+# Astra is an independent, fixed trust boundary. Unlike Kraude and Kryptex,
+# its route and effort must not be changed by ambient environment variables or
+# saved operator configuration.
+VALIDATOR_MODEL = "gpt-6-astra"
+VALIDATOR_EFFORT = "max"
 MANAGER_KIND = "opencode"
 ASTRA_AUTO_SEVERITIES = frozenset({"P1", "P2"})
 
@@ -191,8 +198,6 @@ class GryptonConfig:
     worker_effort: str = WORKER_EFFORT
     manager_model: str = MANAGER_MODEL
     manager_effort: str = MANAGER_EFFORT
-    validator_model: str = VALIDATOR_MODEL
-    validator_effort: str = VALIDATOR_EFFORT
 
     # Non-stop doctrine (R1/R12). stop_on_p1=False => keep hunting even after a P1.
     stop_on_p1: bool = False
@@ -274,7 +279,7 @@ def ensure_layout() -> None:
     """Create Grypton's private runtime directories (idempotent)."""
     for d in (
         STATE_DIR, ENGAGEMENTS_DIR, RUNTIME_DIR, LOG_DIR, PROVIDER_DIR,
-        OPENCODE_WORKSPACES_DIR,
+        CREDENTIALS_DIR, OPENCODE_WORKSPACES_DIR,
         TARGET_DATA_DIR,
     ):
         d.mkdir(parents=True, exist_ok=True, mode=0o700)
