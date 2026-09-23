@@ -14,7 +14,7 @@ from urllib.parse import quote, quote_plus
 from unittest.mock import patch
 
 from grypton import config, credentials
-from grypton.toolserver import dispatch
+from grypton.toolserver import REGISTRY, dispatch
 from grypton.workspace import Constraints, Workspace
 
 
@@ -81,7 +81,10 @@ class _AuthHandler(BaseHTTPRequestHandler):
             self._send(200, {"login": "accepted"}, cookie=self.custom_cookie,
                        cookie_name="grant_marker")
             return
-        self._send(200, {"data": {"access_token": self.token}}, cookie=self.cookie)
+        self._send(200, {
+            "data": {"access_token": self.token},
+            "username": self.username,
+        }, cookie=self.cookie)
 
     def do_GET(self):
         if self.path == "/login":
@@ -330,6 +333,138 @@ class CredentialIsolationTests(unittest.TestCase):
                 self.assertNotIn(secret, observable)
                 self.assertNotIn(secret, argv_text)
             self.assertFalse(any((config.RUNTIME_DIR / "http-tmp" / ws.slug).iterdir()))
+
+    def test_iran_e164_username_normalization_variants(self):
+        variants = {
+            "09123456789": "+989123456789",
+            "0912 345-6789": "+989123456789",
+            "+98 (912) 345 6789": "+989123456789",
+            "0098-912-345-6789": "+989123456789",
+            "98 912 345 6789": "+989123456789",
+        }
+        for stored, expected in variants.items():
+            with self.subTest(stored=stored[:4]):
+                self.assertEqual(
+                    credentials.normalize_login_username(stored, "iran-e164"),
+                    expected,
+                )
+        self.assertEqual(
+            credentials.normalize_login_username("  opaque account  ", "stored"),
+            "  opaque account  ",
+        )
+        for invalid in (
+            "user@example.test", "9123456789", "+9809123456789",
+            "+989123", "09۱۲۳۴۵۶۷۸۹",
+        ):
+            with self.subTest(invalid=invalid[:4]):
+                with self.assertRaises(credentials.CredentialError):
+                    credentials.normalize_login_username(invalid, "iran-e164")
+
+    def test_transformed_username_is_private_in_transport_and_status(self):
+        stored_username = "0912 345-6789"
+        transformed_username = "+989123456789"
+        with isolated_runtime(), patch.object(
+            _AuthHandler, "username", transformed_username
+        ), auth_server() as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "phone", stored_username, _AuthHandler.password
+            )
+            observed_argv: list[list[str]] = []
+            real_run = subprocess.run
+
+            def observe(argv, *args, **kwargs):
+                observed_argv.append([str(item) for item in argv])
+                return real_run(argv, *args, **kwargs)
+
+            with patch("grypton.tools.subprocess.run", side_effect=observe):
+                result = dispatch(ws, "credential_login", {
+                    "url": f"http://127.0.0.1:{port}/login",
+                    "credential": "phone",
+                    "verify_url": f"http://127.0.0.1:{port}/me",
+                    "success_marker": '"authenticated": true',
+                    "username_field": "login",
+                    "password_field": "passcode",
+                    "username_transform": "iran-e164",
+                    "headers": {"X-Login-Representation": transformed_username},
+                })
+            self.assertTrue(result["ok"], result)
+            status = dispatch(ws, "credential_status", {"credential": "phone"})
+            self.assertTrue(status["ok"], status)
+            self.assertEqual(status["data"][0]["username_kind"], "iran-local-phone")
+
+            observable = json.dumps([result, status, observed_argv])
+            observable += (ws.root / ".ledger/tool-calls.jsonl").read_text()
+            observable += "".join(
+                path.read_text(errors="replace")
+                for path in ws.flows_dir.glob("*.http")
+            )
+            variants = {
+                stored_username,
+                transformed_username,
+                quote(stored_username, safe=""),
+                quote_plus(stored_username, safe=""),
+                quote(transformed_username, safe=""),
+                quote_plus(transformed_username, safe=""),
+            }
+            for secret_variant in variants:
+                self.assertNotIn(secret_variant, observable)
+            self.assertIn("GRYPTON_REDACTED_USERNAME", observable)
+
+    def test_invalid_username_transform_does_not_reserve_an_attempt(self):
+        with isolated_runtime(), auth_server() as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "user@example.test", _AuthHandler.password
+            )
+            result = dispatch(ws, "credential_login", {
+                "url": f"http://127.0.0.1:{port}/login",
+                "credential": "primary",
+                "verify_url": f"http://127.0.0.1:{port}/me",
+                "success_marker": '"authenticated": true',
+                "username_transform": "iran-e164",
+            })
+            self.assertFalse(result["ok"], result)
+            self.assertIn("Iranian mobile identifier", result["summary"])
+            self.assertEqual(
+                credentials.session_status(ws.slug, "primary")["attempts"], 0
+            )
+            self.assertEqual(_AuthHandler.login_gets, 0)
+            self.assertEqual(_AuthHandler.login_posts, 0)
+            self.assertEqual(list(ws.flows_dir.glob("*.http")), [])
+
+    def test_status_classifies_username_without_identifier_details(self):
+        with isolated_runtime():
+            values = {
+                "mail": "person@example.test",
+                "local": "0912-345-6789",
+                "e164": "+98 912 345 6789",
+                "other": "account-handle",
+            }
+            expected = {
+                "mail": "email",
+                "local": "iran-local-phone",
+                "e164": "iran-e164-phone",
+                "other": "opaque",
+            }
+            for alias, username in values.items():
+                credentials.save_credential("target", alias, username, "secret")
+            workspace = Workspace("target")
+            workspace.create("https://example.test", "web")
+            rows = dispatch(
+                workspace, "credential_status", {}
+            )["data"]
+            kinds = {row["name"]: row["username_kind"] for row in rows}
+            self.assertEqual(kinds, expected)
+            rendered = json.dumps(rows)
+            for username in values.values():
+                self.assertNotIn(username, rendered)
+
+    def test_credential_login_schema_exposes_username_transform(self):
+        schema = REGISTRY["credential_login"][1]
+        transform = schema["properties"]["username_transform"]
+        self.assertEqual(transform["enum"], ["stored", "iran-e164"])
+        self.assertNotIn("username_transform", schema["required"])
 
     def test_cookie_gate_bootstraps_anonymously_before_single_credential_post(self):
         with isolated_runtime(), cookie_gate_server() as port:

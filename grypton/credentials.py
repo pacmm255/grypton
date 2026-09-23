@@ -21,6 +21,10 @@ from . import config
 
 
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_PHONE_SEPARATORS = re.compile(r"[\s().\-\u2010-\u2015]+")
+_IRAN_LOCAL_MOBILE = re.compile(r"09[0-9]{9}\Z")
+_IRAN_E164_MOBILE = re.compile(r"(?:\+98|0098|98)9[0-9]{9}\Z")
+_EMAIL_USERNAME = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+\Z")
 
 
 class CredentialError(ValueError):
@@ -141,6 +145,43 @@ def load_credential(target: str, name: str) -> dict[str, str]:
     if not isinstance(username, str) or not username or not isinstance(password, str) or not password:
         raise CredentialError("credential file does not contain a username and password")
     return {"username": username, "password": password}
+
+
+def normalize_login_username(username: str, transform: str = "stored") -> str:
+    """Return the private identifier representation requested by a login form."""
+    value = str(username)
+    if transform == "stored":
+        return value
+    if transform != "iran-e164":
+        raise CredentialError("username transform must be stored or iran-e164")
+
+    compact = _PHONE_SEPARATORS.sub("", value.strip())
+    if _IRAN_LOCAL_MOBILE.fullmatch(compact):
+        return "+98" + compact[1:]
+    if _IRAN_E164_MOBILE.fullmatch(compact):
+        if compact.startswith("+98"):
+            national = compact[3:]
+        elif compact.startswith("0098"):
+            national = compact[4:]
+        else:
+            national = compact[2:]
+        return "+98" + national
+    raise CredentialError(
+        "stored username is not an unambiguous Iranian mobile identifier"
+    )
+
+
+def classify_username(username: str) -> str:
+    """Describe an identifier coarsely without returning any of its content."""
+    value = str(username).strip()
+    if _EMAIL_USERNAME.fullmatch(value):
+        return "email"
+    compact = _PHONE_SEPARATORS.sub("", value)
+    if _IRAN_LOCAL_MOBILE.fullmatch(compact):
+        return "iran-local-phone"
+    if _IRAN_E164_MOBILE.fullmatch(compact):
+        return "iran-e164-phone"
+    return "opaque"
 
 
 def list_credentials(target: str) -> list[str]:
@@ -361,8 +402,13 @@ def session_status(target: str, name: str) -> dict[str, bool | str | int]:
         else "exhausted" if attempt["attempts"] >= 2
         else "stored"
     )
+    try:
+        username_kind = classify_username(load_credential(target, alias)["username"])
+    except CredentialError:
+        username_kind = "opaque"
     return {
         "name": alias,
+        "username_kind": username_kind,
         "state": state,
         "has_cookies": has_cookies,
         "has_auth_cookies": has_auth_cookies,

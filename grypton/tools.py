@@ -849,6 +849,7 @@ def credential_status(workspace: Workspace, name: str = "") -> dict:
 def credential_login(workspace: Workspace, url: str, *, credential: str,
                      verify_url: str, success_marker: str,
                      username_field: str = "username", password_field: str = "password",
+                     username_transform: str = "stored",
                      encoding: str = "json", fields: Optional[dict] = None,
                      headers: Optional[dict] = None, timeout: int = 30) -> dict:
     """Make one login attempt, then prove the session on a scoped endpoint."""
@@ -874,6 +875,8 @@ def credential_login(workspace: Workspace, url: str, *, credential: str,
         return _err("Invalid username field name.")
     if not re.fullmatch(r"[A-Za-z0-9_.\[\]-]{1,80}", password_field or ""):
         return _err("Invalid password field name.")
+    if username_transform not in {"stored", "iran-e164"}:
+        return _err("Username transform must be stored or iran-e164.")
     if encoding not in {"json", "form"}:
         return _err("Login encoding must be json or form.")
     if fields is not None and not isinstance(fields, dict):
@@ -884,6 +887,9 @@ def credential_login(workspace: Workspace, url: str, *, credential: str,
         return _err(str(exc))
     try:
         secret = credentials.load_credential(workspace.slug, credential)
+        login_username = credentials.normalize_login_username(
+            secret["username"], username_transform
+        )
         credentials.ensure_login_attempt_available(workspace.slug, credential)
     except credentials.CredentialError as exc:
         return _err(str(exc))
@@ -901,7 +907,7 @@ def credential_login(workspace: Workspace, url: str, *, credential: str,
         bootstrap_flows = list(bootstrap_data.get("bootstrap_flows") or [])
 
         values = dict(fields or {})
-        values[username_field] = secret["username"]
+        values[username_field] = login_username
         values[password_field] = secret["password"]
         if encoding == "json":
             body = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
@@ -911,7 +917,7 @@ def credential_login(workspace: Workspace, url: str, *, credential: str,
             clean_headers.setdefault(
                 "Content-Type", "application/x-www-form-urlencoded"
             )
-        raw_secrets = (secret["username"], secret["password"])
+        raw_secrets = (secret["username"], login_username, secret["password"])
         capture_secrets = _serialized_secret_variants(raw_secrets)
         capture_body = _login_capture_body(
             values, username_field, password_field, encoding, raw_secrets
@@ -983,7 +989,7 @@ def credential_login(workspace: Workspace, url: str, *, credential: str,
         verification = http_request(
             workspace, verify_url, method="GET", timeout=timeout,
             transport=f"credential-verify:{credential}",
-            _secret_values=(secret["username"], secret["password"], *tokens.values()),
+            _secret_values=(*capture_secrets, *tokens.values()),
             _cookie_jar=jar, _bearer_token=credentials.select_bearer(tokens),
             _bearer_origin=login_origin,
             _session_identity=(workspace.slug, credential, login_origin),
@@ -1001,7 +1007,7 @@ def credential_login(workspace: Workspace, url: str, *, credential: str,
         control = http_request(
             workspace, verify_url, method="GET", timeout=timeout,
             transport=f"credential-control:{credential}",
-            _secret_values=(secret["username"], secret["password"], *tokens.values()),
+            _secret_values=(*capture_secrets, *tokens.values()),
             _cookie_jar=bootstrap_jar,
         )
         control_data = (

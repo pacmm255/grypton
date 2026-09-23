@@ -9,7 +9,7 @@ import sys
 import time
 from typing import Callable
 
-from . import config, tools
+from . import config, credentials, tools
 from .providers import append_jsonl
 from .workspace import Workspace
 
@@ -87,6 +87,7 @@ def _credential_login(ws, args):
         ws, args["url"], credential=args["credential"], verify_url=args["verify_url"], success_marker=args["success_marker"],
         username_field=args.get("username_field", "username"),
         password_field=args.get("password_field", "password"),
+        username_transform=args.get("username_transform", "stored"),
         encoding=args.get("encoding", "json"), fields=args.get("fields"),
         headers=args.get("headers"), timeout=args.get("timeout", 30),
     )
@@ -167,6 +168,11 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
             "success_marker": _string("Exact non-secret text required in verification response body"),
             "username_field": _string("Login username/mobile field name"),
             "password_field": _string("Login password field name"),
+            "username_transform": {
+                "type": "string",
+                "enum": ["stored", "iran-e164"],
+                "description": "Username representation for this login",
+            },
             "encoding": {"type": "string", "enum": ["json", "form"]},
             "fields": {"type": "object", "additionalProperties": {"type": "string"}},
             "headers": {"type": "object", "additionalProperties": {"type": "string"}},
@@ -334,20 +340,41 @@ def _record_effectful_tool_start(workspace: Workspace, name: str) -> None:
             os.close(fd)
 
 
-def _redacted(value):
+def _redacted(value, secret_values=()):
     if isinstance(value, dict):
         return {
             key: (
                 "[REDACTED]" if str(key).lower() in _SENSITIVE_AUDIT_KEYS
-                else _redacted(item)
+                else _redacted(item, secret_values)
             )
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [_redacted(item) for item in value]
+        return [_redacted(item, secret_values) for item in value]
     if isinstance(value, str):
-        return tools.redact_sensitive_text(value)
+        return tools.redact_sensitive_text(value, secret_values)
     return value
+
+
+def _audit_secret_values(workspace: Workspace, name: str, args: dict) -> tuple[str, ...]:
+    if name != "credential_login":
+        return ()
+    try:
+        secret = credentials.load_credential(
+            workspace.slug, str(args.get("credential") or "")
+        )
+    except credentials.CredentialError:
+        return ()
+    values = [secret["username"], secret["password"]]
+    try:
+        transformed = credentials.normalize_login_username(
+            secret["username"], str(args.get("username_transform") or "stored")
+        )
+    except credentials.CredentialError:
+        pass
+    else:
+        values.append(transformed)
+    return tools._serialized_secret_variants(values)
 
 
 def dispatch(workspace: Workspace, name: str, args: dict) -> dict:
@@ -381,8 +408,10 @@ def dispatch(workspace: Workspace, name: str, args: dict) -> dict:
             except Exception as exc:
                 result = {"ok": False, "summary": f"{name} failed: {exc}"}
     try:
+        audit_secrets = _audit_secret_values(workspace, name, args or {})
         append_jsonl(workspace.root / ".ledger" / "tool-calls.jsonl", {
-            "at": time.time(), "tool": name, "args": _redacted(args or {}),
+            "at": time.time(), "tool": name,
+            "args": _redacted(args or {}, audit_secrets),
             "ok": bool(result.get("ok")), "summary": result.get("summary", "")[:1000],
             "duration_s": round(time.time() - started, 3),
         })
