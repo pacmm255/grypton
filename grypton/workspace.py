@@ -145,22 +145,10 @@ class Constraints:
             self.hard_rules.append(rule)
 
     def to_prompt_block(self) -> str:
-        lines: list[str] = []
-        # The user's own words during the engagement — HIGHEST authority. Render
-        # first and prominently so it never gets drowned by per-turn context.
+        lines = ["=== ENGAGEMENT DATA ==="]
         if self.standing_instructions:
-            lines.append("═" * 72)
-            lines.append("⚡  STANDING USER INSTRUCTIONS — HIGHEST AUTHORITY · OBEY ABSOLUTELY  ⚡")
-            lines.append("═" * 72)
-            lines.append("These are the user's own words said during this engagement. They")
-            lines.append("OVERRIDE any conflicting directive, prompt assumption, scope inference,")
-            lines.append("or manager guess. Most recent at the bottom — when in doubt, follow the")
-            lines.append("most recent. Stay strictly in this lane; do NOT drift to other scope.")
             for s in self.standing_instructions:
-                lines.append(f"  →  {s}")
-            lines.append("═" * 72)
-            lines.append("")
-        lines.append("=== ENGAGEMENT SCOPE AND ACCEPTANCE DATA ===")
+                lines.append(f"- Operator message: {s}")
         if self.included_severities:
             lines.append(f"- Accepted severities: {', '.join(self.included_severities)}")
         if self.included_classes:
@@ -577,8 +565,7 @@ class Workspace:
     def _render_scope(self) -> None:
         c = self.load_constraints()
         out = [f"# Scope Rules — {self.slug}", "",
-               "These are BINDING user constraints. Both Kryptex (manager) and "
-               "Kraude (worker) receive them every turn.\n", "```",
+               "```",
                c.to_prompt_block(), "```", ""]
         _atomic_write(self.root / "scope-rules.md", "\n".join(out) + "\n")
 

@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from grypton import config
+from grypton import config, prompts
 from grypton.bugcrowd import analyze_snapshot, matching_scope_rules, out_of_scope_rules
 from grypton.chat import Renderer, _command_limit, _compact_tool_result, _expand_workspace_references, _route_input
 from grypton.cli import (_activity_snapshot, _browser_sandbox_check,
@@ -29,7 +29,7 @@ from grypton.engine import Engine
 from grypton.hard_lab import HardLab, score_workspace
 from grypton.manager import KryptexManager, ManagerContext, _check_schema, _extract_json
 from grypton.openclaude import TOKEN_ENV
-from grypton.providers import (MCP_TIMEOUT_MS, OpenCodeClient, OpenCodeResult,
+from grypton.providers import (MCP_TIMEOUT_MS, OpenCodeClient, OpenCodeResult, ProviderError,
                                _codex_child_environment)
 from grypton.reporting import audit_workspace, render_report
 from grypton.toolserver import REGISTRY, dispatch
@@ -1194,6 +1194,38 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(directive.severity_validations, [])
             self.assertEqual(manager.session_id, "ses-manager")
 
+    async def test_manager_restarts_session_after_thinking_signature_rejection(self):
+        with isolated_runtime():
+            ws = Workspace("manager-signature")
+            ws.create("127.0.0.1", "web")
+            manager = KryptexManager(ws, "system")
+            manager.session_id = "ses-old-key"
+            response = {
+                "assessment": "fresh manager session", "directive": "check login",
+                "corrections": [], "new_angles": [], "exhaustion_breaker": "",
+                "scope_enforcement": [], "severity_validations": [],
+                "to_user": "working", "continue": True, "stop_reason": "",
+                "confidence": 0.9,
+            }
+            manager.client.call = AsyncMock(side_effect=[
+                ProviderError("capability_rejected: thinking_signature"),
+                OpenCodeResult(
+                    text=json.dumps(response), session_id="ses-fresh-key", events=[],
+                    tools=[], usage=[], duration_s=0.1,
+                ),
+            ])
+
+            directive = await manager.direct(ManagerContext(
+                target="127.0.0.1", target_type="web", turn_index=2,
+            ))
+
+            self.assertFalse(directive.degraded)
+            self.assertEqual(directive.directive, "check login")
+            self.assertEqual(manager.session_id, "ses-fresh-key")
+            self.assertEqual(manager.client.call.await_args_list[0].kwargs["session_id"],
+                             "ses-old-key")
+            self.assertEqual(manager.client.call.await_args_list[1].kwargs["session_id"], "")
+
     async def test_evidence_snapshot_includes_every_referenced_flow(self):
         with isolated_runtime():
             ws = Workspace("evidence")
@@ -1390,15 +1422,37 @@ class WorkerEventTests(unittest.TestCase):
             self.assertIn(marker, worker.client.agent_prompt)
             self.assertNotIn(marker, worker._build_prompt("do one bounded check"))
 
-    def test_runtime_prompt_uses_engagement_aware_ledger_reader(self):
+    def test_runtime_prompt_adds_no_generated_conduct_rules(self):
         with isolated_runtime():
             worker = OpenCodeWorker(WorkerSpec(
                 session_uuid="", cwd=Path(config.ENGAGEMENTS_DIR) / "prompt-reader",
                 system_prompt="test", extra_env={"GRYPTON_TARGET": "prompt-reader"},
             ))
-            prompt = worker._build_prompt("do one bounded check")
-            self.assertIn("grypton_read_doc", prompt)
-            self.assertIn('{"name": "scope"}', prompt)
+            directive = "Use the supplied credential and check whether login succeeds."
+            prompt = worker._build_prompt(directive)
+            self.assertEqual(prompt, directive)
+            self.assertNotIn("MUST", prompt)
+            self.assertNotIn("Do not", prompt)
+
+    def test_static_role_prompts_do_not_add_prohibitive_rules(self):
+        worker = prompts.worker_system(
+            target="https://example.test/app", target_type="web",
+            workspace=Path("/tmp/example"), constraints_block="SCOPE DATA",
+        )
+        manager = prompts.manager_system(
+            target="https://example.test/app", target_type="web",
+            workspace=Path("/tmp/example"),
+        )
+        workspace = prompts.worker_workspace_md(
+            target="https://example.test/app", target_type="web",
+            workspace=Path("/tmp/example"), constraints_block="SCOPE DATA",
+        )
+        combined = "\n".join((worker, manager, workspace)).lower()
+        for generated_rule in ("do not", "never", "must", "hard rules",
+                               "embedded operating skills"):
+            self.assertNotIn(generated_rule, combined)
+        self.assertIn("use any available tool", worker.lower())
+        self.assertIn("scope data", worker.lower())
 
     def test_explicit_mission_reaches_kraude_runtime_prompt_verbatim(self):
         with isolated_runtime():

@@ -69,17 +69,7 @@ class OpenCodeWorker:
             workspace=self.spec.cwd,
             target_slug=slug,
             allow_tools=True,
-            agent_prompt=(
-                "You are Kraude, the hands-on worker in a persistent Grypton engagement. "
-                f"Your selected OpenClaude route is {self.spec.model} at "
-                f"{self.spec.effort} effort. "
-                "Use tools and produce observable progress. Read engagement ledgers through "
-                "the grypton_read_doc MCP tool, then obey scope-rules.md exactly. "
-                "Record surface, tested techniques, and findings with the grypton MCP "
-                "tools. Resolve routine local blockers yourself. Never inspect or reveal "
-                "provider credentials. End with a concise factual summary.\n\n"
-                + self.spec.system_prompt
-            ),
+            agent_prompt=self.spec.system_prompt,
             event_callback=self._translate_event,
         )
 
@@ -124,23 +114,10 @@ class OpenCodeWorker:
         self._started = False
 
     def _build_prompt(self, directive: str) -> str:
-        return (
-            "=== GRYPTON KRAUDE WORKER RUNTIME ===\n"
-              "Native read/search tools and `grypton_*` MCP tools are "
-              "available; native Bash is disabled. Every network action MUST use a "
-              "`grypton_*` MCP tool so scope checks and Burp-like request/response "
-              "capture cannot be bypassed. Use `grypton_local_analyze` for bounded "
-              "offline file inspection. If an MCP tool is unavailable, record the "
-              "blocker and choose another in-scope lead; no shell or direct network "
-              "fallback is permitted. Prefer ledger tools for durable findings, "
-              "surface entries, and tested techniques. Before every network action "
-              "call `grypton_read_doc` with `{\"name\": \"scope\"}`. Use "
-              "`grypton_read_doc` for scope, program, findings, surface, tested, and "
-              "progress ledgers; do not use native Read on absolute engagement paths. "
-              "Do not inspect files outside this engagement workspace.\n\n"
-              "=== KRYPTEX DIRECTIVE ===\n"
-            + directive
-        )
+        # Role, engagement data, and tool schemas are already installed in the
+        # agent configuration. Keep the live instruction exactly as supplied by
+        # the operator or Kryptex so generated conduct rules cannot distort it.
+        return directive
 
     async def run_turn(self, text: str) -> TurnResult:
         await self.ensure_started()

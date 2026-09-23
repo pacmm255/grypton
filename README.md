@@ -41,6 +41,13 @@ flowchart LR
 
 Kryptex does not validate its own worker. New P1 and P2 findings go to Astra automatically. P3, P4, and P5 findings stay recorded until you explicitly request validation.
 
+Kraude receives a deliberately small role prompt: the target, the recorded
+scope URLs, severity acceptance data, out-of-scope finding categories, and the
+operator or Kryptex instruction for that turn. Grypton passes an explicit
+operator mission verbatim and does not prepend generated conduct rules. The
+OpenCode session supplies the available tool schemas automatically, while the
+tools enforce and capture the recorded scope in code.
+
 ## Set up OpenClaude and the key pool
 
 Before a real run, Grypton expects:
@@ -712,6 +719,15 @@ Common manual commands:
 
 # Install one exact package from the reviewed apt allowlist
 ./bin/grypton tools --target https-app-example-test install jq
+
+# Search a downloaded minified bundle without returning its entire long line
+./bin/grypton tools --target https-app-example-test local-analyze \
+  loot/app.min.js --analyzer literal --pattern '/api/session' \
+  --context-bytes 200 --max-matches 20
+
+# Use a byte-oriented regular expression with case-insensitive matching
+./bin/grypton tools --target https-app-example-test local-analyze \
+  loot/app.min.js --analyzer regex --pattern 'fetch\\([^)]+' --ignore-case
 ```
 
 ## Tool groups
@@ -730,10 +746,16 @@ Large responses are shortened in the live terminal. Private flow capture is
 bounded to 2 MB. Its metadata records the original byte count and whether the
 capture was truncated.
 
-`local_analyze` performs only `file`, `strings`, or SHA-256 analysis. Its input
+`local_analyze` performs `file`, `strings`, SHA-256, literal search, or
+byte-oriented regular-expression search. Its input
 must be a regular file of at most 64 MB inside the engagement workspace. It
 rejects absolute paths, path traversal, symlinks, unsupported analyzers, and
-oversized output. This gives Kraude bounded offline inspection without a shell.
+oversized output. Searches return byte offsets, one-based line numbers,
+zero-based byte offsets within each line, and small context windows. Match
+count, context size, match previews, total returned context, and regex runtime
+are capped, so a match in a single-line minified bundle cannot flood the model.
+Use `--analyzer literal|regex --pattern TEXT`; optionally set `--ignore-case`,
+`--context-bytes` (0–2048), and `--max-matches` (1–50).
 
 `install_tool` accepts only an exact package name from Grypton's reviewed apt
 allowlist: `aapt`, `android-sdk-build-tools`, `apksigner`, `binutils`,
@@ -1009,8 +1031,9 @@ intend to replace the login and reset its saved session.
 
 ## A local analyzer or install request is rejected
 
-`local_analyze` accepts only `file`, `strings`, and `sha256` on a regular file
-inside the engagement. `install_tool` accepts only the exact reviewed apt
+`local_analyze` accepts `file`, `strings`, `sha256`, `literal`, and `regex` on
+a regular file inside the engagement. Literal and regex searches require
+`--pattern` and enforce bounded match counts and context. `install_tool` accepts only the exact reviewed apt
 packages listed in the tool section. These boundaries are fixed; changing the
 spelling, package manager, path, or command does not bypass them.
 
