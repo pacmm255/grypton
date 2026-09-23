@@ -6,6 +6,7 @@ this store and substitutes the values immediately before transport.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import fcntl
 import hashlib
@@ -15,6 +16,7 @@ from pathlib import Path
 import re
 import secrets
 import stat
+import threading
 from urllib.parse import urlsplit
 
 from . import config
@@ -38,6 +40,9 @@ _PROFILE_TRANSPORT_HEADERS = frozenset({
     "keep-alive", "proxy-connection", "te", "trailer", "transfer-encoding",
     "upgrade", "x-http-method-override", "x-original-url", "x-rewrite-url",
 })
+_PROFILE_THREAD_LOCKS: dict[str, threading.RLock] = {}
+_PROFILE_THREAD_LOCKS_GUARD = threading.Lock()
+_PROFILE_LOCK_STATE = threading.local()
 
 
 class CredentialError(ValueError):
@@ -80,6 +85,64 @@ def _profile_dir(target: str) -> Path:
 def auth_profile_path(target: str, name: str) -> Path:
     alias = _safe_name(name, label="credential name")
     return _profile_dir(target) / (alias + ".json")
+
+
+def _profile_thread_lock(path: Path) -> threading.RLock:
+    key = str(path)
+    with _PROFILE_THREAD_LOCKS_GUARD:
+        return _PROFILE_THREAD_LOCKS.setdefault(key, threading.RLock())
+
+
+@contextmanager
+def auth_profile_lock(target: str, name: str):
+    """Serialize one alias's profile snapshot, save, and delete operations."""
+    alias = _safe_name(name, label="credential name")
+    lock_path = _profile_dir(target) / f".{alias}.lock"
+    key = str(lock_path)
+    thread_lock = _profile_thread_lock(lock_path)
+    with thread_lock:
+        depths = getattr(_PROFILE_LOCK_STATE, "depths", None)
+        if depths is None:
+            depths = {}
+            _PROFILE_LOCK_STATE.depths = depths
+        if depths.get(key, 0):
+            depths[key] += 1
+            try:
+                yield
+            finally:
+                depths[key] -= 1
+            return
+
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = -1
+        try:
+            fd = os.open(lock_path, flags, 0o600)
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise OSError("profile lock is not a private regular file")
+            os.fchmod(fd, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except OSError as exc:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise CredentialError("authentication profile lock is unavailable") from exc
+
+        depths[key] = 1
+        try:
+            yield
+        finally:
+            depths.pop(key, None)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
 
@@ -416,16 +479,17 @@ def save_auth_profile(target: str, name: str, profile: object) -> dict:
     alias = _safe_name(name, label="credential name")
     load_credential(target, alias)
     canonical = validate_auth_profile(profile)
-    path = auth_profile_path(target, alias)
-    if path.is_symlink():
-        raise CredentialError("authentication profile must not be a symlink")
-    if path.exists() and not path.is_file():
-        raise CredentialError("authentication profile must be a regular file")
-    _atomic_private_json(path, canonical)
+    with auth_profile_lock(target, alias):
+        path = auth_profile_path(target, alias)
+        if path.is_symlink():
+            raise CredentialError("authentication profile must not be a symlink")
+        if path.exists() and not path.is_file():
+            raise CredentialError("authentication profile must be a regular file")
+        _atomic_private_json(path, canonical)
     return canonical
 
 
-def load_auth_profile_optional(target: str, name: str) -> dict | None:
+def _load_auth_profile_optional_unlocked(target: str, name: str) -> dict | None:
     path = auth_profile_path(target, name)
     if not path.exists() and not path.is_symlink():
         return None
@@ -434,16 +498,22 @@ def load_auth_profile_optional(target: str, name: str) -> dict | None:
     )
 
 
+def load_auth_profile_optional(target: str, name: str) -> dict | None:
+    with auth_profile_lock(target, name):
+        return _load_auth_profile_optional_unlocked(target, name)
+
+
 def delete_auth_profile(target: str, name: str) -> bool:
-    path = auth_profile_path(target, name)
-    if path.is_symlink():
-        raise CredentialError("authentication profile must not be a symlink")
-    if not path.exists():
-        return False
-    if not path.is_file():
-        raise CredentialError("authentication profile must be a regular file")
-    path.unlink()
-    return True
+    with auth_profile_lock(target, name):
+        path = auth_profile_path(target, name)
+        if path.is_symlink():
+            raise CredentialError("authentication profile must not be a symlink")
+        if not path.exists():
+            return False
+        if not path.is_file():
+            raise CredentialError("authentication profile must be a regular file")
+        path.unlink()
+        return True
 
 
 def auth_profile_summary(target: str, name: str) -> dict[str, object]:

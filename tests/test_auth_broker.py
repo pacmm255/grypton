@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -326,6 +327,110 @@ class AuthBrokerTests(unittest.TestCase):
             observable = json.dumps(result, ensure_ascii=False)
             self.assertNotIn("outside.example", observable)
             self.assertNotIn("private-login-path", observable)
+
+    def test_profile_creation_is_linearized_before_broker_route_selection(self):
+        origin = "https://app.example.test"
+        with isolated_runtime():
+            ws = self._workspace(origin)
+            profile = browser_profile(origin)
+            profile_path = credentials.auth_profile_path(ws.slug, "primary")
+            original_atomic_write = credentials._atomic_private_json
+            original_profile_lock = credentials.auth_profile_lock
+            write_entered = threading.Event()
+            allow_write = threading.Event()
+            broker_reached_lock = threading.Event()
+            legacy_called = threading.Event()
+            browser_called = threading.Event()
+            save_errors: list[BaseException] = []
+            broker_errors: list[BaseException] = []
+            broker_results: list[dict] = []
+
+            def paused_atomic_write(path, value):
+                if path == profile_path:
+                    write_entered.set()
+                    if not allow_write.wait(5):
+                        raise RuntimeError("timed out waiting to finish profile write")
+                return original_atomic_write(path, value)
+
+            @contextmanager
+            def observed_profile_lock(target, name):
+                if threading.current_thread().name == "broker-dispatch":
+                    broker_reached_lock.set()
+                with original_profile_lock(target, name):
+                    yield
+
+            def save_profile() -> None:
+                try:
+                    credentials.save_auth_profile(
+                        ws.slug, "primary", profile
+                    )
+                except BaseException as exc:  # captured for the parent test thread
+                    save_errors.append(exc)
+
+            def run_broker() -> None:
+                try:
+                    broker_results.append(dispatch(ws, "credential_login", {
+                        "credential": "primary",
+                        "url": origin + "/legacy-login",
+                        "verify_url": origin + "/legacy-profile",
+                        "success_marker": "legacy-marker",
+                    }))
+                except BaseException as exc:  # captured for the parent test thread
+                    broker_errors.append(exc)
+
+            def browser_result(*_args, **_kwargs):
+                browser_called.set()
+                return {"ok": True, "summary": "profile route", "data": {}}
+
+            def legacy_result(*_args, **_kwargs):
+                legacy_called.set()
+                return {"ok": True, "summary": "legacy route", "data": {}}
+
+            with (
+                patch.object(
+                    credentials, "_atomic_private_json",
+                    side_effect=paused_atomic_write,
+                ),
+                patch.object(
+                    credentials, "auth_profile_lock", observed_profile_lock,
+                ),
+                patch(
+                    "grypton.toolserver.tools.credential_browser_login",
+                    side_effect=browser_result,
+                ),
+                patch(
+                    "grypton.toolserver.tools.credential_login",
+                    side_effect=legacy_result,
+                ),
+            ):
+                saver = threading.Thread(
+                    target=save_profile, name="profile-saver", daemon=True
+                )
+                saver.start()
+                self.assertTrue(write_entered.wait(5))
+                broker = threading.Thread(
+                    target=run_broker, name="broker-dispatch", daemon=True
+                )
+                broker.start()
+                self.assertTrue(broker_reached_lock.wait(5))
+                self.assertFalse(legacy_called.wait(0.2))
+                self.assertFalse(browser_called.is_set())
+                allow_write.set()
+                saver.join(5)
+                broker.join(5)
+
+            self.assertFalse(saver.is_alive())
+            self.assertFalse(broker.is_alive())
+            self.assertEqual(save_errors, [])
+            self.assertEqual(broker_errors, [])
+            self.assertFalse(legacy_called.is_set())
+            self.assertTrue(browser_called.is_set())
+            self.assertEqual(len(broker_results), 1)
+            self.assertTrue(broker_results[0]["ok"], broker_results[0])
+            self.assertEqual(
+                broker_results[0]["data"]["auth_dispatch"]["effective_tool"],
+                "credential_browser_login",
+            )
 
     def test_public_schemas_require_only_alias_and_all_tools_remain_visible(self):
         for name in ("credential_login", "credential_browser_login"):

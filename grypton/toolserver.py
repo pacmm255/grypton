@@ -107,14 +107,6 @@ def _with_auth_dispatch(result: dict, metadata: dict) -> dict:
     return output
 
 
-def _profile_configured_hint(ws: Workspace, credential: object) -> bool:
-    try:
-        path = credentials.auth_profile_path(ws.slug, str(credential or ""))
-    except credentials.CredentialError:
-        return False
-    return path.exists() or path.is_symlink()
-
-
 def _http_login_from_args(ws: Workspace, args: dict) -> dict:
     return tools.credential_login(
         ws, args.get("url", ""), credential=args.get("credential", ""),
@@ -198,29 +190,27 @@ def _profiled_auth_login(ws: Workspace, requested: str,
 
 def _auth_login(ws: Workspace, args: dict, *, requested: str) -> dict:
     credential = str(args.get("credential") or "")
-    configured_hint = _profile_configured_hint(ws, credential)
+    configured = False
     try:
-        profile = credentials.load_auth_profile_optional(
-            ws.slug, credential
-        )
+        with credentials.auth_profile_lock(ws.slug, credential):
+            profile_path = credentials.auth_profile_path(ws.slug, credential)
+            configured = profile_path.exists() or profile_path.is_symlink()
+            profile = credentials.load_auth_profile_optional(
+                ws.slug, credential
+            )
     except credentials.CredentialError:
-        configured_hint = configured_hint or _profile_configured_hint(
-            ws, credential
-        )
         metadata = _auth_dispatch_metadata(
-            requested, "", configured=configured_hint
+            requested, "", configured=configured
         )
         return _with_auth_dispatch({
             "ok": False,
             "summary": (
                 "Configured authentication profile is invalid; replace or clear it."
-                if configured_hint else "Credential alias is invalid."
+                if configured else "Credential alias or profile state is invalid."
             ),
         }, metadata)
 
-    if profile is None and (
-        configured_hint or _profile_configured_hint(ws, credential)
-    ):
+    if configured and profile is None:
         return _with_auth_dispatch({
             "ok": False,
             "summary": "Configured authentication profile is unavailable; retry later.",
