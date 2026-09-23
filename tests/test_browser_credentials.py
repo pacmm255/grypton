@@ -394,6 +394,26 @@ class BrowserCredentialTests(unittest.TestCase):
                 credentials.session_status(ws.slug, "primary")["attempts"], 0
             )
 
+    def test_duplicate_verify_header_is_rejected_before_attempt(self):
+        with isolated_runtime(), spa_auth_server("success") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            request = self._request(port)
+            request["verify_headers"] = {
+                "X-SPA-Client": "one", "x-spa-client": "two",
+            }
+
+            result = dispatch(ws, "credential_browser_login", request)
+
+            self.assertFalse(result["ok"], result)
+            self.assertIn("case-insensitive duplicate", result["summary"])
+            self.assertEqual(_SpaAuthHandler.login_posts, 0)
+            self.assertEqual(
+                credentials.session_status(ws.slug, "primary")["attempts"], 0
+            )
+
     def test_initially_disabled_submit_enables_after_playwright_fill(self):
         with isolated_runtime(), spa_auth_server("disabled-submit") as port:
             ws = self._workspace(port)

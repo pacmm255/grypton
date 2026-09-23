@@ -572,6 +572,7 @@ def _browser_auth_verify_headers(headers: Optional[dict]) -> dict[str, str]:
         raise ValueError("Browser verification headers must be an object.")
     if len(headers) > 32:
         raise ValueError("Browser verification accepts at most 32 protocol headers.")
+    normalized_names: set[str] = set()
     for raw_key, raw_value in headers.items():
         key, value = str(raw_key), str(raw_value)
         if (not key or len(key) > 128
@@ -583,6 +584,12 @@ def _browser_auth_verify_headers(headers: Optional[dict]) -> dict[str, str]:
             raise ValueError(
                 f"Browser verification header {key!r} contains an invalid value."
             )
+        normalized = key.lower()
+        if normalized in normalized_names:
+            raise ValueError(
+                "Browser verification headers contain a case-insensitive duplicate."
+            )
+        normalized_names.add(normalized)
     output = _safe_headers(headers)
     forbidden = _SENSITIVE_HEADERS | {
         "connection", "content-length", "host", "proxy-connection",
