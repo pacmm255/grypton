@@ -77,7 +77,33 @@ def http_profile(origin: str = "https://api.example.test") -> dict:
     }
 
 
+def status_browser_profile(origin: str = "https://app.example.test") -> dict:
+    value = browser_profile(origin)
+    value.pop("success_marker")
+    value["browser"]["verification"] = {
+        "mode": "status-differential",
+        "login_status": 200,
+        "authenticated_status": 200,
+        "anonymous_status": 401,
+        "expected_post_login_url": origin + "/dashboard",
+    }
+    return value
+
+
 class AuthProfileStorageTests(unittest.TestCase):
+    def test_status_differential_profile_is_additive_and_marker_free(self):
+        with isolated_runtime():
+            credentials.save_credential("example", "primary", "user", "pass")
+            saved = credentials.save_auth_profile(
+                "example", "primary", status_browser_profile()
+            )
+            self.assertNotIn("success_marker", saved)
+            self.assertEqual(
+                saved["browser"]["verification"],
+                status_browser_profile()["browser"]["verification"],
+            )
+            self.assertNotIn("verification", browser_profile()["browser"])
+
     def test_private_profile_round_trip_and_safe_status(self):
         with isolated_runtime():
             credentials.save_credential(
@@ -137,6 +163,9 @@ class AuthProfileStorageTests(unittest.TestCase):
         value["browser"]["username_selector"] = ""
         cases.append(value)
         value = browser_profile()
+        value.pop("success_marker")
+        cases.append(value)
+        value = browser_profile()
         value["browser"]["verify_headers"] = {"Authorization": "private"}
         cases.append(value)
         value = browser_profile()
@@ -164,6 +193,38 @@ class AuthProfileStorageTests(unittest.TestCase):
         cases.append(value)
         value = http_profile()
         value["browser"] = browser_profile()["browser"]
+        cases.append(value)
+        value = status_browser_profile()
+        value["success_marker"] = "ambiguous"
+        cases.append(value)
+        value = status_browser_profile()
+        del value["browser"]["verification"]["login_status"]
+        cases.append(value)
+        value = status_browser_profile()
+        value["browser"]["verification"]["login_status"] = True
+        cases.append(value)
+        value = status_browser_profile()
+        value["browser"]["verification"]["login_status"] = 300
+        cases.append(value)
+        value = status_browser_profile()
+        value["browser"]["verification"]["authenticated_status"] = 302
+        cases.append(value)
+        value = status_browser_profile()
+        value["browser"]["verification"]["authenticated_status"] = 401
+        cases.append(value)
+        value = status_browser_profile()
+        value["browser"]["verification"]["anonymous_status"] = 404
+        cases.append(value)
+        value = status_browser_profile()
+        value["browser"]["verification"]["expected_post_login_url"] = (
+            "https://other.example.test/dashboard"
+        )
+        cases.append(value)
+        value = status_browser_profile()
+        value["browser"]["verification"]["expected_post_login_url"] += "#done"
+        cases.append(value)
+        value = status_browser_profile()
+        value["browser"]["verification"]["unknown"] = "hidden"
         cases.append(value)
 
         with isolated_runtime():
@@ -217,6 +278,7 @@ class AuthProfileCliTests(unittest.TestCase):
         ws.save_constraints(Constraints(in_scope=[
             "https://app.example.test/login",
             "https://app.example.test/profile",
+            "https://app.example.test/dashboard",
         ]))
         credentials.save_credential(ws.slug, "primary", "user", "password")
         return ws
@@ -298,6 +360,61 @@ class AuthProfileCliTests(unittest.TestCase):
             self.assertIsNone(
                 credentials.load_auth_profile_optional(ws.slug, "primary")
             )
+
+    def test_cli_configures_status_differential_and_checks_terminal_scope(self):
+        with isolated_runtime():
+            ws = self._workspace()
+            arguments = [
+                "auth", "configure", ws.slug,
+                "--strategy", "browser",
+                "--login-url", "https://app.example.test/login",
+                "--verify-url", "https://app.example.test/profile",
+                "--verification-mode", "status-differential",
+                "--login-status", "200",
+                "--authenticated-status", "200",
+                "--anonymous-status", "401",
+                "--expected-post-login-url", "https://app.example.test/dashboard",
+                "--username-selector", "#user",
+                "--password-selector", "#pass",
+                "--submit-selector", "#submit",
+            ]
+            code, output, error = self._run(arguments)
+            self.assertEqual(code, 0, error)
+            saved = credentials.load_auth_profile_optional(ws.slug, "primary")
+            self.assertNotIn("success_marker", saved)
+            self.assertEqual(
+                saved["browser"]["verification"]["authenticated_status"], 200
+            )
+
+            credentials.delete_auth_profile(ws.slug, "primary")
+            outside = list(arguments)
+            outside[outside.index("https://app.example.test/dashboard")] = (
+                "https://app.example.test/outside"
+            )
+            code, output, error = self._run(outside)
+            self.assertEqual(code, 2)
+            self.assertIn("expected post-login URL", error)
+            self.assertIsNone(
+                credentials.load_auth_profile_optional(ws.slug, "primary")
+            )
+
+    def test_cli_rejects_mixed_marker_and_status_options(self):
+        with isolated_runtime():
+            ws = self._workspace()
+            code, output, error = self._run([
+                "auth", "configure", ws.slug,
+                "--strategy", "browser",
+                "--login-url", "https://app.example.test/login",
+                "--verify-url", "https://app.example.test/profile",
+                "--success-marker", "marker",
+                "--verification-mode", "status-differential",
+                "--login-status", "200",
+                "--authenticated-status", "200",
+                "--anonymous-status", "401",
+                "--expected-post-login-url", "https://app.example.test/dashboard",
+            ])
+            self.assertEqual(code, 2)
+            self.assertIn("cannot use a success marker", error)
 
 
 if __name__ == "__main__":

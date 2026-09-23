@@ -569,6 +569,34 @@ For a rendered login, save its form and verification details once:
   --submit-selector "[data-testid='login-submit']"
 ```
 
+Some applications do not return a useful private text marker. For those, the
+browser profile can prove the session with exact status and URL differences:
+
+```bash
+./bin/grypton auth configure https-app-example-test \
+  --name primary \
+  --strategy browser \
+  --login-url 'https://app.example.test/login' \
+  --verify-url 'https://app.example.test/api/profile' \
+  --verification-mode status-differential \
+  --login-status 200 \
+  --authenticated-status 400 \
+  --anonymous-status 401 \
+  --expected-post-login-url 'https://app.example.test/app/home' \
+  --username-selector "[data-testid='login-username']" \
+  --password-selector "[data-testid='login-password']" \
+  --submit-selector "[data-testid='login-submit']"
+```
+
+In this mode, omit `--success-marker`. Grypton requires one matching form
+submission, the exact configured response status, a passive browser arrival at
+the exact post-login URL, and new reusable session material created by the
+login itself. The live verification request and a fresh replay must finish at
+the verification URL with the configured authenticated status and no redirect.
+A separate fresh browser must finish at that same URL with exactly the
+configured anonymous `401` or `403` status. Any mismatch leaves the session
+unverified.
+
 `--username-transform iran-e164` handles a stored Iranian mobile identifier.
 `--verify-headers` accepts a JSON object containing static protocol headers such
 as `Accept`, `Origin`, `Referer`, `X-Platform`, or `X-Client-Version`. Origin and
@@ -605,14 +633,16 @@ without a profile keeps the explicitly requested tool behavior:
 4. `authenticated_http_request` uses the verified cookie or bearer session for
    later scoped requests.
 
-Both login tools require a scoped verification URL and exact, non-secret text
-that appears only after a successful login. They do not treat an HTTP `200` as
-proof by itself. `credential_login` requires a newly issued session cookie or
+Both login tools require a scoped verification URL. HTTP profiles and marker
+browser profiles also require exact, non-secret text that appears only after a
+successful login. They do not treat an HTTP `200` as proof by itself.
+`credential_login` requires a newly issued session cookie or
 recognized bearer token, then checks that material on the verification URL.
 Custom session-cookie names are supported; unrelated tracking cookies and
 unrelated JSON tokens are rejected.
 
-`credential_browser_login` performs the same proof for a rendered application.
+In marker mode, `credential_browser_login` performs the same proof for a
+rendered application.
 It collects the reusable cookie or recognized bearer material created by the
 form, opens a fresh browser with only that material, and checks the verification
 URL for the exact success marker. It also opens a separate fresh browser with

@@ -1210,12 +1210,38 @@ def cmd_auth(ns) -> int:
                 )
         return 0
     if ns.auth_command == "configure":
+        status_values = (
+            ns.login_status, ns.authenticated_status, ns.anonymous_status,
+            ns.expected_post_login_url,
+        )
+        if ns.strategy == "http" and ns.verification_mode != "marker":
+            print(
+                "ERROR: authentication profile was not saved: "
+                "status-differential verification is browser-only",
+                file=sys.stderr,
+            )
+            return 2
+        if ns.verification_mode == "status-differential" and ns.success_marker:
+            print(
+                "ERROR: authentication profile was not saved: "
+                "status-differential verification cannot use a success marker",
+                file=sys.stderr,
+            )
+            return 2
+        if ns.verification_mode == "marker" and any(
+            value is not None for value in status_values
+        ):
+            print(
+                "ERROR: authentication profile was not saved: "
+                "status verification options require --verification-mode status-differential",
+                file=sys.stderr,
+            )
+            return 2
         profile = {
             "version": 1,
             "strategy": ns.strategy,
             "login_url": ns.login_url,
             "verify_url": ns.verify_url,
-            "success_marker": ns.success_marker,
             "username_transform": ns.username_transform,
             "timeout": ns.timeout if ns.timeout is not None else (
                 45 if ns.strategy == "browser" else 30
@@ -1228,7 +1254,18 @@ def cmd_auth(ns) -> int:
                 "submit_selector": ns.submit_selector,
                 "verify_headers": ns.verify_headers,
             }
+            if ns.verification_mode == "status-differential":
+                profile["browser"]["verification"] = {
+                    "mode": "status-differential",
+                    "login_status": ns.login_status,
+                    "authenticated_status": ns.authenticated_status,
+                    "anonymous_status": ns.anonymous_status,
+                    "expected_post_login_url": ns.expected_post_login_url,
+                }
+            else:
+                profile["success_marker"] = ns.success_marker
         else:
+            profile["success_marker"] = ns.success_marker
             profile["http"] = {
                 "encoding": ns.encoding,
                 "username_field": ns.username_field,
@@ -1246,7 +1283,10 @@ def cmd_auth(ns) -> int:
             for label, url in (
                 ("login URL", ns.login_url),
                 ("verification URL", ns.verify_url),
+                ("expected post-login URL", ns.expected_post_login_url),
             ):
+                if not url:
+                    continue
                 allowed, reason = check_url_scope(workspace, url)
                 if not allowed:
                     raise credentials.CredentialError(
@@ -1587,7 +1627,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     auth_configure.add_argument("--login-url", required=True)
     auth_configure.add_argument("--verify-url", required=True)
-    auth_configure.add_argument("--success-marker", required=True)
+    auth_configure.add_argument("--success-marker", default="")
+    auth_configure.add_argument(
+        "--verification-mode", choices=["marker", "status-differential"],
+        default="marker",
+    )
+    auth_configure.add_argument("--login-status", type=int)
+    auth_configure.add_argument("--authenticated-status", type=int)
+    auth_configure.add_argument("--anonymous-status", type=int)
+    auth_configure.add_argument("--expected-post-login-url")
     auth_configure.add_argument(
         "--username-transform", choices=["stored", "iran-e164"], default="stored"
     )

@@ -44,6 +44,7 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
     token = "browser-token-never-log"
     mode = "success"
     login_posts = 0
+    verify_requests = 0
     verify_header_values = []
 
     def _send(self, status: int, body: bytes, *, content_type: str,
@@ -125,7 +126,9 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
               document.getElementById('result').textContent = JSON.stringify(value);
               {identity_console}
               if (value.access_token) console.log(value.access_token);
-              if (response.ok && !value.otp_required) window.location.assign('/dashboard');
+              if (response.ok && !value.otp_required) window.location.assign(
+                '{"/dashboard?unexpected=1" if type(self).mode == "status-wrong-terminal" else "/dashboard"}'
+              );
             }});
             </script></body></html>""".encode()
             self._send(
@@ -133,9 +136,12 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                 cookie=self.session if type(self).mode == "baseline-cookie" else "",
             )
             return
-        if self.path == "/dashboard":
+        if self.path.startswith("/dashboard"):
             cookie = self.headers.get("Cookie", "")
-            if f"app_session={self.session}" in cookie:
+            if (
+                f"app_session={self.session}" in cookie
+                or type(self).mode == "verify-material-only"
+            ):
                 self._send(
                     200,
                     ("<html><body>signed in " + self.token + "</body></html>").encode(),
@@ -148,6 +154,14 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                 self.end_headers()
             return
         if self.path == "/me":
+            type(self).verify_requests += 1
+            request_number = type(self).verify_requests
+            if type(self).mode == "status-verify-redirect":
+                self.send_response(302)
+                self.send_header("Location", "/me-final")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if type(self).mode == "verify-header":
                 header = self.headers.get("X-SPA-Client", "")
                 type(self).verify_header_values.append(header)
@@ -158,10 +172,31 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                 f"app_session={self.session}" in self.headers.get("Cookie", "")
                 or self.headers.get("Authorization") == f"Bearer {self.token}"
             )
+            if type(self).mode == "verify-material-only" and request_number == 1:
+                self._json(200, {"authenticated": True}, cookie=self.session)
+                return
+            status = 200 if authenticated else 401
+            if type(self).mode == "status-live-mismatch" and request_number == 1:
+                status = 404
+            elif type(self).mode == "status-replay-mismatch" and request_number == 2:
+                status = 404
+            elif type(self).mode == "status-control-mismatch" and not authenticated:
+                status = 403
+            elif type(self).mode == "status-control-404" and not authenticated:
+                status = 404
+            elif type(self).mode == "status-control-200" and not authenticated:
+                status = 200
             self._json(
-                200 if authenticated else 401,
+                status,
                 {"authenticated": authenticated},
             )
+            return
+        if self.path == "/me-final":
+            authenticated = (
+                f"app_session={self.session}" in self.headers.get("Cookie", "")
+                or self.headers.get("Authorization") == f"Bearer {self.token}"
+            )
+            self._json(200 if authenticated else 401, {"authenticated": authenticated})
             return
         self._json(404, {"error": "not found"})
 
@@ -195,8 +230,9 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
             "otp_required": False,
             "captcha": None,
             "username": value.get("username"),
-            "access_token": self.token,
         }
+        if type(self).mode != "verify-material-only":
+            response["access_token"] = self.token
         if type(self).mode == "client-normalizes":
             response.update({
                 "firstName": "Nika",
@@ -208,7 +244,11 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                     "inviteCode": "private-invite-4567",
                 }},
             })
-        self._json(200, response, cookie=self.session)
+        self._json(
+            201 if type(self).mode == "status-login-201" else 200,
+            response,
+            cookie="" if type(self).mode == "verify-material-only" else self.session,
+        )
 
     def log_message(self, *_args):
         pass
@@ -218,6 +258,7 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
 def spa_auth_server(mode: str):
     _SpaAuthHandler.mode = mode
     _SpaAuthHandler.login_posts = 0
+    _SpaAuthHandler.verify_requests = 0
     _SpaAuthHandler.verify_header_values = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _SpaAuthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -247,6 +288,127 @@ class BrowserCredentialTests(unittest.TestCase):
             "success_marker": '"authenticated": true',
             "timeout": 15,
         }
+
+    def _status_profile(self, port: int, *, timeout: int = 15) -> dict:
+        origin = f"http://127.0.0.1:{port}"
+        return {
+            "version": 1,
+            "strategy": "browser",
+            "login_url": origin + "/login",
+            "verify_url": origin + "/me",
+            "username_transform": "iran-e164",
+            "timeout": timeout,
+            "browser": {
+                "username_selector": "[data-testid='login-username']",
+                "password_selector": "[data-testid='login-password']",
+                "submit_selector": "[data-testid='login-submit']",
+                "verify_headers": {},
+                "verification": {
+                    "mode": "status-differential",
+                    "login_status": 200,
+                    "authenticated_status": 200,
+                    "anonymous_status": 401,
+                    "expected_post_login_url": origin + "/dashboard",
+                },
+            },
+        }
+
+    def test_profile_status_differential_proves_real_browser_session(self):
+        with isolated_runtime(), spa_auth_server("success") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            credentials.save_auth_profile(
+                ws.slug, "primary", self._status_profile(port)
+            )
+
+            result = dispatch(
+                ws, "credential_login", {"credential": "primary"}
+            )
+
+            self.assertTrue(result["ok"], result)
+            self.assertIn("status-differential proof", result["summary"])
+            self.assertEqual(result["data"]["verification_mode"], "status-differential")
+            self.assertEqual(result["data"]["matched_submission_count"], 1)
+            self.assertEqual(result["data"]["matched_submission_status"], 200)
+            self.assertTrue(result["data"]["login_session_material"])
+            self.assertEqual(result["data"]["verify_status"], 200)
+            self.assertEqual(result["data"]["replay_status"], 200)
+            self.assertEqual(result["data"]["control_status"], 401)
+            self.assertTrue(result["data"]["session"]["established"])
+            self.assertEqual(_SpaAuthHandler.login_posts, 1)
+
+    def test_status_differential_rejects_only_prelogin_material(self):
+        with isolated_runtime(), spa_auth_server("baseline-cookie") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            credentials.save_auth_profile(
+                ws.slug, "primary", self._status_profile(port)
+            )
+
+            result = dispatch(
+                ws, "credential_browser_login", {"credential": "primary"}
+            )
+
+            self.assertFalse(result["ok"], result)
+            self.assertIn("login did not produce", result["summary"])
+            self.assertFalse(result["data"]["login_session_material"])
+            self.assertFalse(result["data"]["session"]["established"])
+            self.assertEqual(_SpaAuthHandler.login_posts, 1)
+
+    def test_status_differential_requires_material_before_live_verification(self):
+        with isolated_runtime(), spa_auth_server("verify-material-only") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            credentials.save_auth_profile(
+                ws.slug, "primary", self._status_profile(port)
+            )
+
+            result = dispatch(
+                ws, "credential_login", {"credential": "primary"}
+            )
+
+            self.assertFalse(result["ok"], result)
+            self.assertIn("login did not produce", result["summary"])
+            self.assertFalse(result["data"]["login_session_material"])
+            self.assertEqual(result["data"]["verify_status"], 200)
+            self.assertEqual(result["data"]["replay_status"], 0)
+            self.assertFalse(result["data"]["session"]["established"])
+
+    def test_status_differential_rejects_each_exact_proof_mismatch(self):
+        cases = (
+            ("status-login-201", "credential submission status"),
+            ("status-wrong-terminal", "post-login URL"),
+            ("status-live-mismatch", "live verification"),
+            ("status-replay-mismatch", "persisted session replay"),
+            ("status-control-mismatch", "anonymous control"),
+            ("status-control-404", "anonymous control"),
+            ("status-control-200", "anonymous control"),
+            ("status-verify-redirect", "live verification"),
+        )
+        for mode, reason in cases:
+            with self.subTest(mode=mode), isolated_runtime(), spa_auth_server(mode) as port:
+                ws = self._workspace(port)
+                credentials.save_credential(
+                    ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+                )
+                credentials.save_auth_profile(
+                    ws.slug, "primary", self._status_profile(port, timeout=5)
+                )
+
+                result = dispatch(
+                    ws, "credential_browser_login", {"credential": "primary"}
+                )
+
+                self.assertFalse(result["ok"], result)
+                self.assertIn(reason, result["summary"])
+                self.assertFalse(result["data"]["session"]["established"])
+                self.assertEqual(_SpaAuthHandler.login_posts, 1)
 
     def test_spa_login_proves_and_persists_redacted_session(self):
         stored_username = "0912 345-6789"
@@ -568,6 +730,7 @@ class BrowserCredentialTests(unittest.TestCase):
             schema["properties"]["verify_headers"]["additionalProperties"],
             {"type": "string"},
         )
+        self.assertNotIn("verification", schema["properties"])
         with isolated_runtime():
             ws = Workspace("browser-schema")
             ws.create("https://example.test", "web")

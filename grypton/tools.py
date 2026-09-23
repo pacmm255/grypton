@@ -2579,6 +2579,32 @@ def _browser_auth_save_capture(workspace: Workspace, url: str, capture: dict,
     return output, flow
 
 
+def _browser_auth_url_identity(url: str) -> tuple[str, str, str, str]:
+    parsed = urlsplit(str(url or ""))
+    return (
+        credentials.normalize_origin(url), parsed.path or "/",
+        parsed.query, parsed.fragment,
+    )
+
+
+def _browser_auth_url_matches(observed: str, expected: str) -> bool:
+    try:
+        return _browser_auth_url_identity(observed) == _browser_auth_url_identity(
+            expected
+        )
+    except (ValueError, credentials.CredentialError):
+        return False
+
+
+def _browser_auth_was_redirected(response) -> bool:
+    if response is None:
+        return False
+    try:
+        return response.request.redirected_from is not None
+    except Exception:
+        return False
+
+
 def _browser_auth_fresh_probe(
     playwright,
     executable: str,
@@ -2632,6 +2658,7 @@ def _browser_auth_fresh_probe(
             return {
                 "status": status,
                 "final_url": final_url,
+                "redirected": _browser_auth_was_redirected(response),
                 "body": body,
                 "source": "\n".join((body, visible, dom)),
                 "cookies": list(context.cookies()),
@@ -2653,6 +2680,7 @@ def credential_browser_login(
     verify_url: str = "",
     success_marker: str = "",
     verify_headers: Optional[dict] = None,
+    verification: Optional[dict] = None,
     timeout: int = 45,
 ) -> dict:
     """Submit one private credential through a scoped rendered login form."""
@@ -2665,11 +2693,28 @@ def credential_browser_login(
             return blocked
     try:
         login_origin = credentials.normalize_origin(url)
-        if not verify_url or not success_marker:
-            return _err(
-                "Browser login requires a scoped verification URL and a printable "
-                "non-secret success marker."
+        status_verification = None
+        if verification is None:
+            if not verify_url or not success_marker:
+                return _err(
+                    "Browser login requires a scoped verification URL and a printable "
+                    "non-secret success marker."
+                )
+        else:
+            if success_marker:
+                return _err(
+                    "Status-differential browser verification cannot use a success marker."
+                )
+            status_verification = credentials.validate_browser_verification(
+                verification, login_url=url
             )
+            blocked = _scope_error(
+                workspace, status_verification["expected_post_login_url"]
+            )
+            if blocked:
+                return blocked
+            if not verify_url:
+                return _err("Browser login requires a scoped verification URL.")
         if verify_url and credentials.normalize_origin(verify_url) != login_origin:
             return _err(
                 "The browser verification endpoint must use the login page's "
@@ -2687,7 +2732,7 @@ def credential_browser_login(
         submit_selector = _browser_auth_selector(
             submit_selector, label="Submit", default=_BROWSER_SUBMIT_SELECTOR
         )
-        if (
+        if success_marker and (
             len(success_marker) > 200
             or any(ord(char) < 0x20 for char in success_marker)
         ):
@@ -2701,6 +2746,13 @@ def credential_browser_login(
         credentials.ensure_login_attempt_available(workspace.slug, credential)
     except (ValueError, credentials.CredentialError) as exc:
         return _err(str(exc))
+
+    status_mode = status_verification is not None
+    expected_post_login_identity = (
+        _browser_auth_url_identity(
+            status_verification["expected_post_login_url"]
+        ) if status_mode else None
+    )
 
     try:
         from playwright.sync_api import sync_playwright
@@ -2729,14 +2781,18 @@ def credential_browser_login(
     final_url = url
     page_status = 0
     verify_status = 0
+    verify_final_url = ""
+    verify_redirected = False
     verify_source = ""
     verify_body = ""
     replay_status = 0
     replay_source = ""
     replay_final_url = ""
+    replay_redirected = False
     control_status = 0
     control_source = ""
     control_final_url = ""
+    control_redirected = False
     cookies: list[dict] = []
     observed_cookie_sets: list[list[dict]] = []
     local_storage: dict = {}
@@ -2746,6 +2802,9 @@ def credential_browser_login(
     replay_body = ""
     control_body = ""
     material_delta = False
+    login_material_delta = False
+    matched_submission_count = 0
+    matched_submission_status = 0
     browser_identity = ""
     attempt = 0
     blocker = ""
@@ -2839,12 +2898,26 @@ def credential_browser_login(
                         submit.click(timeout=timeout_ms)
                         deadline = time.monotonic() + timeout_seconds
                         while time.monotonic() < deadline:
-                            if any(
+                            submission_seen = any(
                                 item.get("matches_submission") is True
                                 for item in pending_responses
                                 if not item.get("error")
-                            ):
-                                break
+                            )
+                            if submission_seen:
+                                if not status_mode:
+                                    break
+                                try:
+                                    terminal_seen = (
+                                        _browser_auth_url_identity(page.url)
+                                        == expected_post_login_identity
+                                    )
+                                except (ValueError, credentials.CredentialError):
+                                    terminal_seen = False
+                                if terminal_seen:
+                                    # Keep the response-stage listener alive briefly
+                                    # so duplicate credential submissions are observed.
+                                    page.wait_for_timeout(250)
+                                    break
                             page.wait_for_timeout(100)
                     except Exception as exc:
                         failure = (
@@ -2872,6 +2945,26 @@ def credential_browser_login(
                             pending_responses, workspace, secret_values
                         )
                     )
+                    matched_submissions = [
+                        item for item in pending_responses
+                        if isinstance(item, dict)
+                        and not item.get("error")
+                        and item.get("matches_submission") is True
+                    ]
+                    matched_submission_count = len(matched_submissions)
+                    if matched_submission_count == 1:
+                        matched_submission_status = int(
+                            matched_submissions[0].get("status") or 0
+                        )
+                    if status_mode:
+                        raw_response_bodies = [
+                            str(item.get("body") or "")[:MAX_RESPONSE_BYTES]
+                            for item in matched_submissions
+                        ]
+                        response_statuses = [
+                            int(item.get("status") or 0)
+                            for item in matched_submissions
+                        ]
                     identity_sources.extend(
                         str(item.get("body") or "")
                         for item in pending_responses
@@ -2894,6 +2987,17 @@ def credential_browser_login(
                     )
                     observed_cookie_sets.append(cookies)
                     observed_token_sets.append(tokens)
+                    login_changed_cookie = _browser_auth_has_cookie_delta(
+                        baseline_cookies, cookies
+                    )
+                    baseline_token_values = set(baseline_tokens.values())
+                    login_changed_token = any(
+                        value not in baseline_token_values
+                        for value in tokens.values()
+                    )
+                    login_material_delta = (
+                        login_changed_cookie or login_changed_token
+                    )
                     if not blocker:
                         phase["name"] = "verify"
                         verify_header_state["active"] = True
@@ -2903,6 +3007,10 @@ def credential_browser_login(
                         page.wait_for_timeout(250)
                         verify_status = int(verify_response.status) if verify_response else 0
                         verify_final, verify_dom, verify_visible = _browser_auth_snapshot(page)
+                        verify_final_url = verify_final
+                        verify_redirected = _browser_auth_was_redirected(
+                            verify_response
+                        )
                         verify_allowed, verify_reason = check_url_scope(
                             workspace, verify_final
                         )
@@ -2934,7 +3042,6 @@ def credential_browser_login(
                         changed_cookie = _browser_auth_has_cookie_delta(
                             baseline_cookies, cookies
                         )
-                        baseline_token_values = set(baseline_tokens.values())
                         changed_token = any(
                             value not in baseline_token_values
                             for value in tokens.values()
@@ -2944,7 +3051,10 @@ def credential_browser_login(
                     context.close()
                     context = None
 
-                    if not blocker and material_delta:
+                    replay_material_ready = (
+                        login_material_delta if status_mode else material_delta
+                    )
+                    if not blocker and replay_material_ready:
                         phase["name"] = "replay"
                         replay = _browser_auth_fresh_probe(
                             playwright, executable, workspace, verify_url,
@@ -2959,6 +3069,7 @@ def credential_browser_login(
                         replay_body = str(replay.get("body") or "")
                         identity_sources.append(replay_body)
                         replay_final_url = str(replay.get("final_url") or "")
+                        replay_redirected = bool(replay.get("redirected"))
                         replay_cookies = _browser_auth_persistable_cookies(
                             list(replay.get("cookies") or []), url
                         )
@@ -2985,6 +3096,7 @@ def credential_browser_login(
                         control_body = str(control.get("body") or "")
                         identity_sources.append(control_body)
                         control_final_url = str(control.get("final_url") or "")
+                        control_redirected = bool(control.get("redirected"))
                         observed_cookie_sets.append(
                             _browser_auth_persistable_cookies(
                                 list(control.get("cookies") or []), url
@@ -3016,6 +3128,27 @@ def credential_browser_login(
         and proof_status_ok
         and control_conclusive
     )
+    status_proved = bool(
+        status_mode
+        and attempt
+        and not blocker
+        and not failure
+        and login_material_delta
+        and matched_submission_count == 1
+        and matched_submission_status == status_verification["login_status"]
+        and _browser_auth_url_matches(
+            final_url, status_verification["expected_post_login_url"]
+        )
+        and verify_status == status_verification["authenticated_status"]
+        and not verify_redirected
+        and _browser_auth_url_matches(verify_final_url, verify_url)
+        and replay_status == status_verification["authenticated_status"]
+        and not replay_redirected
+        and _browser_auth_url_matches(replay_final_url, verify_url)
+        and control_status == status_verification["anonymous_status"]
+        and not control_redirected
+        and _browser_auth_url_matches(control_final_url, verify_url)
+    )
 
     raw_identity_values = _browser_identity_values(identity_sources)
     identity_values = tuple(sorted({
@@ -3043,7 +3176,9 @@ def credential_browser_login(
         credentials.record_login_outcome(
             workspace.slug, credential, blocked_reason=blocker
         )
-    elif attempt and not failure and material_delta and marker_proved:
+    elif attempt and not failure and (
+        status_proved if status_mode else material_delta and marker_proved
+    ):
         try:
             _browser_auth_install_cookies(
                 workspace, credential, cookies, url
@@ -3069,6 +3204,9 @@ def credential_browser_login(
     safe_replay_url = _browser_redact_identity_text(
         replay_final_url, secret_values, identity_values
     )
+    safe_verify_final_url = _browser_redact_identity_text(
+        verify_final_url, secret_values, identity_values
+    )
     safe_control_url = _browser_redact_identity_text(
         control_final_url, secret_values, identity_values
     )
@@ -3080,8 +3218,14 @@ def credential_browser_login(
         for value in denied_requests
     ]
     capture = {
+        "verification_mode": (
+            "status-differential" if status_mode else "marker"
+        ),
         "login_status": page_status,
         "final_url": safe_final_url,
+        "matched_submission_count": matched_submission_count,
+        "matched_submission_status": matched_submission_status,
+        "login_session_material": login_material_delta,
         "login_api_responses": response_rows,
         "verification": {
             "url": _browser_redact_identity_text(
@@ -3091,6 +3235,8 @@ def credential_browser_login(
                 clean_verify_headers, secret_values, identity_values
             ),
             "status": verify_status,
+            "final_url": safe_verify_final_url,
+            "redirected": verify_redirected,
             "marker_present": bool(success_marker and success_marker in verify_source),
         },
         "persisted_session_replay": {
@@ -3098,11 +3244,13 @@ def credential_browser_login(
             "final_url": safe_replay_url,
             "marker_present": bool(success_marker and success_marker in replay_source),
             "new_session_material": material_delta,
+            "redirected": replay_redirected,
         },
         "anonymous_control": {
             "status": control_status,
             "final_url": safe_control_url,
             "marker_present": bool(success_marker and success_marker in control_source),
+            "redirected": control_redirected,
         },
         "console": safe_console,
         "blocked_requests": safe_denied,
@@ -3131,8 +3279,15 @@ def credential_browser_login(
         "status": page_status,
         "final_url": safe_final_url,
         "verify_status": verify_status,
+        "verify_final_url": safe_verify_final_url,
         "replay_status": replay_status,
         "control_status": control_status,
+        "verification_mode": (
+            "status-differential" if status_mode else "marker"
+        ),
+        "matched_submission_count": matched_submission_count,
+        "matched_submission_status": matched_submission_status,
+        "login_session_material": login_material_delta,
         "login_api_responses": response_rows,
         "auth_blocker": blocker,
         "flow": str(flow),
@@ -3143,8 +3298,12 @@ def credential_browser_login(
         "session": session,
     }
     if established:
+        proof_kind = (
+            "status-differential proof" if status_mode
+            else "marker proof"
+        )
         return _ok(
-            f"Browser session {credential!r} was independently verified after "
+            f"Browser session {credential!r} passed {proof_kind} after "
             f"attempt {attempt}; secrets were not exposed.",
             data,
         )
@@ -3165,7 +3324,32 @@ def credential_browser_login(
             + f" Capture saved to {flow.name}.",
             data,
         )
-    if not material_delta:
+    if status_mode:
+        if matched_submission_count != 1:
+            reason = "exactly one credential submission response was not observed"
+        elif matched_submission_status != status_verification["login_status"]:
+            reason = "the credential submission status did not match the profile"
+        elif not _browser_auth_url_matches(
+            final_url, status_verification["expected_post_login_url"]
+        ):
+            reason = "the passive post-login URL did not match the profile"
+        elif not login_material_delta:
+            reason = "the login did not produce new reusable session material"
+        elif (
+            verify_status != status_verification["authenticated_status"]
+            or verify_redirected
+            or not _browser_auth_url_matches(verify_final_url, verify_url)
+        ):
+            reason = "live verification did not match the configured status and URL"
+        elif (
+            replay_status != status_verification["authenticated_status"]
+            or replay_redirected
+            or not _browser_auth_url_matches(replay_final_url, verify_url)
+        ):
+            reason = "the persisted session replay did not match the configured status and URL"
+        else:
+            reason = "the anonymous control did not match the configured status and URL"
+    elif not material_delta:
         reason = "no new reusable cookie or bearer session material was produced"
     elif success_marker not in replay_source:
         reason = "the persisted session replay did not contain the success marker"

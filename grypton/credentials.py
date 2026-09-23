@@ -359,6 +359,68 @@ def _profile_headers(
     return result
 
 
+def validate_browser_verification(value: object, *, login_url: str) -> dict:
+    """Validate the private status-differential browser proof contract."""
+    verification = _profile_object(value, label="browser verification settings")
+    required = {
+        "mode", "login_status", "authenticated_status", "anonymous_status",
+        "expected_post_login_url",
+    }
+    _reject_unknown_keys(
+        verification, required, label="browser verification settings"
+    )
+    missing = sorted(required.difference(verification))
+    if missing:
+        raise CredentialError(
+            "browser verification settings are incomplete"
+        )
+    if verification.get("mode") != "status-differential":
+        raise CredentialError(
+            "browser verification mode must be status-differential"
+        )
+
+    login_status = verification.get("login_status")
+    authenticated_status = verification.get("authenticated_status")
+    anonymous_status = verification.get("anonymous_status")
+    if (
+        isinstance(login_status, bool) or not isinstance(login_status, int)
+        or not 200 <= login_status <= 299
+    ):
+        raise CredentialError("browser login status must be an exact 2xx status")
+    if (
+        isinstance(authenticated_status, bool)
+        or not isinstance(authenticated_status, int)
+        or not (
+            200 <= authenticated_status <= 299
+            or 400 <= authenticated_status <= 499
+        )
+        or authenticated_status in {401, 403, 429}
+    ):
+        raise CredentialError(
+            "browser authenticated status must be 2xx or 4xx except 401, 403, or 429"
+        )
+    if (
+        isinstance(anonymous_status, bool)
+        or anonymous_status not in {401, 403}
+    ):
+        raise CredentialError("browser anonymous status must be exactly 401 or 403")
+    expected_url = _profile_url(
+        verification.get("expected_post_login_url"),
+        label="expected post-login URL",
+    )
+    if normalize_origin(expected_url) != normalize_origin(login_url):
+        raise CredentialError(
+            "expected post-login URL must use the login page's exact origin"
+        )
+    return {
+        "mode": "status-differential",
+        "login_status": login_status,
+        "authenticated_status": authenticated_status,
+        "anonymous_status": anonymous_status,
+        "expected_post_login_url": expected_url,
+    }
+
+
 def validate_auth_profile(profile: object) -> dict:
     """Return a canonical private auth profile after strict validation."""
     value = _profile_object(profile, label="authentication profile")
@@ -378,9 +440,6 @@ def validate_auth_profile(profile: object) -> dict:
         raise CredentialError(
             "authentication profile URLs must use the same exact origin"
         )
-    success_marker = _profile_text(
-        value.get("success_marker"), label="success marker", maximum=200
-    )
     transform = value.get("username_transform", "stored")
     if transform not in _USERNAME_TRANSFORMS:
         raise CredentialError("username transform must be stored or iran-e164")
@@ -396,7 +455,6 @@ def validate_auth_profile(profile: object) -> dict:
         "strategy": strategy,
         "login_url": login_url,
         "verify_url": verify_url,
-        "success_marker": success_marker,
         "username_transform": transform,
         "timeout": timeout,
     }
@@ -406,9 +464,19 @@ def validate_auth_profile(profile: object) -> dict:
         browser = _profile_object(value.get("browser"), label="browser settings")
         _reject_unknown_keys(browser, {
             "username_selector", "password_selector", "submit_selector",
-            "verify_headers",
+            "verify_headers", "verification",
         }, label="browser settings")
-        canonical["browser"] = {
+        verification = browser.get("verification")
+        if verification is None:
+            canonical["success_marker"] = _profile_text(
+                value.get("success_marker"), label="success marker", maximum=200
+            )
+        else:
+            if "success_marker" in value:
+                raise CredentialError(
+                    "status-differential browser profiles must omit success marker"
+                )
+        canonical_browser = {
             "username_selector": _profile_text(
                 browser.get("username_selector"), label="username selector", maximum=500
             ),
@@ -424,9 +492,17 @@ def validate_auth_profile(profile: object) -> dict:
                 maximum=32,
             ),
         }
+        if verification is not None:
+            canonical_browser["verification"] = validate_browser_verification(
+                verification, login_url=login_url
+            )
+        canonical["browser"] = canonical_browser
     else:
         if value.get("browser") is not None:
             raise CredentialError("HTTP authentication profile cannot contain browser settings")
+        canonical["success_marker"] = _profile_text(
+            value.get("success_marker"), label="success marker", maximum=200
+        )
         http = _profile_object(value.get("http"), label="HTTP settings")
         _reject_unknown_keys(http, {
             "encoding", "username_field", "password_field", "fields", "headers",

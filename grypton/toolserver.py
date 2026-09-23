@@ -150,8 +150,13 @@ def _profiled_auth_login(ws: Workspace, requested: str,
         requested, effective, configured=True,
         revision=credentials.auth_profile_revision(profile),
     )
-    for field in ("login_url", "verify_url"):
-        allowed, _ = tools.check_url_scope(ws, profile[field])
+    scoped_urls = [profile["login_url"], profile["verify_url"]]
+    if profile["strategy"] == "browser":
+        verification = profile["browser"].get("verification")
+        if isinstance(verification, dict):
+            scoped_urls.append(verification["expected_post_login_url"])
+    for candidate in scoped_urls:
+        allowed, _ = tools.check_url_scope(ws, candidate)
         if not allowed:
             return _with_auth_dispatch({
                 "ok": False,
@@ -162,16 +167,21 @@ def _profiled_auth_login(ws: Workspace, requested: str,
 
     if profile["strategy"] == "browser":
         browser = profile["browser"]
+        browser_args = {
+            "credential": credential,
+            "username_transform": profile["username_transform"],
+            "username_selector": browser["username_selector"],
+            "password_selector": browser["password_selector"],
+            "submit_selector": browser["submit_selector"],
+            "verify_url": profile["verify_url"],
+            "success_marker": profile.get("success_marker", ""),
+            "verify_headers": browser["verify_headers"],
+            "timeout": profile["timeout"],
+        }
+        if browser.get("verification") is not None:
+            browser_args["verification"] = browser["verification"]
         result = tools.credential_browser_login(
-            ws, profile["login_url"], credential=credential,
-            username_transform=profile["username_transform"],
-            username_selector=browser["username_selector"],
-            password_selector=browser["password_selector"],
-            submit_selector=browser["submit_selector"],
-            verify_url=profile["verify_url"],
-            success_marker=profile["success_marker"],
-            verify_headers=browser["verify_headers"],
-            timeout=profile["timeout"],
+            ws, profile["login_url"], **browser_args
         )
     else:
         http = profile["http"]
@@ -198,6 +208,15 @@ def _auth_login(ws: Workspace, args: dict, *, requested: str) -> dict:
             profile = credentials.load_auth_profile_optional(
                 ws.slug, credential
             )
+            if not configured and profile is None:
+                result = (
+                    _browser_login_from_args(ws, args)
+                    if requested == "credential_browser_login"
+                    else _http_login_from_args(ws, args)
+                )
+                return _with_auth_dispatch(result, _auth_dispatch_metadata(
+                    requested, requested, configured=False
+                ))
     except credentials.CredentialError:
         metadata = _auth_dispatch_metadata(
             requested, "", configured=configured
@@ -219,14 +238,10 @@ def _auth_login(ws: Workspace, args: dict, *, requested: str) -> dict:
         ))
     if profile is not None:
         return _profiled_auth_login(ws, requested, credential, profile)
-    result = (
-        _browser_login_from_args(ws, args)
-        if requested == "credential_browser_login"
-        else _http_login_from_args(ws, args)
-    )
-    return _with_auth_dispatch(result, _auth_dispatch_metadata(
-        requested, requested, configured=False
-    ))
+    return _with_auth_dispatch({
+        "ok": False,
+        "summary": "Configured authentication profile is unavailable; retry later.",
+    }, _auth_dispatch_metadata(requested, "", configured=True))
 
 
 def _credential_login(ws, args):

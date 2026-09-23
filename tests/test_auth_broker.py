@@ -71,7 +71,80 @@ def http_profile(origin: str) -> dict:
     }
 
 
+def status_browser_profile(origin: str) -> dict:
+    value = browser_profile(origin)
+    value.pop("success_marker")
+    value["browser"]["verification"] = {
+        "mode": "status-differential",
+        "login_status": 200,
+        "authenticated_status": 200,
+        "anonymous_status": 401,
+        "expected_post_login_url": origin + "/private-home-path",
+    }
+    return value
+
+
 class AuthBrokerTests(unittest.TestCase):
+    def test_status_profile_routes_both_aliases_with_private_internal_contract(self):
+        origin = "https://app.example.test"
+        with isolated_runtime():
+            ws = self._workspace(origin)
+            profile = credentials.save_auth_profile(
+                ws.slug, "primary", status_browser_profile(origin)
+            )
+            revision = credentials.auth_profile_revision(profile)
+            with (
+                patch("grypton.toolserver.tools.credential_browser_login") as browser,
+                patch("grypton.toolserver.tools.credential_login") as http,
+            ):
+                browser.return_value = {
+                    "ok": True, "summary": "status delegated", "data": {}
+                }
+                for requested in ("credential_login", "credential_browser_login"):
+                    with self.subTest(requested=requested):
+                        browser.reset_mock()
+                        result = dispatch(ws, requested, self._wrong_transport_args())
+                        self.assertTrue(result["ok"], result)
+                        browser.assert_called_once_with(
+                            ws, profile["login_url"], credential="primary",
+                            username_transform=profile["username_transform"],
+                            username_selector=profile["browser"]["username_selector"],
+                            password_selector=profile["browser"]["password_selector"],
+                            submit_selector=profile["browser"]["submit_selector"],
+                            verify_url=profile["verify_url"], success_marker="",
+                            verify_headers=profile["browser"]["verify_headers"],
+                            verification=profile["browser"]["verification"],
+                            timeout=profile["timeout"],
+                        )
+                        http.assert_not_called()
+                        self._assert_dispatch(
+                            result, requested, "credential_browser_login", revision
+                        )
+
+    def test_status_profile_terminal_url_is_scope_checked_before_delegate(self):
+        origin = "https://app.example.test"
+        with isolated_runtime():
+            ws = self._workspace(origin)
+            credentials.save_auth_profile(
+                ws.slug, "primary", status_browser_profile(origin)
+            )
+            ws.save_constraints(Constraints(in_scope=[
+                origin + "/private-login-path",
+                origin + "/private-profile-path",
+            ]))
+            with patch(
+                "grypton.toolserver.tools.credential_browser_login"
+            ) as browser:
+                result = dispatch(
+                    ws, "credential_login", {"credential": "primary"}
+                )
+            self.assertFalse(result["ok"], result)
+            self.assertIn("outside the engagement scope", result["summary"])
+            browser.assert_not_called()
+            self.assertEqual(
+                credentials.session_status(ws.slug, "primary")["attempts"], 0
+            )
+
     def _workspace(self, origin: str = "https://app.example.test") -> Workspace:
         ws = Workspace("auth-broker-test")
         ws.create(origin, "web")
@@ -432,11 +505,68 @@ class AuthBrokerTests(unittest.TestCase):
                 "credential_browser_login",
             )
 
+    def test_absent_profile_snapshot_holds_lock_through_legacy_delegate(self):
+        origin = "https://app.example.test"
+        with isolated_runtime():
+            ws = self._workspace(origin)
+            legacy_entered = threading.Event()
+            allow_legacy_return = threading.Event()
+            save_finished = threading.Event()
+            errors: list[BaseException] = []
+
+            def legacy(*_args, **_kwargs):
+                legacy_entered.set()
+                if not allow_legacy_return.wait(5):
+                    raise RuntimeError("timed out waiting to release legacy call")
+                return {"ok": True, "summary": "legacy", "data": {}}
+
+            def run_broker():
+                try:
+                    dispatch(ws, "credential_login", {
+                        "credential": "primary",
+                        "url": origin + "/legacy-login",
+                        "verify_url": origin + "/legacy-verify",
+                        "success_marker": "legacy-marker",
+                    })
+                except BaseException as exc:
+                    errors.append(exc)
+
+            def save_profile():
+                try:
+                    credentials.save_auth_profile(
+                        ws.slug, "primary", browser_profile(origin)
+                    )
+                    save_finished.set()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with patch(
+                "grypton.toolserver.tools.credential_login", side_effect=legacy
+            ):
+                broker = threading.Thread(target=run_broker, daemon=True)
+                broker.start()
+                self.assertTrue(legacy_entered.wait(5))
+                saver = threading.Thread(target=save_profile, daemon=True)
+                saver.start()
+                self.assertFalse(save_finished.wait(0.2))
+                allow_legacy_return.set()
+                broker.join(5)
+                saver.join(5)
+
+            self.assertFalse(broker.is_alive())
+            self.assertFalse(saver.is_alive())
+            self.assertEqual(errors, [])
+            self.assertTrue(save_finished.is_set())
+            self.assertIsNotNone(
+                credentials.load_auth_profile_optional(ws.slug, "primary")
+            )
+
     def test_public_schemas_require_only_alias_and_all_tools_remain_visible(self):
         for name in ("credential_login", "credential_browser_login"):
             description, schema, _ = REGISTRY[name]
             self.assertEqual(schema["required"], ["credential"])
             self.assertIn("named private credential", description)
+            self.assertNotIn("verification", schema["properties"])
 
         with isolated_runtime():
             ws = Workspace("auth-broker-schema")
