@@ -5,6 +5,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import sys
 import time
 from typing import Callable
@@ -82,9 +83,43 @@ def _credential_status(ws, args):
     return tools.credential_status(ws, args.get("credential", ""))
 
 
-def _credential_login(ws, args):
+def _auth_dispatch_metadata(requested: str, effective: str, *,
+                            configured: bool, revision: str = "") -> dict:
+    return {
+        "requested_tool": requested,
+        "effective_tool": effective,
+        "profile_configured": bool(configured),
+        "profile_revision": str(revision or ""),
+    }
+
+
+def _with_auth_dispatch(result: dict, metadata: dict) -> dict:
+    output = dict(result) if isinstance(result, dict) else {
+        "ok": False, "summary": "Authentication dispatch returned an invalid result."
+    }
+    data = output.get("data")
+    if not isinstance(data, dict):
+        data = {} if data is None else {"result": data}
+    else:
+        data = dict(data)
+    data["auth_dispatch"] = metadata
+    output["data"] = data
+    return output
+
+
+def _profile_configured_hint(ws: Workspace, credential: object) -> bool:
+    try:
+        path = credentials.auth_profile_path(ws.slug, str(credential or ""))
+    except credentials.CredentialError:
+        return False
+    return path.exists() or path.is_symlink()
+
+
+def _http_login_from_args(ws: Workspace, args: dict) -> dict:
     return tools.credential_login(
-        ws, args["url"], credential=args["credential"], verify_url=args["verify_url"], success_marker=args["success_marker"],
+        ws, args.get("url", ""), credential=args.get("credential", ""),
+        verify_url=args.get("verify_url", ""),
+        success_marker=args.get("success_marker", ""),
         username_field=args.get("username_field", "username"),
         password_field=args.get("password_field", "password"),
         username_transform=args.get("username_transform", "stored"),
@@ -93,9 +128,9 @@ def _credential_login(ws, args):
     )
 
 
-def _credential_browser_login(ws, args):
+def _browser_login_from_args(ws: Workspace, args: dict) -> dict:
     return tools.credential_browser_login(
-        ws, args["url"], credential=args["credential"],
+        ws, args.get("url", ""), credential=args.get("credential", ""),
         username_transform=args.get("username_transform", "stored"),
         username_selector=args.get(
             "username_selector", "[data-testid='login-username']"
@@ -111,6 +146,105 @@ def _credential_browser_login(ws, args):
         verify_headers=args.get("verify_headers"),
         timeout=args.get("timeout", 45),
     )
+
+
+def _profiled_auth_login(ws: Workspace, requested: str,
+                         credential: object, profile: dict) -> dict:
+    effective = (
+        "credential_browser_login"
+        if profile["strategy"] == "browser" else "credential_login"
+    )
+    metadata = _auth_dispatch_metadata(
+        requested, effective, configured=True,
+        revision=credentials.auth_profile_revision(profile),
+    )
+    for field in ("login_url", "verify_url"):
+        allowed, _ = tools.check_url_scope(ws, profile[field])
+        if not allowed:
+            return _with_auth_dispatch({
+                "ok": False,
+                "summary": (
+                    "Configured authentication profile is outside the engagement scope."
+                ),
+            }, metadata)
+
+    if profile["strategy"] == "browser":
+        browser = profile["browser"]
+        result = tools.credential_browser_login(
+            ws, profile["login_url"], credential=credential,
+            username_transform=profile["username_transform"],
+            username_selector=browser["username_selector"],
+            password_selector=browser["password_selector"],
+            submit_selector=browser["submit_selector"],
+            verify_url=profile["verify_url"],
+            success_marker=profile["success_marker"],
+            verify_headers=browser["verify_headers"],
+            timeout=profile["timeout"],
+        )
+    else:
+        http = profile["http"]
+        result = tools.credential_login(
+            ws, profile["login_url"], credential=credential,
+            verify_url=profile["verify_url"],
+            success_marker=profile["success_marker"],
+            username_field=http["username_field"],
+            password_field=http["password_field"],
+            username_transform=profile["username_transform"],
+            encoding=http["encoding"], fields=http["fields"],
+            headers=http["headers"], timeout=profile["timeout"],
+        )
+    return _with_auth_dispatch(result, metadata)
+
+
+def _auth_login(ws: Workspace, args: dict, *, requested: str) -> dict:
+    credential = str(args.get("credential") or "")
+    configured_hint = _profile_configured_hint(ws, credential)
+    try:
+        profile = credentials.load_auth_profile_optional(
+            ws.slug, credential
+        )
+    except credentials.CredentialError:
+        configured_hint = configured_hint or _profile_configured_hint(
+            ws, credential
+        )
+        metadata = _auth_dispatch_metadata(
+            requested, "", configured=configured_hint
+        )
+        return _with_auth_dispatch({
+            "ok": False,
+            "summary": (
+                "Configured authentication profile is invalid; replace or clear it."
+                if configured_hint else "Credential alias is invalid."
+            ),
+        }, metadata)
+
+    if profile is None and (
+        configured_hint or _profile_configured_hint(ws, credential)
+    ):
+        return _with_auth_dispatch({
+            "ok": False,
+            "summary": "Configured authentication profile is unavailable; retry later.",
+        }, _auth_dispatch_metadata(
+            requested, "", configured=True
+        ))
+    if profile is not None:
+        return _profiled_auth_login(ws, requested, credential, profile)
+    result = (
+        _browser_login_from_args(ws, args)
+        if requested == "credential_browser_login"
+        else _http_login_from_args(ws, args)
+    )
+    return _with_auth_dispatch(result, _auth_dispatch_metadata(
+        requested, requested, configured=False
+    ))
+
+
+def _credential_login(ws, args):
+    return _auth_login(ws, args, requested="credential_login")
+
+
+def _credential_browser_login(ws, args):
+    return _auth_login(ws, args, requested="credential_browser_login")
 
 
 def _authenticated_http(ws, args):
@@ -179,8 +313,8 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
         "List named credential aliases and session state metadata.",
         _object({"credential": _string("Optional credential alias")}), _credential_status),
     "credential_login": (
-        "Warm a scoped cookie gate, submit a named private credential to its "
-        "login endpoint, and verify the resulting session.",
+        "Authenticate with a named private credential and capture the resulting "
+        "application behavior.",
         _object({
             "url": _string("In-scope login endpoint"),
             "credential": _string("Credential alias"),
@@ -197,10 +331,10 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
             "fields": {"type": "object", "additionalProperties": {"type": "string"}},
             "headers": {"type": "object", "additionalProperties": {"type": "string"}},
             "timeout": {"type": "integer", "minimum": 1, "maximum": 120},
-        }, ("url", "credential", "verify_url", "success_marker")), _credential_login),
+        }, ("credential",)), _credential_login),
     "credential_browser_login": (
-        "Submit a named private credential through one scoped rendered login "
-        "form and capture the resulting application behavior.",
+        "Authenticate with a named private credential and capture the resulting "
+        "application behavior.",
         _object({
             "url": _string("In-scope rendered login page"),
             "credential": _string("Credential alias"),
@@ -230,7 +364,7 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
                 "description": "Same-origin protocol headers for session proof",
             },
             "timeout": {"type": "integer", "minimum": 5, "maximum": 120},
-        }, ("url", "credential", "verify_url", "success_marker")),
+        }, ("credential",)),
         _credential_browser_login),
     "authenticated_http_request": (
         "Send one scoped request with a named private cookie/bearer session and a sanitized capture.",
@@ -426,6 +560,28 @@ def _audit_secret_values(workspace: Workspace, name: str, args: dict) -> tuple[s
     return tools._serialized_secret_variants(values)
 
 
+def _audit_auth_dispatch(name: str, result: dict) -> dict | None:
+    if name not in {"credential_login", "credential_browser_login"}:
+        return None
+    data = result.get("data") if isinstance(result, dict) else None
+    value = data.get("auth_dispatch") if isinstance(data, dict) else None
+    if not isinstance(value, dict):
+        return None
+    requested = str(value.get("requested_tool") or "")
+    effective = str(value.get("effective_tool") or "")
+    revision = str(value.get("profile_revision") or "")
+    allowed_tools = {"", "credential_login", "credential_browser_login"}
+    if (requested not in allowed_tools or effective not in allowed_tools
+            or (revision and not re.fullmatch(r"[0-9a-f]{12}", revision))):
+        return None
+    return {
+        "requested_tool": requested,
+        "effective_tool": effective,
+        "profile_configured": bool(value.get("profile_configured")),
+        "profile_revision": revision,
+    }
+
+
 def dispatch(workspace: Workspace, name: str, args: dict) -> dict:
     started = time.time()
     if name not in REGISTRY:
@@ -458,12 +614,16 @@ def dispatch(workspace: Workspace, name: str, args: dict) -> dict:
                 result = {"ok": False, "summary": f"{name} failed: {exc}"}
     try:
         audit_secrets = _audit_secret_values(workspace, name, args or {})
-        append_jsonl(workspace.root / ".ledger" / "tool-calls.jsonl", {
+        audit_row = {
             "at": time.time(), "tool": name,
             "args": _redacted(args or {}, audit_secrets),
             "ok": bool(result.get("ok")), "summary": result.get("summary", "")[:1000],
             "duration_s": round(time.time() - started, 3),
-        })
+        }
+        auth_dispatch = _audit_auth_dispatch(name, result)
+        if auth_dispatch is not None:
+            audit_row["auth_dispatch"] = auth_dispatch
+        append_jsonl(workspace.root / ".ledger" / "tool-calls.jsonl", audit_row)
     except OSError:
         pass
     return result

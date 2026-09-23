@@ -558,7 +558,7 @@ class BrowserCredentialTests(unittest.TestCase):
         self.assertIn("private credential", description)
         self.assertEqual(
             schema["required"],
-            ["url", "credential", "verify_url", "success_marker"],
+            ["credential"],
         )
         self.assertEqual(
             schema["properties"]["username_transform"]["enum"],
