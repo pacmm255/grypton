@@ -510,7 +510,9 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
         _object({"domain": _string("In-scope base domain"), "timeout": {"type": "integer"}}, ("domain",)),
         lambda ws, a: tools.subdomain_enum(ws, a["domain"], timeout=a.get("timeout", 180))),
     "local_analyze": ("Inspect or search one regular file inside this engagement with bounded output.",
-        _object({"path": _string("Relative engagement file path"),
+        _object({"path": _string(
+                    "Engagement-relative path, OpenCode engagement/... alias, or exact in-workspace absolute path"
+                 ),
                  "analyzer": {"type": "string", "enum": ["file", "strings", "sha256", "literal", "regex"]},
                  "min_length": {"type": "integer", "minimum": 4, "maximum": 64},
                  "pattern": _string("Required literal text or byte-oriented regular expression for search analyzers"),

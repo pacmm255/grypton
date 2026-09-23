@@ -924,7 +924,21 @@ class ToolTests(unittest.TestCase):
             hashed = local_analyze(ws, "loot/sample.bin", analyzer="sha256")
             self.assertTrue(hashed["ok"], hashed)
             self.assertEqual(len(hashed["data"]["sha256"]), 64)
+            transport_alias = local_analyze(
+                ws, "engagement/loot/sample.bin", analyzer="sha256"
+            )
+            self.assertTrue(transport_alias["ok"], transport_alias)
+            self.assertEqual(transport_alias["data"]["path"], "loot/sample.bin")
+            absolute_inside = local_analyze(ws, str(artifact), analyzer="sha256")
+            self.assertTrue(absolute_inside["ok"], absolute_inside)
+            self.assertEqual(absolute_inside["data"]["path"], "loot/sample.bin")
             self.assertFalse(local_analyze(ws, "../outside", analyzer="sha256")["ok"])
+            self.assertFalse(local_analyze(
+                ws, str(ws.root.parent / "outside.bin"), analyzer="sha256"
+            )["ok"])
+            self.assertFalse(local_analyze(
+                ws, "engagement/../outside", analyzer="sha256"
+            )["ok"])
             link = ws.loot_dir / "link.bin"
             link.symlink_to(artifact)
             self.assertFalse(local_analyze(ws, "loot/link.bin", analyzer="sha256")["ok"])

@@ -875,8 +875,11 @@ capture was truncated.
 `local_analyze` performs `file`, `strings`, SHA-256, literal search, or
 byte-oriented regular-expression search. Its input
 must be a regular file of at most 64 MB inside the engagement workspace. It
-rejects absolute paths, path traversal, symlinks, unsupported analyzers, and
-oversized output. Searches return byte offsets, one-based line numbers,
+accepts a workspace-relative path, OpenCode's exact `engagement/` alias, or the
+exact absolute engagement prefix. Every form is reduced to a relative path and
+opened component by component without following symlinks. Paths outside the
+engagement, traversal, symlinks, unsupported analyzers, and oversized output
+are rejected. Searches return byte offsets, one-based line numbers,
 zero-based byte offsets within each line, and small context windows. Match
 count, context size, match previews, total returned context, and regex runtime
 are capped, so a match in a single-line minified bundle cannot flood the model.

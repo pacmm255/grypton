@@ -4710,6 +4710,28 @@ def install_tool(spec: str, *, manager: str = "auto", timeout: int = 900) -> dic
     return _ok(f"Installed curated package {spec!r} with apt.")
 
 
+def _workspace_relative_file_path(workspace: Workspace, path: str) -> str:
+    """Translate transport-visible workspace paths to the canonical relative form.
+
+    OpenCode runs from a private transport directory where the engagement is
+    exposed as ``engagement/``. Kraude can therefore copy either that alias or
+    the exact absolute engagement path from a tool result. Normalize only those
+    two representations; the component-by-component no-symlink opener remains
+    the authority for traversal and file-type checks.
+    """
+    raw = str(path or "").strip()
+    candidate = Path(raw)
+    if candidate.is_absolute():
+        try:
+            return str(candidate.relative_to(workspace.root))
+        except ValueError:
+            return raw
+    parts = candidate.parts
+    if parts and parts[0] == "engagement":
+        return str(Path(*parts[1:])) if len(parts) > 1 else ""
+    return raw
+
+
 def _open_workspace_regular_file(workspace: Workspace, relative_path: str) -> tuple[int, int]:
     """Open a workspace file without following any path-component symlink."""
     relative = Path(str(relative_path or ""))
@@ -4871,6 +4893,7 @@ def local_analyze(workspace: Workspace, path: str, *, analyzer: str = "file",
     analyzer = str(analyzer or "").lower()
     if analyzer not in {"file", "strings", "sha256", "literal", "regex"}:
         return _err("Analyzer must be one of: file, strings, sha256, literal, regex.")
+    path = _workspace_relative_file_path(workspace, path)
     try:
         fd, size = _open_workspace_regular_file(workspace, path)
     except (OSError, ValueError) as exc:
