@@ -40,7 +40,10 @@ def _affirmative_directive(text: str) -> str:
             clause = clause.strip()
             if clause and not _PROHIBITIVE_DIRECTIVE.match(clause):
                 parts.append(clause)
-    return " ".join(parts).strip()
+    action = " ".join(parts).strip()
+    # Spark occasionally spells the Grypton MCP prefix as "gryphon". Keep the
+    # action intact while mapping that typo to the installed tool namespace.
+    return re.sub(r"\bgryphon_(?=[a-z])", "grypton_", action, flags=re.IGNORECASE)
 
 
 @dataclass

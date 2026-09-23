@@ -1192,6 +1192,12 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(directive=directive):
                 self.assertEqual(Directive(directive=directive).worker_message(), expected)
 
+    def test_worker_handoff_normalizes_grypton_tool_prefix_typo(self):
+        self.assertEqual(
+            Directive(directive="Use gryphon_browse on the login page.").worker_message(),
+            "Use grypton_browse on the login page.",
+        )
+
     async def test_static_manager_prompt_is_not_reinjected_each_turn(self):
         with isolated_runtime():
             ws = Workspace("manager-prompt")
