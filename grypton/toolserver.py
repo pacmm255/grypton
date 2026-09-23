@@ -158,7 +158,9 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
         "List named credentials and safe session state; never returns usernames or secrets.",
         _object({"credential": _string("Optional credential alias")}), _credential_status),
     "credential_login": (
-        "Perform exactly one scoped login with a named private credential. No retries, MFA/OTP solving, or secret output.",
+        "Warm a scoped cookie gate anonymously, then perform exactly one login "
+        "with a named private credential. No credential retries, MFA/OTP solving, "
+        "or secret output.",
         _object({
             "url": _string("In-scope login endpoint"),
             "credential": _string("Credential alias"),

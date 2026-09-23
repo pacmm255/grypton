@@ -249,6 +249,32 @@ def load_attempt_state(target: str, name: str) -> dict:
         "origin": origin,
     }
 
+def _assert_login_attempt_available(state: dict) -> None:
+    if state["established"]:
+        raise CredentialError(
+            "an authenticated session already exists; use authenticated_http_request"
+        )
+    if state["blocked_reason"]:
+        raise CredentialError(
+            f"authentication is blocked: {state['blocked_reason']}; "
+            "operator action is required"
+        )
+    if state["attempts"] >= 2:
+        raise CredentialError(
+            "the two-attempt authentication budget is exhausted; "
+            "operator action is required"
+        )
+
+
+def ensure_login_attempt_available(target: str, name: str) -> None:
+    """Check the attempt budget without reserving an authentication attempt."""
+    lock_path = attempt_path(target, name).with_suffix(".lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "r+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        _assert_login_attempt_available(load_attempt_state(target, name))
+
+
 def begin_login_attempt(target: str, name: str) -> int:
     """Atomically reserve one login attempt; never retry internally."""
     lock_path = attempt_path(target, name).with_suffix(".lock")
@@ -256,18 +282,7 @@ def begin_login_attempt(target: str, name: str) -> int:
     with os.fdopen(fd, "r+", encoding="utf-8") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         state = load_attempt_state(target, name)
-        if state["established"]:
-            raise CredentialError(
-                "an authenticated session already exists; use authenticated_http_request"
-            )
-        if state["blocked_reason"]:
-            raise CredentialError(
-                f"authentication is blocked: {state['blocked_reason']}; operator action is required"
-            )
-        if state["attempts"] >= 2:
-            raise CredentialError(
-                "the two-attempt authentication budget is exhausted; operator action is required"
-            )
+        _assert_login_attempt_available(state)
         state["attempts"] += 1
         _atomic_private_json(attempt_path(target, name), {"version": 1, **state})
         return state["attempts"]
@@ -312,14 +327,18 @@ def _cookie_rows(path: Path) -> list[tuple[str, ...]]:
     return rows
 
 
-def cookie_fingerprints(target: str, name: str) -> set[str]:
-    """Return opaque identities for private cookies without exposing values."""
-    alias = _safe_name(name, label="credential name")
-    path = _session_dir(target) / (alias + ".cookies")
+def cookie_jar_fingerprints(path: Path) -> set[str]:
+    """Return opaque identities for cookies in a private Netscape jar."""
     return {
         hashlib.sha256(chr(9).join(row).encode("utf-8", "replace")).hexdigest()
         for row in _cookie_rows(path)
     }
+
+
+def cookie_fingerprints(target: str, name: str) -> set[str]:
+    """Return opaque identities for private cookies without exposing values."""
+    alias = _safe_name(name, label="credential name")
+    return cookie_jar_fingerprints(_session_dir(target) / (alias + ".cookies"))
 
 
 def session_status(target: str, name: str) -> dict[str, bool | str | int]:

@@ -676,6 +676,165 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
     return _ok(f"{status} · {method} {redact_sensitive_text(url, secrets_to_hide)} · captured {flow.name}", data)
 
 
+def _http_result_status(result: dict) -> int:
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    match = re.search(r"\b(\d{3})\b", str(data.get("status_line") or ""))
+    return int(match.group(1)) if match else 0
+
+
+def _http_result_header(result: dict, name: str) -> str:
+    """Read one response header from the final captured HTTP header block."""
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    response = str(data.get("response") or "")
+    status_starts = list(re.finditer(r"(?im)^HTTP/[^\r\n]+", response))
+    if not status_starts:
+        return ""
+    header_block = re.split(
+        r"\r?\n\r?\n", response[status_starts[-1].start():], maxsplit=1
+    )[0]
+    matches = re.findall(
+        rf"(?im)^{re.escape(name)}\s*:\s*([^\r\n]*)\r?$", header_block
+    )
+    return matches[-1].strip() if matches else ""
+
+
+def _request_url_identity(url: str) -> tuple[str, str, str]:
+    """Compare redirect destinations as requests, ignoring URL fragments."""
+    parsed = urlsplit(url)
+    return credentials.normalize_origin(url), parsed.path or "/", parsed.query
+
+
+@contextmanager
+def _temporary_cookie_jar(workspace: Workspace):
+    """Create a private short-lived cookie jar outside observable workspace state."""
+    directory = config.RUNTIME_DIR / "http-tmp" / workspace.slug
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(directory, 0o700)
+    fd, raw_path = tempfile.mkstemp(prefix=".auth-bootstrap-", suffix=".cookies", dir=directory)
+    path = Path(raw_path)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write("# Netscape HTTP Cookie File\n")
+        yield path
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def _install_cookie_jar(source: Path, destination: Path) -> None:
+    """Atomically seed the credential jar with bounded anonymous edge cookies."""
+    info = source.stat(follow_symlinks=False)
+    if not stat.S_ISREG(info.st_mode) or source.is_symlink():
+        raise credentials.CredentialError("bootstrap cookie jar is not a regular file")
+    if info.st_size > 1_000_000:
+        raise credentials.CredentialError("bootstrap cookie jar exceeded the private size limit")
+    payload = source.read_bytes()
+    temporary = destination.parent / f".{destination.name}.{time.time_ns()}.tmp"
+    fd = os.open(
+        temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600
+    )
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+        os.chmod(destination, 0o600, follow_symlinks=False)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _credential_bootstrap(workspace: Workspace, url: str, *, credential: str,
+                          cookie_jar: Path, timeout: int) -> dict:
+    """Clear a one-hop cookie gate anonymously before any credential attempt."""
+    flows: list[str] = []
+    redirect_codes = {301, 302, 303, 307, 308}
+    for request_number in range(2):
+        cookies_before = credentials.cookie_jar_fingerprints(cookie_jar)
+        response = http_request(
+            workspace, url, method="GET", timeout=timeout,
+            transport=f"credential-bootstrap:{credential}", _cookie_jar=cookie_jar,
+        )
+        data = response.get("data") if isinstance(response.get("data"), dict) else {}
+        if data.get("flow"):
+            flows.append(str(data["flow"]))
+        if not response.get("ok"):
+            response["summary"] = (
+                "Anonymous login bootstrap failed before credentials were sent: "
+                + str(response.get("summary") or "transport failure")
+            )
+            if isinstance(data, dict):
+                data["bootstrap_flows"] = flows
+            return response
+
+        status = _http_result_status(response)
+        if status in redirect_codes:
+            location = _http_result_header(response, "Location")
+            if not location:
+                return _err(
+                    "Anonymous login bootstrap stopped at a redirect without a "
+                    "Location header; credentials were not sent.",
+                    {"bootstrap_flows": flows},
+                )
+            destination = urljoin(url, location)
+            blocked = _scope_error(workspace, destination)
+            if blocked:
+                return _err(
+                    "Anonymous login bootstrap refused an out-of-scope redirect; "
+                    "credentials were not sent.",
+                    {"bootstrap_flows": flows},
+                )
+            try:
+                is_self_redirect = (
+                    _request_url_identity(destination) == _request_url_identity(url)
+                )
+            except credentials.CredentialError:
+                is_self_redirect = False
+            if not is_self_redirect:
+                return _err(
+                    "Anonymous login bootstrap stopped at a different redirect URL; "
+                    "update the login endpoint explicitly before sending credentials.",
+                    {"bootstrap_flows": flows},
+                )
+            cookies_after = credentials.cookie_jar_fingerprints(cookie_jar)
+            if not (cookies_after - cookies_before):
+                return _err(
+                    "Anonymous login bootstrap self-redirected without issuing new "
+                    "cookie state; credentials were not sent.",
+                    {"bootstrap_flows": flows},
+                )
+            if request_number == 1:
+                return _err(
+                    "Anonymous login bootstrap remained in a self-redirect loop after "
+                    "two captured requests; credentials were not sent.",
+                    {"bootstrap_flows": flows},
+                )
+            continue
+
+        if 300 <= status < 400:
+            return _err(
+                "Anonymous login bootstrap returned an unsupported redirect; "
+                "credentials were not sent.",
+                {"bootstrap_flows": flows},
+            )
+        if not status or status == 429 or status >= 500:
+            return _err(
+                f"Anonymous login bootstrap stopped at HTTP {status or 'unknown'}; "
+                "credentials were not sent.",
+                {"bootstrap_flows": flows},
+            )
+        return _ok(
+            f"Anonymous login transport was ready after {request_number + 1} "
+            "captured request(s).",
+            {"bootstrap_flows": flows},
+        )
+
+    return _err(
+        "Anonymous login bootstrap did not reach a stable response; credentials were not sent.",
+        {"bootstrap_flows": flows},
+    )
+
+
 def credential_status(workspace: Workspace, name: str = "") -> dict:
     aliases = credentials.list_credentials(workspace.slug)
     if name:
@@ -725,137 +884,171 @@ def credential_login(workspace: Workspace, url: str, *, credential: str,
         return _err(str(exc))
     try:
         secret = credentials.load_credential(workspace.slug, credential)
+        credentials.ensure_login_attempt_available(workspace.slug, credential)
     except credentials.CredentialError as exc:
         return _err(str(exc))
 
-    values = dict(fields or {})
-    values[username_field] = secret["username"]
-    values[password_field] = secret["password"]
-    if encoding == "json":
-        body = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
-        clean_headers.setdefault("Content-Type", "application/json")
-    else:
-        body = urlencode(values)
-        clean_headers.setdefault("Content-Type", "application/x-www-form-urlencoded")
-    raw_secrets = (secret["username"], secret["password"])
-    capture_secrets = _serialized_secret_variants(raw_secrets)
-    capture_body = _login_capture_body(
-        values, username_field, password_field, encoding, raw_secrets
-    )
-    capture_headers = _redacted_headers(clean_headers, capture_secrets)
-    try:
-        attempt = credentials.begin_login_attempt(workspace.slug, credential)
-        jar = credentials.cookie_jar_path(workspace.slug, credential)
-        cookies_before = credentials.cookie_fingerprints(workspace.slug, credential)
-    except credentials.CredentialError as exc:
-        return _err(str(exc))
-
-    login = http_request(
-        workspace, url, method="POST", headers=clean_headers, body=body,
-        timeout=timeout, transport=f"credential:{credential}",
-        _secret_values=capture_secrets, _cookie_jar=jar,
-        _session_identity=(workspace.slug, credential, login_origin),
-        _capture_headers=capture_headers, _capture_body=capture_body,
-    )
-    login_data = login.get("data") if isinstance(login.get("data"), dict) else {}
-    blocker = str(login_data.get("auth_blocker") or "")
-    if blocker:
-        credentials.record_login_outcome(
-            workspace.slug, credential, blocked_reason=blocker
+    with _temporary_cookie_jar(workspace) as bootstrap_jar:
+        bootstrap = _credential_bootstrap(
+            workspace, url, credential=credential, cookie_jar=bootstrap_jar,
+            timeout=timeout,
         )
-        login["ok"] = False
-        login["summary"] = (
-            f"Authentication stopped after attempt {attempt}: {blocker}. "
+        if not bootstrap.get("ok"):
+            return bootstrap
+        bootstrap_data = (
+            bootstrap.get("data") if isinstance(bootstrap.get("data"), dict) else {}
+        )
+        bootstrap_flows = list(bootstrap_data.get("bootstrap_flows") or [])
+
+        values = dict(fields or {})
+        values[username_field] = secret["username"]
+        values[password_field] = secret["password"]
+        if encoding == "json":
+            body = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+            clean_headers.setdefault("Content-Type", "application/json")
+        else:
+            body = urlencode(values)
+            clean_headers.setdefault(
+                "Content-Type", "application/x-www-form-urlencoded"
+            )
+        raw_secrets = (secret["username"], secret["password"])
+        capture_secrets = _serialized_secret_variants(raw_secrets)
+        capture_body = _login_capture_body(
+            values, username_field, password_field, encoding, raw_secrets
+        )
+        capture_headers = _redacted_headers(clean_headers, capture_secrets)
+        try:
+            jar = credentials.cookie_jar_path(workspace.slug, credential)
+            _install_cookie_jar(bootstrap_jar, jar)
+            attempt = credentials.begin_login_attempt(workspace.slug, credential)
+            # Edge cookies were installed before this snapshot, so they cannot
+            # be mistaken for session material issued by the credential POST.
+            cookies_before = credentials.cookie_fingerprints(
+                workspace.slug, credential
+            )
+        except (OSError, credentials.CredentialError) as exc:
+            return _err(str(exc))
+
+        login = http_request(
+            workspace, url, method="POST", headers=clean_headers, body=body,
+            timeout=timeout, transport=f"credential:{credential}",
+            _secret_values=capture_secrets, _cookie_jar=jar,
+            _session_identity=(workspace.slug, credential, login_origin),
+            _capture_headers=capture_headers, _capture_body=capture_body,
+        )
+        login_data = login.get("data") if isinstance(login.get("data"), dict) else {}
+        login_data["bootstrap_flows"] = bootstrap_flows
+        blocker = str(login_data.get("auth_blocker") or "")
+        if blocker:
+            credentials.record_login_outcome(
+                workspace.slug, credential, blocked_reason=blocker
+            )
+            login["ok"] = False
+            login["summary"] = (
+                f"Authentication stopped after attempt {attempt}: {blocker}. "
+                "No automatic retry was attempted."
+            )
+            return login
+        if not login.get("ok"):
+            credentials.record_login_outcome(workspace.slug, credential)
+            login["summary"] = f"Login attempt {attempt} failed and was not retried."
+            return login
+        if 300 <= _http_result_status(login) < 400:
+            credentials.record_login_outcome(workspace.slug, credential)
+            login["ok"] = False
+            login["summary"] = (
+                f"Login attempt {attempt} received a redirect after the anonymous "
+                "bootstrap. No credential-bearing redirect was followed or retried."
+            )
+            return login
+
+        tokens = credentials.load_tokens(workspace.slug, credential)
+        material = credentials.session_status(workspace.slug, credential)
+        new_cookie_material = bool(
+            credentials.cookie_fingerprints(workspace.slug, credential) - cookies_before
+        )
+        if not (
+            material["has_auth_cookies"]
+            or material["has_bearer_token"]
+            or new_cookie_material
+        ):
+            credentials.record_login_outcome(workspace.slug, credential)
+            login["ok"] = False
+            login["summary"] = (
+                f"Login attempt {attempt} produced no new cookie or recognizable bearer "
+                "session material. It remains unverified and was not retried."
+            )
+            return login
+
+        verification = http_request(
+            workspace, verify_url, method="GET", timeout=timeout,
+            transport=f"credential-verify:{credential}",
+            _secret_values=(secret["username"], secret["password"], *tokens.values()),
+            _cookie_jar=jar, _bearer_token=credentials.select_bearer(tokens),
+            _bearer_origin=login_origin,
+            _session_identity=(workspace.slug, credential, login_origin),
+        )
+        verify_data = (
+            verification.get("data")
+            if isinstance(verification.get("data"), dict) else {}
+        )
+        verify_response = str(verify_data.get("response") or "")
+        verify_body = re.split(r"\r?\n\r?\n", verify_response)[-1]
+        verify_status = str(verify_data.get("status_line") or "")
+        # Prove that the marker depends on auth material while retaining the
+        # same anonymous edge cookies that allowed the verification request to
+        # reach the application origin.
+        control = http_request(
+            workspace, verify_url, method="GET", timeout=timeout,
+            transport=f"credential-control:{credential}",
+            _secret_values=(secret["username"], secret["password"], *tokens.values()),
+            _cookie_jar=bootstrap_jar,
+        )
+        control_data = (
+            control.get("data") if isinstance(control.get("data"), dict) else {}
+        )
+        control_response = str(control_data.get("response") or "")
+        control_body = re.split(r"\r?\n\r?\n", control_response)[-1]
+        control_status = str(control_data.get("status_line") or "")
+        control_match = re.search(r"\b(\d{3})\b", control_status)
+        control_code = int(control_match.group(1)) if control_match else 0
+        control_is_conclusive = (
+            control.get("ok")
+            and (200 <= control_code < 300 or control_code in {401, 403, 404})
+            and success_marker not in control_body
+        )
+        established = bool(
+            verification.get("ok")
+            and re.search(r"\b2\d\d\b", verify_status)
+            and success_marker in verify_body
+            and control_is_conclusive
+        )
+        verify_blocker = str(verify_data.get("auth_blocker") or "")
+        credentials.record_login_outcome(
+            workspace.slug, credential, established=established,
+            blocked_reason=verify_blocker,
+            origin=login_origin if established else None,
+        )
+        verify_data["credential"] = credential
+        verify_data["bootstrap_flows"] = bootstrap_flows
+        verify_data["login_flow"] = login_data.get("flow")
+        verify_data["control_flow"] = control_data.get("flow")
+        verify_data["session"] = credentials.session_status(
+            workspace.slug, credential
+        )
+        if established:
+            verification["summary"] = (
+                f"Authenticated session {credential!r} was verified on the scoped "
+                f"verification endpoint after attempt {attempt}; secrets were not exposed."
+            )
+            return verification
+        verification["ok"] = False
+        verification["summary"] = (
+            f"Login attempt {attempt} left unverified session material: the scoped "
+            "success marker was absent or was not proven to depend on the session. "
             "No automatic retry was attempted."
         )
-        return login
-    if not login.get("ok"):
-        credentials.record_login_outcome(workspace.slug, credential)
-        login["summary"] = f"Login attempt {attempt} failed and was not retried."
-        return login
-
-    tokens = credentials.load_tokens(workspace.slug, credential)
-    material = credentials.session_status(workspace.slug, credential)
-    new_cookie_material = bool(
-        credentials.cookie_fingerprints(workspace.slug, credential) - cookies_before
-    )
-    if not (
-        material["has_auth_cookies"]
-        or material["has_bearer_token"]
-        or new_cookie_material
-    ):
-        credentials.record_login_outcome(workspace.slug, credential)
-        login["ok"] = False
-        login["summary"] = (
-            f"Login attempt {attempt} produced no new cookie or recognizable bearer "
-            "session material. It remains unverified and was not retried."
-        )
-        return login
-
-    verification = http_request(
-        workspace, verify_url, method="GET", timeout=timeout,
-        transport=f"credential-verify:{credential}",
-        _secret_values=(secret["username"], secret["password"], *tokens.values()),
-        _cookie_jar=jar, _bearer_token=credentials.select_bearer(tokens),
-        _bearer_origin=login_origin,
-        _session_identity=(workspace.slug, credential, login_origin),
-    )
-    verify_data = (
-        verification.get("data") if isinstance(verification.get("data"), dict) else {}
-    )
-    verify_response = str(verify_data.get("response") or "")
-    verify_body = re.split(r"\r?\n\r?\n", verify_response)[-1]
-    verify_status = str(verify_data.get("status_line") or "")
-    # Prove that the marker depends on the new private session. A public page
-    # can contain the same words and a tracking cookie can be newly issued;
-    # accepting only the authenticated response would misclassify that pair.
-    control = http_request(
-        workspace, verify_url, method="GET", timeout=timeout,
-        transport=f"credential-control:{credential}",
-        _secret_values=(secret["username"], secret["password"], *tokens.values()),
-    )
-    control_data = (
-        control.get("data") if isinstance(control.get("data"), dict) else {}
-    )
-    control_response = str(control_data.get("response") or "")
-    control_body = re.split(r"\r?\n\r?\n", control_response)[-1]
-    control_status = str(control_data.get("status_line") or "")
-    control_match = re.search(r"\b(\d{3})\b", control_status)
-    control_code = int(control_match.group(1)) if control_match else 0
-    control_is_conclusive = (
-        control.get("ok")
-        and (200 <= control_code < 300 or control_code in {401, 403, 404})
-        and success_marker not in control_body
-    )
-    established = bool(
-        verification.get("ok")
-        and re.search(r"\b2\d\d\b", verify_status)
-        and success_marker in verify_body
-        and control_is_conclusive
-    )
-    verify_blocker = str(verify_data.get("auth_blocker") or "")
-    credentials.record_login_outcome(
-        workspace.slug, credential, established=established,
-        blocked_reason=verify_blocker,
-        origin=login_origin if established else None,
-    )
-    verify_data["credential"] = credential
-    verify_data["login_flow"] = login_data.get("flow")
-    verify_data["control_flow"] = control_data.get("flow")
-    verify_data["session"] = credentials.session_status(workspace.slug, credential)
-    if established:
-        verification["summary"] = (
-            f"Authenticated session {credential!r} was verified on the scoped "
-            f"verification endpoint after attempt {attempt}; secrets were not exposed."
-        )
         return verification
-    verification["ok"] = False
-    verification["summary"] = (
-        f"Login attempt {attempt} left unverified session material: the scoped "
-        "success marker was absent or was not proven to depend on the session. "
-        "No automatic retry was attempted."
-    )
-    return verification
 
 
 def authenticated_http_request(workspace: Workspace, url: str, *, credential: str,

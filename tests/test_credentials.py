@@ -44,6 +44,8 @@ class _AuthHandler(BaseHTTPRequestHandler):
     cookie = "session-cookie-never-log"
     token = "access-token-never-log"
     custom_cookie = "custom-cookie-never-log"
+    login_gets = 0
+    login_posts = 0
 
     def _send(self, status: int, value: dict, *, cookie: str = "",
               cookie_name: str = "app_session") -> None:
@@ -57,6 +59,8 @@ class _AuthHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_POST(self):
+        if self.path == "/login":
+            type(self).login_posts += 1
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode()
         if self.path == "/mfa":
@@ -80,6 +84,8 @@ class _AuthHandler(BaseHTTPRequestHandler):
         self._send(200, {"data": {"access_token": self.token}}, cookie=self.cookie)
 
     def do_GET(self):
+        if self.path == "/login":
+            type(self).login_gets += 1
         cookie = self.headers.get("Cookie", "")
         authorization = self.headers.get("Authorization", "")
         authenticated = (
@@ -110,7 +116,110 @@ class _AuthHandler(BaseHTTPRequestHandler):
 
 @contextmanager
 def auth_server():
+    _AuthHandler.login_gets = 0
+    _AuthHandler.login_posts = 0
     server = ThreadingHTTPServer(("127.0.0.1", 0), _AuthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+class _CookieGateHandler(BaseHTTPRequestHandler):
+    username = "gate-user@example.test"
+    password = "gate-password-never-log"
+    edge_cookie = "edge-cookie-never-log"
+    session_cookie = "gate-session-never-log"
+    redirect_location = ""
+    login_gets = 0
+    login_posts = 0
+    posts_without_edge_cookie = 0
+    authenticated_verifications = 0
+    anonymous_controls = 0
+
+    def _json(self, status: int, value: dict, *, cookie: str = "",
+              cookie_name: str = "") -> None:
+        payload = json.dumps(value).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        if cookie:
+            self.send_header("Set-Cookie", f"{cookie_name}={cookie}; HttpOnly; Path=/")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _edge_redirect(self) -> None:
+        self.send_response(307)
+        self.send_header("Location", type(self).redirect_location or "/login")
+        self.send_header(
+            "Set-Cookie",
+            f"edge_clearance={self.edge_cookie}; HttpOnly; Path=/",
+        )
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_GET(self):
+        cookie = self.headers.get("Cookie", "")
+        has_edge = f"edge_clearance={self.edge_cookie}" in cookie
+        has_session = f"app_session={self.session_cookie}" in cookie
+        if self.path == "/login":
+            type(self).login_gets += 1
+            if not has_edge:
+                self._edge_redirect()
+            else:
+                self._json(405, {"error": "method not allowed"})
+            return
+        if self.path == "/me" and not has_edge:
+            self._edge_redirect()
+            return
+        if self.path == "/me" and has_session:
+            type(self).authenticated_verifications += 1
+            self._json(200, {"authenticated": True})
+            return
+        if self.path == "/me" and has_edge:
+            type(self).anonymous_controls += 1
+        self._json(401, {"authenticated": False})
+
+    def do_POST(self):
+        if self.path != "/login":
+            self._json(404, {"error": "not found"})
+            return
+        type(self).login_posts += 1
+        cookie = self.headers.get("Cookie", "")
+        if f"edge_clearance={self.edge_cookie}" not in cookie:
+            type(self).posts_without_edge_cookie += 1
+            self._edge_redirect()
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            value = json.loads(self.rfile.read(length).decode())
+        except ValueError:
+            value = {}
+        if value.get("login") != self.username or value.get("passcode") != self.password:
+            self._json(401, {"error": "invalid credentials"})
+            return
+        self._json(
+            200, {"login": "accepted"}, cookie=self.session_cookie,
+            cookie_name="app_session",
+        )
+
+    def log_message(self, *args):
+        pass
+
+
+@contextmanager
+def cookie_gate_server(*, redirect_location: str = ""):
+    _CookieGateHandler.redirect_location = redirect_location
+    _CookieGateHandler.login_gets = 0
+    _CookieGateHandler.login_posts = 0
+    _CookieGateHandler.posts_without_edge_cookie = 0
+    _CookieGateHandler.authenticated_verifications = 0
+    _CookieGateHandler.anonymous_controls = 0
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _CookieGateHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -222,6 +331,99 @@ class CredentialIsolationTests(unittest.TestCase):
                 self.assertNotIn(secret, argv_text)
             self.assertFalse(any((config.RUNTIME_DIR / "http-tmp" / ws.slug).iterdir()))
 
+    def test_cookie_gate_bootstraps_anonymously_before_single_credential_post(self):
+        with isolated_runtime(), cookie_gate_server() as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary",
+                _CookieGateHandler.username, _CookieGateHandler.password,
+            )
+            result = dispatch(ws, "credential_login", {
+                "url": f"http://127.0.0.1:{port}/login",
+                "credential": "primary",
+                "verify_url": f"http://127.0.0.1:{port}/me",
+                "success_marker": '"authenticated": true',
+                "username_field": "login",
+                "password_field": "passcode",
+            })
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(_CookieGateHandler.login_gets, 2)
+            self.assertEqual(_CookieGateHandler.login_posts, 1)
+            self.assertEqual(_CookieGateHandler.posts_without_edge_cookie, 0)
+            self.assertEqual(_CookieGateHandler.authenticated_verifications, 1)
+            self.assertEqual(_CookieGateHandler.anonymous_controls, 1)
+            status = credentials.session_status(ws.slug, "primary")
+            self.assertEqual(status["attempts"], 1)
+            self.assertTrue(status["established"])
+            self.assertEqual(len(result["data"]["bootstrap_flows"]), 2)
+
+            captures = [
+                path.read_text(encoding="utf-8", errors="replace")
+                for path in ws.flows_dir.glob("*.http")
+            ]
+            self.assertEqual(len(captures), 5)
+            transports = "\n".join(captures)
+            self.assertEqual(transports.count('"transport": "credential-bootstrap:primary"'), 2)
+            self.assertIn('"transport": "credential:primary"', transports)
+            self.assertIn('"transport": "credential-verify:primary"', transports)
+            self.assertIn('"transport": "credential-control:primary"', transports)
+            observable = json.dumps(result) + transports
+            for secret in (
+                _CookieGateHandler.username, _CookieGateHandler.password,
+                _CookieGateHandler.edge_cookie, _CookieGateHandler.session_cookie,
+            ):
+                self.assertNotIn(secret, observable)
+
+    def test_normal_login_uses_one_preflight_and_one_credential_post(self):
+        with isolated_runtime(), auth_server() as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", _AuthHandler.username, _AuthHandler.password
+            )
+            result = dispatch(ws, "credential_login", {
+                "url": f"http://127.0.0.1:{port}/login",
+                "credential": "primary",
+                "verify_url": f"http://127.0.0.1:{port}/me",
+                "success_marker": '"authenticated": true',
+                "username_field": "login",
+                "password_field": "passcode",
+            })
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(_AuthHandler.login_gets, 1)
+            self.assertEqual(_AuthHandler.login_posts, 1)
+            self.assertEqual(len(result["data"]["bootstrap_flows"]), 1)
+            self.assertEqual(
+                credentials.session_status(ws.slug, "primary")["attempts"], 1
+            )
+
+    def test_bootstrap_never_follows_an_off_scope_redirect(self):
+        with isolated_runtime(), probe_server() as probe_port:
+            redirect = f"http://127.0.0.1:{probe_port}/outside"
+            with cookie_gate_server(redirect_location=redirect) as port:
+                ws = self._workspace(port)
+                credentials.save_credential(
+                    ws.slug, "primary",
+                    _CookieGateHandler.username, _CookieGateHandler.password,
+                )
+                result = dispatch(ws, "credential_login", {
+                    "url": f"http://127.0.0.1:{port}/login",
+                    "credential": "primary",
+                    "verify_url": f"http://127.0.0.1:{port}/me",
+                    "success_marker": '"authenticated": true',
+                    "username_field": "login",
+                    "password_field": "passcode",
+                })
+                self.assertFalse(result["ok"], result)
+                self.assertIn("out-of-scope redirect", result["summary"])
+                self.assertEqual(_CookieGateHandler.login_gets, 1)
+                self.assertEqual(_CookieGateHandler.login_posts, 0)
+                self.assertEqual(_ProbeHandler.requests, 0)
+                self.assertEqual(
+                    credentials.session_status(ws.slug, "primary")["attempts"], 0
+                )
+                self.assertEqual(len(list(ws.flows_dir.glob("*.http"))), 1)
+
     def test_cross_origin_verification_and_followup_fail_before_network(self):
         with isolated_runtime(), auth_server() as port, probe_server() as other_port:
             ws = self._workspace(port)
@@ -312,8 +514,11 @@ class CredentialIsolationTests(unittest.TestCase):
                     })
                     self.assertFalse(result["ok"], result)
                     created = set(ws.flows_dir.glob("*.http")) - before
-                    self.assertEqual(len(created), 1)
-                    capture = created.pop().read_text(encoding="utf-8")
+                    self.assertEqual(len(created), 2)
+                    captures = [
+                        path.read_text(encoding="utf-8") for path in created
+                    ]
+                    capture = "\n".join(captures)
                     variants = {
                         username, password,
                         quote(username, safe=""), quote_plus(username, safe=""),
@@ -329,6 +534,9 @@ class CredentialIsolationTests(unittest.TestCase):
                     self.assertIn("GRYPTON_REDACTED_PASSWORD", capture)
                     self.assertIn(username_field, capture)
                     self.assertIn(password_field, capture)
+                    self.assertEqual(sum(
+                        "GRYPTON_REDACTED_USERNAME" in item for item in captures
+                    ), 1)
 
     def test_invalid_arguments_and_scope_do_not_consume_login_budget(self):
         with isolated_runtime(), auth_server() as port:
