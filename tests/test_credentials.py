@@ -13,7 +13,7 @@ import unittest
 from urllib.parse import quote, quote_plus
 from unittest.mock import patch
 
-from grypton import config, credentials
+from grypton import config, credentials, tools
 from grypton.toolserver import REGISTRY, dispatch
 from grypton.workspace import Constraints, Workspace
 
@@ -46,6 +46,7 @@ class _AuthHandler(BaseHTTPRequestHandler):
     custom_cookie = "custom-cookie-never-log"
     login_gets = 0
     login_posts = 0
+    verification_denied = False
 
     def _send(self, status: int, value: dict, *, cookie: str = "",
               cookie_name: str = "app_session") -> None:
@@ -101,13 +102,21 @@ class _AuthHandler(BaseHTTPRequestHandler):
         elif self.path == "/public-marker":
             self._send(200, {"authenticated": True})
         elif self.path == "/followup-401" and authenticated:
-            self._send(401, {"error": "session expired"})
+            self._send(
+                401,
+                {"error": "endpoint denied", "access_token": "denied-token-never-keep"},
+                cookie="denied-cookie-never-keep",
+            )
         elif self.path == "/followup-403" and authenticated:
             self._send(403, {"error": "session revoked"})
         elif self.path == "/followup-mfa" and authenticated:
             self._send(200, {"mfa_required": True})
+        elif self.path == "/followup-captcha" and authenticated:
+            self._send(200, {"captcha": True})
         elif self.path == "/followup-limit" and authenticated:
             self._send(429, {"error": "rate limited"})
+        elif self.path == "/me" and type(self).verification_denied:
+            self._send(401, {"authenticated": False})
         elif self.path in {"/me", "/second"} and authenticated:
             self._send(200, {"authenticated": True, "access_token": self.token})
         else:
@@ -121,6 +130,7 @@ class _AuthHandler(BaseHTTPRequestHandler):
 def auth_server():
     _AuthHandler.login_gets = 0
     _AuthHandler.login_posts = 0
+    _AuthHandler.verification_denied = False
     server = ThreadingHTTPServer(("127.0.0.1", 0), _AuthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -809,11 +819,12 @@ class CredentialIsolationTests(unittest.TestCase):
             self.assertFalse(status["has_auth_cookies"])
             self.assertFalse(status["has_bearer_token"])
 
-    def test_authenticated_followup_blockers_invalidate_the_session(self):
+    def test_authenticated_endpoint_denials_preserve_proven_session(self):
         cases = (
-            ("401", "rejected or blocked"),
-            ("403", "rejected or blocked"),
-            ("mfa", "MFA/OTP"),
+            ("401", "endpoint-unauthenticated"),
+            ("403", "endpoint-forbidden"),
+            ("mfa", "step-up-required"),
+            ("captcha", "challenge"),
             ("limit", "rate-limited"),
         )
         with isolated_runtime(), auth_server() as port:
@@ -833,15 +844,377 @@ class CredentialIsolationTests(unittest.TestCase):
                         "password_field": "passcode",
                     })
                     self.assertTrue(login["ok"], login)
+                    jar = credentials.cookie_jar_path(ws.slug, alias)
+                    cookies_before = jar.read_bytes()
+                    tokens_before = credentials.token_path(
+                        ws.slug, alias
+                    ).read_bytes()
                     result = dispatch(ws, "authenticated_http_request", {
                         "url": f"http://127.0.0.1:{port}/followup-{suffix}",
                         "credential": alias,
                     })
                     self.assertFalse(result["ok"], result)
+                    self.assertIn("retained", result["summary"])
+                    observation = result["data"]["auth_observation"]
+                    self.assertEqual(observation["kind"], expected)
+                    self.assertFalse(observation["conclusive_for_session"])
+                    self.assertFalse(observation["state_changed"])
+                    self.assertNotIn("credential", observation["detail"].lower())
+                    self.assertNotIn("auth_blocker", result["data"])
                     status = credentials.session_status(ws.slug, alias)
-                    self.assertFalse(status["established"])
-                    self.assertEqual(status["state"], "blocked")
-                    self.assertIn(expected, status["blocked_reason"])
+                    self.assertTrue(status["established"])
+                    self.assertEqual(status["state"], "authenticated")
+                    self.assertEqual(status["blocked_reason"], "")
+                    self.assertEqual(jar.read_bytes(), cookies_before)
+                    self.assertEqual(
+                        credentials.token_path(ws.slug, alias).read_bytes(),
+                        tokens_before,
+                    )
+
+                    followup = dispatch(ws, "authenticated_http_request", {
+                        "url": f"http://127.0.0.1:{port}/second",
+                        "credential": alias,
+                    })
+                    self.assertTrue(followup["ok"], followup)
+                    self.assertTrue(
+                        credentials.session_status(ws.slug, alias)["established"]
+                    )
+
+    def test_verification_endpoint_denial_requires_complete_reproof(self):
+        with isolated_runtime(), auth_server() as port:
+            ws = self._workspace(port)
+            alias = "verification-denial"
+            origin = f"http://127.0.0.1:{port}"
+            credentials.save_credential(
+                ws.slug, alias, _AuthHandler.username, _AuthHandler.password
+            )
+            login = dispatch(ws, "credential_login", {
+                "url": origin + "/login",
+                "credential": alias,
+                "verify_url": origin + "/me",
+                "success_marker": '"authenticated": true',
+                "username_field": "login",
+                "password_field": "passcode",
+            })
+            self.assertTrue(login["ok"], login)
+            credentials.save_auth_profile(ws.slug, alias, {
+                "version": 1,
+                "strategy": "http",
+                "login_url": origin + "/login",
+                "verify_url": origin + "/me",
+                "success_marker": '"authenticated": true',
+                "username_transform": "stored",
+                "timeout": 30,
+                "http": {
+                    "encoding": "json",
+                    "username_field": "login",
+                    "password_field": "passcode",
+                    "fields": {},
+                    "headers": {},
+                },
+            })
+            jar = credentials.cookie_jar_path(ws.slug, alias)
+            cookie_snapshot = jar.read_bytes()
+            token_snapshot = credentials.token_path(ws.slug, alias).read_bytes()
+
+            _AuthHandler.verification_denied = True
+            denied = dispatch(ws, "authenticated_http_request", {
+                "url": origin + "/me",
+                "credential": alias,
+            })
+
+            self.assertFalse(denied["ok"], denied)
+            self.assertIn("complete session proof was not rerun", denied["summary"])
+            self.assertTrue(denied["data"]["session_state_retained"])
+            status = credentials.session_status(ws.slug, alias)
+            self.assertTrue(status["established"])
+            self.assertEqual(status["blocked_reason"], "")
+            self.assertEqual(jar.read_bytes(), cookie_snapshot)
+            self.assertEqual(
+                credentials.token_path(ws.slug, alias).read_bytes(),
+                token_snapshot,
+            )
+
+            _AuthHandler.verification_denied = False
+            healthy = dispatch(ws, "authenticated_http_request", {
+                "url": origin + "/me",
+                "credential": alias,
+            })
+            self.assertTrue(healthy["ok"], healthy)
+
+    def test_concurrent_denial_rollback_cannot_clobber_successful_rotation(self):
+        with isolated_runtime():
+            ws = Workspace("credential-concurrency")
+            origin = "https://app.example.test"
+            ws.create(origin, "web")
+            ws.save_constraints(Constraints(in_scope=[origin]))
+            alias = "primary"
+            credentials.save_credential(ws.slug, alias, "user", "password")
+            jar = credentials.cookie_jar_path(ws.slug, alias)
+
+            def cookie_payload(value: str) -> str:
+                return (
+                    "# Netscape HTTP Cookie File\n"
+                    "app.example.test\tFALSE\t/\tTRUE\t0\tapp_session\t"
+                    + value + "\n"
+                )
+
+            jar.write_text(cookie_payload("initial-session-material"))
+            credentials.save_tokens(
+                ws.slug, alias, {"access_token": "initial-access-token"},
+                origin=origin,
+            )
+            credentials.record_login_outcome(
+                ws.slug, alias, established=True, origin=origin
+            )
+
+            denied_entered = threading.Event()
+            allow_denied_return = threading.Event()
+            success_entered = threading.Event()
+            results: dict[str, dict] = {}
+            errors: list[BaseException] = []
+
+            def fake_http(_workspace, url, **_kwargs):
+                if url.endswith("/denied"):
+                    jar.write_text(cookie_payload("denied-session-material"))
+                    credentials.save_tokens(
+                        ws.slug, alias,
+                        {"access_token": "denied-access-token"},
+                        origin=origin,
+                    )
+                    denied_entered.set()
+                    if not allow_denied_return.wait(5):
+                        raise RuntimeError("timed out waiting to release denial")
+                    return {
+                        "ok": True,
+                        "summary": "HTTP 401",
+                        "data": {
+                            "status_line": "HTTP/1.1 401 Unauthorized",
+                            "auth_blocker": "endpoint denied the request",
+                        },
+                    }
+                success_entered.set()
+                jar.write_text(cookie_payload("rotated-session-material"))
+                credentials.save_tokens(
+                    ws.slug, alias,
+                    {"access_token": "rotated-access-token"},
+                    origin=origin,
+                )
+                return {
+                    "ok": True,
+                    "summary": "HTTP 200",
+                    "data": {"status_line": "HTTP/1.1 200 OK"},
+                }
+
+            def request(label: str, path: str) -> None:
+                try:
+                    results[label] = tools.authenticated_http_request(
+                        ws, origin + path, credential=alias
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with patch("grypton.tools.http_request", side_effect=fake_http):
+                denied = threading.Thread(
+                    target=request, args=("denied", "/denied"), daemon=True
+                )
+                denied.start()
+                self.assertTrue(denied_entered.wait(5))
+                success = threading.Thread(
+                    target=request, args=("success", "/success"), daemon=True
+                )
+                success.start()
+                self.assertFalse(success_entered.wait(0.2))
+                allow_denied_return.set()
+                denied.join(5)
+                success.join(5)
+
+            self.assertFalse(denied.is_alive())
+            self.assertFalse(success.is_alive())
+            self.assertEqual(errors, [])
+            self.assertFalse(results["denied"]["ok"])
+            self.assertTrue(results["success"]["ok"])
+            self.assertIn("rotated-session-material", jar.read_text())
+            self.assertEqual(
+                credentials.load_tokens(ws.slug, alias),
+                {"access_token": "rotated-access-token"},
+            )
+            self.assertTrue(
+                credentials.session_status(ws.slug, alias)["established"]
+            )
+
+    def test_non_success_http_responses_roll_back_poisoned_material(self):
+        with isolated_runtime():
+            ws = Workspace("credential-error-material")
+            origin = "https://app.example.test"
+            ws.create(origin, "web")
+            ws.save_constraints(Constraints(in_scope=[origin]))
+            alias = "primary"
+            credentials.save_credential(ws.slug, alias, "user", "password")
+            jar = credentials.cookie_jar_path(ws.slug, alias)
+            original_cookie = (
+                "# Netscape HTTP Cookie File\n"
+                "app.example.test\tFALSE\t/\tTRUE\t0\tapp_session\t"
+                "original-session-material\n"
+            ).encode()
+            jar.write_bytes(original_cookie)
+            credentials.save_tokens(
+                ws.slug, alias, {"access_token": "original-access-token"},
+                origin=origin,
+            )
+            token_file = credentials.token_path(ws.slug, alias)
+            original_tokens = token_file.read_bytes()
+            credentials.record_login_outcome(
+                ws.slug, alias, established=True, origin=origin
+            )
+
+            for status in (400, 500):
+                with self.subTest(status=status):
+                    def poisoned_http(_workspace, _url, **kwargs):
+                        Path(kwargs["_cookie_jar"]).write_text(
+                            "# Netscape HTTP Cookie File\n"
+                            "app.example.test\tFALSE\t/\tTRUE\t0\tapp_session\t"
+                            "poisoned-session-material\n"
+                        )
+                        credentials.save_tokens(
+                            ws.slug, alias,
+                            {"access_token": "poisoned-access-token"},
+                            origin=origin,
+                        )
+                        return {
+                            "ok": True,
+                            "summary": f"HTTP {status}",
+                            "data": {
+                                "status_line": f"HTTP/1.1 {status} Error",
+                                "response": "{}",
+                                "auth_blocker": "",
+                            },
+                        }
+
+                    with patch(
+                        "grypton.tools.http_request", side_effect=poisoned_http
+                    ):
+                        result = tools.authenticated_http_request(
+                            ws, origin + "/verification", credential=alias
+                        )
+
+                    self.assertTrue(result["ok"], result)
+                    self.assertTrue(result["data"]["session_state_retained"])
+                    self.assertTrue(result["data"]["session_material_rollback"])
+                    self.assertTrue(result["data"]["session"]["established"])
+                    self.assertEqual(jar.read_bytes(), original_cookie)
+                    self.assertEqual(token_file.read_bytes(), original_tokens)
+
+    def test_failed_request_restores_absent_cookie_jar_before_reporting_session(self):
+        with isolated_runtime():
+            ws = Workspace("bearer-only-rollback")
+            origin = "https://app.example.test"
+            ws.create(origin, "web")
+            ws.save_constraints(Constraints(in_scope=[origin]))
+            alias = "bearer-only"
+            credentials.save_credential(ws.slug, alias, "user", "password")
+            credentials.save_tokens(
+                ws.slug, alias, {"access_token": "original-access-token"},
+                origin=origin,
+            )
+            credentials.record_login_outcome(
+                ws.slug, alias, established=True, origin=origin
+            )
+            jar = credentials.cookie_jar_storage_path(ws.slug, alias)
+            self.assertFalse(jar.exists())
+
+            def poisoned_http(_workspace, _url, **kwargs):
+                Path(kwargs["_cookie_jar"]).write_text(
+                    "# Netscape HTTP Cookie File\n"
+                    "app.example.test\tFALSE\t/\tTRUE\t0\tapp_session\t"
+                    "poisoned-session-material\n"
+                )
+                credentials.save_tokens(
+                    ws.slug, alias, {"access_token": "poisoned-access-token"},
+                    origin=origin,
+                )
+                return {
+                    "ok": True,
+                    "summary": "HTTP 400",
+                    "data": {
+                        "status_line": "HTTP/1.1 400 Bad Request",
+                        "response": "{}",
+                        "auth_blocker": "",
+                    },
+                }
+
+            with patch("grypton.tools.http_request", side_effect=poisoned_http):
+                result = tools.authenticated_http_request(
+                    ws, origin + "/verification", credential=alias
+                )
+
+            self.assertTrue(result["ok"], result)
+            self.assertFalse(jar.exists())
+            self.assertFalse(result["data"]["session"]["has_cookies"])
+            self.assertTrue(result["data"]["session"]["has_bearer_token"])
+            self.assertEqual(
+                credentials.load_tokens(ws.slug, alias),
+                {"access_token": "original-access-token"},
+            )
+
+    def test_authenticated_request_exception_restores_material(self):
+        with isolated_runtime():
+            ws = Workspace("credential-exception-material")
+            origin = "https://app.example.test"
+            ws.create(origin, "web")
+            ws.save_constraints(Constraints(in_scope=[origin]))
+            alias = "primary"
+            credentials.save_credential(ws.slug, alias, "user", "password")
+            jar = credentials.cookie_jar_path(ws.slug, alias)
+            jar.write_text(
+                "# Netscape HTTP Cookie File\n"
+                "app.example.test\tFALSE\t/\tTRUE\t0\tapp_session\t"
+                "original-session-material\n"
+            )
+            credentials.save_tokens(
+                ws.slug, alias, {"access_token": "original-access-token"},
+                origin=origin,
+            )
+            cookie_snapshot = jar.read_bytes()
+            token_file = credentials.token_path(ws.slug, alias)
+            token_snapshot = token_file.read_bytes()
+            credentials.record_login_outcome(
+                ws.slug, alias, established=True, origin=origin
+            )
+
+            def exploding_http(_workspace, _url, **kwargs):
+                Path(kwargs["_cookie_jar"]).write_text("poisoned")
+                credentials.save_tokens(
+                    ws.slug, alias, {"access_token": "poisoned-access-token"},
+                    origin=origin,
+                )
+                raise RuntimeError("post-transport processing failed")
+
+            with patch("grypton.tools.http_request", side_effect=exploding_http):
+                result = tools.authenticated_http_request(
+                    ws, origin + "/explode", credential=alias
+                )
+
+            self.assertFalse(result["ok"], result)
+            self.assertIn("restored", result["summary"])
+            self.assertEqual(jar.read_bytes(), cookie_snapshot)
+            self.assertEqual(token_file.read_bytes(), token_snapshot)
+            self.assertTrue(
+                credentials.session_status(ws.slug, alias)["established"]
+            )
+
+    def test_http_challenge_detection_ignores_false_flags(self):
+        for body in (
+            '{"otp_required": false}',
+            '{"mfa_required": false}',
+            '{"captcha": false}',
+            '{"captcha": null}',
+            "Captcha is not required",
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(
+                    tools._authentication_blocker(body, "HTTP/1.1 200 OK"), ""
+                )
 
     def test_cookie_jar_symlink_is_rejected(self):
         with isolated_runtime() as root:

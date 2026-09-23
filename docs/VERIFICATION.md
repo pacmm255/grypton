@@ -68,6 +68,18 @@ terminal URL, login/live/replay/control status, duplicate or missing matching
 submissions, and material created only by verification all fail. Captures expose
 only status, method, completeness, and URL/Location equality facts for redirect
 hops. The verified material must work through `authenticated_http_request`.
+An arbitrary same-origin 401, 403, MFA, CAPTCHA, or rate-limit response must be
+reported as an endpoint denial while the proven session remains established.
+The cookie jar and token file must match their exact pre-request state, and a
+known-good authenticated endpoint must still work afterward. A per-credential
+lock serializes snapshot, request, commit, and rollback so a denied concurrent
+request cannot overwrite a successful cookie or token rotation. A standalone
+request to the configured verification URL also cannot revoke state because it
+does not rerun the complete login, replay, and anonymous-control proof.
+Transport exceptions, unknown statuses, and non-2xx/3xx responses must also
+restore the exact prior files, including preserving an absent cookie jar. Their
+response remains observable, and a valid 400 verifier contract does not clear
+the established state.
 Tool results, captures, rendered HTML, response bodies, console messages, and
 audit rows must omit the stored username, transformed username, password,
 cookie, bearer token, and their encoded forms.

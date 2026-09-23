@@ -643,16 +643,66 @@ def _extract_auth_tokens(response: str) -> dict[str, str]:
 
 def _authentication_blocker(response: str, status_line: str) -> str:
     """Classify states where autonomous auth must stop rather than retry."""
-    lowered = response.lower()
-    if re.search(r"(?:\b(?:mfa|2fa|two[- _]factor|one[- ]time password|otp)\b|(?:mfa|otp|two[_-]?factor)[_-]?required\b)", lowered):
+    match = re.search(r"\b(\d{3})\b", status_line)
+    status = int(match.group(1)) if match else 0
+    observed = _browser_auth_blocker(response, (status,) if status else ())
+    if "MFA/OTP" in observed:
         return "interactive MFA/OTP is required; Grypton will not bypass or retry it"
-    if "captcha" in lowered:
+    if "CAPTCHA" in observed:
         return "a CAPTCHA challenge is active; Grypton will not bypass or retry it"
-    if re.search(r"\b429\b", status_line):
+    if status == 429:
         return "the authentication endpoint rate-limited the attempt"
-    if re.search(r"\b(?:401|403)\b", status_line):
+    if status in {401, 403}:
         return "the supplied credential was rejected or blocked"
     return ""
+
+
+def _endpoint_auth_observation(response: str, status_line: str) -> dict[str, object]:
+    """Describe one endpoint response without judging the proven session."""
+    challenge = _browser_auth_blocker(response, ())
+    if "MFA/OTP" in challenge:
+        return {
+            "kind": "step-up-required",
+            "detail": "the endpoint presented an MFA/OTP step-up",
+            "conclusive_for_session": False,
+            "state_changed": False,
+        }
+    if "CAPTCHA" in challenge:
+        return {
+            "kind": "challenge",
+            "detail": "the endpoint presented a CAPTCHA challenge",
+            "conclusive_for_session": False,
+            "state_changed": False,
+        }
+    match = re.search(r"\b(\d{3})\b", status_line)
+    status = int(match.group(1)) if match else 0
+    if status == 429:
+        return {
+            "kind": "rate-limited",
+            "detail": "the endpoint returned HTTP 429 rate limiting",
+            "conclusive_for_session": False,
+            "state_changed": False,
+        }
+    if status == 401:
+        return {
+            "kind": "endpoint-unauthenticated",
+            "detail": "the endpoint returned HTTP 401 unauthenticated",
+            "conclusive_for_session": False,
+            "state_changed": False,
+        }
+    if status == 403:
+        return {
+            "kind": "endpoint-forbidden",
+            "detail": "the endpoint returned HTTP 403 forbidden",
+            "conclusive_for_session": False,
+            "state_changed": False,
+        }
+    return {
+        "kind": "access-denied",
+        "detail": "the endpoint denied this request",
+        "conclusive_for_session": False,
+        "state_changed": False,
+    }
 
 
 def _save_flow(workspace: Workspace, method: str, url: str, headers: Optional[dict],
@@ -926,6 +976,78 @@ def _install_cookie_jar(source: Path, destination: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _snapshot_private_material(path: Path) -> tuple[bool, bytes, int]:
+    """Read a bounded private file so a denied request can be rolled back."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return False, b"", 0o600
+    except OSError as exc:
+        raise credentials.CredentialError(
+            "private session material could not be opened safely"
+        ) from exc
+    try:
+        info = os.fstat(fd)
+        mode = stat.S_IMODE(info.st_mode)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or mode & 0o077
+        ):
+            raise credentials.CredentialError(
+                "private session material is not a private regular file"
+            )
+        if info.st_size > 1_000_000:
+            raise credentials.CredentialError(
+                "private session material exceeded the size limit"
+            )
+        chunks: list[bytes] = []
+        remaining = 1_000_001
+        while remaining:
+            chunk = os.read(fd, min(65_536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if len(payload) > 1_000_000:
+            raise credentials.CredentialError(
+                "private session material exceeded the size limit"
+            )
+        return True, payload, mode
+    finally:
+        os.close(fd)
+
+
+def _restore_private_material(
+    path: Path, snapshot: tuple[bool, bytes, int]
+) -> None:
+    """Atomically restore the exact private-file state captured before a call."""
+    existed, payload, mode = snapshot
+    if not existed:
+        path.unlink(missing_ok=True)
+        return
+    temporary = path.parent / f".{path.name}.{time.time_ns()}.rollback"
+    fd = os.open(
+        temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+        mode,
+    )
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, mode, follow_symlinks=False)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _credential_bootstrap(workspace: Workspace, url: str, *, credential: str,
                           cookie_jar: Path, timeout: int) -> dict:
     """Clear a one-hop cookie gate anonymously before any credential attempt."""
@@ -1034,6 +1156,30 @@ def credential_login(workspace: Workspace, url: str, *, credential: str,
                      username_transform: str = "stored",
                      encoding: str = "json", fields: Optional[dict] = None,
                      headers: Optional[dict] = None, timeout: int = 30) -> dict:
+    """Serialize one complete HTTP login proof with other session writers."""
+    try:
+        with credentials.auth_profile_lock(workspace.slug, credential):
+            with credentials.session_material_lock(workspace.slug, credential):
+                return _credential_login_locked(
+                    workspace, url, credential=credential, verify_url=verify_url,
+                    success_marker=success_marker, username_field=username_field,
+                    password_field=password_field,
+                    username_transform=username_transform, encoding=encoding,
+                    fields=fields, headers=headers, timeout=timeout,
+                )
+    except credentials.CredentialError as exc:
+        return _err(str(exc))
+
+
+def _credential_login_locked(workspace: Workspace, url: str, *, credential: str,
+                             verify_url: str, success_marker: str,
+                             username_field: str = "username",
+                             password_field: str = "password",
+                             username_transform: str = "stored",
+                             encoding: str = "json",
+                             fields: Optional[dict] = None,
+                             headers: Optional[dict] = None,
+                             timeout: int = 30) -> dict:
     """Make one login attempt, then prove the session on a scoped endpoint."""
     for candidate in (url, verify_url):
         blocked = _scope_error(workspace, candidate)
@@ -1248,64 +1394,134 @@ def authenticated_http_request(workspace: Workspace, url: str, *, credential: st
     except ValueError as exc:
         return _err(str(exc))
     try:
-        secret = credentials.load_credential(workspace.slug, credential)
-        tokens = credentials.load_tokens(workspace.slug, credential)
-        session = credentials.session_status(workspace.slug, credential)
-    except credentials.CredentialError as exc:
+        with credentials.auth_profile_lock(workspace.slug, credential):
+            secret = credentials.load_credential(workspace.slug, credential)
+            with credentials.session_material_lock(workspace.slug, credential):
+                tokens = credentials.load_tokens(workspace.slug, credential)
+                session = credentials.session_status(workspace.slug, credential)
+                if not session["established"]:
+                    return _err(
+                        f"Named credential {credential!r} has no established session; "
+                        "call credential_login once first."
+                    )
+                bound_origin = str(session.get("origin") or "")
+                try:
+                    request_origin = credentials.normalize_origin(url)
+                    bound_origin = credentials.normalize_origin(bound_origin)
+                except credentials.CredentialError:
+                    return _err(
+                        f"Named credential {credential!r} has no valid private origin "
+                        "binding; authenticate it again before use."
+                    )
+                if request_origin != bound_origin:
+                    return _err(
+                        f"Refused authenticated request for {credential!r}: the URL does "
+                        "not match the session's exact login origin (scheme, host, and "
+                        "effective port)."
+                    )
+                bearer = credentials.select_bearer(tokens)
+                if (
+                    bearer
+                    and credentials.token_origin(workspace.slug, credential)
+                    != bound_origin
+                ):
+                    return _err(
+                        f"Refused bearer authorization for {credential!r}: its private "
+                        "origin binding is missing or does not match the established "
+                        "session."
+                    )
+
+                jar_storage = credentials.cookie_jar_storage_path(
+                    workspace.slug, credential
+                )
+                token_file = credentials.token_path(workspace.slug, credential)
+                cookie_snapshot = _snapshot_private_material(jar_storage)
+                token_snapshot = _snapshot_private_material(token_file)
+                commit_material = False
+                material_restored = False
+                try:
+                    jar = credentials.cookie_jar_path(workspace.slug, credential)
+                    result = http_request(
+                        workspace, url, method=method, headers=clean_headers, body=body,
+                        timeout=timeout, transport=f"authenticated:{credential}",
+                        _secret_values=(
+                            secret["username"], secret["password"], *tokens.values()
+                        ),
+                        _cookie_jar=jar, _bearer_token=bearer,
+                        _bearer_origin=bound_origin,
+                        _session_identity=(workspace.slug, credential, bound_origin),
+                    )
+                    data = (
+                        result.get("data")
+                        if isinstance(result.get("data"), dict) else None
+                    )
+                    status = _http_result_status(result)
+                    blocker = str(data.get("auth_blocker") or "") if data else ""
+                    commit_material = bool(
+                        result.get("ok")
+                        and not blocker
+                        and 200 <= status < 400
+                    )
+                    if not commit_material:
+                        _restore_private_material(jar_storage, cookie_snapshot)
+                        _restore_private_material(token_file, token_snapshot)
+                        material_restored = True
+
+                    if data is not None:
+                        if blocker:
+                            data.pop("auth_blocker", None)
+                            data["auth_observation"] = _endpoint_auth_observation(
+                                str(data.get("response") or ""),
+                                str(data.get("status_line") or ""),
+                            )
+                            data["session_state_retained"] = True
+                            data["session_material_rollback"] = True
+                            result["ok"] = False
+                            try:
+                                profile = credentials.load_auth_profile_optional(
+                                    workspace.slug, credential
+                                )
+                            except credentials.CredentialError:
+                                profile = None
+                            is_verification_endpoint = bool(
+                                profile
+                                and str(method or "GET").strip().upper() == "GET"
+                                and _browser_auth_url_matches(
+                                    url, str(profile.get("verify_url") or "")
+                                )
+                            )
+                            if is_verification_endpoint:
+                                result["summary"] = (
+                                    f"The configured verification endpoint returned HTTP "
+                                    f"{status or 'denial'} for this standalone request. The "
+                                    "complete session proof was not rerun, so the established "
+                                    "session and its private material were retained."
+                                )
+                            else:
+                                result["summary"] = (
+                                    f"Authenticated request for {credential!r} was denied at "
+                                    f"this endpoint with HTTP {status or 'denial'}. The "
+                                    "independently proven session and its private material "
+                                    "were retained."
+                                )
+                        elif not commit_material:
+                            data["session_state_retained"] = True
+                            data["session_material_rollback"] = True
+                        data["credential"] = credential
+                        data["session"] = credentials.session_status(
+                            workspace.slug, credential
+                        )
+                    return result
+                finally:
+                    if not commit_material and not material_restored:
+                        _restore_private_material(jar_storage, cookie_snapshot)
+                        _restore_private_material(token_file, token_snapshot)
+    except (OSError, credentials.CredentialError) as exc:
         return _err(str(exc))
-    if not session["established"]:
+    except Exception:
         return _err(
-            f"Named credential {credential!r} has no established session; "
-            "call credential_login once first."
+            "Authenticated request failed; its private session material was restored."
         )
-    bound_origin = str(session.get("origin") or "")
-    try:
-        request_origin = credentials.normalize_origin(url)
-        bound_origin = credentials.normalize_origin(bound_origin)
-    except credentials.CredentialError:
-        return _err(
-            f"Named credential {credential!r} has no valid private origin binding; "
-            "authenticate it again before use."
-        )
-    if request_origin != bound_origin:
-        return _err(
-            f"Refused authenticated request for {credential!r}: the URL does not "
-            "match the session's exact login origin (scheme, host, and effective port)."
-        )
-    bearer = credentials.select_bearer(tokens)
-    if bearer and credentials.token_origin(workspace.slug, credential) != bound_origin:
-        return _err(
-            f"Refused bearer authorization for {credential!r}: its private origin "
-            "binding is missing or does not match the established session."
-        )
-    jar = credentials.cookie_jar_path(workspace.slug, credential)
-    result = http_request(
-        workspace, url, method=method, headers=clean_headers, body=body, timeout=timeout,
-        transport=f"authenticated:{credential}",
-        _secret_values=(
-            secret["username"], secret["password"], *tokens.values()
-        ),
-        _cookie_jar=jar, _bearer_token=bearer, _bearer_origin=bound_origin,
-        _session_identity=(workspace.slug, credential, bound_origin),
-    )
-    data = result.get("data") if isinstance(result.get("data"), dict) else None
-    if data is not None:
-        blocker = str(data.get("auth_blocker") or "")
-        if blocker:
-            credentials.record_login_outcome(
-                workspace.slug, credential, established=False,
-                blocked_reason=blocker,
-            )
-            result["ok"] = False
-            result["summary"] = (
-                f"Authenticated session {credential!r} is no longer usable: {blocker}. "
-                "The session was blocked pending operator action."
-            )
-        data["credential"] = credential
-        data["session"] = credentials.session_status(
-            workspace.slug, credential
-        )
-    return result
 
 
 class Goja:
@@ -2754,6 +2970,39 @@ def _browser_auth_fresh_probe(
 
 
 def credential_browser_login(
+    workspace: Workspace,
+    url: str,
+    *,
+    credential: str,
+    username_transform: str = "stored",
+    username_selector: str = _BROWSER_USERNAME_SELECTOR,
+    password_selector: str = _BROWSER_PASSWORD_SELECTOR,
+    submit_selector: str = _BROWSER_SUBMIT_SELECTOR,
+    verify_url: str = "",
+    success_marker: str = "",
+    verify_headers: Optional[dict] = None,
+    verification: Optional[dict] = None,
+    timeout: int = 45,
+) -> dict:
+    """Serialize one complete browser login proof with other session writers."""
+    try:
+        with credentials.auth_profile_lock(workspace.slug, credential):
+            with credentials.session_material_lock(workspace.slug, credential):
+                return _credential_browser_login_locked(
+                    workspace, url, credential=credential,
+                    username_transform=username_transform,
+                    username_selector=username_selector,
+                    password_selector=password_selector,
+                    submit_selector=submit_selector,
+                    verify_url=verify_url, success_marker=success_marker,
+                    verify_headers=verify_headers, verification=verification,
+                    timeout=timeout,
+                )
+    except credentials.CredentialError as exc:
+        return _err(str(exc))
+
+
+def _credential_browser_login_locked(
     workspace: Workspace,
     url: str,
     *,

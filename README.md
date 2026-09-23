@@ -662,8 +662,12 @@ Each call reserves at most one login attempt and submits once; it does not
 retry the form internally. Each named credential has a two-attempt limit so an
 autonomous run cannot keep trying a login. MFA, OTP, CAPTCHA, rejection, and
 rate limiting are recorded as the observed result. A later authenticated
-request that receives a 401, 403, MFA, CAPTCHA, or 429 response invalidates the
-successful state and records the blocker.
+request can still be denied on a particular route even while the proven
+origin-bound session remains valid elsewhere. Grypton reports that endpoint
+denial without clearing the established state and rolls back any cookie or
+token changes made by a denied, failed, or non-2xx/3xx response. The response is
+still returned as an endpoint observation. Only a complete authentication proof
+changes the session state.
 
 Named credentials and session material live under
 `.state/credentials/<engagement>/`, outside the engagement workspace. Private

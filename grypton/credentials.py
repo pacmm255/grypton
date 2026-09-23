@@ -87,19 +87,16 @@ def auth_profile_path(target: str, name: str) -> Path:
     return _profile_dir(target) / (alias + ".json")
 
 
-def _profile_thread_lock(path: Path) -> threading.RLock:
+def _private_thread_lock(path: Path) -> threading.RLock:
     key = str(path)
     with _PROFILE_THREAD_LOCKS_GUARD:
         return _PROFILE_THREAD_LOCKS.setdefault(key, threading.RLock())
 
 
 @contextmanager
-def auth_profile_lock(target: str, name: str):
-    """Serialize one alias's profile snapshot, save, and delete operations."""
-    alias = _safe_name(name, label="credential name")
-    lock_path = _profile_dir(target) / f".{alias}.lock"
+def _private_interprocess_lock(lock_path: Path, *, error: str):
     key = str(lock_path)
-    thread_lock = _profile_thread_lock(lock_path)
+    thread_lock = _private_thread_lock(lock_path)
     with thread_lock:
         depths = getattr(_PROFILE_LOCK_STATE, "depths", None)
         if depths is None:
@@ -123,7 +120,7 @@ def auth_profile_lock(target: str, name: str):
             fd = os.open(lock_path, flags, 0o600)
             info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                raise OSError("profile lock is not a private regular file")
+                raise OSError("lock is not a private regular file")
             os.fchmod(fd, 0o600)
             fcntl.flock(fd, fcntl.LOCK_EX)
         except OSError as exc:
@@ -132,7 +129,7 @@ def auth_profile_lock(target: str, name: str):
                     os.close(fd)
                 except OSError:
                     pass
-            raise CredentialError("authentication profile lock is unavailable") from exc
+            raise CredentialError(error) from exc
 
         depths[key] = 1
         try:
@@ -145,14 +142,40 @@ def auth_profile_lock(target: str, name: str):
                 os.close(fd)
 
 
+@contextmanager
+def auth_profile_lock(target: str, name: str):
+    """Serialize one alias's profile snapshot, save, and delete operations."""
+    alias = _safe_name(name, label="credential name")
+    lock_path = _profile_dir(target) / f".{alias}.lock"
+    with _private_interprocess_lock(
+        lock_path, error="authentication profile lock is unavailable"
+    ):
+        yield
+
+
+@contextmanager
+def session_material_lock(target: str, name: str):
+    """Serialize session writers and authenticated transactions for one alias."""
+    alias = _safe_name(name, label="credential name")
+    lock_path = _session_dir(target) / f".{alias}.material.lock"
+    with _private_interprocess_lock(
+        lock_path, error="private session lock is unavailable"
+    ):
+        yield
+
 
 def _session_dir(target: str) -> Path:
     return _private_dir(credential_dir(target) / ".sessions")
 
 
-def cookie_jar_path(target: str, name: str) -> Path:
+def cookie_jar_storage_path(target: str, name: str) -> Path:
+    """Return the private jar path without creating session material."""
     alias = _safe_name(name, label="credential name")
-    path = _session_dir(target) / (alias + ".cookies")
+    return _session_dir(target) / (alias + ".cookies")
+
+
+def cookie_jar_path(target: str, name: str) -> Path:
+    path = cookie_jar_storage_path(target, name)
     if path.is_symlink():
         raise CredentialError("cookie jar must not be a symlink")
     if path.exists() and not path.is_file():
