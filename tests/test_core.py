@@ -24,6 +24,7 @@ from grypton.cli import (_activity_snapshot, _claude_style_arguments, _constrain
 from grypton.engine import Engine
 from grypton.hard_lab import HardLab, score_workspace
 from grypton.manager import KryptexManager, ManagerContext, _check_schema, _extract_json
+from grypton.openclaude import TOKEN_ENV
 from grypton.providers import MCP_TIMEOUT_MS, OpenCodeClient, OpenCodeResult
 from grypton.reporting import audit_workspace, render_report
 from grypton.toolserver import REGISTRY, dispatch
@@ -104,7 +105,7 @@ class CliTests(unittest.TestCase):
     def test_exact_routes_are_pinned(self):
         self.assertEqual(config.WORKER_MODEL, "zai-coding-plan/glm-5.3")
         self.assertEqual(config.WORKER_EFFORT, "max")
-        self.assertEqual(config.MANAGER_MODEL, "opencode-go/muse-spark-1.3-contributor")
+        self.assertEqual(config.MANAGER_MODEL, "go/muse-spark-1.3-contributor")
         self.assertEqual(config.MANAGER_EFFORT, "xhigh")
         self.assertEqual(config.VALIDATOR_MODEL, "gpt-6-astra")
         self.assertEqual(config.VALIDATOR_EFFORT, "max")
@@ -598,8 +599,7 @@ class WorkerEventTests(unittest.TestCase):
         self.assertEqual(permissions["external_directory"]["/tmp/grypton-transport/*"], "allow")
         self.assertEqual(permissions["external_directory"]["*"], "deny")
 
-    @patch("grypton.providers.opencode_credential", return_value={"type": "api", "key": "test-key"})
-    def test_mcp_subprocess_imports_from_source_when_state_home_is_elsewhere(self, _credential):
+    def test_mcp_subprocess_imports_from_source_when_state_home_is_elsewhere(self):
         with isolated_runtime():
             workspace = config.ENGAGEMENTS_DIR / "mcp-import"
             workspace.mkdir(parents=True)
@@ -608,13 +608,37 @@ class WorkerEventTests(unittest.TestCase):
                 workspace=workspace, target_slug="mcp-import", allow_tools=True,
                 agent_prompt="test",
             )
-            env, _ = client._environment()
+            gateway_token = "fixture-local-gateway-token"
+            transport_route = f"openclaude/{config.WORKER_MODEL}"
+            client.gateway = SimpleNamespace(
+                model_route=transport_route,
+                token=gateway_token,
+                provider_config=lambda provider_id: {
+                    provider_id: {
+                        "npm": "@ai-sdk/anthropic",
+                        "options": {
+                            "baseURL": "http://127.0.0.1:32123/v1",
+                            "apiKey": "{env:" + TOKEN_ENV + "}",
+                        },
+                        "models": {config.WORKER_MODEL: {"variants": {"max": {}}}},
+                    }
+                },
+                environment=lambda: {TOKEN_ENV: gateway_token},
+            )
+            env, secret = client._environment()
+            inline = json.loads(env["OPENCODE_CONFIG_CONTENT"])
             paths = env["PYTHONPATH"].split(os.pathsep)
             self.assertEqual(paths[0], str(config.SOURCE_ROOT))
             self.assertEqual(
-                json.loads(env["OPENCODE_CONFIG_CONTENT"])["mcp"]["grypton"]["environment"]["PYTHONPATH"],
+                inline["mcp"]["grypton"]["environment"]["PYTHONPATH"],
                 str(config.SOURCE_ROOT),
             )
+            self.assertEqual(inline["enabled_providers"], ["openclaude"])
+            self.assertEqual(inline["model"], transport_route)
+            self.assertIn("openclaude", inline["provider"])
+            self.assertEqual(env[TOKEN_ENV], gateway_token)
+            self.assertEqual(secret, gateway_token)
+            self.assertNotIn(gateway_token, env["OPENCODE_CONFIG_CONTENT"])
 
     def test_tool_error_text_is_rendered_and_retained(self):
         with isolated_runtime():

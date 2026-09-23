@@ -25,7 +25,7 @@ where = ["."]
 include = ["grypton", "grypton.*"]
 
 [tool.setuptools.package-data]
-grypton = ["resources/*.json", "resources/prompts/*", "resources/skills/*.md", "resources/web/*"]
+grypton = ["resources/*.json", "resources/*.mjs", "resources/prompts/*", "resources/skills/*.md", "resources/web/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

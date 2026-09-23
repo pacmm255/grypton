@@ -16,6 +16,7 @@ import time
 from typing import Callable, Optional
 
 from . import config
+from .openclaude import OpenClaudeError, OpenClaudeGateway
 
 
 MAX_STREAM_BYTES = 16_000_000
@@ -289,38 +290,77 @@ class OpenCodeClient:
             engagement_link.symlink_to(self.workspace, target_is_directory=True)
         self.transcripts = private_dir(self.workspace / "transcripts")
         self.proc: Optional[asyncio.subprocess.Process] = None
+        self.gateway: OpenClaudeGateway | None = None
+
+    def _on_gateway_event(self, event: dict) -> None:
+        """Retain sanitized OpenClaude notices and expose them to the live UI."""
+        append_jsonl(self.transcripts / "openclaude.events.jsonl", {
+            "at": time.time(), "role": self.role, **event,
+        })
+        if self.event_callback:
+            try:
+                self.event_callback(event)
+            except Exception:
+                pass
+
+    async def _ensure_gateway(self) -> OpenClaudeGateway:
+        # Preserve one sidecar across calls so its spent-key cooldown survives.
+        # If that process died between calls, rebuild it before a new request;
+        # never replay a call that may already have streamed or used tools.
+        if self.gateway is not None:
+            try:
+                await self.gateway.status()
+            except Exception:
+                try:
+                    await self.gateway.close()
+                except Exception:
+                    pass
+                self.gateway = None
+        if self.gateway is None:
+            self.gateway = OpenClaudeGateway(
+                self.route,
+                self.effort,
+                self.role,
+                self.transport_workspace,
+                self._on_gateway_event,
+            )
+        try:
+            await self.gateway.start()
+        except OpenClaudeError as exc:
+            try:
+                await self.gateway.close()
+            except Exception:
+                pass
+            self.gateway = None
+            raise ProviderError(f"{self.role} OpenClaude gateway failed: {exc}") from exc
+        # OpenClaude owns the canonical public ID (for example go/... rather
+        # than OpenCode's credential-store ID opencode-go/...).
+        self.route = self.gateway.model.route_id
+        self.provider = self.gateway.model.provider
+        return self.gateway
 
     def _environment(self) -> tuple[dict, str]:
-        auth = opencode_credential(self.provider)
+        if self.gateway is None:
+            raise ProviderError("OpenClaude gateway must be started before building OpenCode state.")
+        gateway = self.gateway
         for kind in ("config", "data", "cache", "state"):
             private_dir(self.runtime / kind)
         _seed_opencode_dependencies(self.runtime / "config/opencode")
-        atomic_json(self.runtime / "data/opencode/auth.json", {self.provider: auth})
-        source_catalog = _host_xdg("CACHE", ".cache") / "opencode/models.json"
-        catalog_target = self.runtime / "cache/opencode/models.json"
-        if source_catalog.is_file() and not catalog_target.is_file():
-            try:
-                catalog = json.loads(source_catalog.read_text(encoding="utf-8"))
-                atomic_json(catalog_target, {self.provider: catalog[self.provider]})
-            except (OSError, ValueError, KeyError):
-                pass
 
         permissions = self._permissions(
             self.allow_tools,
             self.workspace if self.allow_tools else None,
             self.transport_workspace if self.allow_tools else None,
         )
+        transport_provider = "openclaude"
+        transport_route = gateway.model_route
         inline = {
             "$schema": "https://opencode.ai/config.json",
-            # Grypton already records immutable request/response flows, append-only
-            # ledgers, and full provider event streams. OpenCode's separate Git
-            # snapshot refresh can deadlock before the first model event when
-            # several isolated sessions initialize concurrently, so disable that
-            # redundant layer for provider transports.
             "snapshot": False,
-            "enabled_providers": [self.provider],
-            "model": self.route,
-            "small_model": self.route,
+            "enabled_providers": [transport_provider],
+            "provider": gateway.provider_config(transport_provider),
+            "model": transport_route,
+            "small_model": transport_route,
             "default_agent": f"grypton-{self.role}",
             "permission": permissions,
             "share": "disabled",
@@ -330,11 +370,9 @@ class OpenCodeClient:
                 f"grypton-{self.role}": {
                     "description": f"Grypton {self.role}",
                     "mode": "primary",
-                    "model": self.route,
+                    "model": transport_route,
                     "prompt": self.agent_prompt,
                     "permission": permissions,
-                    # Yield back to Kryptex often enough for it to correct course
-                    # while still leaving room for a useful autonomous burst.
                     "steps": 40 if self.allow_tools else 4,
                 }
             },
@@ -347,19 +385,12 @@ class OpenCodeClient:
                     "command": [sys.executable, "-m", "grypton.toolserver"],
                     "cwd": str(config.GRYPTON_HOME),
                     "enabled": True,
-                    # Network probes retain their own bounded timeouts.  This
-                    # ceiling must be longer so OpenCode does not abort a
-                    # healthy MCP call first and report an empty tool error.
                     "timeout": MCP_TIMEOUT_MS,
                     "environment": {
                         "GRYPTON_HOME": str(config.GRYPTON_HOME),
                         "GRYPTON_TARGET": self.target_slug,
                         "KRYPTON_HOME": str(config.GRYPTON_HOME),
                         "KRYPTON_TARGET": self.target_slug,
-                        # The state home may be distinct from the checkout or
-                        # installed package root.  The MCP subprocess imports
-                        # Grypton's code from SOURCE_ROOT while it writes
-                        # engagement data under GRYPTON_HOME.
                         "PYTHONPATH": str(config.SOURCE_ROOT),
                     },
                 }
@@ -383,16 +414,8 @@ class OpenCodeClient:
             "OPENCODE_DISABLE_PROJECT_CONFIG": "true",
             "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS": "true",
             "OPENCODE_DISABLE_DEFAULT_PLUGINS": "true",
-            # OpenCode 1.18.x can still enter the repository-copy path while
-            # selecting a session even when snapshot tracking is disabled.
-            # Provider sessions use Grypton's immutable logs and work directly
-            # in their engagement workspace, so that copy is unnecessary.
             "OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT": "true",
             "OPENCODE_PERMISSION": json.dumps(permissions),
-            # Engagement workspaces live below the Grypton source checkout.
-            # Prevent Git/OpenCode from treating the whole source repository as
-            # the model's project; that caused startup scans and snapshot work
-            # across every runtime when three engagements launched together.
             "GIT_CEILING_DIRECTORIES": str(config.GRYPTON_HOME),
             "GRYPTON_HOME": str(config.GRYPTON_HOME),
             "GRYPTON_TARGET": self.target_slug,
@@ -401,15 +424,14 @@ class OpenCodeClient:
             "KRYPTON_TARGET": self.target_slug,
             "PATH": f"{config.BIN_DIR}:{env.get('PATH', '')}",
             "NO_COLOR": "1",
+            **gateway.environment(),
         })
-        # Preserve importability for the local MCP child even when an operator
-        # directs runtime state to another filesystem location.
         source_path = str(config.SOURCE_ROOT)
         inherited_pythonpath = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = source_path + (
             os.pathsep + inherited_pythonpath if inherited_pythonpath else ""
         )
-        return env, auth["key"]
+        return env, gateway.token
 
     async def call(
         self,
@@ -420,10 +442,12 @@ class OpenCodeClient:
         title: str = "",
     ) -> OpenCodeResult:
         binary = config.require_binary("opencode")
+        gateway = await self._ensure_gateway()
         env, secret = self._environment()
+        transport_route = gateway.model_route
         argv = [
             binary, "run", "--pure", "--format", "json",
-            "--model", self.route, "--variant", self.effort,
+            "--model", transport_route, "--variant", self.effort,
             "--agent", f"grypton-{self.role}",
             "--title", title or f"Grypton {self.role}",
             "--dir", str(self.transport_workspace), "--thinking",
@@ -567,6 +591,9 @@ class OpenCodeClient:
             "role": self.role,
             "route": self.route,
             "effort": self.effort,
+            "transport_route": transport_route,
+            "runner": "opencode",
+            "gateway": "openclaude",
             "session_id": result_session,
             "resumed": bool(session_id),
             "duration_s": round(duration, 3),
@@ -578,7 +605,14 @@ class OpenCodeClient:
             "prompt_sha256": prompt_hash,
             "stdout_sha256": hashlib.sha256(cleaned_stdout.encode("utf-8")).hexdigest(),
             "stderr_present": bool(cleaned_stderr),
+            "ok": not returncode and not errors and bool(texts),
         }
+        gateway_events = gateway.drain_events()
+        call_record["failover_count"] = sum(
+            1 for event in gateway_events
+            if event.get("type") == "openclaude_notice"
+            and "continuing on key" in str(event.get("message") or "")
+        )
         append_jsonl(self.transcripts / "provider-calls.jsonl", call_record)
         if returncode:
             detail = cleaned_stderr[-1000:] or (errors[-1] if errors else "no error detail")
@@ -602,6 +636,9 @@ class OpenCodeClient:
     async def cancel(self) -> None:
         if self.proc is not None:
             await _terminate(self.proc)
+        if self.gateway is not None:
+            await self.gateway.close()
+            self.gateway = None
 
 
 class CodexValidator:

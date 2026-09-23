@@ -55,6 +55,9 @@ BIN_DIR = (
     else Path(sys.executable).parent
 )
 KRYPTON_HOME = GRYPTON_HOME                      # compatibility for restored modules
+OPENCLAUDE_HOME = Path(os.environ.get("GRYPTON_OPENCLAUDE_HOME", "/root/openclaude")).resolve()
+OPENCLAUDE_BIN = OPENCLAUDE_HOME / "bin" / "openclaude.mjs"
+
 
 # --------------------------------------------------------------------------
 # Exact requested model/provider/effort routes.
@@ -63,9 +66,9 @@ KRYPTON_HOME = GRYPTON_HOME                      # compatibility for restored mo
 WORKER_PROVIDER = os.environ.get("GRYPTON_WORKER_PROVIDER", "zai-coding-plan")
 WORKER_MODEL = os.environ.get("GRYPTON_WORKER_MODEL", "zai-coding-plan/glm-5.3")
 WORKER_EFFORT = os.environ.get("GRYPTON_WORKER_EFFORT", "max")
-MANAGER_PROVIDER = os.environ.get("GRYPTON_MANAGER_PROVIDER", "opencode-go")
+MANAGER_PROVIDER = os.environ.get("GRYPTON_MANAGER_PROVIDER", "go")
 MANAGER_MODEL = os.environ.get(
-    "GRYPTON_MANAGER_MODEL", "opencode-go/muse-spark-1.3-contributor")
+    "GRYPTON_MANAGER_MODEL", "go/muse-spark-1.3-contributor")
 MANAGER_EFFORT = os.environ.get("GRYPTON_MANAGER_EFFORT", "xhigh")
 VALIDATOR_PROVIDER = "openai"
 VALIDATOR_MODEL = os.environ.get("GRYPTON_VALIDATOR_MODEL", "gpt-6-astra")
@@ -84,15 +87,38 @@ WORKER_MODEL_ALIASES = {
     "glm-5.3": "zai-coding-plan/glm-5.3",
 }
 
+MODEL_ROUTE_ALIASES = {
+    "opencode-go/muse-spark-1.3-contributor": "go/muse-spark-1.3-contributor",
+}
+
+
+def normalize_model_route(name: str) -> str:
+    """Return the public OpenClaude route for a configured model name."""
+    route = str(name or "").strip()
+    if not route:
+        return ""
+    route = MODEL_ROUTE_ALIASES.get(route, route)
+    if route.startswith("opencode-go/"):
+        return f"go/{route.removeprefix('opencode-go/')}"
+    if route.startswith("opencode/"):
+        return f"zen/{route.removeprefix('opencode/')}"
+    return route
+
+
+def resolve_manager_model(name: str) -> str:
+    """Normalize legacy manager routes to OpenClaude public routes."""
+    return normalize_model_route(name)
+
 
 def resolve_worker_model(name: str) -> str:
     """Expand the supported GLM shortcut; qualified OpenCode routes pass through."""
     if not name:
         return ""
-    return WORKER_MODEL_ALIASES.get(name.strip().lower(), name.strip())
+    return normalize_model_route(WORKER_MODEL_ALIASES.get(name.strip().lower(), name.strip()))
 
 
 WORKER_MODEL = resolve_worker_model(WORKER_MODEL)
+MANAGER_MODEL = resolve_manager_model(MANAGER_MODEL)
 
 # --------------------------------------------------------------------------
 # External tools
@@ -205,10 +231,43 @@ class GryptonConfig:
             except (OSError, ValueError):
                 data = {}
         known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
-        return cls(**{k: v for k, v in data.items() if k in known})
+        loaded = cls(**{k: v for k, v in data.items() if k in known})
+        loaded.worker_model = resolve_worker_model(loaded.worker_model)
+        loaded.manager_model = resolve_manager_model(loaded.manager_model)
+        return loaded
 
     def save(self) -> None:
-        (GRYPTON_HOME / "grypton.json").write_text(json.dumps(asdict(self), indent=2))
+        """Write global defaults atomically with private permissions."""
+        path = GRYPTON_HOME / "grypton.json"
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(asdict(self), indent=2) + '\n')
+        os.replace(tmp, path)
+
+
+def effective_role_models(meta: object | None = None) -> dict[str, dict[str, str]]:
+    """Return effective per-role routes and efforts, honoring workspace overrides."""
+
+    def selected(field: str, fallback: str) -> str:
+        value = getattr(meta, field, "") if meta is not None else ""
+        return str(value or fallback)
+
+    return {
+        "worker": {
+            "route": resolve_worker_model(selected("worker_model", CONFIG.worker_model)),
+            "effort": selected("worker_effort", CONFIG.worker_effort),
+        },
+        "manager": {
+            "route": resolve_manager_model(selected("manager_model", CONFIG.manager_model)),
+            "effort": selected("manager_effort", CONFIG.manager_effort),
+        },
+        "validator": {
+            "route": VALIDATOR_MODEL,
+            "effort": VALIDATOR_EFFORT,
+        },
+    }
 
 
 def ensure_layout() -> None:

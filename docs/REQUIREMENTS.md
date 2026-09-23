@@ -7,7 +7,7 @@ upstream `targets/` tree are not part of the fork.
 |---|---|
 | Fork Krypton's autonomous core without target data | `FORK_MANIFEST.json`; autonomous loop in `grypton/engine.py`; top-level `target/` stays empty; runtime lives under `.state/` |
 | Kraude uses GLM 5.3 max through the Z.AI Coding Plan connector | `grypton/config.py`, `grypton/providers.py`, `grypton/worker.py`; exact route `zai-coding-plan/glm-5.3`, variant `max` |
-| Kryptex uses Muse Spark 1.3 xhigh through OpenCode Go | `grypton/config.py`, `grypton/providers.py`, `grypton/manager.py`; exact route `opencode-go/muse-spark-1.3-contributor`, variant `xhigh` |
+| Kryptex uses Muse Spark 1.3 xhigh through OpenCode and the local OpenClaude gateway | `grypton/config.py`, `grypton/openclaude.py`, `grypton/providers.py`, `grypton/manager.py`; public route `go/muse-spark-1.3-contributor`, effort `xhigh` |
 | Do not use OpenCode Zen or Go for Kraude | Provider-specific isolated OpenCode state in `grypton/providers.py`; worker connector contains only `zai-coding-plan` |
 | Kryptex acts as the autonomous operator and resolves routine blockers | Manager prompt and `grypton/manager.py` require an executable substitute, local setup, tool install, anonymous path, or in-scope pivot; the engine overrides idle and soft-retreat directives |
 | P1/P2 findings are independently validated with Astra max | Fresh tool-disabled `codex exec` process for each P1/P2 in `grypton/providers.py`; P3–P5 require `grypton validate TARGET FINDING`; exact model `gpt-6-astra`, effort `max`; a fair bounded allocator includes every explicitly referenced artifact without letting a large early capture starve later controls |

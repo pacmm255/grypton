@@ -200,11 +200,12 @@ class TargetMeta:
     status: str = "initialized"      # initialized|running|paused|stopped
     worker_uuid: str = ""
     worker_project_dir: str = ""
-    worker_kind: str = ""            # opencode
+    worker_kind: str = ""            # opencode+openclaude
     manager_session_id: str = ""     # persistent OpenCode Spark session id
     fallback_manager_session_id: str = ""  # retained for old metadata compatibility
     worker_model: str = ""           # per-target override; empty => config default
-    manager_kind: str = ""           # opencode
+    worker_effort: str = ""
+    manager_kind: str = ""           # opencode+openclaude
     manager_model: str = ""
     manager_effort: str = ""
     validator_model: str = ""

@@ -1,4 +1,4 @@
-"""The Grypton orchestrator: GLM tools, Spark direction, Astra validation.
+"""The Grypton orchestrator: selectable worker, manager direction, Astra validation.
 
 Each iteration:
   1. Worker (Kraude) runs one turn on the manager's directive.
@@ -137,11 +137,21 @@ def _tool_result_text(content) -> str:
 
 class Engine:
     def __init__(self, slug: str, *, backend: str = "real",
-                 emit: Optional[Callable[..., None]] = None):
+                 emit: Optional[Callable[..., None]] = None,
+                 worker_model: str = "", worker_effort: str = "",
+                 manager_model: str = "", manager_effort: str = ""):
+        self._worker_model_explicit = bool(worker_model)
+        self._manager_model_explicit = bool(manager_model)
+        self._worker_effort_explicit = bool(worker_effort)
+        self._manager_effort_explicit = bool(manager_effort)
         self.ws = Workspace(slug)
         self.slug = self.ws.slug
         self.backend = backend
         self.emit = emit or (lambda *a, **k: None)
+        self.worker_model = worker_model or config.CONFIG.worker_model
+        self.worker_effort = worker_effort or config.CONFIG.worker_effort
+        self.manager_model = manager_model or config.CONFIG.manager_model
+        self.manager_effort = manager_effort or config.CONFIG.manager_effort
 
         self.worker = None
         self.manager = None
@@ -157,6 +167,7 @@ class Engine:
         self._user_to_worker: asyncio.Queue = asyncio.Queue()
         self._user_to_manager: asyncio.Queue = asyncio.Queue()
         self._mgr_lock = asyncio.Lock()        # serialize all Codex calls (one session)
+        self._model_switches: asyncio.Queue = asyncio.Queue()
         self._user_chat_task = None
         self._exhaustion_streak = 0
         self._idle_streak = 0          # consecutive 0-tool-call worker turns
@@ -208,6 +219,15 @@ class Engine:
 
         meta = self.ws.load_meta()
         self.turn_index = meta.turn_index
+        if not fresh_clone:
+            if not self._worker_model_explicit and meta.worker_model:
+                self.worker_model = meta.worker_model
+            if not self._worker_effort_explicit and getattr(meta, "worker_effort", ""):
+                self.worker_effort = meta.worker_effort
+            if not self._manager_model_explicit and meta.manager_model:
+                self.manager_model = meta.manager_model
+            if not self._manager_effort_explicit and meta.manager_effort:
+                self.manager_effort = meta.manager_effort
 
         # ---- backend wiring ----
         if self.backend == "mock":
@@ -219,24 +239,24 @@ class Engine:
         else:
             from .manager import KryptexManager
             from .worker import KraudeWorker, WorkerSpec
-            worker_model = config.WORKER_MODEL
             worker_uuid = "" if fresh_clone else (meta.worker_uuid or "")
             self.ws.update_meta(
                 worker_uuid=worker_uuid,
-                worker_kind="opencode",
-                worker_model=worker_model,
+                worker_kind="opencode+openclaude",
+                worker_model=self.worker_model,
+                worker_effort=self.worker_effort,
                 worker_project_dir="opencode",
-                manager_kind="opencode",
-                manager_model=config.MANAGER_MODEL,
-                manager_effort=config.MANAGER_EFFORT,
+                manager_kind="opencode+openclaude",
+                manager_model=self.manager_model,
+                manager_effort=self.manager_effort,
                 validator_model=config.VALIDATOR_MODEL,
             )
             spec = WorkerSpec(
                 session_uuid=worker_uuid,
                 cwd=self.ws.root,
                 system_prompt=wsys,
-                model=worker_model,
-                effort=config.WORKER_EFFORT,
+                model=self.worker_model,
+                effort=self.worker_effort,
                 extra_env={
                     "GRYPTON_TARGET": self.slug,
                     "GRYPTON_HOME": str(config.GRYPTON_HOME),
@@ -248,20 +268,38 @@ class Engine:
             self.worker = KraudeWorker(spec, on_event=self._on_worker_event)
             self.manager = KryptexManager(self.ws, msys,
                                           on_event=self._on_manager_event,
-                                          manager_kind="opencode",
-                                          manager_model=config.MANAGER_MODEL,
-                                          manager_effort=config.MANAGER_EFFORT)
+                                          manager_kind="opencode+openclaude",
+                                          manager_model=self.manager_model,
+                                          manager_effort=self.manager_effort)
             if meta.manager_session_id:
                 self.manager.session_id = meta.manager_session_id
+            from .providers import append_jsonl
+            selected_at = time.time()
+            for role, route, effort in (
+                ("worker", self.worker_model, self.worker_effort),
+                ("manager", self.manager_model, self.manager_effort),
+            ):
+                append_jsonl(self.ws.root / ".ledger" / "model-switches.jsonl", {
+                    "at": selected_at,
+                    "turn": self.turn_index,
+                    "role": role,
+                    "route": route,
+                    "effort": effort,
+                    "source": "run-start" if fresh_clone else "resume",
+                })
 
         self.ws.update_meta(status="running")
         self.emit("status", text="Starting worker process…")
         await self.worker.start()
-        self.emit("status", text=(
-            f"Kraude online ({config.WORKER_MODEL} · {config.WORKER_EFFORT}). "
-            f"Kryptex uses {config.MANAGER_MODEL} · {config.MANAGER_EFFORT}; "
-            f"P1/P2 findings route automatically to {config.VALIDATOR_MODEL} · "
-            f"{config.VALIDATOR_EFFORT}."))
+        if self.backend == "mock":
+            self.emit("status", text=(
+                "Offline mock roles are online; no model provider or validator call will run."))
+        else:
+            self.emit("status", text=(
+                f"Kraude online ({self.worker_model} · {self.worker_effort}) through OpenClaude. "
+                f"Kryptex uses {self.manager_model} · {self.manager_effort} through OpenClaude; "
+                f"P1/P2 findings route automatically to {config.VALIDATOR_MODEL} · "
+                f"{config.VALIDATOR_EFFORT}."))
 
     # ----------------------------------------------------------- main loop
 
@@ -287,6 +325,7 @@ class Engine:
                 self._stop("max_turns safety ceiling reached")
                 break
 
+            await self._apply_pending_model_switches()
             directive_text = self._prepend_user_to_worker(directive_text)
 
             # ---- worker turn ----
@@ -384,6 +423,10 @@ class Engine:
             # spending a slow manager turn first.
             if self.stop_requested:
                 break
+
+            # Apply changes requested while Kraude was working before the next
+            # Kryptex call; both roles are idle at this boundary.
+            await self._apply_pending_model_switches()
 
             # User→manager messages are handled in real time by _user_chat_loop;
             # their persisted standing instructions are already in the constraints
@@ -836,6 +879,87 @@ class Engine:
         (self._user_to_worker if to_worker else self._user_to_manager).put_nowait(text)
         self.emit("user_echo", text=text, to_worker=to_worker)
 
+    def current_models(self) -> dict[str, dict[str, str]]:
+        return {
+            "kraude": {"route": self.worker_model, "effort": self.worker_effort},
+            "kryptex": {"route": self.manager_model, "effort": self.manager_effort},
+            "validator": {
+                "route": config.VALIDATOR_MODEL,
+                "effort": config.VALIDATOR_EFFORT,
+            },
+        }
+
+    def request_model_switch(self, role: str, route: str, effort: str = "") -> None:
+        """Queue a validated-at-boundary role change from the synchronous console."""
+        normalized = str(role or "").strip().lower()
+        normalized = {"worker": "kraude", "manager": "kryptex"}.get(normalized, normalized)
+        if normalized not in {"kraude", "kryptex"}:
+            raise ValueError("role must be kraude or kryptex")
+        requested = str(route or "").strip()
+        if not requested:
+            raise ValueError("a model route is required")
+        self._model_switches.put_nowait({
+            "role": normalized,
+            "route": requested,
+            "effort": str(effort or "").strip(),
+            "requested_at": time.time(),
+        })
+        self.emit("status", text=(
+            f"Queued {normalized} model change to {requested}"
+            + (f" · {effort}" if effort else "")
+            + "; it will apply at the next safe role boundary."
+        ))
+
+    async def _apply_pending_model_switches(self) -> None:
+        from .openclaude import resolve_model
+
+        while not self._model_switches.empty():
+            try:
+                request = self._model_switches.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            role = request["role"]
+            try:
+                selection = await asyncio.to_thread(
+                    resolve_model,
+                    request["route"],
+                    effort=request["effort"] or None,
+                    require_tools=role == "kraude",
+                )
+                route = selection.route_id
+                effort = selection.effort
+                if role == "kraude":
+                    if hasattr(self.worker, "switch_model"):
+                        await self.worker.switch_model(route, effort)
+                    self.worker_model, self.worker_effort = route, effort
+                    self.ws.update_meta(
+                        worker_model=route,
+                        worker_effort=effort,
+                        worker_uuid=getattr(self.worker, "session_id", "") or "",
+                    )
+                else:
+                    async with self._mgr_lock:
+                        if hasattr(self.manager, "switch_model"):
+                            await self.manager.switch_model(route, effort)
+                    self.manager_model, self.manager_effort = route, effort
+                    self.ws.update_meta(
+                        manager_model=route,
+                        manager_effort=effort,
+                        manager_session_id=getattr(self.manager, "session_id", "") or "",
+                    )
+                from .providers import append_jsonl
+                append_jsonl(self.ws.root / ".ledger" / "model-switches.jsonl", {
+                    "at": time.time(),
+                    "turn": self.turn_index,
+                    "role": role,
+                    "route": route,
+                    "effort": effort,
+                    "source": "operator",
+                })
+                self.emit("model_switch", role=role, route=route, effort=effort)
+            except Exception as exc:
+                self.emit("error", text=f"Could not switch {role} model: {exc}")
+
     def request_stop(self, reason: str = "user requested stop") -> None:
         self.stop_requested = True
         self.stop_reason = reason
@@ -889,9 +1013,13 @@ class Engine:
             (self.ws.root / ".ledger" / "STOP").unlink(missing_ok=True)
         except OSError:
             pass
-        self.ws.update_meta(status="stopped", turn_index=self.turn_index,
-                            worker_uuid=getattr(self.worker, "session_id", "") or "",
-                            manager_session_id=getattr(self.manager, "session_id", "") or "")
+        self.ws.update_meta(
+            status="stopped", turn_index=self.turn_index,
+            worker_uuid=getattr(self.worker, "session_id", "") or "",
+            manager_session_id=getattr(self.manager, "session_id", "") or "",
+            worker_model=self.worker_model, worker_effort=self.worker_effort,
+            manager_model=self.manager_model, manager_effort=self.manager_effort,
+        )
         try:
             if self.worker:
                 await self.worker.aclose()
@@ -932,7 +1060,9 @@ class Engine:
 
     def _on_worker_event(self, evt: dict) -> None:
         etype = evt.get("type")
-        if etype == "stream_event":
+        if isinstance(etype, str) and etype.startswith("openclaude_"):
+            self.emit("gateway", role="Kraude", event=evt)
+        elif etype == "stream_event":
             inner = evt.get("event") or {}
             if inner.get("type") == "content_block_delta":
                 delta = inner.get("delta") or {}
@@ -966,7 +1096,10 @@ class Engine:
         t = evt.get("type")
         if t == "manager_event":
             inner = evt.get("event") if isinstance(evt.get("event"), dict) else {}
-            self.emit("manager_provider", kind=inner.get("type", "event"), event=inner)
+            if str(inner.get("type") or "").startswith("openclaude_"):
+                self.emit("gateway", role="Kryptex", event=inner)
+            else:
+                self.emit("manager_provider", kind=inner.get("type", "event"), event=inner)
         elif t == "manager_fallback":
             self.emit("manager_fallback", via=evt.get("via", "deterministic"),
                       reason=evt.get("reason", ""))

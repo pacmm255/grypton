@@ -25,6 +25,20 @@ CHROME_ARGS = [
 ]
 
 
+def _browser_executable() -> str:
+    """Prefer an installed Playwright shell over host wrappers with stale paths."""
+    shells = sorted(
+        Path.home().glob(
+            ".cache/ms-playwright/chromium_headless_shell-*/chrome-linux/headless_shell"
+        ),
+        reverse=True,
+    )
+    for candidate in shells:
+        if candidate.is_file():
+            return str(candidate)
+    return "/opt/google/chrome/chrome"
+
+
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="grypton-ui-") as directory:
         root = Path(directory)
@@ -84,7 +98,7 @@ def main() -> None:
             try:
                 with sync_playwright() as playwright:
                     browser = playwright.chromium.launch(
-                        headless=True, executable_path="/opt/google/chrome/chrome",
+                        headless=True, executable_path=_browser_executable(),
                         args=CHROME_ARGS,
                         ignore_default_args=["--enable-unsafe-swiftshader"],
                     )

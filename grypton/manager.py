@@ -1,7 +1,7 @@
 """Kryptex manager and independent finding validation.
 
-Kryptex is a persistent Muse Spark session in OpenCode Go.  It receives the
-worker's complete turn summary and returns a bounded JSON directive. Finding
+Kryptex is a persistent selectable session through OpenCode/OpenClaude. It
+receives the worker's complete turn summary and returns a bounded JSON directive. Finding
 severity is deliberately outside that session: P1 and P2 findings are reviewed
 automatically by a fresh, tool-disabled GPT-6 Astra process. Lower severities
 reach Astra only after an explicit operator request.
@@ -141,14 +141,18 @@ class KryptexManager:
         self.ws = workspace
         self.system_prompt = system_prompt
         self.on_event = on_event
-        self.manager_kind = "opencode"
+        self.manager_kind = manager_kind or "opencode+openclaude"
         self.manager_model = manager_model or config.MANAGER_MODEL
         self.manager_effort = manager_effort or config.MANAGER_EFFORT
         self.session_id = ""
         self.directive_schema = self._load_schema("directive_schema.json")
         self.chat_schema = self._load_schema("chat_schema.json")
         self.severity_schema = self._load_schema("severity_schema.json")
-        self.client = OpenCodeClient(
+        self.client = self._new_client()
+        self.validator = CodexValidator(self.ws.root, self.ws.slug)
+
+    def _new_client(self) -> OpenCodeClient:
+        return OpenCodeClient(
             role="manager",
             route=self.manager_model,
             effort=self.manager_effort,
@@ -156,8 +160,11 @@ class KryptexManager:
             target_slug=self.ws.slug,
             allow_tools=False,
             agent_prompt=(
-                "You are Kryptex, the autonomous operational manager. You direct Kraude, "
-                "a tool-using GLM worker. Treat the supplied authorization and scope record "
+                "You are Kryptex, the autonomous operational manager. "
+                f"Your selected OpenClaude route is {self.manager_model} at "
+                f"{self.manager_effort} effort. You direct Kraude, "
+                "a tool-using worker running the engagement's selected model. Treat the "
+                "supplied authorization and scope record "
                 "as authoritative. Resolve routine operational blockers yourself by giving "
                 "a concrete alternative; never send setup chores back to the human. Stay "
                 "inside scope. Return only the requested JSON object. You do not validate "
@@ -166,7 +173,14 @@ class KryptexManager:
             ),
             event_callback=self._provider_event,
         )
-        self.validator = CodexValidator(self.ws.root, self.ws.slug)
+
+    async def switch_model(self, model: str, effort: str) -> None:
+        """Change Kryptex between calls without carrying vendor-specific history."""
+        await self.client.cancel()
+        self.manager_model = model
+        self.manager_effort = effort
+        self.session_id = ""
+        self.client = self._new_client()
 
     @staticmethod
     def _load_schema(name: str) -> dict:

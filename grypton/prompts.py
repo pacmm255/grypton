@@ -62,8 +62,8 @@ def worker_workspace_md(*, target: str, target_type: str, workspace: Path,
     """An AGENTS.md dropped in the worker cwd for compaction-safe context."""
     return f"""# Grypton engagement — {target}
 
-You are **Kraude**, Grypton's GLM 5.3 max worker. Kryptex (Muse Spark 1.3
-xhigh) directs each turn; GPT-6 Astra max validates new findings independently.
+You are **Kraude**, Grypton's selected tool-using worker. Kryptex, the selected
+manager, directs each turn; GPT-6 Astra max validates new findings independently.
 
 - Target: `{target}`  ·  Type: `{target_type}`
 - Workspace: `{workspace}`

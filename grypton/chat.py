@@ -389,6 +389,27 @@ class Renderer:
             if d.get("reason"):
                 print(dim(f"      reason: {d['reason'][:240]}"))
 
+        elif kind == "gateway":
+            event = d.get("event") if isinstance(d.get("event"), dict) else {}
+            event_type = event.get("type")
+            if event_type == "openclaude_notice":
+                print(yellow(f"  ↻ OpenClaude · {d.get('role', 'role')}: "
+                             f"{event.get('message', '')}"))
+            elif event_type == "openclaude_effort" and self.view != "quiet":
+                print(dim(f"  · OpenClaude effort · {d.get('role', 'role')} · "
+                          f"{event.get('requested', 'auto')} → "
+                          f"{event.get('effective', 'auto')} ({event.get('status', '')})"))
+            elif event_type == "openclaude_gateway" and self.view == "full":
+                print(dim(f"  · OpenClaude gateway · {d.get('role', 'role')} · "
+                          f"{event.get('route', '')} · {event.get('effort', '')}"))
+            elif event_type == "openclaude_request" and self.view == "full":
+                print(dim(f"  · OpenClaude request · {d.get('role', 'role')} · "
+                          f"{event.get('route', '')} · tools={len(event.get('tools') or [])}"))
+
+        elif kind == "model_switch":
+            print(green(f"◆ {d.get('role', 'role').title()} now uses "
+                        f"{d.get('route', '')} · {d.get('effort', '')} via OpenClaude."))
+
         elif kind == "error":
             print(red(f"  ✖ {d.get('text','')}"))
 
@@ -427,7 +448,10 @@ Grypton Code commands
   /surface               attack-surface ledger
   /tested                tested-techniques ledger
   /scope                 binding scope and standing instructions
-  /models                pinned model routes
+  /models [filter]       browse available OpenClaude routes
+  /model                  show active routes
+  /model kraude ROUTE [EFFORT]
+  /model kryptex ROUTE [EFFORT]
   /audit                 evidence, scope, and validator integrity check
   /view quiet|normal|full control stream detail
   /note <text>           persist an operator note without a manager call
@@ -603,14 +627,36 @@ def _print_cost(engine) -> None:
 
 
 def _print_config(engine, renderer: Renderer) -> None:
-    from . import config
     constraints = engine.ws.load_constraints()
+    models = engine.current_models()
     print(bold("Configuration"))
-    print(f"  worker       {config.WORKER_MODEL} · {config.WORKER_EFFORT}")
-    print(f"  manager      {config.MANAGER_MODEL} · {config.MANAGER_EFFORT}")
-    print(f"  validator    {config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT} (automatic P1/P2)")
+    print(f"  worker       {models['kraude']['route']} · {models['kraude']['effort']} · OpenClaude")
+    print(f"  manager      {models['kryptex']['route']} · {models['kryptex']['effort']} · OpenClaude")
+    print(f"  validator    {models['validator']['route']} · {models['validator']['effort']} (automatic P1/P2)")
     print(f"  console      {renderer.view} · scoped captured-tool mode")
     print(f"  in scope     {', '.join(constraints.in_scope) or '—'}")
+
+
+async def _print_model_catalog(search: str = "") -> None:
+    from .openclaude import list_models
+
+    try:
+        rows = await asyncio.to_thread(list_models, search)
+    except Exception as exc:
+        print(yellow(f"OpenClaude catalog unavailable: {exc}"))
+        return
+    available = [row for row in rows if row.status == "available"]
+    if not available:
+        print(dim("No available OpenClaude models match that filter."))
+        return
+    print(bold(f"OpenClaude models ({len(available)} available"
+               + (f", filter={search!r}" if search else "") + "):"))
+    for row in available[:40]:
+        efforts = ",".join(row.efforts) or "auto"
+        tool = "tools" if row.tools else "text"
+        print(f"  {row.route_id:<48} {row.protocol:<10} {tool:<5} {efforts}")
+    if len(available) > 40:
+        print(dim(f"  … {len(available) - 40} more; use /models FILTER to narrow the list."))
 
 
 def _print_permissions(engine) -> None:
@@ -703,14 +749,21 @@ def _run_local_inspection(engine, command: str) -> None:
 
 
 def print_console_header(*, target: str, target_type: str, backend: str,
-                         renderer: Renderer) -> None:
+                         renderer: Renderer, models: dict | None = None) -> None:
     """Render the stable shell before providers begin emitting live events."""
     from . import config
+    models = models or {
+        "kraude": {"route": config.CONFIG.worker_model, "effort": config.CONFIG.worker_effort},
+        "kryptex": {"route": config.CONFIG.manager_model, "effort": config.CONFIG.manager_effort},
+        "validator": {"route": config.VALIDATOR_MODEL, "effort": config.VALIDATOR_EFFORT},
+    }
 
     print(bold(cyan("\n╭── Grypton Code ─────────────────────────────────────────────")))
     print(f"│ {target} · {target_type} · {backend}")
-    print(dim(f"│ GLM {config.WORKER_EFFORT} · Spark {config.MANAGER_EFFORT} · "
-              f"Astra {config.VALIDATOR_EFFORT} · console {renderer.view}"))
+    print(dim(f"│ Kraude {models['kraude']['route']} · {models['kraude']['effort']}"))
+    print(dim(f"│ Kryptex {models['kryptex']['route']} · {models['kryptex']['effort']}"))
+    print(dim(f"│ Astra {models['validator']['route']} · {models['validator']['effort']} · "
+              f"console {renderer.view}"))
     print(dim("╰── Type /help for commands · @findings to prioritize a workspace record"))
 
 
@@ -721,7 +774,8 @@ async def interact(engine, renderer: Renderer | None = None, *, accept_input: bo
         renderer = candidate if isinstance(candidate, Renderer) else Renderer()
     if show_header:
         print_console_header(target=engine.target, target_type=engine.target_type,
-                             backend=engine.backend, renderer=renderer)
+                             backend=engine.backend, renderer=renderer,
+                             models=engine.current_models())
     loop_task = asyncio.create_task(engine.run())
     if not accept_input:
         await loop_task
@@ -799,11 +853,37 @@ def _route_input(engine, renderer: Renderer, text: str) -> bool:
     if text == "/scope":
         print(engine.ws.load_constraints().to_prompt_block())
         return False
-    if text in ("/model", "/models"):
-        from . import config
-        print(f"Kraude    {config.WORKER_MODEL} · {config.WORKER_EFFORT}\n"
-              f"Kryptex   {config.MANAGER_MODEL} · {config.MANAGER_EFFORT}\n"
-              f"Validator {config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT} (P1/P2 automatic)")
+    if text == "/model":
+        models = engine.current_models()
+        print(f"Kraude    {models['kraude']['route']} · {models['kraude']['effort']} · OpenClaude\n"
+              f"Kryptex   {models['kryptex']['route']} · {models['kryptex']['effort']} · OpenClaude\n"
+              f"Validator {models['validator']['route']} · {models['validator']['effort']} "
+              f"(P1/P2 automatic)")
+        print(dim("Change one with /model kraude ROUTE [EFFORT] or "
+                  "/model kryptex ROUTE [EFFORT]."))
+        return False
+    if text == "/models" or text.startswith("/models "):
+        search = text[len("/models"):].strip()
+        asyncio.create_task(_print_model_catalog(search))
+        return False
+    if text.startswith("/model "):
+        try:
+            parts = shlex.split(text)
+        except ValueError as exc:
+            print(yellow(f"Could not parse model command: {exc}"))
+            return False
+        if len(parts) not in {3, 4} or parts[1].lower() not in {
+                "kraude", "worker", "kryptex", "manager"}:
+            print(yellow("Usage: /model kraude|kryptex ROUTE [EFFORT]"))
+            return False
+        try:
+            engine.request_model_switch(
+                parts[1],
+                parts[2],
+                parts[3] if len(parts) == 4 else "",
+            )
+        except ValueError as exc:
+            print(yellow(str(exc)))
         return False
     if text in ("/audit", "/review"):
         _print_audit(engine)

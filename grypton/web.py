@@ -31,6 +31,15 @@ def _jsonl(path: Path, limit: int = 200) -> list[dict]:
     return rows
 
 
+def _named_models(meta=None) -> dict:
+    names = {"worker": "Kraude", "manager": "Kryptex", "validator": "Validator"}
+    models = config.effective_role_models(meta)
+    return {
+        role: {"name": names[role], "route": value["route"], "effort": value["effort"]}
+        for role, value in models.items()
+    }
+
+
 def engagement_summary(slug: str) -> dict:
     ws = Workspace(slug)
     meta = ws.load_meta()
@@ -38,6 +47,7 @@ def engagement_summary(slug: str) -> dict:
     confirmed = ws.confirmed_findings()
     calls = _jsonl(ws.transcripts_dir / "provider-calls.jsonl", 10_000)
     return {"id": slug, "target": meta.target, "type": meta.target_type,
+            "models": _named_models(meta),
             "status": meta.status, "turns": meta.turn_index,
             "surface": len(ws.surface.all()), "tested": len(ws.tested.all()),
             "findings": len(findings), "confirmed": len(confirmed),
@@ -57,10 +67,12 @@ def engagement_summary(slug: str) -> dict:
 
 def dashboard_state() -> dict:
     engagements = [engagement_summary(slug) for slug in reversed(list_targets())]
-    return {"version": "3.4.0", "models": {
-        "worker": {"name": "Kraude", "route": config.WORKER_MODEL, "effort": config.WORKER_EFFORT},
-        "manager": {"name": "Kryptex", "route": config.MANAGER_MODEL, "effort": config.MANAGER_EFFORT},
-        "validator": {"name": "Validator", "route": config.VALIDATOR_MODEL, "effort": config.VALIDATOR_EFFORT}},
+    return {"version": "3.4.0", "models": _named_models(),
+        "openclaude": {
+            "home": str(config.OPENCLAUDE_HOME),
+            "installed": config.OPENCLAUDE_BIN.is_file(),
+            "configured": (config.OPENCLAUDE_HOME / "openclaude.config.json").is_file(),
+        },
         "counts": {"engagements": len(engagements),
                    "running": sum(row["status"] == "running" for row in engagements),
                    "tools": sum(row["tool_calls"] for row in engagements),

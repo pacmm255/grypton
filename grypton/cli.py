@@ -94,7 +94,60 @@ def _constraints(ns, target: str) -> Constraints:
     return value
 
 
-def _configure_run(ns) -> None:
+def _selection_value(selection, *names: str) -> str:
+    if isinstance(selection, dict):
+        for name in names:
+            if selection.get(name):
+                return str(selection[name])
+    for name in names:
+        value = getattr(selection, name, "")
+        if value:
+            return str(value)
+    model = getattr(selection, "model", None)
+    if model is not None:
+        for name in names:
+            value = getattr(model, name, "")
+            if value:
+                return str(value)
+    return ""
+
+
+def _resolve_role_selection(route: str, effort: str, *, require_tools: bool) -> dict[str, str]:
+    """Validate one public OpenClaude route and return its effective selection."""
+    from .openclaude import resolve_model
+
+    public_route = config.normalize_model_route(route)
+    selected = resolve_model(public_route, effort=effort, require_tools=require_tools)
+    resolved_route = _selection_value(selected, "route", "route_id", "id") or public_route
+    resolved_effort = _selection_value(selected, "effort", "effective_effort") or effort
+    return {"route": config.normalize_model_route(resolved_route), "effort": resolved_effort}
+
+
+def _requested_role_models(ns, meta=None, *, validate: bool = False) -> dict[str, dict[str, str]]:
+    models = config.effective_role_models(meta)
+    worker_model = getattr(ns, "worker_model", None)
+    worker_effort = getattr(ns, "worker_effort", None)
+    manager_model = getattr(ns, "manager_model", None)
+    manager_effort = getattr(ns, "manager_effort", None)
+    if worker_model:
+        models["worker"]["route"] = config.resolve_worker_model(worker_model)
+    if worker_effort:
+        models["worker"]["effort"] = str(worker_effort)
+    if manager_model:
+        models["manager"]["route"] = config.resolve_manager_model(manager_model)
+    if manager_effort:
+        models["manager"]["effort"] = str(manager_effort)
+    if validate:
+        models["worker"] = _resolve_role_selection(
+            models["worker"]["route"], models["worker"]["effort"], require_tools=True
+        )
+        models["manager"] = _resolve_role_selection(
+            models["manager"]["route"], models["manager"]["effort"], require_tools=False
+        )
+    return models
+
+
+def _configure_run(ns, ws: Workspace | None = None, *, fresh: bool = False) -> dict[str, dict[str, str]]:
     if getattr(ns, "auto_stop_time", None) is not None:
         config.CONFIG.max_run_seconds = int(ns.auto_stop_time) * 60
     elif getattr(ns, "max_seconds", None) is not None:
@@ -103,15 +156,40 @@ def _configure_run(ns) -> None:
         config.CONFIG.max_turns = int(ns.max_turns)
     config.CONFIG.stop_on_p1 = bool(getattr(ns, "stop_on_p1", False))
     config.CONFIG.backend = getattr(ns, "backend", "real")
+    meta = None if fresh or ws is None else ws.load_meta()
+    models = _requested_role_models(ns, meta, validate=config.CONFIG.backend == "real")
+    if ws is not None:
+        ws.update_meta(
+            worker_kind="opencode+openclaude",
+            worker_model=models["worker"]["route"],
+            worker_effort=models["worker"]["effort"],
+            manager_kind="opencode+openclaude",
+            manager_model=models["manager"]["route"],
+            manager_effort=models["manager"]["effort"],
+            validator_model=config.VALIDATOR_MODEL,
+        )
+    return models
 
 
 def _run_engagement(ws: Workspace, ns, *, brief: str, fresh: bool) -> int:
     from .chat import Renderer, interact, print_console_header
     from .engine import Engine
 
-    _configure_run(ns)
+    try:
+        models = _configure_run(ns, ws, fresh=fresh)
+    except (ValueError, RuntimeError, OSError) as exc:
+        print(f"ERROR: invalid model selection: {exc}", file=sys.stderr)
+        return 2
     renderer = Renderer(getattr(ns, "console", "normal"))
-    engine = Engine(ws.slug, backend=config.CONFIG.backend, emit=renderer.emit)
+    engine = Engine(
+        ws.slug,
+        backend=config.CONFIG.backend,
+        emit=renderer.emit,
+        worker_model=models["worker"]["route"],
+        worker_effort=models["worker"]["effort"],
+        manager_model=models["manager"]["route"],
+        manager_effort=models["manager"]["effort"],
+    )
 
     async def execute():
         loop = asyncio.get_running_loop()
@@ -125,7 +203,8 @@ def _run_engagement(ws: Workspace, ns, *, brief: str, fresh: bool) -> int:
         # events, and printing it after setup puts startup lines above the
         # console frame and looks like a broken interactive session.
         print_console_header(target=meta.target, target_type=meta.target_type,
-                             backend=config.CONFIG.backend, renderer=renderer)
+                             backend=config.CONFIG.backend, renderer=renderer,
+                             models=engine.current_models())
         await engine.setup(brief=brief, target=meta.target, target_type=meta.target_type,
                            fresh_clone=fresh)
         await interact(engine, renderer, accept_input=not getattr(ns, "print_mode", False),
@@ -194,6 +273,7 @@ def _status(slug: str) -> dict:
                 by_role[role] += 1
     except (OSError, ValueError):
         pass
+    models = config.effective_role_models(meta)
     return {"slug": slug, "target": meta.target, "status": meta.status,
             "type": meta.target_type, "turns": meta.turn_index,
             "findings": len(ws.findings.all()),
@@ -202,9 +282,8 @@ def _status(slug: str) -> dict:
             "surface": len(ws.surface.all()), "tested": len(ws.tested.all()),
             "tool_calls": _count_lines(ws.root / ".ledger" / "tool-calls.jsonl"),
             "provider_calls": by_role,
-            "models": {"worker": f"{config.WORKER_MODEL} · {config.WORKER_EFFORT}",
-                       "manager": f"{config.MANAGER_MODEL} · {config.MANAGER_EFFORT}",
-                       "validator": f"{config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT}"},
+            "models": {role: f"{value['route']} · {value['effort']}"
+                       for role, value in models.items()},
             "workspace": str(ws.root)}
 
 
@@ -432,6 +511,8 @@ def cmd_plan(ns) -> int:
     selected_type = ns.type
     scenarios = [row["id"] for row in load_scenarios()
                  if selected_type == "auto" or selected_type in row.get("target_types", [])]
+    models = _requested_role_models(ns)
+    models["validator"]["automatic_severities"] = sorted(config.ASTRA_AUTO_SEVERITIES)
     output = {
         "target": target,
         "type": selected_type,
@@ -440,12 +521,7 @@ def cmd_plan(ns) -> int:
         "scope": constraints.in_scope,
         "out_of_scope": constraints.out_of_scope,
         "hard_rules": constraints.hard_rules,
-        "models": {
-            "worker": {"route": config.WORKER_MODEL, "effort": config.WORKER_EFFORT},
-            "manager": {"route": config.MANAGER_MODEL, "effort": config.MANAGER_EFFORT},
-            "validator": {"route": config.VALIDATOR_MODEL, "effort": config.VALIDATOR_EFFORT,
-                          "automatic_severities": sorted(config.ASTRA_AUTO_SEVERITIES)},
-        },
+        "models": models,
         "scenario_ids": scenarios,
         "created": False,
     }
@@ -455,12 +531,22 @@ def cmd_plan(ns) -> int:
     command = f"grypton init --target {shlex.quote(target)} --type {shlex.quote(selected_type)}"
     if ns.brief:
         command += f" --brief {shlex.quote(ns.brief)}"
+    if getattr(ns, "worker_model", None):
+        command += f" --kraude-model {shlex.quote(ns.worker_model)}"
+    if getattr(ns, "worker_effort", None):
+        command += f" --kraude-effort {shlex.quote(ns.worker_effort)}"
+    if getattr(ns, "manager_model", None):
+        command += f" --kryptex-model {shlex.quote(ns.manager_model)}"
+    if getattr(ns, "manager_effort", None):
+        command += f" --kryptex-effort {shlex.quote(ns.manager_effort)}"
     print("Grypton preflight — no workspace or provider was started")
     print(f"  target       {target} ({selected_type})")
     print(f"  workspace    {output['workspace']}")
     print(f"  in scope     {', '.join(constraints.in_scope) or '—'}")
     print(f"  out of scope {', '.join(constraints.out_of_scope) or '—'}")
-    print(f"  models       GLM → Spark → Astra (P1/P2 automatic)")
+    print(f"  Kraude      {models['worker']['route']} · {models['worker']['effort']}")
+    print(f"  Kryptex     {models['manager']['route']} · {models['manager']['effort']}")
+    print(f"  validator   {models['validator']['route']} · {models['validator']['effort']} (P1/P2 automatic)")
     print(f"  playbooks    {', '.join(scenarios) or 'auto routing at startup'}")
     print(f"  start        {command}")
     return 0
@@ -668,22 +754,104 @@ def cmd_stop(ns) -> int:
     return 0
 
 
+def _catalog_value(model, name: str, default=None):
+    if isinstance(model, dict):
+        return model.get(name, default)
+    return getattr(model, name, default)
+
+
+def _catalog_row(model) -> dict:
+    route = (_catalog_value(model, "route_id") or _catalog_value(model, "route") or
+             _catalog_value(model, "id") or "")
+    efforts = (_catalog_value(model, "efforts") or
+               _catalog_value(model, "supported_efforts") or ())
+    if isinstance(efforts, str):
+        efforts = [efforts]
+    return {
+        "route": config.normalize_model_route(str(route)),
+        "label": str(_catalog_value(model, "label", route) or route),
+        "provider": str(_catalog_value(model, "provider", "") or ""),
+        "model": str(_catalog_value(model, "upstream_model", "") or
+                     _catalog_value(model, "model", "") or ""),
+        "status": str(_catalog_value(model, "status", "active") or "active"),
+        "reason": str(_catalog_value(model, "reason", "") or ""),
+        "tools": _catalog_value(model, "tools", False) is True,
+        "reasoning": _catalog_value(model, "reasoning", False) is True,
+        "efforts": [str(value) for value in efforts],
+        "default_effort": str(_catalog_value(model, "effort_default", "auto") or "auto"),
+        "context_window": int(_catalog_value(model, "context_window", 0) or 0),
+        "max_output_tokens": int(_catalog_value(model, "max_output_tokens", 0) or 0),
+    }
+
+
+def _catalog_rows(search: str = "", *, include_all: bool = False) -> list[dict]:
+    from .openclaude import list_models
+
+    rows = [_catalog_row(model) for model in list_models()]
+    query = str(search or "").strip().lower()
+    if query:
+        rows = [row for row in rows if query in " ".join(
+            str(row.get(field) or "").lower()
+            for field in ("route", "label", "provider", "model", "status")
+        )]
+    if not include_all:
+        rows = [row for row in rows if row["status"] == "available"]
+    return sorted(rows, key=lambda row: row["route"])
+
+
 def cmd_models(ns) -> int:
-    print(f"Kraude    {config.WORKER_MODEL} · {config.WORKER_EFFORT} · OpenCode Z.AI Coding Plan\n"
-          f"Kryptex   {config.MANAGER_MODEL} · {config.MANAGER_EFFORT} · OpenCode Go\n"
-          f"Validator {config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT} · "
-          f"Codex (fresh; automatic P1/P2 only)")
-    return 0
-
-
-def _model_in_catalog(route: str) -> bool:
-    provider, model = route.split("/", 1)
+    defaults = config.effective_role_models()
+    changed = False
     try:
-        result = subprocess.run([config.require_binary("opencode"), "models", provider],
-                                capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0 and any(line.strip() == route for line in result.stdout.splitlines())
+        if ns.set_kraude or ns.kraude_effort:
+            selected = _resolve_role_selection(
+                ns.set_kraude or defaults["worker"]["route"],
+                ns.kraude_effort or defaults["worker"]["effort"],
+                require_tools=True,
+            )
+            config.CONFIG.worker_model = selected["route"]
+            config.CONFIG.worker_effort = selected["effort"]
+            changed = True
+        if ns.set_kryptex or ns.kryptex_effort:
+            selected = _resolve_role_selection(
+                ns.set_kryptex or defaults["manager"]["route"],
+                ns.kryptex_effort or defaults["manager"]["effort"],
+                require_tools=False,
+            )
+            config.CONFIG.manager_model = selected["route"]
+            config.CONFIG.manager_effort = selected["effort"]
+            changed = True
+        if changed:
+            config.CONFIG.save()
+            defaults = config.effective_role_models()
+        rows = _catalog_rows(ns.search, include_all=ns.all)
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        print(f"ERROR: OpenClaude model catalog unavailable: {exc}", file=sys.stderr)
+        return 1
+    output = {"defaults": defaults, "models": rows}
+    if ns.json:
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+        return 0
+    if changed:
+        print("Saved global model defaults.")
+    print(f"Kraude    {defaults['worker']['route']} · {defaults['worker']['effort']} · OpenClaude")
+    print(f"Kryptex   {defaults['manager']['route']} · {defaults['manager']['effort']} · OpenClaude")
+    print(f"Validator {defaults['validator']['route']} · {defaults['validator']['effort']} · "
+          "Codex (fresh; automatic P1/P2 only)")
+    print("\nOpenClaude models")
+    if not rows:
+        print("  No matching models.")
+        return 0
+    for row in rows:
+        capabilities = []
+        if row["tools"]:
+            capabilities.append("tools")
+        if row["reasoning"]:
+            capabilities.append("reasoning")
+        efforts = ",".join(row["efforts"]) or row["default_effort"]
+        detail = ", ".join(capabilities) or "text"
+        print(f"  {row['route']:<52} {row['status']:<10} {detail}; effort={efforts}")
+    return 0
 
 
 def _mcp_probe() -> tuple[bool, str]:
@@ -701,20 +869,36 @@ def _mcp_probe() -> tuple[bool, str]:
 
 
 def cmd_doctor(ns) -> int:
-    from .providers import opencode_credential
     checks = []
-    for binary in ("opencode", "codex", "curl", "httpx", "playwright",
+    for binary in ("node", "opencode", "codex", "curl", "httpx", "playwright",
                    "google-chrome", "subfinder"):
         found = config.find_binary(binary)
         checks.append((binary, bool(found), found or "missing"))
-    for provider in (config.WORKER_PROVIDER, config.MANAGER_PROVIDER):
+    checks.append(("OpenClaude installation", config.OPENCLAUDE_BIN.is_file(),
+                   str(config.OPENCLAUDE_BIN)))
+    checks.append(("OpenClaude config", (config.OPENCLAUDE_HOME / "openclaude.config.json").is_file(),
+                   str(config.OPENCLAUDE_HOME / "openclaude.config.json")))
+    defaults = config.effective_role_models()
+    try:
+        rows = _catalog_rows()
+        routes = {row["route"] for row in rows}
+        checks.append(("OpenClaude catalog", bool(rows), f"{len(rows)} available public routes"))
+    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+        routes = set()
+        checks.append(("OpenClaude catalog", False, _redact_summary(exc)))
+    for role, require_tools in (("worker", True), ("manager", False)):
+        selected = defaults[role]
+        name = f"{role} route {selected['route']}"
+        if selected["route"] not in routes:
+            checks.append((name, False, "missing from OpenClaude catalog"))
+            continue
         try:
-            opencode_credential(provider)
-            checks.append((provider + " connector", True, "connected (credential hidden)"))
-        except Exception as exc:
-            checks.append((provider + " connector", False, str(exc)))
-    checks.append((config.WORKER_MODEL, _model_in_catalog(config.WORKER_MODEL), "OpenCode catalog"))
-    checks.append((config.MANAGER_MODEL, _model_in_catalog(config.MANAGER_MODEL), "OpenCode catalog"))
+            _resolve_role_selection(selected["route"], selected["effort"],
+                                    require_tools=require_tools)
+            detail = f"effort={selected['effort']}" + ("; tools required" if require_tools else "")
+            checks.append((name, True, detail))
+        except (OSError, RuntimeError, ValueError) as exc:
+            checks.append((name, False, _redact_summary(exc)))
     mcp_ok, mcp_detail = _mcp_probe()
     checks.append(("Grypton MCP", mcp_ok, mcp_detail))
     checks.append(("Goja", (config.GOJA_DIR / "bin/goja-proxy").is_file(),
@@ -834,10 +1018,20 @@ def cmd_demo(ns) -> int:
     return cmd_init(ns)
 
 
+def _model_options(parser) -> None:
+    parser.add_argument("--kraude-model", "--model", dest="worker_model", metavar="ROUTE",
+                        help="OpenClaude route for Kraude")
+    parser.add_argument("--kraude-effort", dest="worker_effort", metavar="LEVEL",
+                        help="Reasoning effort for Kraude")
+    parser.add_argument("--kryptex-model", dest="manager_model", metavar="ROUTE",
+                        help="OpenClaude route for Kryptex")
+    parser.add_argument("--kryptex-effort", dest="manager_effort", metavar="LEVEL",
+                        help="Reasoning effort for Kryptex")
+
+
 def _run_options(parser) -> None:
     parser.add_argument("-m", "--brief", default="", help="Engagement mission")
-    parser.add_argument("--model", dest="worker_model", choices=["glm", "glm-5.3", "zai-coding-plan/glm-5.3"],
-                        help="Kraude route alias; the worker remains pinned to GLM 5.3")
+    _model_options(parser)
     parser.add_argument("--permission-mode", choices=["scoped"], default="scoped",
                         help="Use Grypton's recorded-scope, captured-tool permission mode")
     parser.add_argument("-p", "--print", dest="print_mode", action="store_true",
@@ -880,6 +1074,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("--include", default=""); plan.add_argument("--in-scope", default="")
     plan.add_argument("--out-scope", default=""); plan.add_argument("--rule", action="append", default=[])
     plan.add_argument("--authorization-file"); plan.add_argument("--bugcrowd-brief")
+    _model_options(plan)
     plan.add_argument("--json", action="store_true"); plan.set_defaults(func=cmd_plan)
     resume = sub.add_parser("resume", help="Resume a persistent engagement")
     resume.add_argument("target"); _run_options(resume); resume.set_defaults(func=cmd_resume)
@@ -928,7 +1123,15 @@ def build_parser() -> argparse.ArgumentParser:
                                                         default="markdown")
     report.add_argument("--output"); report.set_defaults(func=cmd_report)
     stop = sub.add_parser("stop"); stop.add_argument("target"); stop.set_defaults(func=cmd_stop)
-    models = sub.add_parser("models"); models.set_defaults(func=cmd_models)
+    models = sub.add_parser("models", help="Browse OpenClaude routes or set global role defaults")
+    models.add_argument("search", nargs="?", default="", help="Filter route, provider, model, or status")
+    models.add_argument("--json", action="store_true")
+    models.add_argument("--all", action="store_true",
+                        help="Include disconnected and unsupported catalog routes")
+    models.add_argument("--set-kraude", metavar="ROUTE", help="Save the global Kraude route")
+    models.add_argument("--set-kryptex", metavar="ROUTE", help="Save the global Kryptex route")
+    models.add_argument("--kraude-effort", metavar="LEVEL")
+    models.add_argument("--kryptex-effort", metavar="LEVEL"); models.set_defaults(func=cmd_models)
     doctor = sub.add_parser("doctor"); doctor.set_defaults(func=cmd_doctor)
     tools_parser = sub.add_parser("tools", help="Call the scoped HTTP/Goja/capture tool surface")
     tools_parser.add_argument("arguments", nargs=argparse.REMAINDER); tools_parser.set_defaults(func=cmd_tools)
@@ -970,7 +1173,8 @@ _COMMAND_NAMES = {
 _COMPAT_VALUE_OPTIONS = {
     "--target", "--type", "--only", "--exclude", "--include", "--in-scope", "--out-scope", "--rule",
     "--authorization-file", "--bugcrowd-brief", "-m", "--brief", "--max-seconds", "--max-turns",
-    "--auto-stop-time", "--console", "--model", "--permission-mode", "--backend",
+    "--auto-stop-time", "--console", "--model", "--kraude-model", "--kraude-effort",
+    "--kryptex-model", "--kryptex-effort", "--permission-mode", "--backend",
 }
 
 
@@ -1081,13 +1285,15 @@ def main(argv=None) -> int:
 
 
 def worker_main(argv=None) -> int:
-    print(f"Kraude is pinned to {config.WORKER_MODEL} · {config.WORKER_EFFORT}. "
+    models = config.effective_role_models()
+    print(f"Kraude defaults to {models['worker']['route']} · {models['worker']['effort']}. "
           "Start it with `grypton init --target HOST`.")
     return 0
 
 
 def manager_main(argv=None) -> int:
-    print(f"Kryptex is pinned to {config.MANAGER_MODEL} · {config.MANAGER_EFFORT}; "
+    models = config.effective_role_models()
+    print(f"Kryptex defaults to {models['manager']['route']} · {models['manager']['effort']}; "
           f"automatic P1/P2 validation uses "
-          f"{config.VALIDATOR_MODEL} · {config.VALIDATOR_EFFORT}.")
+          f"{models['validator']['route']} · {models['validator']['effort']}.")
     return 0

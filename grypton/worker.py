@@ -1,4 +1,4 @@
-"""Kraude: a persistent GLM 5.3 max worker driven through OpenCode."""
+"""Kraude: a persistent, selectable worker driven through OpenCode/OpenClaude."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -48,20 +48,31 @@ class OpenCodeWorker:
         self.on_event = on_event
         self.session_id = spec.session_uuid or ""
         self._started = False
+        self.client = self._new_client()
+
+    def _new_client(self) -> OpenCodeClient:
+        """Build the transport for the current role selection.
+
+        Model changes intentionally create a fresh provider session. Grypton's
+        durable ledgers remain the source of engagement memory, while an old
+        vendor/model transcript is not replayed into an incompatible route.
+        """
         slug = (
-            spec.extra_env.get("GRYPTON_TARGET")
-            or spec.extra_env.get("KRYPTON_TARGET")
-            or spec.cwd.name
+            self.spec.extra_env.get("GRYPTON_TARGET")
+            or self.spec.extra_env.get("KRYPTON_TARGET")
+            or self.spec.cwd.name
         )
-        self.client = OpenCodeClient(
+        return OpenCodeClient(
             role="worker",
-            route=spec.model or config.WORKER_MODEL,
-            effort=spec.effort or config.WORKER_EFFORT,
-            workspace=spec.cwd,
+            route=self.spec.model or config.WORKER_MODEL,
+            effort=self.spec.effort or config.WORKER_EFFORT,
+            workspace=self.spec.cwd,
             target_slug=slug,
             allow_tools=True,
             agent_prompt=(
                 "You are Kraude, the hands-on worker in a persistent Grypton engagement. "
+                f"Your selected OpenClaude route is {self.spec.model} at "
+                f"{self.spec.effort} effort. "
                 "Use tools and produce observable progress. Read engagement ledgers through "
                 "the grypton_read_doc MCP tool, then obey scope-rules.md exactly. "
                 "Record surface, tested techniques, and findings with the grypton MCP "
@@ -71,6 +82,16 @@ class OpenCodeWorker:
             ),
             event_callback=self._translate_event,
         )
+
+    async def switch_model(self, model: str, effort: str) -> None:
+        """Apply an already validated selection between worker turns."""
+        await self.client.cancel()
+        self.spec.model = model
+        self.spec.effort = effort
+        self.session_id = ""
+        self.spec.session_uuid = ""
+        self.client = self._new_client()
+        self._started = False
 
     async def start(self) -> None:
         if self._started:
@@ -106,7 +127,7 @@ class OpenCodeWorker:
         tool_bin = config.find_binary("grypton-tool") or str(config.BIN_DIR / "grypton-tool")
         slug = self.spec.extra_env.get("GRYPTON_TARGET", self.spec.cwd.name)
         return (
-            "=== OPENCODE GLM WORKER RUNTIME ===\n"
+            "=== GRYPTON KRAUDE WORKER RUNTIME ===\n"
               "Native Bash/read/write/edit tools and `grypton_*` MCP tools are "
               "available. Every network action MUST use a `grypton_*` MCP tool so "
               "scope checks and Burp-like request/response capture cannot be bypassed. "

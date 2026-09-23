@@ -4,17 +4,24 @@ Grypton Code is a persistent, tool-using security-testing workspace. You give it
 
 Use Grypton only for systems you are allowed to assess.
 
+Grypton uses the local OpenClaude installation at `/root/openclaude` as the
+model gateway for Kraude and Kryptex. OpenCode still hosts their sessions and
+tools. Astra validation remains a separate, direct Codex process.
+
 ```bash
 cd /root/grypton
 ./bin/grypton doctor
 ```
 
-If `doctor` shows `OK` for the two OpenCode connectors, Codex, and Grypton MCP, you are ready to start.
+If `doctor` shows `OK` for OpenClaude, the selected routes, OpenCode, Codex,
+and Grypton MCP, you are ready to start.
 
 ```mermaid
 flowchart LR
     O[You] --> K[Kryptex\nmanager]
     K --> W[Kraude\nworker]
+    OC[OpenClaude\nmodel gateway] --> K
+    OC --> W
     W --> T[Scoped tools]
     T --> E[Private evidence workspace]
     E --> K
@@ -27,10 +34,40 @@ flowchart LR
 | Role | What it does | Model route |
 | --- | --- | --- |
 | **Kraude** | Maps the target, uses the scoped tools, records evidence, and writes finding candidates. | `zai-coding-plan/glm-5.3` at `max` |
-| **Kryptex** | Manages Kraude, chooses the next useful step, corrects weak work, and handles ordinary blockers. | `opencode-go/muse-spark-1.3-contributor` at `xhigh` |
+| **Kryptex** | Manages Kraude, chooses the next useful step, corrects weak work, and handles ordinary blockers. | `go/muse-spark-1.3-contributor` at `xhigh` |
 | **Astra** | Independently reviews serious finding evidence. | `gpt-6-astra` at `max` |
 
 Kryptex does not validate its own worker. New P1 and P2 findings go to Astra automatically. P3, P4, and P5 findings stay recorded until you explicitly request validation.
+
+## Set up OpenClaude and the key pool
+
+Before a real run, Grypton expects:
+
+- Node.js and OpenCode on `PATH`;
+- a complete OpenClaude checkout at `/root/openclaude` with
+  `openclaude.config.json`;
+- the OpenClaude `go` provider configured to use the OpenCode Go credential
+  and `/root/open` as its `keyFile`;
+- one API key per non-empty line in `/root/open`, with private file permissions;
+- Codex configured for the independent Astra validator.
+
+Never put a literal API key in Grypton configuration, a command, a report, or
+an engagement file. OpenClaude reads the primary OpenCode credential and the
+key file inside its sidecar. Grypton receives only an authenticated loopback
+gateway address and sanitized status events.
+
+The default role selections are:
+
+```text
+Kraude   zai-coding-plan/glm-5.3         max
+Kryptex  go/muse-spark-1.3-contributor   xhigh
+Astra    gpt-6-astra                      max
+```
+
+`opencode-go/...` is accepted as a legacy input and normalized to the public
+OpenClaude route `go/...`. Set `GRYPTON_OPENCLAUDE_HOME` if OpenClaude is
+installed somewhere else, or `GRYPTON_OPENCLAUDE_CONFIG` to select another
+OpenClaude configuration file.
 
 ## Five ideas to know first
 
@@ -138,7 +175,10 @@ Add these options to `init`, `resume`, or the direct start form.
 | `--rule "text"` | Add a permanent engagement rule. Repeat this option when needed. |
 | `--authorization-file FILE` | Save a hash of an authorization record with the engagement. |
 | `--bugcrowd-brief FILE` | Import scope and automation rules from a saved Bugcrowd brief. |
-| `--model glm` | Accept the worker route alias. Kraude stays pinned to GLM 5.3. |
+| `--kraude-model ROUTE` or `--model ROUTE` | Use this OpenClaude route for Kraude. |
+| `--kraude-effort LEVEL` | Set Kraude's supported reasoning effort. |
+| `--kryptex-model ROUTE` | Use this OpenClaude route for Kryptex. |
+| `--kryptex-effort LEVEL` | Set Kryptex's supported reasoning effort. |
 | `--permission-mode scoped` | Use Grypton's scope-checked, captured-tool mode. |
 | `-p` or `--print` | Do not wait for console input. Keep the event stream in stdout. |
 | `--console quiet` | Start with compact terminal output. Also accepts `normal` and `full`. |
@@ -179,6 +219,108 @@ Resume quietly and write the stream to a log:
 
 ---
 
+# Choose Kraude and Kryptex models
+
+OpenClaude supplies the model catalog for both roles. Astra is deliberately not
+part of this selection: it stays on direct Codex with `gpt-6-astra` at `max`.
+
+## Browse available routes
+
+```bash
+# Show available OpenClaude routes
+./bin/grypton models
+
+# Search route IDs, providers, labels, and models
+./bin/grypton models glm
+./bin/grypton models muse
+
+# Include disconnected or unsupported catalog entries when diagnosing
+./bin/grypton models --all
+
+# Machine-readable available routes and current defaults
+./bin/grypton models --json
+```
+
+Grypton refuses a route that OpenClaude marks unavailable. Kraude's route must
+support tool calls. Grypton also refuses an effort level that the selected
+route does not support.
+
+## Change global defaults
+
+These commands save private global defaults in `/root/grypton/grypton.json`:
+
+```bash
+./bin/grypton models \
+  --set-kraude zai-coding-plan/glm-5.3 \
+  --kraude-effort max
+
+./bin/grypton models \
+  --set-kryptex go/muse-spark-1.3-contributor \
+  --kryptex-effort xhigh
+```
+
+Global defaults apply when a new engagement does not supply role flags. They do
+not silently replace the model already saved for an existing engagement.
+
+## Select models for one engagement
+
+Use role flags with `plan`, `init`, a direct start, or `resume`:
+
+```bash
+./bin/grypton init \
+  --target "https://app.example.test" \
+  --kraude-model zai-coding-plan/glm-5.3 \
+  --kraude-effort max \
+  --kryptex-model go/muse-spark-1.3-contributor \
+  --kryptex-effort xhigh \
+  -m "Map the authorized web surface"
+```
+
+The route and effort are saved in the engagement. A later `resume` uses those
+saved values unless you pass new role flags.
+
+## Change a role during a run
+
+In the interactive console:
+
+```text
+❯ /model
+❯ /models glm
+❯ /model kraude zai-coding-plan/glm-5.3 max
+❯ /model kryptex go/muse-spark-1.3-contributor xhigh
+```
+
+The change is queued and applied at the next safe role boundary. Grypton opens
+a fresh provider session for that role so a transcript from one vendor or model
+is not replayed to another. Findings, flows, progress, scope, and other durable
+engagement records remain available. The new selection is saved for resume.
+
+## Automatic API-key failover
+
+OpenClaude builds each provider's key pool from the configured primary
+credential followed by the lines in its `keyFile`. For the Go plan, that key
+file is `/root/open`. Duplicate keys are removed without printing their values.
+
+OpenClaude automatically moves to the next usable key when the provider answer
+shows a key-specific condition:
+
+- HTTP 401 or 402;
+- a 403 identified as data-policy, blocked-account, credit, quota, or billing;
+- a 429 identified as a spent usage plan, account limit, credits, or balance.
+
+The failed key enters a cooldown, so later requests do not immediately reuse
+it. Temporary connection failures and HTTP 408, 425, or 5xx responses are
+retried with bounded delay when the configured retry window permits it.
+
+Grypton does not rotate keys for a malformed request, an unknown model, an
+unsupported effort, a tool error, or a scope denial because a different key
+cannot fix those conditions. OpenClaude never replays a request after a
+response has begun. This avoids duplicate tool activity and duplicate probes.
+Sanitized gateway, request, effort, and rotation notices are written under the
+engagement's `transcripts/` directory; API keys are never written there.
+
+---
+
 # The interactive console
 
 The terminal is designed like a Code-style session. It has a compact startup card, a `❯` prompt, streamed work, and slash commands.
@@ -208,7 +350,10 @@ Your messages are saved as standing instructions for the engagement. Kryptex rec
 | `/config` | Show model routes, scope mode, and console mode. |
 | `/permissions` | Show the enforced network and tool boundaries. |
 | `/resume` | Print the command to resume this engagement later. |
-| `/models` or `/model` | Show the three pinned model routes. |
+| `/model` | Show the active Kraude, Kryptex, and Astra routes. |
+| `/models [filter]` | Browse available OpenClaude routes. |
+| `/model kraude ROUTE [EFFORT]` | Queue a Kraude route change. |
+| `/model kryptex ROUTE [EFFORT]` | Queue a Kryptex route change. |
 | `/audit` or `/review` | Run the evidence and scope integrity check. |
 | `/stop` | Request a clean stop after the active worker step. |
 
@@ -524,7 +669,10 @@ Each engagement has a private directory:
 
 Do not edit the active ledger files while an engagement is running. Use the console or the CLI commands to add instructions and review evidence.
 
-Provider credentials are kept in private runtime state. They are not shown by `doctor`, reports, or normal console output.
+Provider credentials stay inside OpenClaude's credential loader and private
+runtime state. The local gateway token is passed through the child process
+environment. Keys are not placed in OpenCode configuration, engagement
+metadata, `doctor` output, reports, or normal console output.
 
 ---
 
@@ -538,7 +686,79 @@ Run:
 ./bin/grypton doctor
 ```
 
-Fix the first failed item. The most common requirements are the `opencode` binary, the Z.AI Coding Plan connector, the OpenCode Go connector, Codex, curl, and the Grypton MCP server.
+Fix the first failed item. The usual requirements are Node.js, OpenCode,
+Codex, curl, the Grypton MCP server, a complete `/root/openclaude` checkout,
+its configuration and catalog, and usable credentials for the selected routes.
+`doctor` checks the current Kraude route, effort, and tool capability separately
+from the Kryptex selection.
+
+## OpenClaude is missing or its catalog is unavailable
+
+Confirm the local installation and configuration exist, then run the catalog
+command directly through Grypton:
+
+```bash
+ls -ld /root/openclaude
+ls -l /root/openclaude/bin/openclaude.mjs \
+      /root/openclaude/openclaude.config.json
+./bin/grypton models
+./bin/grypton doctor
+```
+
+If OpenClaude lives elsewhere, export `GRYPTON_OPENCLAUDE_HOME` before running
+Grypton. If you use a different config, export `GRYPTON_OPENCLAUDE_CONFIG`.
+
+## A route or effort is rejected
+
+Search the live local catalog instead of guessing a route name:
+
+```bash
+./bin/grypton models glm
+./bin/grypton models muse
+```
+
+Use a route marked available and choose one of its listed effort levels. Kraude
+also needs a model with tool support. The old route prefix `opencode-go/` is
+accepted, but status, reports, and saved metadata show its canonical `go/`
+form.
+
+## OpenClaude reports no usable credential
+
+Do not paste a key into the Grypton console. Check only the files and their
+permissions:
+
+```bash
+ls -l /root/open
+chmod 600 /root/open
+./bin/grypton doctor
+```
+
+The Go key pool expects one key per non-empty line. Blank lines and lines
+starting with `#` are ignored. OpenClaude also includes the primary OpenCode Go
+credential and removes duplicates. If a provider uses another credential
+source, fix that source in `openclaude.config.json` or OpenCode's own supported
+connection flow.
+
+## Every key is limited or spent
+
+OpenClaude tries every usable key before returning the provider error. A spent
+key remains on cooldown. Add a valid spare through the configured private key
+file or wait for the provider's stated reset; restarting repeatedly does not
+restore quota. Use `/view full` to see sanitized gateway notices, or review:
+
+```text
+.state/engagements/ENGAGEMENT/transcripts/openclaude.events.jsonl
+```
+
+The file contains route names, status notices, and short key fingerprints. It
+does not contain the keys.
+
+## A live model change starts a new session
+
+That is expected. A `/model kraude ...` or `/model kryptex ...` change closes
+that role's old provider session at a safe boundary and starts a clean one.
+Grypton keeps the engagement ledgers and writes the selected route and effort
+to engagement metadata, so `resume` continues with the new selection.
 
 ## `a target is required`
 

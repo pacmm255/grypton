@@ -53,6 +53,8 @@ def final_severity(finding: dict) -> str:
 
 
 def audit_workspace(ws) -> dict:
+    meta = ws.load_meta()
+    models = config.effective_role_models(meta)
     findings = ws.findings.all()
     surface = ws.surface.all()
     tested = ws.tested.all()
@@ -60,29 +62,71 @@ def audit_workspace(ws) -> dict:
     tools = read_jsonl(ws.root / ".ledger" / "tool-calls.jsonl")
 
     expected = {
-        "worker": (config.WORKER_MODEL, config.WORKER_EFFORT),
-        "manager": (config.MANAGER_MODEL, config.MANAGER_EFFORT),
-        "validator": (config.VALIDATOR_MODEL, config.VALIDATOR_EFFORT),
+        "worker": (models["worker"]["route"], models["worker"]["effort"]),
+        "manager": (models["manager"]["route"], models["manager"]["effort"]),
+        "validator": (models["validator"]["route"], models["validator"]["effort"]),
     }
     route_errors = []
     provider_counts = Counter()
+    role_aliases = {"kraude": "worker", "kryptex": "manager"}
+    selections = []
+    for row in read_jsonl(ws.root / ".ledger" / "model-switches.jsonl"):
+        role = role_aliases.get(str(row.get("role") or "").lower(),
+                                str(row.get("role") or "").lower())
+        if role not in {"worker", "manager"}:
+            continue
+        try:
+            selected_at = float(row.get("at") or 0)
+        except (TypeError, ValueError):
+            selected_at = 0.0
+        selections.append({
+            "role": role,
+            "at": selected_at,
+            "route": config.normalize_model_route(str(row.get("route") or "")),
+            "effort": str(row.get("effort") or ""),
+        })
+
+    def expected_for_call(role: str, call: dict) -> tuple[str, str]:
+        if role == "validator":
+            return expected[role]
+        try:
+            called_at = float(call.get("at") or 0)
+        except (TypeError, ValueError):
+            called_at = 0.0
+        prior = [
+            row for row in selections
+            if row["role"] == role and row["at"] <= called_at
+        ]
+        if prior:
+            selected = max(prior, key=lambda row: row["at"])
+            return selected["route"], selected["effort"]
+        return expected[role]
+
     for call in calls:
         role = str(call.get("role") or "unknown")
         provider_counts[role] += 1
         if role not in expected:
             route_errors.append(f"unknown provider role {role}")
             continue
-        route, effort = expected[role]
-        if (call.get("route"), call.get("effort")) != (route, effort):
+        route, effort = expected_for_call(role, call)
+        observed_route = str(call.get("route") or "")
+        if role != "validator":
+            observed_route = config.normalize_model_route(observed_route)
+        if (observed_route, call.get("effort")) != (route, effort):
             route_errors.append(
                 f"{role}: {call.get('route')} · {call.get('effort')}"
             )
+
+    def provider_failed(row: dict) -> bool:
+        if "ok" in row:
+            return row.get("ok") is not True
+        return row.get("returncode") != 0 or bool(row.get("stderr_present"))
 
     provider_failures = [
         {"role": row.get("role"), "returncode": row.get("returncode"),
          "stderr": bool(row.get("stderr_present"))}
         for row in calls
-        if row.get("returncode") != 0 or row.get("stderr_present")
+        if provider_failed(row)
     ]
 
     unvalidated = []
@@ -144,10 +188,11 @@ def audit_workspace(ws) -> dict:
     target_dir = config.TARGET_DATA_DIR
     target_dir_empty = target_dir.is_dir() and not any(target_dir.iterdir())
     result = {
-        "target": ws.load_meta().target,
+        "target": meta.target,
         "slug": ws.slug,
-        "status": ws.load_meta().status,
-        "turns": ws.load_meta().turn_index,
+        "status": meta.status,
+        "turns": meta.turn_index,
+        "models": models,
         "counts": {
             "findings": len(findings),
             "confirmed_findings": len(ws.confirmed_findings()),
@@ -186,9 +231,9 @@ def render_report(ws) -> str:
         f"- **Turns:** {audit['turns']}",
         f"- **Audit:** {'PASS' if audit['ok'] else 'ATTENTION REQUIRED'}", "",
         "## Model routes", "",
-        f"- Kraude: `{config.WORKER_MODEL}` · `{config.WORKER_EFFORT}`",
-        f"- Kryptex: `{config.MANAGER_MODEL}` · `{config.MANAGER_EFFORT}`",
-        f"- Validator: `{config.VALIDATOR_MODEL}` · `{config.VALIDATOR_EFFORT}`", "",
+        f"- Kraude: `{audit['models']['worker']['route']}` · `{audit['models']['worker']['effort']}`",
+        f"- Kryptex: `{audit['models']['manager']['route']}` · `{audit['models']['manager']['effort']}`",
+        f"- Validator: `{audit['models']['validator']['route']}` · `{audit['models']['validator']['effort']}`", "",
         "## Activity", "",
         f"- {audit['counts']['tool_calls']} structured tool events, "
         f"{audit['counts']['network_tool_calls']} network tool calls",
