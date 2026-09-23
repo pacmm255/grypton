@@ -2024,7 +2024,7 @@ def _browser_auth_locator(page, selector: str, *, role: str, timeout_ms: int):
     input_type = str((details or {}).get("type") or "")
     aria_role = str((details or {}).get("role") or "")
     disabled = bool((details or {}).get("disabled"))
-    if disabled:
+    if disabled and role != "submit":
         raise ValueError(f"{role} control is disabled")
     if role == "username":
         accepted = tag == "textarea" or (
@@ -2043,6 +2043,27 @@ def _browser_auth_locator(page, selector: str, *, role: str, timeout_ms: int):
     if not accepted:
         raise ValueError(f"{role} selector did not resolve to a compatible form control")
     return locator
+
+
+def _browser_auth_wait_for_submit(page, locator, timeout_ms: int) -> None:
+    """Wait for client-side form validation to enable the submit control."""
+    deadline = time.monotonic() + max(1, int(timeout_ms)) / 1000
+    while True:
+        try:
+            enabled = bool(locator.evaluate(
+                """el => el.isConnected && !el.disabled &&
+                el.getAttribute('aria-disabled') !== 'true'"""
+            ))
+        except Exception:
+            enabled = False
+        if enabled:
+            return
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        if remaining_ms <= 0:
+            raise ValueError(
+                "submit control remained disabled after the form fields were populated"
+            )
+        page.wait_for_timeout(min(100, remaining_ms))
 
 
 def _browser_auth_collect_responses(responses: list[dict],
@@ -2585,12 +2606,10 @@ def credential_browser_login(
                     baseline_tokens = _browser_auth_tokens((), baseline_storage)
                     observed_cookie_sets.append(baseline_cookies)
                     observed_token_sets.append(baseline_tokens)
-                    attempt = credentials.begin_login_attempt(
-                        workspace.slug, credential
-                    )
                     phase["name"] = "login"
                     username.fill(login_username, timeout=timeout_ms)
                     password.fill(secret["password"], timeout=timeout_ms)
+                    _browser_auth_wait_for_submit(page, submit, timeout_ms)
                     capture_session = None
                     try:
                         capture_session, pending_responses = (
@@ -2601,6 +2620,9 @@ def credential_browser_login(
                                 )),
                                 _serialized_secret_variants((secret["password"],)),
                             )
+                        )
+                        attempt = credentials.begin_login_attempt(
+                            workspace.slug, credential
                         )
                         submit.click(timeout=timeout_ms)
                         deadline = time.monotonic() + timeout_seconds

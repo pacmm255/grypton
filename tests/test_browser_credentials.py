@@ -72,13 +72,30 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                 "<p id='challenge'>CAPTCHA challenge active</p>"
                 if type(self).mode == "captcha" else ""
             )
+            disabled_submit = type(self).mode in {
+                "disabled-submit", "disabled-submit-never",
+            }
+            submit_attribute = " disabled" if disabled_submit else ""
+            enable_script = """
+            <script>
+            const loginUsername = document.querySelector('[data-testid="login-username"]');
+            const loginPassword = document.querySelector('[data-testid="login-password"]');
+            const loginSubmit = document.querySelector('[data-testid="login-submit"]');
+            const updateSubmit = () => {
+              loginSubmit.disabled = !(loginUsername.value && loginPassword.value);
+            };
+            loginUsername.addEventListener('input', updateSubmit);
+            loginPassword.addEventListener('input', updateSubmit);
+            </script>
+            """ if type(self).mode == "disabled-submit" else ""
             html = f"""<!doctype html><html><body>
             {challenge}
             <form id="login-form">
               <input data-testid="login-username" type="tel">
               <input data-testid="login-password" type="password">
-              <button data-testid="login-submit" type="submit">Sign in</button>
+              <button data-testid="login-submit" type="submit"{submit_attribute}>Sign in</button>
             </form><div id="result"></div>
+            {enable_script}
             <script>
             document.getElementById('login-form').addEventListener('submit', async (event) => {{
               event.preventDefault();
@@ -269,6 +286,38 @@ class BrowserCredentialTests(unittest.TestCase):
                 row.get("status") == 200
                 for row in result["data"]["login_api_responses"]
             ))
+
+    def test_initially_disabled_submit_enables_after_playwright_fill(self):
+        with isolated_runtime(), spa_auth_server("disabled-submit") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+
+            result = dispatch(ws, "credential_browser_login", self._request(port))
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["data"]["attempt"], 1)
+            self.assertEqual(_SpaAuthHandler.login_posts, 1)
+
+    def test_submit_that_never_enables_does_not_reserve_attempt(self):
+        with isolated_runtime(), spa_auth_server("disabled-submit-never") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            request = self._request(port)
+            request["timeout"] = 5
+
+            result = dispatch(ws, "credential_browser_login", request)
+
+            self.assertFalse(result["ok"], result)
+            self.assertIn("remained disabled", result["summary"])
+            self.assertEqual(result["data"]["attempt"], 0)
+            self.assertEqual(_SpaAuthHandler.login_posts, 0)
+            self.assertEqual(
+                credentials.session_status(ws.slug, "primary")["attempts"], 0
+            )
 
     def test_prelogin_cookie_cannot_prove_credential_session(self):
         with isolated_runtime(), spa_auth_server("baseline-cookie") as port:
