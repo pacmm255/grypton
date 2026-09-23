@@ -32,6 +32,10 @@ class WorkerPromptProjectionTests(unittest.TestCase):
         self.assertNotIn("Avoid testing today", block)
         self.assertNotIn("elsewhere.test", block)
 
+        manager_block = constraints.to_prompt_block()
+        self.assertIn("Severity for https://example.test/app: Medium", manager_block)
+        self.assertIn("Conditional out-of-scope finding: CORS", manager_block)
+
     def test_worker_system_and_workspace_are_exact_projection(self):
         block = "=== ENGAGEMENT DATA ===\n- In scope: https://example.test — severity: High"
         system = prompts.worker_system(

@@ -160,15 +160,24 @@ class Constraints:
             lines.append(f"- Out-of-scope finding categories: {', '.join(self.excluded_classes)}")
         if self.in_scope:
             lines.append(f"- In-scope URLs/hosts: {', '.join(self.in_scope)}")
+        for item in self.in_scope:
+            severity = str(self.url_severities.get(item) or "").strip()
+            if severity:
+                lines.append(f"- Severity for {item}: {severity}")
         if self.out_of_scope:
             lines.append(f"- Out-of-scope URLs/hosts: {', '.join(self.out_of_scope)}")
+        for exclusion in self.conditional_exclusions:
+            value = str(exclusion or "").strip()
+            if value:
+                lines.append(f"- Conditional out-of-scope finding: {value}")
         for r in self.hard_rules:
             lines.append(f"- {r}")
         if self.notes:
             lines.append(f"- Notes: {self.notes}")
         if not (self.standing_instructions or self.included_severities or
                 self.included_classes or self.excluded_classes or self.in_scope or
-                self.out_of_scope or self.hard_rules or self.notes):
+                self.out_of_scope or self.url_severities or
+                self.conditional_exclusions or self.hard_rules or self.notes):
             lines.append("- No additional engagement parameters were supplied.")
         return "\n".join(lines)
 
