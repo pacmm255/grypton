@@ -89,8 +89,12 @@ class AuthBrokerTests(unittest.TestCase):
         origin = "https://app.example.test"
         with isolated_runtime():
             ws = self._workspace(origin)
+            configured = status_browser_profile(origin)
+            configured["browser"]["verification"][
+                "anonymous_redirect_statuses"
+            ] = [307]
             profile = credentials.save_auth_profile(
-                ws.slug, "primary", status_browser_profile(origin)
+                ws.slug, "primary", configured
             )
             revision = credentials.auth_profile_revision(profile)
             with (
@@ -567,6 +571,14 @@ class AuthBrokerTests(unittest.TestCase):
             self.assertEqual(schema["required"], ["credential"])
             self.assertIn("named private credential", description)
             self.assertNotIn("verification", schema["properties"])
+            for property_name in schema["properties"]:
+                self.assertNotIn("redirect", property_name.lower())
+                self.assertNotIn("status", property_name.lower())
+            for private_name in (
+                "login_status", "authenticated_status", "anonymous_status",
+                "expected_post_login_url", "anonymous_redirect_statuses",
+            ):
+                self.assertNotIn(private_name, schema["properties"])
 
         with isolated_runtime():
             ws = Workspace("auth-broker-schema")

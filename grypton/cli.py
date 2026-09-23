@@ -1212,7 +1212,7 @@ def cmd_auth(ns) -> int:
     if ns.auth_command == "configure":
         status_values = (
             ns.login_status, ns.authenticated_status, ns.anonymous_status,
-            ns.expected_post_login_url,
+            ns.expected_post_login_url, ns.anonymous_redirect_status,
         )
         if ns.strategy == "http" and ns.verification_mode != "marker":
             print(
@@ -1262,6 +1262,10 @@ def cmd_auth(ns) -> int:
                     "anonymous_status": ns.anonymous_status,
                     "expected_post_login_url": ns.expected_post_login_url,
                 }
+                if ns.anonymous_redirect_status is not None:
+                    profile["browser"]["verification"][
+                        "anonymous_redirect_statuses"
+                    ] = ns.anonymous_redirect_status
             else:
                 profile["success_marker"] = ns.success_marker
         else:
@@ -1636,6 +1640,10 @@ def build_parser() -> argparse.ArgumentParser:
     auth_configure.add_argument("--authenticated-status", type=int)
     auth_configure.add_argument("--anonymous-status", type=int)
     auth_configure.add_argument("--expected-post-login-url")
+    auth_configure.add_argument(
+        "--anonymous-redirect-status", type=int, action="append",
+        help="Expected anonymous verification redirect status; repeat in hop order",
+    )
     auth_configure.add_argument(
         "--username-transform", choices=["stored", "iran-e164"], default="stored"
     )

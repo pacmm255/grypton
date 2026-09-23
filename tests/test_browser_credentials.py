@@ -13,7 +13,9 @@ from unittest.mock import patch
 
 from grypton import config, credentials
 from grypton.toolserver import REGISTRY, _handle, dispatch
-from grypton.tools import _browser_auth_blocker
+from grypton.tools import (
+    _browser_auth_blocker, _browser_auth_redirect_contract_matches,
+)
 from grypton.workspace import Constraints, Workspace
 
 
@@ -172,6 +174,24 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                 f"app_session={self.session}" in self.headers.get("Cookie", "")
                 or self.headers.get("Authorization") == f"Bearer {self.token}"
             )
+            if (
+                not authenticated
+                and request_number == 3
+                and type(self).mode in {
+                    "status-anon-redirect", "status-anon-redirect-status",
+                    "status-anon-redirect-url",
+                }
+            ):
+                self.send_response(
+                    302 if type(self).mode == "status-anon-redirect-status" else 307
+                )
+                self.send_header(
+                    "Location",
+                    "/me-hop" if type(self).mode == "status-anon-redirect-url" else "/me",
+                )
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if type(self).mode == "verify-material-only" and request_number == 1:
                 self._json(200, {"authenticated": True}, cookie=self.session)
                 return
@@ -190,6 +210,12 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                 status,
                 {"authenticated": authenticated},
             )
+            return
+        if self.path == "/me-hop" and type(self).mode == "status-anon-redirect-url":
+            self.send_response(307)
+            self.send_header("Location", "/me")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
             return
         if self.path == "/me-final":
             authenticated = (
@@ -289,9 +315,12 @@ class BrowserCredentialTests(unittest.TestCase):
             "timeout": 15,
         }
 
-    def _status_profile(self, port: int, *, timeout: int = 15) -> dict:
+    def _status_profile(
+        self, port: int, *, timeout: int = 15,
+        anonymous_redirect_statuses: list[int] | None = None,
+    ) -> dict:
         origin = f"http://127.0.0.1:{port}"
-        return {
+        profile = {
             "version": 1,
             "strategy": "browser",
             "login_url": origin + "/login",
@@ -312,6 +341,11 @@ class BrowserCredentialTests(unittest.TestCase):
                 },
             },
         }
+        if anonymous_redirect_statuses is not None:
+            profile["browser"]["verification"][
+                "anonymous_redirect_statuses"
+            ] = anonymous_redirect_statuses
+        return profile
 
     def test_profile_status_differential_proves_real_browser_session(self):
         with isolated_runtime(), spa_auth_server("success") as port:
@@ -338,6 +372,99 @@ class BrowserCredentialTests(unittest.TestCase):
             self.assertEqual(result["data"]["control_status"], 401)
             self.assertTrue(result["data"]["session"]["established"])
             self.assertEqual(_SpaAuthHandler.login_posts, 1)
+
+    def test_status_differential_accepts_configured_anonymous_self_redirect(self):
+        with isolated_runtime(), spa_auth_server("status-anon-redirect") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            credentials.save_auth_profile(
+                ws.slug, "primary",
+                self._status_profile(
+                    port, anonymous_redirect_statuses=[307]
+                ),
+            )
+
+            result = dispatch(
+                ws, "credential_browser_login", {"credential": "primary"}
+            )
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["data"]["control_status"], 401)
+            self.assertEqual(result["data"]["control_redirect_chain"], [{
+                "status": 307,
+                "method": "GET",
+                "request_url_exact": True,
+                "location_exact": True,
+                "complete": True,
+            }])
+            self.assertEqual(result["data"]["verify_redirect_chain"], [])
+            self.assertEqual(result["data"]["replay_redirect_chain"], [])
+            self.assertTrue(result["data"]["session"]["established"])
+
+    def test_status_differential_redirect_contract_fails_closed(self):
+        cases = (
+            ("success", [307]),
+            ("status-anon-redirect", []),
+            ("status-anon-redirect-status", [307]),
+            ("status-anon-redirect-url", [307, 307]),
+        )
+        for mode, redirects in cases:
+            with self.subTest(mode=mode), isolated_runtime(), spa_auth_server(mode) as port:
+                ws = self._workspace(port)
+                credentials.save_credential(
+                    ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+                )
+                credentials.save_auth_profile(
+                    ws.slug, "primary",
+                    self._status_profile(
+                        port, anonymous_redirect_statuses=redirects
+                    ),
+                )
+
+                result = dispatch(
+                    ws, "credential_browser_login", {"credential": "primary"}
+                )
+
+                self.assertFalse(result["ok"], result)
+                self.assertIn("anonymous control", result["summary"])
+                self.assertFalse(result["data"]["session"]["established"])
+                serialized = json.dumps(result, ensure_ascii=False)
+                serialized += "".join(
+                    path.read_text(errors="replace")
+                    for path in ws.flows_dir.glob("*.http")
+                )
+                self.assertNotIn("/me-hop", serialized)
+
+    def test_redirect_contract_rejects_wrong_method_status_url_and_ancestry(self):
+        verify_url = "https://app.example.test/profile"
+        valid = [{
+            "status": 307,
+            "method": "GET",
+            "url": verify_url,
+            "location": verify_url,
+            "complete": True,
+        }]
+        self.assertTrue(_browser_auth_redirect_contract_matches(
+            valid, [307], verify_url, "GET"
+        ))
+        mutations = (
+            ({**valid[0], "method": "POST"}, [307], "GET"),
+            ({**valid[0], "status": 302}, [307], "GET"),
+            ({**valid[0], "url": "https://app.example.test/other"}, [307], "GET"),
+            ({**valid[0], "location": "/other"}, [307], "GET"),
+            ({**valid[0], "complete": False}, [307], "GET"),
+            (valid[0], [307], "POST"),
+        )
+        for hop, statuses, final_method in mutations:
+            with self.subTest(hop=hop, final_method=final_method):
+                self.assertFalse(_browser_auth_redirect_contract_matches(
+                    [hop], statuses, verify_url, final_method
+                ))
+        self.assertFalse(_browser_auth_redirect_contract_matches(
+            [], [307], verify_url, "GET"
+        ))
 
     def test_status_differential_rejects_only_prelogin_material(self):
         with isolated_runtime(), spa_auth_server("baseline-cookie") as port:

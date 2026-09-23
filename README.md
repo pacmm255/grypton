@@ -594,8 +594,13 @@ the exact post-login URL, and new reusable session material created by the
 login itself. The live verification request and a fresh replay must finish at
 the verification URL with the configured authenticated status and no redirect.
 A separate fresh browser must finish at that same URL with exactly the
-configured anonymous `401` or `403` status. Any mismatch leaves the session
-unverified.
+configured anonymous `401` or `403` status. Verification redirects are rejected
+by default. If the anonymous endpoint has a stable self-redirect, add its exact
+ordered statuses with a repeatable option such as
+`--anonymous-redirect-status 307`. Every configured hop must use `GET`, start at
+the exact verification URL, point back to that exact URL, and match the ordered
+status list; live and authenticated replay verification remain zero-hop. Any
+mismatch leaves the session unverified.
 
 `--username-transform iran-e164` handles a stored Iranian mobile identifier.
 `--verify-headers` accepts a JSON object containing static protocol headers such

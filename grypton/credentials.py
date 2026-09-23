@@ -366,8 +366,10 @@ def validate_browser_verification(value: object, *, login_url: str) -> dict:
         "mode", "login_status", "authenticated_status", "anonymous_status",
         "expected_post_login_url",
     }
+    redirect_fields = {"anonymous_redirect_statuses"}
     _reject_unknown_keys(
-        verification, required, label="browser verification settings"
+        verification, required | redirect_fields,
+        label="browser verification settings",
     )
     missing = sorted(required.difference(verification))
     if missing:
@@ -412,13 +414,33 @@ def validate_browser_verification(value: object, *, login_url: str) -> dict:
         raise CredentialError(
             "expected post-login URL must use the login page's exact origin"
         )
-    return {
+    canonical = {
         "mode": "status-differential",
         "login_status": login_status,
         "authenticated_status": authenticated_status,
         "anonymous_status": anonymous_status,
         "expected_post_login_url": expected_url,
     }
+    allowed_redirect_statuses = {301, 302, 303, 307, 308}
+    for field in sorted(redirect_fields):
+        if field not in verification:
+            continue
+        statuses = verification[field]
+        if not isinstance(statuses, list) or len(statuses) > 8:
+            raise CredentialError(
+                "browser redirect status chains must be lists of at most 8 statuses"
+            )
+        if any(
+            isinstance(status, bool)
+            or not isinstance(status, int)
+            or status not in allowed_redirect_statuses
+            for status in statuses
+        ):
+            raise CredentialError(
+                "browser redirect status chains may contain only 301, 302, 303, 307, or 308"
+            )
+        canonical[field] = list(statuses)
+    return canonical
 
 
 def validate_auth_profile(profile: object) -> dict:

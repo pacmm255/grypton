@@ -103,6 +103,36 @@ class AuthProfileStorageTests(unittest.TestCase):
                 status_browser_profile()["browser"]["verification"],
             )
             self.assertNotIn("verification", browser_profile()["browser"])
+            self.assertNotIn(
+                "anonymous_redirect_statuses",
+                saved["browser"]["verification"],
+            )
+            self.assertEqual(
+                credentials.auth_profile_revision(browser_profile()),
+                "dbb828eaa978",
+            )
+            self.assertEqual(
+                credentials.auth_profile_revision(status_browser_profile()),
+                "6fcf46f985c4",
+            )
+
+            with_redirect = status_browser_profile()
+            with_redirect["browser"]["verification"][
+                "anonymous_redirect_statuses"
+            ] = [307]
+            saved = credentials.save_auth_profile(
+                "example", "primary", with_redirect
+            )
+            self.assertEqual(
+                saved["browser"]["verification"][
+                    "anonymous_redirect_statuses"
+                ],
+                [307],
+            )
+            safe_status = credentials.session_status("example", "primary")
+            safe_text = json.dumps(safe_status, ensure_ascii=False)
+            self.assertNotIn("anonymous_redirect_statuses", safe_text)
+            self.assertNotIn("[307]", safe_text)
 
     def test_private_profile_round_trip_and_safe_status(self):
         with isolated_runtime():
@@ -225,6 +255,21 @@ class AuthProfileStorageTests(unittest.TestCase):
         cases.append(value)
         value = status_browser_profile()
         value["browser"]["verification"]["unknown"] = "hidden"
+        cases.append(value)
+        value = status_browser_profile()
+        value["browser"]["verification"]["anonymous_redirect_statuses"] = "307"
+        cases.append(value)
+        value = status_browser_profile()
+        value["browser"]["verification"]["anonymous_redirect_statuses"] = [True]
+        cases.append(value)
+        value = status_browser_profile()
+        value["browser"]["verification"]["anonymous_redirect_statuses"] = [304]
+        cases.append(value)
+        value = status_browser_profile()
+        value["browser"]["verification"]["anonymous_redirect_statuses"] = [307] * 9
+        cases.append(value)
+        value = status_browser_profile()
+        value["browser"]["verification"]["live_redirect_statuses"] = [307]
         cases.append(value)
 
         with isolated_runtime():
@@ -373,6 +418,7 @@ class AuthProfileCliTests(unittest.TestCase):
                 "--login-status", "200",
                 "--authenticated-status", "200",
                 "--anonymous-status", "401",
+                "--anonymous-redirect-status", "307",
                 "--expected-post-login-url", "https://app.example.test/dashboard",
                 "--username-selector", "#user",
                 "--password-selector", "#pass",
@@ -384,6 +430,12 @@ class AuthProfileCliTests(unittest.TestCase):
             self.assertNotIn("success_marker", saved)
             self.assertEqual(
                 saved["browser"]["verification"]["authenticated_status"], 200
+            )
+            self.assertEqual(
+                saved["browser"]["verification"][
+                    "anonymous_redirect_statuses"
+                ],
+                [307],
             )
 
             credentials.delete_auth_profile(ws.slug, "primary")
@@ -415,6 +467,17 @@ class AuthProfileCliTests(unittest.TestCase):
             ])
             self.assertEqual(code, 2)
             self.assertIn("cannot use a success marker", error)
+
+            code, output, error = self._run([
+                "auth", "configure", ws.slug,
+                "--strategy", "browser",
+                "--login-url", "https://app.example.test/login",
+                "--verify-url", "https://app.example.test/profile",
+                "--success-marker", "marker",
+                "--anonymous-redirect-status", "307",
+            ])
+            self.assertEqual(code, 2)
+            self.assertIn("require --verification-mode", error)
 
 
 if __name__ == "__main__":

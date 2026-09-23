@@ -2596,13 +2596,96 @@ def _browser_auth_url_matches(observed: str, expected: str) -> bool:
         return False
 
 
-def _browser_auth_was_redirected(response) -> bool:
+def _browser_auth_response_method(response) -> str:
     if response is None:
-        return False
+        return ""
     try:
-        return response.request.redirected_from is not None
+        return str(response.request.method or "").upper()
     except Exception:
+        return ""
+
+
+def _browser_auth_redirect_chain(response) -> list[dict]:
+    """Return ordered redirect responses leading to a terminal navigation."""
+    if response is None:
+        return []
+    reversed_chain: list[dict] = []
+    try:
+        request = response.request
+        while request.redirected_from is not None:
+            previous = request.redirected_from
+            previous_response = previous.response()
+            headers = (
+                previous_response.headers
+                if previous_response is not None else {}
+            )
+            reversed_chain.append({
+                "status": int(previous_response.status) if previous_response else 0,
+                "method": str(previous.method or "").upper(),
+                "url": str(previous.url or ""),
+                "location": str(headers.get("location") or ""),
+                "complete": previous_response is not None,
+            })
+            request = previous
+            if len(reversed_chain) > 8:
+                break
+    except Exception:
+        reversed_chain.append({
+            "status": 0, "method": "", "url": "", "location": "",
+            "complete": False,
+        })
+    return list(reversed(reversed_chain))
+
+
+def _browser_auth_redirect_contract_matches(
+    chain: list[dict], expected_statuses: Iterable[int],
+    verify_url: str, final_method: str,
+) -> bool:
+    statuses = list(expected_statuses)
+    if str(final_method or "").upper() != "GET" or len(chain) != len(statuses):
         return False
+    for hop, expected_status in zip(chain, statuses):
+        source_url = str(hop.get("url") or "")
+        location = str(hop.get("location") or "")
+        try:
+            observed_status = int(hop.get("status") or 0)
+            configured_status = int(expected_status)
+        except (TypeError, ValueError):
+            return False
+        if (
+            hop.get("complete") is not True
+            or str(hop.get("method") or "").upper() != "GET"
+            or observed_status != configured_status
+            or not _browser_auth_url_matches(source_url, verify_url)
+            or not location
+            or not _browser_auth_url_matches(
+                urljoin(source_url, location), verify_url
+            )
+        ):
+            return False
+    return True
+
+
+def _browser_auth_safe_redirect_chain(
+    chain: list[dict], verify_url: str,
+) -> list[dict]:
+    """Expose proof facts without persisting redirect header values."""
+    rows: list[dict] = []
+    for hop in chain:
+        source_url = str(hop.get("url") or "")
+        location = str(hop.get("location") or "")
+        rows.append({
+            "status": int(hop.get("status") or 0),
+            "method": str(hop.get("method") or "").upper(),
+            "request_url_exact": _browser_auth_url_matches(source_url, verify_url),
+            "location_exact": bool(
+                location and _browser_auth_url_matches(
+                    urljoin(source_url, location), verify_url
+                )
+            ),
+            "complete": hop.get("complete") is True,
+        })
+    return rows
 
 
 def _browser_auth_fresh_probe(
@@ -2657,8 +2740,10 @@ def _browser_auth_fresh_probe(
                 body = ""
             return {
                 "status": status,
+                "response_url": str(response.url or "") if response else "",
                 "final_url": final_url,
-                "redirected": _browser_auth_was_redirected(response),
+                "method": _browser_auth_response_method(response),
+                "redirect_chain": _browser_auth_redirect_chain(response),
                 "body": body,
                 "source": "\n".join((body, visible, dom)),
                 "cookies": list(context.cookies()),
@@ -2781,17 +2866,26 @@ def credential_browser_login(
     final_url = url
     page_status = 0
     verify_status = 0
+    verify_response_url = ""
     verify_final_url = ""
+    verify_method = ""
+    verify_redirect_chain: list[dict] = []
     verify_redirected = False
     verify_source = ""
     verify_body = ""
     replay_status = 0
     replay_source = ""
+    replay_response_url = ""
     replay_final_url = ""
+    replay_method = ""
+    replay_redirect_chain: list[dict] = []
     replay_redirected = False
     control_status = 0
     control_source = ""
+    control_response_url = ""
     control_final_url = ""
+    control_method = ""
+    control_redirect_chain: list[dict] = []
     control_redirected = False
     cookies: list[dict] = []
     observed_cookie_sets: list[list[dict]] = []
@@ -3006,11 +3100,17 @@ def credential_browser_login(
                         )
                         page.wait_for_timeout(250)
                         verify_status = int(verify_response.status) if verify_response else 0
+                        verify_response_url = (
+                            str(verify_response.url or "")
+                            if verify_response else ""
+                        )
                         verify_final, verify_dom, verify_visible = _browser_auth_snapshot(page)
                         verify_final_url = verify_final
-                        verify_redirected = _browser_auth_was_redirected(
+                        verify_method = _browser_auth_response_method(verify_response)
+                        verify_redirect_chain = _browser_auth_redirect_chain(
                             verify_response
                         )
+                        verify_redirected = bool(verify_redirect_chain)
                         verify_allowed, verify_reason = check_url_scope(
                             workspace, verify_final
                         )
@@ -3065,11 +3165,18 @@ def credential_browser_login(
                             verify_headers=clean_verify_headers,
                         )
                         replay_status = int(replay.get("status") or 0)
+                        replay_response_url = str(
+                            replay.get("response_url") or ""
+                        )
                         replay_source = str(replay.get("source") or "")
                         replay_body = str(replay.get("body") or "")
                         identity_sources.append(replay_body)
                         replay_final_url = str(replay.get("final_url") or "")
-                        replay_redirected = bool(replay.get("redirected"))
+                        replay_method = str(replay.get("method") or "").upper()
+                        replay_redirect_chain = list(
+                            replay.get("redirect_chain") or []
+                        )
+                        replay_redirected = bool(replay_redirect_chain)
                         replay_cookies = _browser_auth_persistable_cookies(
                             list(replay.get("cookies") or []), url
                         )
@@ -3092,11 +3199,18 @@ def credential_browser_login(
                             verify_headers=clean_verify_headers,
                         )
                         control_status = int(control.get("status") or 0)
+                        control_response_url = str(
+                            control.get("response_url") or ""
+                        )
                         control_source = str(control.get("source") or "")
                         control_body = str(control.get("body") or "")
                         identity_sources.append(control_body)
                         control_final_url = str(control.get("final_url") or "")
-                        control_redirected = bool(control.get("redirected"))
+                        control_method = str(control.get("method") or "").upper()
+                        control_redirect_chain = list(
+                            control.get("redirect_chain") or []
+                        )
+                        control_redirected = bool(control_redirect_chain)
                         observed_cookie_sets.append(
                             _browser_auth_persistable_cookies(
                                 list(control.get("cookies") or []), url
@@ -3140,13 +3254,24 @@ def credential_browser_login(
             final_url, status_verification["expected_post_login_url"]
         )
         and verify_status == status_verification["authenticated_status"]
-        and not verify_redirected
+        and _browser_auth_redirect_contract_matches(
+            verify_redirect_chain, (), verify_url, verify_method,
+        )
+        and _browser_auth_url_matches(verify_response_url, verify_url)
         and _browser_auth_url_matches(verify_final_url, verify_url)
         and replay_status == status_verification["authenticated_status"]
-        and not replay_redirected
+        and _browser_auth_redirect_contract_matches(
+            replay_redirect_chain, (), verify_url, replay_method,
+        )
+        and _browser_auth_url_matches(replay_response_url, verify_url)
         and _browser_auth_url_matches(replay_final_url, verify_url)
         and control_status == status_verification["anonymous_status"]
-        and not control_redirected
+        and _browser_auth_redirect_contract_matches(
+            control_redirect_chain,
+            status_verification.get("anonymous_redirect_statuses", ()),
+            verify_url, control_method,
+        )
+        and _browser_auth_url_matches(control_response_url, verify_url)
         and _browser_auth_url_matches(control_final_url, verify_url)
     )
 
@@ -3210,6 +3335,15 @@ def credential_browser_login(
     safe_control_url = _browser_redact_identity_text(
         control_final_url, secret_values, identity_values
     )
+    safe_verify_redirect_chain = _browser_auth_safe_redirect_chain(
+        verify_redirect_chain, verify_url
+    )
+    safe_replay_redirect_chain = _browser_auth_safe_redirect_chain(
+        replay_redirect_chain, verify_url
+    )
+    safe_control_redirect_chain = _browser_auth_safe_redirect_chain(
+        control_redirect_chain, verify_url
+    )
     safe_console = _browser_redacted_capture_value(
         console, secret_values, identity_values
     )
@@ -3236,21 +3370,36 @@ def credential_browser_login(
             ),
             "status": verify_status,
             "final_url": safe_verify_final_url,
+            "response_url_exact": _browser_auth_url_matches(
+                verify_response_url, verify_url
+            ),
+            "method": verify_method,
             "redirected": verify_redirected,
+            "redirect_chain": safe_verify_redirect_chain,
             "marker_present": bool(success_marker and success_marker in verify_source),
         },
         "persisted_session_replay": {
             "status": replay_status,
             "final_url": safe_replay_url,
+            "response_url_exact": _browser_auth_url_matches(
+                replay_response_url, verify_url
+            ),
             "marker_present": bool(success_marker and success_marker in replay_source),
             "new_session_material": material_delta,
+            "method": replay_method,
             "redirected": replay_redirected,
+            "redirect_chain": safe_replay_redirect_chain,
         },
         "anonymous_control": {
             "status": control_status,
             "final_url": safe_control_url,
+            "response_url_exact": _browser_auth_url_matches(
+                control_response_url, verify_url
+            ),
             "marker_present": bool(success_marker and success_marker in control_source),
+            "method": control_method,
             "redirected": control_redirected,
+            "redirect_chain": safe_control_redirect_chain,
         },
         "console": safe_console,
         "blocked_requests": safe_denied,
@@ -3280,8 +3429,11 @@ def credential_browser_login(
         "final_url": safe_final_url,
         "verify_status": verify_status,
         "verify_final_url": safe_verify_final_url,
+        "verify_redirect_chain": safe_verify_redirect_chain,
         "replay_status": replay_status,
+        "replay_redirect_chain": safe_replay_redirect_chain,
         "control_status": control_status,
+        "control_redirect_chain": safe_control_redirect_chain,
         "verification_mode": (
             "status-differential" if status_mode else "marker"
         ),
@@ -3337,18 +3489,33 @@ def credential_browser_login(
             reason = "the login did not produce new reusable session material"
         elif (
             verify_status != status_verification["authenticated_status"]
-            or verify_redirected
+            or not _browser_auth_redirect_contract_matches(
+                verify_redirect_chain, (), verify_url, verify_method,
+            )
+            or not _browser_auth_url_matches(verify_response_url, verify_url)
             or not _browser_auth_url_matches(verify_final_url, verify_url)
         ):
-            reason = "live verification did not match the configured status and URL"
+            reason = (
+                "live verification did not match the configured status, URL, "
+                "method, and redirect chain"
+            )
         elif (
             replay_status != status_verification["authenticated_status"]
-            or replay_redirected
+            or not _browser_auth_redirect_contract_matches(
+                replay_redirect_chain, (), verify_url, replay_method,
+            )
+            or not _browser_auth_url_matches(replay_response_url, verify_url)
             or not _browser_auth_url_matches(replay_final_url, verify_url)
         ):
-            reason = "the persisted session replay did not match the configured status and URL"
+            reason = (
+                "the persisted session replay did not match the configured status, "
+                "URL, method, and redirect chain"
+            )
         else:
-            reason = "the anonymous control did not match the configured status and URL"
+            reason = (
+                "the anonymous control did not match the configured status, URL, "
+                "method, and redirect chain"
+            )
     elif not material_delta:
         reason = "no new reusable cookie or bearer session material was produced"
     elif success_marker not in replay_source:
