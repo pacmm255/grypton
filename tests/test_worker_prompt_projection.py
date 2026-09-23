@@ -54,7 +54,7 @@ class WorkerPromptProjectionTests(unittest.TestCase):
         self.assertEqual(workspace.strip(), block)
 
     def test_all_tools_remain_visible_with_neutral_auth_descriptions(self):
-        self.assertEqual(len(REGISTRY), 31)
+        self.assertEqual(len(REGISTRY), 32)
         descriptions = {name: value[0] for name, value in REGISTRY.items()}
         self.assertEqual(set(descriptions), set(REGISTRY))
         combined = "\n".join(descriptions.values()).lower()

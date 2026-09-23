@@ -93,6 +93,25 @@ def _credential_login(ws, args):
     )
 
 
+def _credential_browser_login(ws, args):
+    return tools.credential_browser_login(
+        ws, args["url"], credential=args["credential"],
+        username_transform=args.get("username_transform", "stored"),
+        username_selector=args.get(
+            "username_selector", "[data-testid='login-username']"
+        ),
+        password_selector=args.get(
+            "password_selector", "[data-testid='login-password']"
+        ),
+        submit_selector=args.get(
+            "submit_selector", "[data-testid='login-submit']"
+        ),
+        verify_url=args.get("verify_url", ""),
+        success_marker=args.get("success_marker", ""),
+        timeout=args.get("timeout", 45),
+    )
+
+
 def _authenticated_http(ws, args):
     return tools.authenticated_http_request(
         ws, args["url"], credential=args["credential"],
@@ -178,6 +197,35 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
             "headers": {"type": "object", "additionalProperties": {"type": "string"}},
             "timeout": {"type": "integer", "minimum": 1, "maximum": 120},
         }, ("url", "credential", "verify_url", "success_marker")), _credential_login),
+    "credential_browser_login": (
+        "Submit a named private credential through one scoped rendered login "
+        "form and capture the resulting application behavior.",
+        _object({
+            "url": _string("In-scope rendered login page"),
+            "credential": _string("Credential alias"),
+            "username_transform": {
+                "type": "string",
+                "enum": ["stored", "iran-e164"],
+                "description": "Username representation for this login",
+            },
+            "username_selector": _string(
+                "Username CSS selector; defaults to Milli login-username testid"
+            ),
+            "password_selector": _string(
+                "Password CSS selector; defaults to Milli login-password testid"
+            ),
+            "submit_selector": _string(
+                "Submit CSS selector; defaults to Milli login-submit testid"
+            ),
+            "verify_url": _string(
+                "Scoped same-origin page or endpoint for session proof"
+            ),
+            "success_marker": _string(
+                "Exact non-secret text used for independent session proof"
+            ),
+            "timeout": {"type": "integer", "minimum": 5, "maximum": 120},
+        }, ("url", "credential", "verify_url", "success_marker")),
+        _credential_browser_login),
     "authenticated_http_request": (
         "Send one scoped request with a named private cookie/bearer session and a sanitized capture.",
         _object({
@@ -357,7 +405,7 @@ def _redacted(value, secret_values=()):
 
 
 def _audit_secret_values(workspace: Workspace, name: str, args: dict) -> tuple[str, ...]:
-    if name != "credential_login":
+    if name not in {"credential_login", "credential_browser_login"}:
         return ()
     try:
         secret = credentials.load_credential(

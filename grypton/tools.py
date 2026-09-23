@@ -1651,6 +1651,9 @@ def httpx_probe(workspace: Workspace, targets: str) -> dict:
 
 
 _BROWSER_ACCOUNT = "grypton-browser"
+_BROWSER_USERNAME_SELECTOR = "[data-testid='login-username']"
+_BROWSER_PASSWORD_SELECTOR = "[data-testid='login-password']"
+_BROWSER_SUBMIT_SELECTOR = "[data-testid='login-submit']"
 
 
 def _browser_executable() -> str:
@@ -1766,6 +1769,63 @@ def _isolated_browser_profile(executable: str):
         shutil.rmtree(data_root, ignore_errors=True)
 
 
+def _launch_scoped_browser_context(playwright, launch_profile: dict,
+                                   workspace: Workspace,
+                                   denied_requests: list[str],
+                                   bound_header_origin: str = "",
+                                   bound_headers: Optional[dict] = None):
+    """Launch the shared browser boundary and scope-check every network route."""
+    context = playwright.chromium.launch_persistent_context(
+        user_data_dir=launch_profile["profile"],
+        headless=True,
+        executable_path=launch_profile["executable"],
+        ignore_default_args=["--enable-unsafe-swiftshader"],
+        env=launch_profile["environment"],
+        chromium_sandbox=True,
+        ignore_https_errors=True,
+        service_workers="block",
+        args=["--disable-gpu", "--disable-software-rasterizer",
+              "--disable-gpu-compositing", "--disable-dev-shm-usage",
+              "--disable-background-networking"],
+    )
+    if hasattr(context, "route_web_socket"):
+        # Browser WebSockets do not carry an HTTP path that Grypton's request
+        # capture can audit, so keep them closed in scoped mode.
+        context.route_web_socket("**/*", lambda web_socket: web_socket.close())
+
+    def scope_route(route) -> None:
+        request_url = route.request.url
+        scheme = urlsplit(request_url).scheme.lower()
+        if scheme in {"about", "blob", "data"}:
+            route.continue_()
+            return
+        allowed, _ = check_url_scope(workspace, request_url)
+        if allowed:
+            request_headers = None
+            if bound_header_origin and bound_headers:
+                try:
+                    same_origin = (
+                        credentials.normalize_origin(request_url)
+                        == bound_header_origin
+                    )
+                except credentials.CredentialError:
+                    same_origin = False
+                if same_origin:
+                    request_headers = dict(route.request.headers)
+                    request_headers.update(bound_headers)
+            if request_headers is None:
+                route.continue_()
+            else:
+                route.continue_(headers=request_headers)
+        else:
+            if len(denied_requests) < 100:
+                denied_requests.append(request_url)
+            route.abort("blockedbyclient")
+
+    context.route("**/*", scope_route)
+    return context
+
+
 def browse(workspace: Workspace, url: str, *, timeout: int = 45) -> dict:
     blocked = _scope_error(workspace, url)
     if blocked:
@@ -1789,39 +1849,9 @@ def browse(workspace: Workspace, url: str, *, timeout: int = 45) -> dict:
         with _isolated_browser_profile(executable) as launch_profile:
             browser_identity = str(launch_profile["identity"])
             with sync_playwright() as playwright:
-                context = playwright.chromium.launch_persistent_context(
-                    user_data_dir=launch_profile["profile"],
-                    headless=True,
-                    executable_path=launch_profile["executable"],
-                    ignore_default_args=["--enable-unsafe-swiftshader"],
-                    env=launch_profile["environment"],
-                    chromium_sandbox=True,
-                    ignore_https_errors=True,
-                    service_workers="block",
-                    args=["--disable-gpu", "--disable-software-rasterizer",
-                          "--disable-gpu-compositing", "--disable-dev-shm-usage",
-                          "--disable-background-networking"],
+                context = _launch_scoped_browser_context(
+                    playwright, launch_profile, workspace, denied_requests
                 )
-                if hasattr(context, "route_web_socket"):
-                    # Browser WebSockets do not carry an HTTP path that Grypton's
-                    # request capture can audit, so keep them closed in scoped mode.
-                    context.route_web_socket("**/*", lambda web_socket: web_socket.close())
-
-                def scope_route(route) -> None:
-                    request_url = route.request.url
-                    scheme = urlsplit(request_url).scheme.lower()
-                    if scheme in {"about", "blob", "data"}:
-                        route.continue_()
-                        return
-                    allowed, _ = check_url_scope(workspace, request_url)
-                    if allowed:
-                        route.continue_()
-                    else:
-                        if len(denied_requests) < 100:
-                            denied_requests.append(request_url)
-                        route.abort("blockedbyclient")
-
-                context.route("**/*", scope_route)
                 page = context.new_page()
                 page.on("console", lambda message: console.append({
                     "type": message.type, "text": message.text[:2000]
@@ -1855,6 +1885,1024 @@ def browse(workspace: Workspace, url: str, *, timeout: int = 45) -> dict:
     if not html:
         return _err(f"Headless browser returned an empty DOM; capture saved to {flow.name}.", data)
     return _ok(f"Chromium saved {len(html)} bytes to {output.name} and {flow.name}.", data)
+
+
+def _browser_auth_selector(value: str, *, label: str, default: str) -> str:
+    selector = str(value or default).strip()
+    if (not selector or len(selector) > 500
+            or any(ord(char) < 0x20 or ord(char) == 0x7f for char in selector)):
+        raise ValueError(f"{label} selector must be 1-500 printable characters")
+    return selector
+
+
+def _browser_auth_snapshot(page) -> tuple[str, str, str]:
+    """Read one bounded rendered page snapshot without returning form values."""
+    final_url = str(page.url or "")
+    try:
+        dom = str(page.locator("html").evaluate(
+            "(el, limit) => el.outerHTML.slice(0, limit)",
+            MAX_RESPONSE_BYTES,
+        ) or "")
+    except Exception:
+        dom = ""
+    try:
+        visible = str(page.locator("body").evaluate(
+            "el => (el.innerText || '').slice(0, 200000)"
+        ) or "")
+    except Exception:
+        visible = ""
+    return final_url, dom[:MAX_RESPONSE_BYTES], visible[:200_000]
+
+
+def _browser_auth_blocker(text: str, statuses: Iterable[int] = ()) -> str:
+    """Describe an observed authentication challenge or rejection factually."""
+    raw = str(text or "")
+    challenge = ""
+    json_messages: list[str] = []
+
+    def truthy(value) -> bool:
+        if value is True:
+            return True
+        if isinstance(value, (int, float)):
+            return value == 1
+        return isinstance(value, str) and value.strip().lower() in {
+            "1", "true", "yes", "required", "active", "challenge",
+        }
+
+    def walk(value, depth: int = 0) -> None:
+        nonlocal challenge
+        if challenge or depth > 4:
+            return
+        if isinstance(value, dict):
+            for key, child in value.items():
+                normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+                if truthy(child):
+                    if normalized in {
+                        "otp", "mfa", "2fa", "twofactor", "verificationcode",
+                    } or any(term in normalized for term in (
+                        "otprequired", "mfarequired", "2farequired",
+                        "twofactorrequired", "verificationcoderequired",
+                    )):
+                        challenge = "MFA/OTP challenge was presented"
+                        return
+                    if normalized in {
+                        "captcha", "recaptcha", "hcaptcha", "turnstile",
+                    } or any(term in normalized for term in (
+                        "captcharequired", "captchaactive", "captchachallenge",
+                    )):
+                        challenge = "CAPTCHA challenge was presented"
+                        return
+                walk(child, depth + 1)
+        elif isinstance(value, list):
+            for child in value[:100]:
+                walk(child, depth + 1)
+        elif isinstance(value, str):
+            json_messages.append(value[:4000])
+
+    parsed_any = False
+    candidates = [raw, *re.split(r"\r?\n\r?\n|\r?\n", raw)]
+    for chunk in dict.fromkeys(candidates):
+        try:
+            parsed = json.loads(chunk)
+        except (TypeError, ValueError):
+            continue
+        parsed_any = True
+        walk(parsed)
+        if challenge:
+            return challenge
+
+    lowered = ("\n".join(json_messages) if parsed_any else raw).lower()
+
+    affirmative_otp = re.search(
+        r"(?:\b(?:mfa|2fa|two[- _]factor|one[- ]time(?: password| code)?|otp|"
+        r"verification code)\b.{0,50}\b(?:required|challenge|requested|sent|enter|provide)\b|"
+        r"\b(?:required|challenge|requested|sent|enter|provide)\b.{0,50}"
+        r"\b(?:mfa|2fa|two[- _]factor|one[- ]time(?: password| code)?|otp|"
+        r"verification code)\b)",
+        lowered,
+    )
+    if affirmative_otp and not re.search(
+        r"\b(?:not|isn't|is not|no)\s+(?:currently\s+)?(?:required|active)\b",
+        lowered,
+    ):
+        return "MFA/OTP challenge was presented"
+    affirmative_captcha = re.search(
+        r"(?:\b(?:captcha|recaptcha|hcaptcha|turnstile)\b.{0,50}"
+        r"\b(?:required|challenge|active|failed|verify|verification)\b|"
+        r"\b(?:required|challenge|active|failed|verify|verification)\b.{0,50}"
+        r"\b(?:captcha|recaptcha|hcaptcha|turnstile)\b)",
+        lowered,
+    )
+    if affirmative_captcha and not re.search(
+        r"\b(?:captcha|recaptcha|hcaptcha|turnstile)\b.{0,20}"
+        r"\b(?:not required|inactive|disabled|false|null)\b",
+        lowered,
+    ):
+        return "CAPTCHA challenge was presented"
+    codes = {int(value) for value in statuses if str(value).isdigit()}
+    if 429 in codes:
+        return "authentication endpoint returned HTTP 429 rate limiting"
+    if codes.intersection({401, 403}) or re.search(
+        r"\b(?:invalid|incorrect|wrong|rejected)\s+(?:credential|credentials|"
+        r"password|username|login)\b",
+        lowered,
+    ):
+        return "supplied credential was rejected or blocked"
+    return ""
+
+
+def _browser_auth_locator(page, selector: str, *, role: str, timeout_ms: int):
+    locator = page.locator(selector).first
+    locator.wait_for(state="visible", timeout=timeout_ms)
+    details = locator.evaluate(
+        """el => ({tag: el.tagName.toLowerCase(),
+                    type: (el.getAttribute('type') || '').toLowerCase(),
+                    role: (el.getAttribute('role') || '').toLowerCase(),
+                    disabled: !!el.disabled})"""
+    )
+    tag = str((details or {}).get("tag") or "")
+    input_type = str((details or {}).get("type") or "")
+    aria_role = str((details or {}).get("role") or "")
+    disabled = bool((details or {}).get("disabled"))
+    if disabled:
+        raise ValueError(f"{role} control is disabled")
+    if role == "username":
+        accepted = tag == "textarea" or (
+            tag == "input" and input_type in {
+                "", "text", "email", "tel", "number", "search", "url"
+            }
+        )
+    elif role == "password":
+        accepted = tag == "input" and input_type == "password"
+    else:
+        accepted = (
+            tag == "button"
+            or (tag == "input" and input_type in {"button", "image", "submit"})
+            or aria_role == "button"
+        )
+    if not accepted:
+        raise ValueError(f"{role} selector did not resolve to a compatible form control")
+    return locator
+
+
+def _browser_auth_collect_responses(responses: list[dict],
+                                    workspace: Workspace,
+                                    secret_values: Iterable[str]):
+    rows: list[dict] = []
+    raw_bodies: list[str] = []
+    statuses: list[int] = []
+    secrets = tuple(secret_values)
+    candidates = [
+        observed for observed in responses[:8]
+        if not observed.get("error")
+    ]
+    preferred = next((
+        observed for observed in candidates
+        if observed.get("matches_submission") is True
+    ), None)
+    if preferred is None:
+        preferred = next((
+        observed for observed in candidates
+        if _browser_auth_response_url(str(observed.get("url") or ""))
+        ), candidates[0] if candidates else None)
+    for observed in responses[:8]:
+        try:
+            if observed.get("error"):
+                rows.append({
+                    "phase": str(observed.get("phase") or "login"),
+                    "error": redact_sensitive_text(
+                        str(observed.get("error")), secrets
+                    )[:1000],
+                })
+                continue
+            response_url = str(observed.get("url") or "")
+            allowed, _ = check_url_scope(workspace, response_url)
+            if not allowed:
+                continue
+            body = str(observed.get("body") or "")[:MAX_RESPONSE_BYTES]
+            status = int(observed.get("status") or 0)
+            if observed is preferred:
+                statuses.append(status)
+                raw_bodies.append(body)
+            rows.append({
+                "phase": str(observed.get("phase") or "login"),
+                "method": str(observed.get("method") or "").upper(),
+                "resource_type": str(observed.get("resource_type") or ""),
+                "url": redact_sensitive_text(response_url, secrets),
+                "status": status,
+                "body": redact_sensitive_text(body, secrets)[:MAX_INLINE_RESPONSE_CHARS],
+                "body_truncated": bool(
+                    observed.get("body_truncated")
+                    or len(body) > MAX_INLINE_RESPONSE_CHARS
+                ),
+            })
+        except Exception as exc:
+            rows.append({
+                "phase": str(observed.get("phase") or "login"),
+                "error": redact_sensitive_text(str(exc), secrets)[:1000],
+            })
+    return rows, raw_bodies, statuses
+
+
+def _browser_auth_response_url(url: str) -> bool:
+    try:
+        path = urlsplit(url).path.lower()
+    except ValueError:
+        return False
+    return bool(re.search(
+        r"(?:^|[/_.-])(?:login|signin|sign-in|auth|session|token|otp)(?:[/_.-]|$)",
+        path,
+    ))
+
+
+def _browser_auth_enable_response_capture(context, page, workspace: Workspace,
+                                          denied_requests: list[str],
+                                          username_values: Iterable[str],
+                                          password_values: Iterable[str]):
+    """Capture bounded non-GET responses at CDP response stage."""
+    session = context.new_cdp_session(page)
+    responses: list[dict] = []
+
+    def paused(event: dict) -> None:
+        request_id = str(event.get("requestId") or "")
+        request = event.get("request") if isinstance(event.get("request"), dict) else {}
+        request_url = str(request.get("url") or "")
+        method = str(request.get("method") or "").upper()
+        resource_type = str(event.get("resourceType") or "").lower()
+        post_data = str(request.get("postData") or "")
+        matches_submission = bool(
+            post_data
+            and any(value and value in post_data for value in username_values)
+            and any(value and value in post_data for value in password_values)
+        )
+        resumed = False
+        try:
+            allowed, _ = check_url_scope(workspace, request_url)
+            if not allowed:
+                if len(denied_requests) < 100:
+                    denied_requests.append(request_url)
+                session.send("Fetch.failRequest", {
+                    "requestId": request_id,
+                    "errorReason": "BlockedByClient",
+                })
+                resumed = True
+                return
+            if method == "GET" or len(responses) >= 8:
+                return
+            headers = event.get("responseHeaders")
+            content_length = 0
+            if isinstance(headers, list):
+                for header in headers:
+                    if (isinstance(header, dict)
+                            and str(header.get("name") or "").lower() == "content-length"):
+                        try:
+                            content_length = max(0, int(header.get("value") or 0))
+                        except (TypeError, ValueError):
+                            content_length = 0
+                        break
+            body = ""
+            truncated = content_length > MAX_RESPONSE_BYTES
+            if not truncated:
+                result = session.send("Fetch.getResponseBody", {
+                    "requestId": request_id,
+                })
+                raw = str(result.get("body") or "")
+                if result.get("base64Encoded"):
+                    if len(raw) > ((MAX_RESPONSE_BYTES + 2) // 3) * 4:
+                        decoded = b""
+                        truncated = True
+                    else:
+                        decoded = base64.b64decode(raw, validate=False)
+                else:
+                    if len(raw) > MAX_RESPONSE_BYTES:
+                        decoded = raw[:MAX_RESPONSE_BYTES].encode(
+                            "utf-8", "replace"
+                        )
+                        truncated = True
+                    else:
+                        decoded = raw.encode("utf-8", "replace")
+                truncated = len(decoded) > MAX_RESPONSE_BYTES
+                body = decoded[:MAX_RESPONSE_BYTES].decode("utf-8", "replace")
+            responses.append({
+                "phase": "login",
+                "method": method,
+                "resource_type": resource_type,
+                "url": request_url,
+                "status": int(event.get("responseStatusCode") or 0),
+                "body": body,
+                "body_truncated": truncated,
+                "matches_submission": matches_submission,
+            })
+        except Exception as exc:
+            responses.append({
+                "phase": "login",
+                "error": "Login response capture failed: " + str(exc),
+            })
+        finally:
+            if not resumed:
+                try:
+                    session.send("Fetch.continueResponse", {"requestId": request_id})
+                except Exception:
+                    try:
+                        session.send("Fetch.continueRequest", {"requestId": request_id})
+                    except Exception:
+                        pass
+
+    session.on("Fetch.requestPaused", paused)
+    session.send("Fetch.enable", {
+        "patterns": [{"urlPattern": "*", "requestStage": "Response"}]
+    })
+    return session, responses
+
+
+def _browser_auth_cookie_payload(cookies: list[dict], login_url: str) -> bytes:
+    """Convert applicable Playwright cookies to a private curl cookie jar."""
+    cookies = _browser_auth_persistable_cookies(cookies, login_url)
+    lines = ["# Netscape HTTP Cookie File"]
+    for cookie in cookies:
+        domain = str(cookie.get("domain") or "").lower().rstrip(".")
+        path = str(cookie.get("path") or "/")
+        name = str(cookie.get("name") or "")
+        value = str(cookie.get("value") or "")
+        include_subdomains = "TRUE" if domain.startswith(".") else "FALSE"
+        secure = "TRUE" if bool(cookie.get("secure")) else "FALSE"
+        try:
+            expires = max(0, int(float(cookie.get("expires") or 0)))
+        except (TypeError, ValueError):
+            expires = 0
+        rendered_domain = domain
+        if bool(cookie.get("httpOnly")):
+            rendered_domain = "#HttpOnly_" + rendered_domain
+        lines.append("\t".join((
+            rendered_domain, include_subdomains, path, secure, str(expires),
+            name, value,
+        )))
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _browser_auth_persistable_cookies(cookies: list[dict], login_url: str) -> list[dict]:
+    """Keep cookies that can apply to the exact login host and serialize safely."""
+    host = (urlsplit(login_url).hostname or "").lower().rstrip(".")
+    output: list[dict] = []
+    for cookie in cookies:
+        domain = str(cookie.get("domain") or "").lower().rstrip(".")
+        plain_domain = domain.lstrip(".")
+        if not plain_domain or not (
+            host == plain_domain or host.endswith("." + plain_domain)
+        ):
+            continue
+        path = str(cookie.get("path") or "/")
+        name = str(cookie.get("name") or "")
+        value = str(cookie.get("value") or "")
+        if (not name or not 8 <= len(value) <= 8192
+                or any("\t" in item or "\r" in item or "\n" in item
+                           for item in (domain, path, name, value))):
+            continue
+        output.append(dict(cookie))
+    return output
+
+
+def _browser_auth_cookie_fingerprints(cookies: list[dict]) -> set[str]:
+    fields = ("domain", "path", "name", "value", "secure", "httpOnly", "sameSite")
+    return {
+        hashlib.sha256(json.dumps(
+            {key: cookie.get(key) for key in fields},
+            sort_keys=True, ensure_ascii=False, separators=(",", ":"),
+        ).encode("utf-8", "replace")).hexdigest()
+        for cookie in cookies
+    }
+
+
+def _browser_auth_has_cookie_delta(before: list[dict], after: list[dict]) -> bool:
+    baseline = _browser_auth_cookie_fingerprints(before)
+    for cookie in after:
+        value = str(cookie.get("value") or "")
+        if not 8 <= len(value) <= 8192:
+            continue
+        if not _browser_auth_cookie_fingerprints([cookie]).issubset(baseline):
+            return True
+    return False
+
+
+def _browser_auth_local_storage(page) -> dict:
+    try:
+        value = page.evaluate(
+            """() => {
+              const output = {}; let total = 0;
+              const count = Math.min(localStorage.length, 100);
+              for (let i = 0; i < count && total < 1000000; i++) {
+                const rawKey = localStorage.key(i);
+                if (rawKey === null) continue;
+                const key = rawKey.slice(0, 512);
+                const rawValue = localStorage.getItem(rawKey) || '';
+                const remaining = Math.max(0, 1000000 - total - key.length);
+                const value = rawValue.slice(0, Math.min(65536, remaining));
+                output[key] = value; total += key.length + value.length;
+              }
+              return output;
+            }"""
+        )
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _browser_auth_tokens(response_bodies: Iterable[str], local_storage: dict) -> dict[str, str]:
+    tokens: dict[str, str] = {}
+    for body in response_bodies:
+        tokens.update(_extract_auth_tokens(str(body)))
+    tokens.update(_extract_auth_tokens(json.dumps(local_storage, ensure_ascii=False)))
+    for value in local_storage.values():
+        if isinstance(value, str):
+            tokens.update(_extract_auth_tokens(value))
+    return {
+        key: value for key, value in tokens.items()
+        if 12 <= len(value) <= 16_384
+        and not any(ord(char) < 0x20 or ord(char) == 0x7f for char in value)
+    }
+
+
+def _browser_auth_install_cookies(workspace: Workspace, credential: str,
+                                  cookies: list[dict], login_url: str) -> None:
+    payload = _browser_auth_cookie_payload(cookies, login_url)
+    with _temporary_cookie_jar(workspace) as temporary:
+        fd = os.open(temporary, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        _install_cookie_jar(
+            temporary, credentials.cookie_jar_path(workspace.slug, credential)
+        )
+
+
+def _browser_auth_save_capture(workspace: Workspace, url: str, capture: dict,
+                               rendered_dom: str,
+                               secret_values: Iterable[str]) -> tuple[Path, Path]:
+    secrets = tuple(secret_values)
+    safe_capture = _redacted_capture_value(capture, secrets)
+    safe_dom = redact_sensitive_text(rendered_dom, secrets)[:MAX_RESPONSE_BYTES]
+    workspace.scratch_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    output = workspace.scratch_dir / f"browser-auth-{time.time_ns()}.html"
+    fd = os.open(
+        output, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600
+    )
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write(safe_dom)
+    flow_body = json.dumps(
+        {**safe_capture, "rendered_dom": safe_dom},
+        ensure_ascii=False, separators=(",", ":"),
+    )
+    flow = _save_flow(
+        workspace, "BROWSER", url, {}, None, flow_body,
+        transport="credential-playwright-chromium", returncode=0,
+        secret_values=secrets,
+    )
+    return output, flow
+
+
+def _browser_auth_fresh_probe(
+    playwright,
+    executable: str,
+    workspace: Workspace,
+    url: str,
+    *,
+    phase: str,
+    denied_requests: list[str],
+    console: list[dict],
+    timeout_ms: int,
+    cookies: Optional[list[dict]] = None,
+    bearer_token: str = "",
+) -> dict:
+    """Load one proof URL in a fresh browser with only supplied session material."""
+    with _isolated_browser_profile(executable) as launch_profile:
+        context = _launch_scoped_browser_context(
+            playwright, launch_profile, workspace, denied_requests,
+            credentials.normalize_origin(url) if bearer_token else "",
+            {"Authorization": f"Bearer {bearer_token}"}
+            if bearer_token else None,
+        )
+        try:
+            if cookies:
+                context.add_cookies(cookies)
+            page = context.new_page()
+            page.on("console", lambda message: console.append({
+                "phase": phase,
+                "type": str(message.type),
+                "text": str(message.text)[:4000],
+            }) if len(console) < 100 else None)
+            response = page.goto(
+                url, wait_until="domcontentloaded", timeout=timeout_ms
+            )
+            page.wait_for_timeout(250)
+            status = int(response.status) if response else 0
+            final_url, dom, visible = _browser_auth_snapshot(page)
+            allowed, reason = check_url_scope(workspace, final_url)
+            if not allowed:
+                raise RuntimeError(
+                    f"{phase} browser proof ended outside scope: {reason}"
+                )
+            try:
+                body = bytes(response.body() or b"").decode(
+                    "utf-8", "replace"
+                )[:MAX_RESPONSE_BYTES] if response else ""
+            except Exception:
+                body = ""
+            return {
+                "status": status,
+                "final_url": final_url,
+                "body": body,
+                "source": "\n".join((body, visible, dom)),
+                "cookies": list(context.cookies()),
+                "local_storage": _browser_auth_local_storage(page),
+            }
+        finally:
+            context.close()
+
+
+def credential_browser_login(
+    workspace: Workspace,
+    url: str,
+    *,
+    credential: str,
+    username_transform: str = "stored",
+    username_selector: str = _BROWSER_USERNAME_SELECTOR,
+    password_selector: str = _BROWSER_PASSWORD_SELECTOR,
+    submit_selector: str = _BROWSER_SUBMIT_SELECTOR,
+    verify_url: str = "",
+    success_marker: str = "",
+    timeout: int = 45,
+) -> dict:
+    """Submit one private credential through a scoped rendered login form."""
+    verify_url = str(verify_url or "").strip()
+    for candidate in (url, verify_url):
+        if not candidate:
+            continue
+        blocked = _scope_error(workspace, candidate)
+        if blocked:
+            return blocked
+    try:
+        login_origin = credentials.normalize_origin(url)
+        if not verify_url or not success_marker:
+            return _err(
+                "Browser login requires a scoped verification URL and a printable "
+                "non-secret success marker."
+            )
+        if verify_url and credentials.normalize_origin(verify_url) != login_origin:
+            return _err(
+                "The browser verification endpoint must use the login page's "
+                "exact origin (scheme, host, and effective port)."
+            )
+        if username_transform not in {"stored", "iran-e164"}:
+            return _err("Username transform must be stored or iran-e164.")
+        username_selector = _browser_auth_selector(
+            username_selector, label="Username", default=_BROWSER_USERNAME_SELECTOR
+        )
+        password_selector = _browser_auth_selector(
+            password_selector, label="Password", default=_BROWSER_PASSWORD_SELECTOR
+        )
+        submit_selector = _browser_auth_selector(
+            submit_selector, label="Submit", default=_BROWSER_SUBMIT_SELECTOR
+        )
+        if (
+            len(success_marker) > 200
+            or any(ord(char) < 0x20 for char in success_marker)
+        ):
+            return _err(
+                "Browser verification success marker must be 1-200 printable characters."
+            )
+        secret = credentials.load_credential(workspace.slug, credential)
+        login_username = credentials.normalize_login_username(
+            secret["username"], username_transform
+        )
+        credentials.ensure_login_attempt_available(workspace.slug, credential)
+    except (ValueError, credentials.CredentialError) as exc:
+        return _err(str(exc))
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return _err("Python Playwright is not installed.")
+    executable = _browser_executable()
+    if not executable:
+        return _err("No Playwright-compatible Chromium or Chrome executable is installed.")
+
+    timeout_seconds = max(5, min(int(timeout), 120))
+    timeout_ms = timeout_seconds * 1000
+    secret_values = _serialized_secret_variants((
+        secret["username"], login_username, secret["password"],
+    ))
+    denied_requests: list[str] = []
+    console: list[dict] = []
+    pending_responses: list[dict] = []
+    response_rows: list[dict] = []
+    raw_response_bodies: list[str] = []
+    response_statuses: list[int] = []
+    rendered_dom = ""
+    visible_text = ""
+    final_url = url
+    page_status = 0
+    verify_status = 0
+    verify_source = ""
+    verify_body = ""
+    replay_status = 0
+    replay_source = ""
+    replay_final_url = ""
+    control_status = 0
+    control_source = ""
+    control_final_url = ""
+    cookies: list[dict] = []
+    observed_cookie_sets: list[list[dict]] = []
+    local_storage: dict = {}
+    observed_token_sets: list[dict[str, str]] = []
+    tokens: dict[str, str] = {}
+    material_delta = False
+    browser_identity = ""
+    attempt = 0
+    blocker = ""
+    failure = ""
+    phase = {"name": "initial"}
+    context = None
+
+    def remember_console(message) -> None:
+        if len(console) < 100:
+            console.append({
+                "phase": phase["name"], "type": str(message.type),
+                "text": str(message.text)[:4000],
+            })
+
+    try:
+        with _isolated_browser_profile(executable) as launch_profile:
+            browser_identity = str(launch_profile["identity"])
+            with sync_playwright() as playwright:
+                context = _launch_scoped_browser_context(
+                    playwright, launch_profile, workspace, denied_requests
+                )
+                page = context.new_page()
+                page.on("console", remember_console)
+                response = page.goto(
+                    url, wait_until="domcontentloaded", timeout=timeout_ms
+                )
+                page.wait_for_timeout(250)
+                page_status = int(response.status) if response else 0
+                final_url, rendered_dom, visible_text = _browser_auth_snapshot(page)
+                final_allowed, final_reason = check_url_scope(workspace, final_url)
+                if not final_allowed:
+                    raise RuntimeError(
+                        f"browser ended outside scope before login: {final_reason}"
+                    )
+                initial_observation = _browser_auth_blocker(
+                    visible_text,
+                    (page_status,) if page_status == 429 else (),
+                )
+                if initial_observation.startswith(("MFA/OTP", "CAPTCHA")):
+                    blocker = initial_observation
+                elif page_status == 429:
+                    blocker = initial_observation
+                elif page_status in {401, 403}:
+                    blocker = (
+                        f"login page access returned HTTP {page_status} before "
+                        "credential submission"
+                    )
+                if blocker:
+                    credentials.record_login_outcome(
+                        workspace.slug, credential, blocked_reason=blocker
+                    )
+                else:
+                    username = _browser_auth_locator(
+                        page, username_selector, role="username", timeout_ms=timeout_ms
+                    )
+                    password = _browser_auth_locator(
+                        page, password_selector, role="password", timeout_ms=timeout_ms
+                    )
+                    submit = _browser_auth_locator(
+                        page, submit_selector, role="submit", timeout_ms=timeout_ms
+                    )
+                    baseline_cookies = _browser_auth_persistable_cookies(
+                        list(context.cookies()), url
+                    )
+                    baseline_storage = _browser_auth_local_storage(page)
+                    baseline_tokens = _browser_auth_tokens((), baseline_storage)
+                    observed_cookie_sets.append(baseline_cookies)
+                    observed_token_sets.append(baseline_tokens)
+                    attempt = credentials.begin_login_attempt(
+                        workspace.slug, credential
+                    )
+                    phase["name"] = "login"
+                    username.fill(login_username, timeout=timeout_ms)
+                    password.fill(secret["password"], timeout=timeout_ms)
+                    capture_session = None
+                    try:
+                        capture_session, pending_responses = (
+                            _browser_auth_enable_response_capture(
+                                context, page, workspace, denied_requests,
+                                _serialized_secret_variants((
+                                    secret["username"], login_username,
+                                )),
+                                _serialized_secret_variants((secret["password"],)),
+                            )
+                        )
+                        submit.click(timeout=timeout_ms)
+                        deadline = time.monotonic() + timeout_seconds
+                        while time.monotonic() < deadline:
+                            if any(
+                                item.get("matches_submission") is True
+                                for item in pending_responses
+                                if not item.get("error")
+                            ):
+                                break
+                            page.wait_for_timeout(100)
+                    except Exception as exc:
+                        failure = (
+                            "Browser form submission did not complete: " + str(exc)
+                        )
+                    finally:
+                        if capture_session is not None:
+                            try:
+                                capture_session.send("Fetch.disable")
+                            except Exception:
+                                pass
+                    try:
+                        page.wait_for_timeout(750)
+                    except Exception:
+                        pass
+
+                    final_url, rendered_dom, visible_text = _browser_auth_snapshot(page)
+                    final_allowed, final_reason = check_url_scope(workspace, final_url)
+                    if not final_allowed:
+                        raise RuntimeError(
+                            f"browser ended outside scope after login: {final_reason}"
+                        )
+                    response_rows, raw_response_bodies, response_statuses = (
+                        _browser_auth_collect_responses(
+                            pending_responses, workspace, secret_values
+                        )
+                    )
+                    if not raw_response_bodies and not response_statuses and not failure:
+                        failure = (
+                            "No credential submission response was captured before "
+                            "the configured deadline."
+                        )
+                    blocker = _browser_auth_blocker(
+                        "\n".join(raw_response_bodies), response_statuses
+                    ) or _browser_auth_blocker(visible_text)
+                    cookies = _browser_auth_persistable_cookies(
+                        list(context.cookies()), url
+                    )
+                    local_storage = _browser_auth_local_storage(page)
+                    tokens = _browser_auth_tokens(
+                        raw_response_bodies, local_storage
+                    )
+                    observed_cookie_sets.append(cookies)
+                    observed_token_sets.append(tokens)
+                    if not blocker:
+                        phase["name"] = "verify"
+                        verify_response = page.goto(
+                            verify_url, wait_until="domcontentloaded", timeout=timeout_ms
+                        )
+                        page.wait_for_timeout(250)
+                        verify_status = int(verify_response.status) if verify_response else 0
+                        verify_final, verify_dom, verify_visible = _browser_auth_snapshot(page)
+                        verify_allowed, verify_reason = check_url_scope(
+                            workspace, verify_final
+                        )
+                        if not verify_allowed:
+                            raise RuntimeError(
+                                f"browser verification ended outside scope: {verify_reason}"
+                            )
+                        try:
+                            verify_body = bytes(verify_response.body() or b"").decode(
+                                "utf-8", "replace"
+                            )[:MAX_RESPONSE_BYTES] if verify_response else ""
+                        except Exception:
+                            verify_body = ""
+                        verify_source = "\n".join(
+                            (verify_body, verify_visible, verify_dom)
+                        )
+                        # Verification can rotate cookies or refresh a bearer.
+                        # Snapshot only after it completes so persisted state is current.
+                        cookies = _browser_auth_persistable_cookies(
+                            list(context.cookies()), url
+                        )
+                        local_storage = _browser_auth_local_storage(page)
+                        tokens = _browser_auth_tokens(
+                            (*raw_response_bodies, verify_body), local_storage
+                        )
+                        observed_cookie_sets.append(cookies)
+                        observed_token_sets.append(tokens)
+                        changed_cookie = _browser_auth_has_cookie_delta(
+                            baseline_cookies, cookies
+                        )
+                        baseline_token_values = set(baseline_tokens.values())
+                        changed_token = any(
+                            value not in baseline_token_values
+                            for value in tokens.values()
+                        )
+                        material_delta = changed_cookie or changed_token
+
+                    context.close()
+                    context = None
+
+                    if not blocker and material_delta:
+                        phase["name"] = "replay"
+                        replay = _browser_auth_fresh_probe(
+                            playwright, executable, workspace, verify_url,
+                            phase="replay", denied_requests=denied_requests,
+                            console=console, timeout_ms=timeout_ms,
+                            cookies=cookies,
+                            bearer_token=credentials.select_bearer(tokens),
+                        )
+                        replay_status = int(replay.get("status") or 0)
+                        replay_source = str(replay.get("source") or "")
+                        replay_final_url = str(replay.get("final_url") or "")
+                        replay_cookies = _browser_auth_persistable_cookies(
+                            list(replay.get("cookies") or []), url
+                        )
+                        replay_tokens = dict(tokens)
+                        replay_tokens.update(_browser_auth_tokens(
+                            (str(replay.get("body") or ""),),
+                            replay.get("local_storage")
+                            if isinstance(replay.get("local_storage"), dict) else {},
+                        ))
+                        observed_cookie_sets.append(replay_cookies)
+                        observed_token_sets.append(replay_tokens)
+                        cookies = replay_cookies
+                        tokens = replay_tokens
+
+                        phase["name"] = "control"
+                        control = _browser_auth_fresh_probe(
+                            playwright, executable, workspace, verify_url,
+                            phase="control", denied_requests=denied_requests,
+                            console=console, timeout_ms=timeout_ms,
+                        )
+                        control_status = int(control.get("status") or 0)
+                        control_source = str(control.get("source") or "")
+                        control_final_url = str(control.get("final_url") or "")
+                        observed_cookie_sets.append(
+                            _browser_auth_persistable_cookies(
+                                list(control.get("cookies") or []), url
+                            )
+                        )
+                        observed_token_sets.append(_browser_auth_tokens(
+                            (str(control.get("body") or ""),),
+                            control.get("local_storage")
+                            if isinstance(control.get("local_storage"), dict) else {},
+                        ))
+    except Exception as exc:
+        failure = failure or f"Headless browser authentication failed: {exc}"
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+    proof_status_ok = 200 <= replay_status < 300
+    control_conclusive = bool(
+        success_marker
+        and (200 <= control_status < 300 or control_status in {401, 403, 404})
+        and success_marker not in control_source
+    )
+    marker_proved = bool(
+        success_marker
+        and success_marker in replay_source
+        and proof_status_ok
+        and control_conclusive
+    )
+
+    runtime_secrets = [*secret_values]
+    for observed_tokens in observed_token_sets:
+        runtime_secrets.extend(observed_tokens.values())
+    for observed_cookies in observed_cookie_sets:
+        runtime_secrets.extend(
+            value for cookie in observed_cookies
+            if 8 <= len(value := str(cookie.get("value") or "")) <= 8192
+        )
+    secret_values = tuple(sorted({
+        *secret_values,
+        *_serialized_secret_variants(runtime_secrets),
+    }, key=len, reverse=True))
+    response_rows = _redacted_capture_value(response_rows, secret_values)
+
+    established = False
+    if attempt and blocker:
+        credentials.record_login_outcome(
+            workspace.slug, credential, blocked_reason=blocker
+        )
+    elif attempt and not failure and material_delta and marker_proved:
+        try:
+            _browser_auth_install_cookies(
+                workspace, credential, cookies, url
+            )
+            if tokens:
+                credentials.save_tokens(
+                    workspace.slug, credential, tokens, origin=login_origin
+                )
+            credentials.record_login_outcome(
+                workspace.slug, credential, established=True,
+                origin=login_origin,
+            )
+            established = True
+        except (OSError, credentials.CredentialError) as exc:
+            failure = failure or f"Private browser session could not be saved: {exc}"
+            credentials.record_login_outcome(workspace.slug, credential)
+    elif attempt:
+        credentials.record_login_outcome(workspace.slug, credential)
+
+    safe_final_url = redact_sensitive_text(final_url, secret_values)
+    safe_replay_url = redact_sensitive_text(replay_final_url, secret_values)
+    safe_control_url = redact_sensitive_text(control_final_url, secret_values)
+    safe_console = _redacted_capture_value(console, secret_values)
+    safe_denied = [
+        redact_sensitive_text(value, secret_values) for value in denied_requests
+    ]
+    capture = {
+        "login_status": page_status,
+        "final_url": safe_final_url,
+        "login_api_responses": response_rows,
+        "verification": {
+            "url": redact_sensitive_text(verify_url, secret_values),
+            "status": verify_status,
+            "marker_present": bool(success_marker and success_marker in verify_source),
+        },
+        "persisted_session_replay": {
+            "status": replay_status,
+            "final_url": safe_replay_url,
+            "marker_present": bool(success_marker and success_marker in replay_source),
+            "new_session_material": material_delta,
+        },
+        "anonymous_control": {
+            "status": control_status,
+            "final_url": safe_control_url,
+            "marker_present": bool(success_marker and success_marker in control_source),
+        },
+        "console": safe_console,
+        "blocked_requests": safe_denied,
+        "auth_blocker": blocker,
+        "failure": redact_sensitive_text(failure, secret_values),
+    }
+    try:
+        html_path, flow = _browser_auth_save_capture(
+            workspace, url, capture, rendered_dom, secret_values
+        )
+    except OSError as exc:
+        return _err(
+            "Browser authentication capture could not be saved: "
+            + redact_sensitive_text(str(exc), secret_values)
+        )
+
+    session = credentials.session_status(workspace.slug, credential)
+    data = {
+        "credential": credential,
+        "attempt": attempt,
+        "status": page_status,
+        "final_url": safe_final_url,
+        "verify_status": verify_status,
+        "replay_status": replay_status,
+        "control_status": control_status,
+        "login_api_responses": response_rows,
+        "auth_blocker": blocker,
+        "flow": str(flow),
+        "html_path": str(html_path),
+        "blocked_requests": safe_denied,
+        "console": safe_console,
+        "browser_identity": browser_identity,
+        "session": session,
+    }
+    if established:
+        return _ok(
+            f"Browser session {credential!r} was independently verified after "
+            f"attempt {attempt}; secrets were not exposed.",
+            data,
+        )
+    if blocker:
+        position = (
+            f"after attempt {attempt}" if attempt
+            else "before credential submission"
+        )
+        return _err(
+            f"Browser authentication stopped {position}: {blocker}.",
+            data,
+        )
+    if failure:
+        return _err(
+            redact_sensitive_text(failure, secret_values)
+            + f" Capture saved to {flow.name}.",
+            data,
+        )
+    if not material_delta:
+        reason = "no new reusable cookie or bearer session material was produced"
+    elif success_marker not in replay_source:
+        reason = "the persisted session replay did not contain the success marker"
+    elif not control_conclusive:
+        reason = "the anonymous control did not prove the marker was session-dependent"
+    else:
+        reason = "the persisted session replay response was not successful"
+    return _err(
+        f"Browser login attempt {attempt} remains unverified because {reason}. "
+        f"Capture saved to {flow.name}.",
+        data,
+    )
 
 
 def dns_lookup(workspace: Workspace, host: str) -> dict:

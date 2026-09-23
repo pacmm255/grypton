@@ -16,7 +16,8 @@ FLOW_RE = re.compile(r"flow-\d+\.http")
 NETWORK_TOOLS = {
     "http_request", "httpx_probe", "browse", "dns_lookup", "tls_certificate",
     "port_scan", "subdomain_enum", "goja_request", "flow_replay", "artifact_download",
-    "tcp_exchange", "research", "credential_login", "authenticated_http_request",
+    "tcp_exchange", "research", "credential_login", "credential_browser_login",
+    "authenticated_http_request",
 }
 
 
