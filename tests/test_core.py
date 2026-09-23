@@ -1637,6 +1637,162 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(Engine._is_hard_stop(reason, convergence_allowed=True))
         self.assertTrue(Engine._is_hard_stop("program automation prohibited"))
 
+    def test_deadline_mode_does_not_treat_authentication_blocker_as_boundary(self):
+        with isolated_runtime():
+            ws = Workspace("deadline-auth-blocker")
+            ws.create("https://app.example.test", "web")
+            ws.save_constraints(Constraints(
+                in_scope=["https://app.example.test"],
+                out_of_scope=["https://admin.example.test"],
+            ))
+            engine = Engine(
+                "deadline-auth-blocker", backend="mock", run_until_deadline=True
+            )
+            directive = Directive(
+                cont=False,
+                stop_reason=(
+                    "Authorization and convergence boundary: authenticated /app "
+                    "testing blocked on enabled:false activation requiring signup/OTP flow"
+                ),
+            )
+
+            self.assertFalse(engine._manager_stop_is_binding(
+                directive, convergence_reason="repeated probe convergence"
+            ))
+
+    def test_deadline_mode_honors_exact_recorded_out_of_scope_boundary(self):
+        with isolated_runtime():
+            ws = Workspace("deadline-recorded-scope")
+            ws.create("https://app.example.test", "web")
+            ws.save_constraints(Constraints(
+                in_scope=["https://app.example.test"],
+                out_of_scope=["https://admin.example.test/private"],
+            ))
+            engine = Engine(
+                "deadline-recorded-scope", backend="mock", run_until_deadline=True
+            )
+            exact = Directive(
+                cont=False,
+                stop_reason=(
+                    "Recorded out-of-scope boundary reached at "
+                    "https://admin.example.test/private"
+                ),
+            )
+            canonical_mock_wording = Directive(
+                cont=False,
+                stop_reason=(
+                    "Out-of-scope / authorization boundary reached at "
+                    "https://admin.example.test/private"
+                ),
+            )
+            url_first_wording = Directive(
+                cont=False,
+                stop_reason=(
+                    "https://admin.example.test/private is out of scope"
+                ),
+            )
+            endpoint_wording = Directive(
+                cont=False,
+                stop_reason=(
+                    "Out-of-scope endpoint https://admin.example.test/private was reached"
+                ),
+            )
+            invented = Directive(
+                cont=False,
+                stop_reason="Out-of-scope boundary reached at https://other.example.test",
+            )
+            lookalike_host = Directive(
+                cont=False,
+                stop_reason=(
+                    "Out-of-scope boundary reached at "
+                    "https://admin.example.test.evil/private"
+                ),
+            )
+            lookalike_path = Directive(
+                cont=False,
+                stop_reason=(
+                    "Out-of-scope boundary reached at "
+                    "https://admin.example.test/privateer"
+                ),
+            )
+            contextual_only = Directive(
+                cont=False,
+                stop_reason="Authorization and convergence boundary at the activation gate",
+                scope_enforcement=[
+                    "Keep requests away from https://admin.example.test/private"
+                ],
+            )
+            negated = Directive(
+                cont=False,
+                stop_reason=(
+                    "Authorization remains blocked; no out-of-scope request was made; "
+                    "recorded exclusion URL is https://admin.example.test/private"
+                ),
+            )
+
+            self.assertTrue(engine._manager_stop_is_binding(exact))
+            self.assertTrue(engine._manager_stop_is_binding(canonical_mock_wording))
+            self.assertTrue(engine._manager_stop_is_binding(url_first_wording))
+            self.assertTrue(engine._manager_stop_is_binding(endpoint_wording))
+            self.assertFalse(engine._manager_stop_is_binding(invented))
+            self.assertFalse(engine._manager_stop_is_binding(lookalike_host))
+            self.assertFalse(engine._manager_stop_is_binding(lookalike_path))
+            self.assertFalse(engine._manager_stop_is_binding(contextual_only))
+            self.assertFalse(engine._manager_stop_is_binding(negated))
+
+    def test_recorded_url_boundary_citation_uses_url_structure(self):
+        root = "https://admin.example.test/"
+        self.assertTrue(Engine._boundary_text_contains(
+            "Recorded out-of-scope URL https://admin.example.test/private", root
+        ))
+        self.assertTrue(Engine._boundary_text_contains(
+            "Recorded out-of-scope URL https://admin.example.test?view=1", root
+        ))
+        for lookalike in (
+            "https://admin.example.test:444/private",
+            "https://admin.example.test@evil.test/private",
+            "https://admin.example.test%2eevil/private",
+        ):
+            with self.subTest(lookalike=lookalike):
+                self.assertFalse(Engine._boundary_text_contains(
+                    f"Recorded out-of-scope URL {lookalike}", root
+                ))
+        path_rule = "https://admin.example.test/private/"
+        for traversal in (
+            "https://admin.example.test/private/../public",
+            "https://admin.example.test/private/%2e%2e/public",
+            "https://admin.example.test/private/%252e%252e/public",
+        ):
+            with self.subTest(traversal=traversal):
+                self.assertFalse(Engine._boundary_text_contains(
+                    f"Recorded out-of-scope URL {traversal}", path_rule
+                ))
+
+    def test_deadline_mode_honors_only_recorded_automation_prohibition(self):
+        with isolated_runtime():
+            ws = Workspace("deadline-automation-ban")
+            ws.create("https://app.example.test", "web")
+            ws.save_constraints(Constraints(
+                in_scope=["https://app.example.test"],
+                hard_rules=["Program automation is prohibited."],
+            ))
+            engine = Engine(
+                "deadline-automation-ban", backend="mock", run_until_deadline=True
+            )
+            directive = Directive(
+                cont=False, stop_reason="Program automation prohibited"
+            )
+            self.assertTrue(engine._manager_stop_is_binding(directive))
+
+            ws.save_constraints(Constraints(in_scope=["https://app.example.test"]))
+            self.assertFalse(engine._manager_stop_is_binding(directive))
+
+            ws.save_constraints(Constraints(
+                in_scope=["https://app.example.test"],
+                hard_rules=["Program automation is not prohibited."],
+            ))
+            self.assertFalse(engine._manager_stop_is_binding(directive))
+
     async def test_mock_loop_persists_independent_verdict(self):
         with isolated_runtime():
             old_turns, old_seconds = config.CONFIG.max_turns, config.CONFIG.max_run_seconds
@@ -1707,6 +1863,103 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(engine.turn_index, 5)
                 self.assertIn("max_turns safety ceiling", engine.stop_reason)
                 self.assertNotIn("convergence guard", engine.stop_reason)
+            finally:
+                for field, value in old.items():
+                    setattr(config.CONFIG, field, value)
+
+    async def test_detached_deadline_loop_overrides_manager_auth_stop(self):
+        with isolated_runtime():
+            fields = ("max_turns", "max_run_seconds", "passive_stagnation_limit",
+                      "repetitive_probe_turn_limit", "exhaustion_threshold")
+            old = {field: getattr(config.CONFIG, field) for field in fields}
+            config.CONFIG.max_turns = 3
+            config.CONFIG.max_run_seconds = 0
+            config.CONFIG.passive_stagnation_limit = 99
+            config.CONFIG.repetitive_probe_turn_limit = 99
+            config.CONFIG.exhaustion_threshold = 99
+            events = []
+            try:
+                ws = Workspace("deadline-manager-auth-stop")
+                ws.create("https://app.example.test", "web")
+                ws.save_constraints(Constraints(
+                    in_scope=["https://app.example.test"],
+                    out_of_scope=["https://admin.example.test"],
+                ))
+                engine = Engine(
+                    "deadline-manager-auth-stop", backend="mock",
+                    run_until_deadline=True,
+                    emit=lambda kind, **payload: events.append((kind, payload)),
+                )
+                await engine.setup(
+                    brief="check authentication", target="https://app.example.test",
+                    target_type="web",
+                )
+                engine.worker.script = lambda _worker, _directive: "Authentication still blocked."
+                engine.manager.direct = AsyncMock(return_value=Directive(
+                    assessment="Activation gate is still closed.",
+                    directive="Try the next in-scope authentication path.",
+                    cont=False,
+                    stop_reason=(
+                        "Authorization and convergence boundary: authenticated /app "
+                        "testing blocked on enabled:false activation requiring signup/OTP flow"
+                    ),
+                ))
+
+                await engine.run()
+
+                self.assertEqual(engine.turn_index, 3)
+                self.assertIn("max_turns safety ceiling", engine.stop_reason)
+                self.assertEqual(engine.manager.direct.await_count, 3)
+                self.assertTrue(any(
+                    kind == "status" and "attempted a soft stop" in payload.get("text", "")
+                    for kind, payload in events
+                ))
+            finally:
+                for field, value in old.items():
+                    setattr(config.CONFIG, field, value)
+
+    async def test_detached_deadline_loop_stops_on_recorded_scope_boundary(self):
+        with isolated_runtime():
+            fields = ("max_turns", "max_run_seconds", "passive_stagnation_limit",
+                      "repetitive_probe_turn_limit", "exhaustion_threshold")
+            old = {field: getattr(config.CONFIG, field) for field in fields}
+            config.CONFIG.max_turns = 5
+            config.CONFIG.max_run_seconds = 0
+            config.CONFIG.passive_stagnation_limit = 99
+            config.CONFIG.repetitive_probe_turn_limit = 99
+            config.CONFIG.exhaustion_threshold = 99
+            try:
+                ws = Workspace("deadline-manager-recorded-stop")
+                ws.create("https://app.example.test", "web")
+                ws.save_constraints(Constraints(
+                    in_scope=["https://app.example.test"],
+                    out_of_scope=["https://admin.example.test/private"],
+                ))
+                engine = Engine(
+                    "deadline-manager-recorded-stop", backend="mock",
+                    run_until_deadline=True,
+                )
+                await engine.setup(
+                    brief="check authentication", target="https://app.example.test",
+                    target_type="web",
+                )
+                engine.manager.direct = AsyncMock(return_value=Directive(
+                    assessment="Worker crossed the recorded boundary.",
+                    cont=False,
+                    stop_reason=(
+                        "Recorded out-of-scope boundary reached at "
+                        "https://admin.example.test/private"
+                    ),
+                ))
+
+                await engine.run()
+
+                self.assertEqual(engine.turn_index, 1)
+                self.assertEqual(
+                    engine.stop_reason,
+                    "Recorded out-of-scope boundary reached at "
+                    "https://admin.example.test/private",
+                )
             finally:
                 for field, value in old.items():
                     setattr(config.CONFIG, field, value)

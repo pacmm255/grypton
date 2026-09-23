@@ -104,6 +104,40 @@ _RECOVERY_ACTION = (
 )
 
 
+# Detached deadline runs treat the supervisor deadline as their completion
+# boundary.  A model's free-form stop_reason is therefore not enough to end the
+# run: only a boundary that can be joined back to structured engagement data is
+# binding.  Keep these expressions narrow; authentication trouble is an
+# operational blocker, not a program prohibition.
+_EXPLICIT_OUT_OF_SCOPE_RX = re.compile(
+    r"\bout[- ]of[- ]scope\b|\boutside (?:the )?(?:recorded |program )?scope\b",
+    re.IGNORECASE,
+)
+_NEGATED_BOUNDARY_PREFIX_RX = re.compile(
+    r"\b(?:no|not|never|without)\b[^.;\n]{0,48}$",
+    re.IGNORECASE,
+)
+_URL_CITATION_RX = re.compile(
+    r"https?://[^\s<>()\[\]{}\"'`]+",
+    re.IGNORECASE,
+)
+_AUTOMATION_PROHIBITION_RX = re.compile(
+    r"(?:"
+    r"\b(?:program )?automation\s+(?:is\s+)?(?:strictly\s+)?"
+    r"(?:prohibited|forbidden|disallowed|banned)\b"
+    r"|\bautomated (?:testing|tools?|scanners?)\s+(?:is|are)\s+"
+    r"(?:strictly\s+)?(?:prohibited|forbidden|disallowed|banned)\b"
+    r"|\b(?:program|policy)\s+(?:prohibits?|forbids?|disallows?|bans?)\s+"
+    r"(?:the use of\s+)?(?:automation|automated (?:testing|tools?|scanners?))\b"
+    r"|\bno automated (?:testing|tools?|scanners?)\s+(?:is|are)\s+"
+    r"(?:allowed|permitted)\b"
+    r"|\b(?:program|policy)\s+(?:does not|doesn't)\s+(?:allow|permit)\s+"
+    r"automated (?:testing|tools?|scanners?)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def _tool_result_text(content) -> str:
     """Flatten a tool_result content payload (string | list of blocks) to text."""
     if isinstance(content, str):
@@ -485,11 +519,8 @@ class Engine:
             # convergence may also close the run. Routine blockers and an
             # unsupported "we are done" response are reframed into a new action.
             if not directive.cont:
-                if self._is_hard_stop(
-                    directive.stop_reason,
-                    convergence_allowed=(
-                        bool(convergence_reason) and not self.run_until_deadline
-                    ),
+                if self._manager_stop_is_binding(
+                    directive, convergence_reason=convergence_reason
                 ):
                     self._stop(directive.stop_reason or "scope or authorization boundary")
                     break
@@ -1002,6 +1033,104 @@ class Engine:
             "convergence", "exhaust", "defense ceiling", "no safe novel",
         ))
         return boundary or converged
+
+    @staticmethod
+    def _boundary_text_contains(text: str, recorded_value: str) -> bool:
+        """Match one recorded boundary value without interpreting model prose."""
+        recorded = " ".join(str(recorded_value or "").split())
+        if "://" in recorded:
+            # Reuse the network-tool scope policy so a manager citation and an
+            # actual request agree on repeated decoding and dot-segment rules.
+            from .tools import _canonical_url_path, _url_matches_rule
+
+            try:
+                expected = urlsplit(recorded)
+                expected.port
+            except ValueError:
+                return False
+            if expected.scheme.casefold() not in {"http", "https"} or not expected.hostname:
+                return False
+            if expected.username is not None or expected.password is not None:
+                return False
+
+            for raw in _URL_CITATION_RX.findall(str(text or "")):
+                candidate_text = raw.rstrip(".,;!?")
+                try:
+                    candidate = urlsplit(candidate_text)
+                    candidate_port = candidate.port
+                except ValueError:
+                    continue
+                if candidate.username is not None or candidate.password is not None:
+                    continue
+                candidate_scheme = candidate.scheme.casefold()
+                if candidate_scheme not in {"http", "https"} or not candidate.hostname:
+                    continue
+                candidate_port = candidate_port or {"http": 80, "https": 443}.get(
+                    candidate_scheme
+                )
+                candidate_path = _canonical_url_path(candidate.path or "/")
+                if candidate_port is None or candidate_path is None:
+                    continue
+                if _url_matches_rule(
+                    candidate, candidate_port, candidate_path, recorded
+                ):
+                    return True
+            return False
+
+        haystack = " ".join(str(text or "").casefold().split())
+        needle = " ".join(recorded.casefold().split()).rstrip("/")
+        if not needle:
+            return False
+        # Do not let a recorded host/path prefix authorize a model-supplied
+        # lookalike (`example.test.evil`, `/privateer`). URL separators still
+        # allow a recorded host to be cited with a child path or query.
+        pattern = rf"(?<![a-z0-9._~%:@-]){re.escape(needle)}(?![a-z0-9._~%:@-])"
+        return bool(re.search(pattern, haystack))
+
+    def _matches_recorded_deadline_boundary(self, directive) -> bool:
+        """Return whether a model stop cites a binding recorded boundary.
+
+        Deadline mode intentionally does not infer authority from generic words
+        such as ``authorization``, ``permission``, or ``scope``.  It accepts an
+        out-of-scope stop only when the directive cites an exact entry from the
+        structured out-of-scope list.  An automation prohibition must likewise
+        exist in the recorded hard rules and in the stop directive.  External
+        stop flags and runtime ceilings bypass this method
+        and remain binding in the main loop.
+        """
+        reason = str(getattr(directive, "stop_reason", "") or "")
+        if not reason:
+            return False
+        constraints = self.ws.load_constraints()
+
+        explicit_scope_claim = any(
+            not _NEGATED_BOUNDARY_PREFIX_RX.search(reason[:match.start()])
+            for match in _EXPLICIT_OUT_OF_SCOPE_RX.finditer(reason)
+        )
+        if explicit_scope_claim:
+            if any(
+                self._boundary_text_contains(reason, item)
+                for item in constraints.out_of_scope
+            ):
+                return True
+
+        recorded_automation_ban = any(
+            _AUTOMATION_PROHIBITION_RX.search(str(rule or ""))
+            for rule in constraints.hard_rules
+        )
+        return bool(
+            recorded_automation_ban
+            and _AUTOMATION_PROHIBITION_RX.search(reason)
+        )
+
+    def _manager_stop_is_binding(self, directive, *, convergence_reason: str = "") -> bool:
+        """Classify a manager-requested stop for this engine run mode."""
+        if self.run_until_deadline:
+            return self._matches_recorded_deadline_boundary(directive)
+        return self._is_hard_stop(
+            getattr(directive, "stop_reason", ""),
+            convergence_allowed=bool(convergence_reason),
+        )
 
     def _stop(self, reason: str) -> None:
         self.stop_requested = True
