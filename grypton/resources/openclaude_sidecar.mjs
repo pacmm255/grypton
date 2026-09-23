@@ -22,6 +22,17 @@ function cleanText(value, limit = 2000) {
   return text.length <= limit ? text : `${text.slice(0, limit)}…`;
 }
 
+function cleanNoticeText(value, limit = 1500) {
+  // OpenClaude identifies rotated credentials with short fingerprints. They
+  // are useful inside its private pool, but add no value to Grypton's durable
+  // transcript and can correlate an account across runs.
+  let text = String(value ?? '').replace(CONTROL, '');
+  text = text.replace(/(bearer\s+)[A-Za-z0-9._~+\/-]+/gi, '$1[REDACTED]');
+  text = text.replace(/\bsk-[A-Za-z0-9_-]{12,}\b/g, '[REDACTED]');
+  text = text.replace(/\b(key\s+)[a-f0-9]{8}\b/gi, '$1[REDACTED]');
+  return text.length <= limit ? text : `${text.slice(0, limit)}…`;
+}
+
 function failMessage(error) {
   const message = cleanText(error?.message || error || 'OpenClaude sidecar error', 1000);
   return message || 'OpenClaude sidecar error';
@@ -96,7 +107,18 @@ function safeNotice(kind, value = {}) {
   if (kind === 'notice') return {
     type: 'openclaude_notice',
     route: cleanText(value.route, 300),
-    message: cleanText(value.message, 1500),
+    message: cleanNoticeText(value.message, 1500),
+  };
+  if (kind === 'terminal') return {
+    type: 'openclaude_terminal',
+    route: cleanText(value.route, 300),
+    reason: value.reason === 'credential_pool_exhausted'
+      ? value.reason : 'provider_terminal',
+    upstreamStatus: Number.isSafeInteger(value.upstreamStatus)
+      && value.upstreamStatus >= 100 && value.upstreamStatus <= 599
+      ? value.upstreamStatus : 0,
+    poolSize: Number.isSafeInteger(value.poolSize)
+      && value.poolSize > 0 && value.poolSize <= 1000 ? value.poolSize : 0,
   };
   if (kind === 'request') return {
     type: 'openclaude_request',
@@ -186,15 +208,44 @@ async function start(route, effort, port) {
   }
   selectedRoute = route;
   selectedEffort = effort || '';
+  let poolSize = 0;
+  let rotations = 0;
+  let terminalSent = false;
   gateway = await startGateway(activeConfig, {
     token,
     ...(Number.isSafeInteger(port) && port >= 0 && port <= 65535 ? { port } : {}),
     getConfig: () => activeConfig,
-    credentialPoolLoader: provider => loadCredentialPool(provider, process.env),
+    credentialPoolLoader: async provider => {
+      const pool = await loadCredentialPool(provider, process.env);
+      poolSize = Array.isArray(pool) ? pool.length : 0;
+      rotations = 0;
+      terminalSent = false;
+      return pool;
+    },
     effortForRoute: routeId => routeId === selectedRoute && selectedEffort && selectedEffort !== 'auto'
       ? selectedEffort : undefined,
-    onNotice: value => emit('notice', value),
+    onNotice: value => {
+      if (/\bcontinuing on key\b/i.test(String(value?.message || ''))) rotations++;
+      emit('notice', value);
+    },
     onRequest: value => emit('request', value),
+    onResponse: value => {
+      const status = Number(value?.status || 0);
+      // A 402 benches the current key for the long-term cooldown. Once the
+      // gateway has already rotated through every other configured key, no
+      // response can arrive from this request. Give the parent a structured,
+      // credential-free signal so it can end the stuck client retry loop.
+      if (!terminalSent && status === 402 && poolSize > 0
+          && rotations >= poolSize - 1) {
+        terminalSent = true;
+        emit('terminal', {
+          route: value?.route || selectedRoute,
+          reason: 'credential_pool_exhausted',
+          upstreamStatus: status,
+          poolSize,
+        });
+      }
+    },
     onEffort: value => emit('effort', value),
   });
   return { url: gateway.url, headerName: gateway.headerName, route: selectedRoute };

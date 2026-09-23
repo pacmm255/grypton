@@ -449,12 +449,22 @@ class OpenCodeClient:
         self.transcripts = private_dir(self.workspace / "transcripts")
         self.proc: Optional[asyncio.subprocess.Process] = None
         self.gateway: OpenClaudeGateway | None = None
+        self._terminal_signal: asyncio.Event | None = None
+        self._terminal_error = ""
 
     def _on_gateway_event(self, event: dict) -> None:
         """Retain sanitized OpenClaude notices and expose them to the live UI."""
         append_jsonl(self.transcripts / "openclaude.events.jsonl", {
             "at": time.time(), "role": self.role, **event,
         })
+        if event.get("type") == "openclaude_terminal":
+            status = event.get("upstream_status")
+            suffix = f" (upstream HTTP {status})" if status else ""
+            self._terminal_error = (
+                f"{self.role} OpenClaude credential pool exhausted{suffix}."
+            )
+            if self._terminal_signal is not None:
+                self._terminal_signal.set()
         if self.event_callback:
             try:
                 self.event_callback(event)
@@ -620,6 +630,8 @@ class OpenCodeClient:
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
+        self._terminal_signal = asyncio.Event()
+        self._terminal_error = ""
         assert self.proc.stdin and self.proc.stdout and self.proc.stderr
         self.proc.stdin.write(prompt.encode("utf-8"))
         await self.proc.stdin.drain()
@@ -679,21 +691,46 @@ class OpenCodeClient:
 
         stdout_task = asyncio.create_task(read_stdout(self.proc.stdout))
         stderr_task = asyncio.create_task(read_limited(self.proc.stderr))
+        io_task = asyncio.gather(stdout_task, stderr_task, self.proc.wait())
+        terminal_task = asyncio.create_task(self._terminal_signal.wait())
         try:
-            cleaned_stdout, stderr, returncode = await asyncio.wait_for(
-                asyncio.gather(stdout_task, stderr_task, self.proc.wait()), timeout=timeout
+            done, _ = await asyncio.wait(
+                (io_task, terminal_task), timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
             )
-        except asyncio.TimeoutError as exc:
-            await _terminate(self.proc)
-            raise ProviderError(f"{self.role} OpenCode call timed out after {timeout:g}s.") from exc
+            if not done:
+                await _terminate(self.proc)
+                await asyncio.gather(io_task, return_exceptions=True)
+                raise ProviderError(
+                    f"{self.role} OpenCode call timed out after {timeout:g}s."
+                )
+            if terminal_task in done and terminal_task.result():
+                await _terminate(self.proc)
+                await asyncio.gather(io_task, return_exceptions=True)
+                raise ProviderError(
+                    self._terminal_error
+                    or f"{self.role} OpenClaude provider became terminal."
+                )
+            cleaned_stdout, stderr, returncode = await io_task
+        except ProviderError:
+            if self.proc.returncode is None:
+                await _terminate(self.proc)
+            await asyncio.gather(io_task, return_exceptions=True)
+            raise
         except BaseException:
             await _terminate(self.proc)
+            await asyncio.gather(io_task, return_exceptions=True)
             raise
         finally:
+            if not terminal_task.done():
+                terminal_task.cancel()
+            await asyncio.gather(terminal_task, return_exceptions=True)
             for task in (stdout_task, stderr_task):
                 if not task.done():
                     task.cancel()
             await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            self._terminal_signal = None
+            self._terminal_error = ""
 
         cleaned_stderr = clean(stderr.decode("utf-8", errors="replace"), (secret,))
         if cleaned_stderr:

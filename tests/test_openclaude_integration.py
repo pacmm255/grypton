@@ -13,6 +13,7 @@ import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from grypton import config
@@ -136,6 +137,41 @@ def rotation_provider():
         thread.join(timeout=2)
 
 
+@contextmanager
+def exhausted_provider():
+    calls: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            calls.append(self.headers.get("Authorization", ""))
+            body = json.dumps({
+                "error": {
+                    "type": "PaymentRequiredError",
+                    "message": "fixture quota exhausted",
+                }
+            }).encode()
+            self.send_response(402)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1], calls
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
 class OpenClaudeAdapterTests(unittest.TestCase):
     def test_legacy_route_resolves_and_enforces_effort_and_tool_capability(self):
         model = catalog_model()
@@ -184,9 +220,26 @@ class OpenClaudeAdapterTests(unittest.TestCase):
             sanitized = gateway._sanitize_event({
                 "type": "openclaude_notice",
                 "route": model.route_id,
-                "message": "Bearer " + gateway.token,
+                "message": "key deadbeef failed; Bearer " + gateway.token,
             })
             self.assertNotIn(gateway.token, json.dumps(sanitized))
+            self.assertNotIn("deadbeef", json.dumps(sanitized))
+
+            terminal = gateway._sanitize_event({
+                "type": "openclaude_terminal",
+                "route": model.route_id,
+                "reason": "credential_pool_exhausted",
+                "upstreamStatus": 402,
+                "poolSize": 5,
+                "message": "key deadbeef",
+            })
+            self.assertEqual(terminal, {
+                "type": "openclaude_terminal",
+                "route": model.route_id,
+                "reason": "credential_pool_exhausted",
+                "upstream_status": 402,
+                "pool_size": 5,
+            })
 
 
     def test_child_environment_keeps_configured_credentials_and_drops_ambient_secrets(self):
@@ -572,6 +625,108 @@ class OpenClaudeRotationTests(unittest.IsolatedAsyncioTestCase):
                     serialized = json.dumps(notices)
                     self.assertNotIn(PRIMARY_KEY, serialized)
                     self.assertNotIn(SPARE_KEY, serialized)
+                finally:
+                    await gateway.close()
+
+    async def test_full_pool_402_emits_terminal_signal_without_fingerprints(self):
+        asyncio.get_running_loop().slow_callback_duration = 1.0
+        with exhausted_provider() as (port, calls), tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key_file = root / "keys"
+            key_file.write_text(SPARE_KEY + "\n", encoding="utf-8")
+            key_file.chmod(0o600)
+            config_path = root / "openclaude.config.json"
+            config_path.write_text(json.dumps({
+                "defaultRoute": "fixture-chat",
+                "fastRoute": "fixture-chat",
+                "reasoningRoute": "fixture-chat",
+                "retry": {
+                    "windowMs": 0,
+                    "maxDelayMs": 1000,
+                    "keyCooldownMs": 1000,
+                },
+                "providers": {
+                    "fixture": {
+                        "baseUrl": f"http://127.0.0.1:{port}/v1",
+                        "credential": {
+                            "env": "GRYPTON_TEST_ROTATION_KEY",
+                            "keyFile": str(key_file),
+                        },
+                    }
+                },
+                "routes": {
+                    "fixture-chat": {
+                        "provider": "fixture",
+                        "model": "fixture-model",
+                        "protocol": "chat",
+                        "label": "Fixture chat",
+                        "contextWindow": 128_000,
+                        "maxOutputTokens": 4096,
+                    }
+                },
+            }), encoding="utf-8")
+
+            with patch.dict(os.environ, {"GRYPTON_TEST_ROTATION_KEY": PRIMARY_KEY}):
+                gateway = OpenClaudeGateway(
+                    "fixture-chat",
+                    "auto",
+                    "manager",
+                    root / "transport",
+                    openclaude_root=OPENCLAUDE_ROOT,
+                    config_path=config_path,
+                )
+                try:
+                    await gateway.start()
+
+                    def post() -> tuple[int, str]:
+                        request = Request(
+                            gateway.url + "/v1/messages",
+                            data=json.dumps({
+                                "model": "fixture-chat",
+                                "max_tokens": 40,
+                                "messages": [{"role": "user", "content": "fixture"}],
+                                "stream": False,
+                            }).encode(),
+                            headers={
+                                "content-type": "application/json",
+                                "x-api-key": gateway.token,
+                            },
+                            method="POST",
+                        )
+                        try:
+                            with urlopen(request, timeout=10) as response:
+                                return response.status, response.read().decode()
+                        except HTTPError as exc:
+                            return exc.code, exc.read().decode()
+
+                    status, _ = await asyncio.to_thread(post)
+                    self.assertEqual(status, 402)
+                    self.assertEqual(calls, [
+                        f"Bearer {PRIMARY_KEY}",
+                        f"Bearer {SPARE_KEY}",
+                    ])
+                    events: list[dict] = []
+                    terminal: list[dict] = []
+                    for _ in range(100):
+                        events.extend(gateway.drain_events())
+                        terminal = [
+                            event for event in events
+                            if event.get("type") == "openclaude_terminal"
+                        ]
+                        if terminal:
+                            break
+                        await asyncio.sleep(0.01)
+                    self.assertEqual(terminal, [{
+                        "type": "openclaude_terminal",
+                        "route": "fixture-chat",
+                        "reason": "credential_pool_exhausted",
+                        "upstream_status": 402,
+                        "pool_size": 2,
+                    }])
+                    serialized = json.dumps(events)
+                    self.assertNotIn(PRIMARY_KEY, serialized)
+                    self.assertNotIn(SPARE_KEY, serialized)
+                    self.assertNotRegex(serialized, r"\bkey [a-f0-9]{8}\b")
                 finally:
                     await gateway.close()
 

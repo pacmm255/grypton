@@ -749,8 +749,36 @@ class OpenClaudeGateway:
     def _sanitize_event(event: Mapping[str, Any]) -> dict:
         kind = _clean(event.get("type"), 80)
         if kind == "openclaude_notice":
+            raw_message = re.sub(
+                r"\b(key\s+)[a-f0-9]{8}\b", r"\1[REDACTED]",
+                str(event.get("message") or ""), flags=re.IGNORECASE,
+            )
+            message = re.sub(
+                r"\b(key\s+)[a-f0-9]{8}\b", r"\1[REDACTED]",
+                _clean(raw_message, 1500), flags=re.IGNORECASE,
+            )
             return {"type": kind, "route": _clean(event.get("route"), 300),
-                    "message": _clean(event.get("message"), 1500)}
+                    "message": message}
+        if kind == "openclaude_terminal":
+            try:
+                status = int(event.get("upstreamStatus") or 0)
+            except (TypeError, ValueError):
+                status = 0
+            try:
+                pool_size = int(event.get("poolSize") or 0)
+            except (TypeError, ValueError):
+                pool_size = 0
+            return {
+                "type": kind,
+                "route": _clean(event.get("route"), 300),
+                "reason": (
+                    "credential_pool_exhausted"
+                    if event.get("reason") == "credential_pool_exhausted"
+                    else "provider_terminal"
+                ),
+                "upstream_status": status if 100 <= status <= 599 else 0,
+                "pool_size": pool_size if 0 < pool_size <= 1000 else 0,
+            }
         if kind == "openclaude_request":
             return {
                 "type": kind,

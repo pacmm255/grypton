@@ -10,8 +10,10 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from grypton import config
-from grypton.providers import (MAX_ASSISTANT_TEXT_CHARS, OpenCodeClient,
+from grypton.manager import KryptexManager, ManagerContext
+from grypton.providers import (MAX_ASSISTANT_TEXT_CHARS, OpenCodeClient, ProviderError,
                                _select_assistant_text)
+from grypton.workspace import Workspace
 
 
 @contextmanager
@@ -168,6 +170,112 @@ class ProviderOutputTests(unittest.TestCase):
                 self.assertEqual(record["raw_final_text_chars"], len(final))
                 self.assertEqual(record["normalized_text_chars"], len(result.text))
                 self.assertTrue(record["text_filtered"])
+
+        asyncio.run(exercise())
+
+    def test_terminal_gateway_signal_ends_opencode_call_promptly(self):
+        class _Input:
+            def write(self, value):
+                self.value = value
+
+            async def drain(self):
+                return None
+
+            def close(self):
+                return None
+
+        class _Stream:
+            async def read(self, _size):
+                return b""
+
+        class _Process:
+            pid = 43211
+
+            def __init__(self):
+                self.stdin = _Input()
+                self.stdout = _Stream()
+                self.stderr = _Stream()
+                self.returncode = None
+                self.done = asyncio.Event()
+
+            async def wait(self):
+                await self.done.wait()
+                return self.returncode
+
+        async def exercise():
+            with isolated_runtime():
+                workspace = config.ENGAGEMENTS_DIR / "terminal-call"
+                workspace.mkdir(parents=True)
+                client = OpenCodeClient(
+                    role="manager", route="go/muse-spark-1.3-contributor",
+                    effort="xhigh", workspace=workspace,
+                    target_slug="terminal-call", allow_tools=False,
+                    agent_prompt="test",
+                )
+                process = _Process()
+                gateway = SimpleNamespace(
+                    model_route="openclaude/go/muse-spark-1.3-contributor",
+                    drain_events=lambda: [],
+                )
+
+                async def terminate(proc):
+                    proc.returncode = -15
+                    proc.done.set()
+
+                with patch.object(client, "_ensure_gateway", AsyncMock(return_value=gateway)), \
+                        patch.object(client, "_environment", return_value=({}, "fixture-secret")), \
+                        patch.object(config, "require_binary", return_value="/usr/bin/true"), \
+                        patch("grypton.providers.asyncio.create_subprocess_exec",
+                              new=AsyncMock(return_value=process)), \
+                        patch("grypton.providers._terminate",
+                              new=AsyncMock(side_effect=terminate)) as stop:
+                    call = asyncio.create_task(client.call("fixture prompt", timeout=30))
+                    for _ in range(20):
+                        if client._terminal_signal is not None:
+                            break
+                        await asyncio.sleep(0)
+                    self.assertIsNotNone(client._terminal_signal)
+                    client._on_gateway_event({
+                        "type": "openclaude_terminal",
+                        "route": "go/muse-spark-1.3-contributor",
+                        "reason": "credential_pool_exhausted",
+                        "upstream_status": 402,
+                        "pool_size": 5,
+                    })
+                    with self.assertRaisesRegex(
+                        ProviderError, r"credential pool exhausted \(upstream HTTP 402\)"
+                    ):
+                        await asyncio.wait_for(call, timeout=1)
+                    stop.assert_awaited_once_with(process)
+
+                transcript = (
+                    workspace / "transcripts/openclaude.events.jsonl"
+                ).read_text(encoding="utf-8")
+                self.assertIn('"reason": "credential_pool_exhausted"', transcript)
+                self.assertNotIn("fixture-secret", transcript)
+
+        asyncio.run(exercise())
+
+    def test_terminal_provider_error_uses_manager_deterministic_fallback(self):
+        async def exercise():
+            with isolated_runtime():
+                workspace = Workspace("terminal-manager")
+                workspace.create("example.test", "web")
+                events: list[dict] = []
+                manager = KryptexManager(workspace, "test", on_event=events.append)
+                manager.client.call = AsyncMock(side_effect=ProviderError(
+                    "manager OpenClaude credential pool exhausted (upstream HTTP 402)."
+                ))
+
+                directive = await manager.direct(ManagerContext(
+                    target="example.test", target_type="web", turn_index=3,
+                ))
+
+                self.assertTrue(directive.degraded)
+                self.assertTrue(directive.cont)
+                self.assertEqual(directive.fallback_provider, "deterministic")
+                self.assertEqual(events[-1]["type"], "manager_fallback")
+                self.assertEqual(events[-1]["via"], "deterministic")
 
         asyncio.run(exercise())
 
