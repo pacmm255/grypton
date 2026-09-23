@@ -180,8 +180,9 @@ The acceptance conditions are:
 - the request is not replayed after any response stream begins.
 
 Repeat classification checks for 401/402, qualifying quota or billing 403,
-and qualifying spent-plan 429 results. Separately verify that connection
-failures and HTTP 408, 425, and 5xx obey the configured retry window. Invalid
+and generic 429 results. Verify single-key and multi-key 429 exhaustion ends
+promptly, and that a later request does not revisit a key still in cooldown.
+Separately verify that connection failures and HTTP 408, 425, and 5xx obey the configured retry window. Invalid
 requests, unknown routes, unsupported effort, ordinary permission denials,
 tool errors, and scope denials must not rotate keys.
 

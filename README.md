@@ -378,10 +378,13 @@ shows a key-specific condition:
 
 - HTTP 401 or 402;
 - a 403 identified as data-policy, blocked-account, credit, quota, or billing;
-- a 429 identified as a spent usage plan, account limit, credits, or balance.
+- any HTTP 429 returned by the configured provider.
 
 The failed key enters a cooldown, so later requests do not immediately reuse
-it. Temporary connection failures and HTTP 408, 425, or 5xx responses are
+it. Grypton tries each currently usable key at most once for a 429. If every
+key is limited, the role call ends immediately instead of waiting inside
+OpenClaude's retry window or letting OpenCode repeat the request. Temporary
+connection failures and HTTP 408, 425, or 5xx responses are
 retried with bounded delay when the configured retry window permits it.
 
 Grypton does not rotate keys for a malformed request, an unknown model, an

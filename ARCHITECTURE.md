@@ -75,7 +75,7 @@ OpenClaude classifies an upstream failure before deciding what can help:
 | --- | --- |
 | 401 or 402 | Bench the key and use the next usable key. |
 | 403 identified as data policy, blocked account, credits, quota, or billing | Bench the key and use the next usable key. |
-| 429 identified as a plan/account usage limit, credits, or insufficient balance | Bench the key and use the next usable key. |
+| Any provider HTTP 429 | Bench the key and use the next usable key once; end the role call promptly when the pool is exhausted. |
 | Connection failure, 408, 425, or 5xx | Retry with bounded backoff when the configured retry window permits it. |
 | Invalid request, unknown model, unsupported effort, ordinary permission denial, tool error, or scope denial | Return the error without spending another key. |
 
@@ -85,9 +85,9 @@ model answer or tool request from being emitted twice. A model switch closes
 the old role gateway, so the new selection gets a clean transport lifecycle.
 
 Gateway events are sanitized before they reach Grypton. The engine records
-route, protocol, message and tool counts, effective effort, safe notices, and
-short key fingerprints in `transcripts/openclaude.events.jsonl`. It never
-records a key.
+route, protocol, message and tool counts, effective effort, and safe notices
+in `transcripts/openclaude.events.jsonl`. It records neither keys nor key
+fingerprints.
 
 Target login credentials use a separate local broker in `credentials.py`.
 Engagement prompts and MCP arguments contain only a short alias. The broker

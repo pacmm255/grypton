@@ -180,6 +180,30 @@ let selectedRoute = '';
 let selectedEffort = '';
 let shuttingDown = false;
 
+async function rotateRateLimitedCredential(input, init, observe) {
+  const response = await fetch(input, init);
+  observe?.(response, init);
+  if (response.status !== 429) return response;
+
+  // OpenClaude normally treats an unqualified 429 as a transient provider
+  // burst and retries the same key for the configured retry window. Grypton
+  // has a credential pool and needs to traverse it once instead. Replace only
+  // the private error body with a classification token OpenClaude already
+  // recognizes as key-specific exhaustion; preserve the upstream status and
+  // retry metadata. Provider error bodies are never exposed or retained.
+  try { await response.body?.cancel(); } catch {}
+  const headers = new Headers(response.headers);
+  headers.set('content-type', 'application/json');
+  headers.delete('content-length');
+  headers.delete('content-encoding');
+  headers.delete('transfer-encoding');
+  return new Response(JSON.stringify({ error: { type: 'GoUsageLimit' } }), {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
 async function refreshCatalog(refresh = false) {
   catalog = await readCatalog(baseConfig, {
     env: process.env,
@@ -209,43 +233,88 @@ async function start(route, effort, port) {
   selectedRoute = route;
   selectedEffort = effort || '';
   let poolSize = 0;
-  let rotations = 0;
+  let credentialPool = [];
   let terminalSent = false;
+  // OpenClaude retains its own spent-key cooldowns. Mirror only hashed
+  // identities here so pool exhaustion remains observable when a later
+  // request starts with one or more keys already benched.
+  const credentialFailures = new Map();
+  const pruneCredentialFailures = () => {
+    const now = Date.now();
+    for (const [fingerprint, until] of credentialFailures) {
+      if (until <= now) credentialFailures.delete(fingerprint);
+    }
+  };
+  const requestCredential = init => {
+    const headers = new Headers(init?.headers || {});
+    const bearer = String(headers.get('authorization') || '').replace(/^Bearer\s+/i, '');
+    const apiKey = String(headers.get('x-api-key') || '');
+    return credentialPool.find(entry => entry?.key === bearer || entry?.key === apiKey);
+  };
+  const observeCredentialResponse = (response, init) => {
+    pruneCredentialFailures();
+    const entry = requestCredential(init);
+    if (!entry?.fingerprint) return;
+    if (response.ok) return;
+    if (![401, 402, 429].includes(response.status)) return;
+    const retryAfter = Number(response.headers.get('retry-after'));
+    const configured = Number(activeConfig?.retry?.keyCooldownMs);
+    const fallback = response.status === 429
+      ? 60_000
+      : Number.isSafeInteger(configured) && configured > 0 ? configured : 900_000;
+    const cooldown = Number.isFinite(retryAfter) && retryAfter > 0
+      ? Math.round(retryAfter * 1000) : fallback;
+    credentialFailures.set(
+      entry.fingerprint,
+      Date.now() + Math.min(cooldown, 7 * 86_400_000),
+    );
+    if (!terminalSent && credentialPool.length > 0
+        && credentialPool.every(item => credentialFailures.has(item.fingerprint))) {
+      terminalSent = true;
+      emit('terminal', {
+        route: selectedRoute,
+        reason: 'credential_pool_exhausted',
+        upstreamStatus: response.status,
+        poolSize: credentialPool.length,
+      });
+    }
+  };
   gateway = await startGateway(activeConfig, {
     token,
     ...(Number.isSafeInteger(port) && port >= 0 && port <= 65535 ? { port } : {}),
     getConfig: () => activeConfig,
+    fetch: (input, init) => rotateRateLimitedCredential(
+      input, init, observeCredentialResponse,
+    ),
     credentialPoolLoader: async provider => {
       const pool = await loadCredentialPool(provider, process.env);
-      poolSize = Array.isArray(pool) ? pool.length : 0;
-      rotations = 0;
+      credentialPool = Array.isArray(pool) ? pool : [];
+      poolSize = credentialPool.length;
+      pruneCredentialFailures();
       terminalSent = false;
-      return pool;
+      return credentialPool;
     },
     effortForRoute: routeId => routeId === selectedRoute && selectedEffort && selectedEffort !== 'auto'
       ? selectedEffort : undefined,
     onNotice: value => {
-      if (/\bcontinuing on key\b/i.test(String(value?.message || ''))) rotations++;
+      const message = String(value?.message || '');
       emit('notice', value);
-    },
-    onRequest: value => emit('request', value),
-    onResponse: value => {
-      const status = Number(value?.status || 0);
-      // A 402 benches the current key for the long-term cooldown. Once the
-      // gateway has already rotated through every other configured key, no
-      // response can arrive from this request. Give the parent a structured,
-      // credential-free signal so it can end the stuck client retry loop.
-      if (!terminalSent && status === 402 && poolSize > 0
-          && rotations >= poolSize - 1) {
+      // This fixed OpenClaude notice is emitted only after a credential-class
+      // failure when every key is already benched and the gateway is about to
+      // sleep. It also covers classified 403 failures without interpreting or
+      // retaining their provider body here.
+      if (!terminalSent && poolSize > 0
+          && /^every key for this provider is spent or limited; waiting\b/i.test(message)) {
         terminalSent = true;
         emit('terminal', {
           route: value?.route || selectedRoute,
           reason: 'credential_pool_exhausted',
-          upstreamStatus: status,
+          upstreamStatus: 0,
           poolSize,
         });
       }
     },
+    onRequest: value => emit('request', value),
     onEffort: value => emit('effort', value),
   });
   return { url: gateway.url, headerName: gateway.headerName, route: selectedRoute };
