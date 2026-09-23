@@ -28,6 +28,16 @@ def _csv(value: str) -> list[str]:
     return [item.strip() for item in (value or "").split(",") if item.strip()]
 
 
+def _json_object_argument(value: str) -> dict:
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("value must be a JSON object") from exc
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("value must be a JSON object")
+    return parsed
+
+
 _DURATION_RX = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*$", re.I)
 
 
@@ -1187,7 +1197,93 @@ def cmd_auth(ns) -> int:
                 print(f"No named credentials for {target}.")
             for alias in aliases:
                 status = credentials.session_status(target, alias)
-                print(f"{alias}: {status['state']}")
+                profile = status.get("auth_profile") or {}
+                if profile.get("configured") and profile.get("valid", True):
+                    profile_text = f" · {profile['strategy']} profile"
+                elif profile.get("configured"):
+                    profile_text = " · invalid profile"
+                else:
+                    profile_text = ""
+                print(
+                    f"{alias}: {status['state']}{profile_text} · "
+                    f"attempts {status['attempts']}/2"
+                )
+        return 0
+    if ns.auth_command == "configure":
+        profile = {
+            "version": 1,
+            "strategy": ns.strategy,
+            "login_url": ns.login_url,
+            "verify_url": ns.verify_url,
+            "success_marker": ns.success_marker,
+            "username_transform": ns.username_transform,
+            "timeout": ns.timeout if ns.timeout is not None else (
+                45 if ns.strategy == "browser" else 30
+            ),
+        }
+        if ns.strategy == "browser":
+            profile["browser"] = {
+                "username_selector": ns.username_selector,
+                "password_selector": ns.password_selector,
+                "submit_selector": ns.submit_selector,
+                "verify_headers": ns.verify_headers,
+            }
+        else:
+            profile["http"] = {
+                "encoding": ns.encoding,
+                "username_field": ns.username_field,
+                "password_field": ns.password_field,
+                "fields": ns.fields,
+                "headers": ns.headers,
+            }
+        try:
+            workspace = Workspace(target)
+            if not workspace.exists():
+                raise credentials.CredentialError(
+                    "engagement does not exist; initialize it before configuring authentication"
+                )
+            from .tools import check_url_scope
+            for label, url in (
+                ("login URL", ns.login_url),
+                ("verification URL", ns.verify_url),
+            ):
+                allowed, reason = check_url_scope(workspace, url)
+                if not allowed:
+                    raise credentials.CredentialError(
+                        f"{label} is outside the engagement scope: {reason}"
+                    )
+            saved = credentials.save_auth_profile(target, ns.name, profile)
+            summary = credentials.auth_profile_summary(target, ns.name)
+        except credentials.CredentialError as exc:
+            print(f"ERROR: authentication profile was not saved: {exc}", file=sys.stderr)
+            return 2
+        if ns.json:
+            print(json.dumps({
+                "target": target,
+                "credential": ns.name,
+                "auth_profile": summary,
+            }, indent=2, ensure_ascii=False))
+        else:
+            print(
+                f"Saved {saved['strategy']} authentication profile for "
+                f"credential {ns.name!r} in {target}."
+            )
+        return 0
+    if ns.auth_command == "clear-profile":
+        try:
+            removed = credentials.delete_auth_profile(target, ns.name)
+        except credentials.CredentialError as exc:
+            print(f"ERROR: authentication profile was not cleared: {exc}", file=sys.stderr)
+            return 2
+        if ns.json:
+            print(json.dumps({
+                "target": target,
+                "credential": ns.name,
+                "removed": removed,
+            }, indent=2, ensure_ascii=False))
+        else:
+            state = "Cleared" if removed else "No saved"
+            print(f"{state} authentication profile for credential {ns.name!r} in {target}.")
         return 0
     try:
         username = input("Username: ")
@@ -1481,6 +1577,41 @@ def build_parser() -> argparse.ArgumentParser:
     auth_list.add_argument("target", help="Engagement slug or target")
     auth_list.add_argument("--json", action="store_true")
     auth_list.set_defaults(func=cmd_auth)
+    auth_configure = auth_sub.add_parser(
+        "configure", help="Configure private automatic authentication routing"
+    )
+    auth_configure.add_argument("target", help="Engagement slug or target")
+    auth_configure.add_argument("--name", default="primary", help="Credential alias")
+    auth_configure.add_argument(
+        "--strategy", required=True, choices=["browser", "http"]
+    )
+    auth_configure.add_argument("--login-url", required=True)
+    auth_configure.add_argument("--verify-url", required=True)
+    auth_configure.add_argument("--success-marker", required=True)
+    auth_configure.add_argument(
+        "--username-transform", choices=["stored", "iran-e164"], default="stored"
+    )
+    auth_configure.add_argument("--timeout", type=int)
+    auth_configure.add_argument("--username-selector", default="")
+    auth_configure.add_argument("--password-selector", default="")
+    auth_configure.add_argument("--submit-selector", default="")
+    auth_configure.add_argument(
+        "--verify-headers", type=_json_object_argument, default={}
+    )
+    auth_configure.add_argument("--encoding", choices=["json", "form"], default="json")
+    auth_configure.add_argument("--username-field", default="username")
+    auth_configure.add_argument("--password-field", default="password")
+    auth_configure.add_argument("--fields", type=_json_object_argument, default={})
+    auth_configure.add_argument("--headers", type=_json_object_argument, default={})
+    auth_configure.add_argument("--json", action="store_true")
+    auth_configure.set_defaults(func=cmd_auth)
+    auth_clear = auth_sub.add_parser(
+        "clear-profile", help="Remove automatic authentication routing"
+    )
+    auth_clear.add_argument("target", help="Engagement slug or target")
+    auth_clear.add_argument("--name", default="primary", help="Credential alias")
+    auth_clear.add_argument("--json", action="store_true")
+    auth_clear.set_defaults(func=cmd_auth)
     models = sub.add_parser("models", help="Browse OpenClaude routes or set global role defaults")
     models.add_argument("search", nargs="?", default="", help="Filter route, provider, model, or status")
     models.add_argument("--json", action="store_true")

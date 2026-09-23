@@ -25,6 +25,19 @@ _PHONE_SEPARATORS = re.compile(r"[\s().\-\u2010-\u2015]+")
 _IRAN_LOCAL_MOBILE = re.compile(r"09[0-9]{9}\Z")
 _IRAN_E164_MOBILE = re.compile(r"(?:\+98|0098|98)9[0-9]{9}\Z")
 _EMAIL_USERNAME = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+\Z")
+_FIELD_NAME = re.compile(r"[A-Za-z0-9_.\[\]-]{1,80}\Z")
+_HEADER_NAME = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}\Z")
+_AUTH_PROFILE_STRATEGIES = frozenset({"browser", "http"})
+_USERNAME_TRANSFORMS = frozenset({"stored", "iran-e164"})
+_PROFILE_SENSITIVE_HEADERS = frozenset({
+    "authorization", "proxy-authorization", "cookie", "set-cookie",
+    "x-api-key", "x-auth-token", "x-csrf-token", "x-xsrf-token",
+})
+_PROFILE_TRANSPORT_HEADERS = frozenset({
+    "connection", "content-length", "expect", "forwarded", "host",
+    "keep-alive", "proxy-connection", "te", "trailer", "transfer-encoding",
+    "upgrade", "x-http-method-override", "x-original-url", "x-rewrite-url",
+})
 
 
 class CredentialError(ValueError):
@@ -58,6 +71,15 @@ def credential_dir(target: str) -> Path:
 
 def _credential_path(target: str, name: str) -> Path:
     return credential_dir(target) / (_safe_name(name, label="credential name") + ".json")
+
+
+def _profile_dir(target: str) -> Path:
+    return _private_dir(credential_dir(target) / ".profiles")
+
+
+def auth_profile_path(target: str, name: str) -> Path:
+    alias = _safe_name(name, label="credential name")
+    return _profile_dir(target) / (alias + ".json")
 
 
 
@@ -123,19 +145,19 @@ def save_credential(target: str, name: str, username: str, password: str) -> str
     return alias
 
 
-def _read_private_json(path: Path) -> dict:
+def _read_private_json(path: Path, *, label: str = "credential file") -> dict:
     try:
         info = path.stat(follow_symlinks=False)
     except FileNotFoundError as exc:
         raise CredentialError("named credential does not exist") from exc
     if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
-        raise CredentialError("credential file must be a private regular file (mode 0600)")
+        raise CredentialError(f"{label} must be a private regular file (mode 0600)")
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        raise CredentialError("credential file is unreadable or malformed") from exc
+        raise CredentialError(f"{label} is unreadable or malformed") from exc
     if not isinstance(value, dict):
-        raise CredentialError("credential file is malformed")
+        raise CredentialError(f"{label} is malformed")
     return value
 
 
@@ -190,6 +212,253 @@ def list_credentials(target: str) -> list[str]:
         path.stem for path in directory.glob("*.json")
         if _NAME.fullmatch(path.stem) and path.is_file() and not path.is_symlink()
     )
+
+
+def _profile_url(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or not value or len(value) > 8192:
+        raise CredentialError(f"{label} must be an absolute HTTP(S) URL")
+    if any(ord(char) < 0x20 or ord(char) == 0x7f for char in value):
+        raise CredentialError(f"{label} contains invalid characters")
+    try:
+        parsed = urlsplit(value)
+        normalize_origin(value)
+    except (CredentialError, ValueError) as exc:
+        raise CredentialError(f"{label} must be an absolute HTTP(S) URL") from exc
+    if parsed.fragment:
+        raise CredentialError(f"{label} must not contain a URL fragment")
+    return value
+
+
+def _profile_text(value: object, *, label: str, maximum: int) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > maximum:
+        raise CredentialError(f"{label} must be 1-{maximum} printable characters")
+    if any(ord(char) < 0x20 or ord(char) == 0x7f for char in value):
+        raise CredentialError(f"{label} must be 1-{maximum} printable characters")
+    return value
+
+
+def _profile_object(value: object, *, label: str) -> dict:
+    if not isinstance(value, dict):
+        raise CredentialError(f"{label} must be an object")
+    return value
+
+
+def _reject_unknown_keys(value: dict, allowed: set[str], *, label: str) -> None:
+    unknown = sorted(str(key) for key in value if key not in allowed)
+    if unknown:
+        raise CredentialError(
+            f"{label} contains unsupported field(s): {', '.join(unknown)}"
+        )
+
+
+def _profile_headers(
+    value: object, *, label: str, origin: str, maximum: int = 50
+) -> dict[str, str]:
+    headers = _profile_object(value, label=label)
+    if len(headers) > maximum:
+        raise CredentialError(f"{label} may contain at most {maximum} headers")
+    result: dict[str, str] = {}
+    normalized_names: set[str] = set()
+    forbidden = _PROFILE_SENSITIVE_HEADERS | _PROFILE_TRANSPORT_HEADERS
+    for raw_key, raw_value in headers.items():
+        if not isinstance(raw_key, str) or not _HEADER_NAME.fullmatch(raw_key):
+            raise CredentialError(f"{label} contains an invalid header name")
+        key = raw_key.strip()
+        lowered = key.lower()
+        if (
+            lowered in forbidden
+            or lowered.startswith("sec-")
+            or lowered.startswith("x-forwarded-")
+        ):
+            raise CredentialError(f"{label} contains a private or transport header")
+        if lowered in normalized_names:
+            raise CredentialError(f"{label} contains a duplicate header name")
+        normalized_names.add(lowered)
+        if not isinstance(raw_value, str) or len(raw_value) > 4096:
+            raise CredentialError(f"{label} values must be strings up to 4096 characters")
+        if any(ord(char) < 0x20 and char != "\t" for char in raw_value) or "\x7f" in raw_value:
+            raise CredentialError(f"{label} contains an invalid header value")
+        if lowered == "origin":
+            try:
+                header_origin = normalize_origin(raw_value)
+            except CredentialError as exc:
+                raise CredentialError(f"{label} Origin must use the login origin") from exc
+            if header_origin != origin or urlsplit(raw_value).path not in {"", "/"}:
+                raise CredentialError(f"{label} Origin must use the login origin")
+        elif lowered in {"referer", "referrer"}:
+            try:
+                header_origin = normalize_origin(raw_value)
+            except CredentialError as exc:
+                raise CredentialError(f"{label} Referer must use the login origin") from exc
+            if header_origin != origin:
+                raise CredentialError(f"{label} Referer must use the login origin")
+        result[key] = raw_value
+    return result
+
+
+def validate_auth_profile(profile: object) -> dict:
+    """Return a canonical private auth profile after strict validation."""
+    value = _profile_object(profile, label="authentication profile")
+    _reject_unknown_keys(value, {
+        "version", "strategy", "login_url", "verify_url", "success_marker",
+        "username_transform", "timeout", "browser", "http",
+    }, label="authentication profile")
+    if value.get("version") != 1:
+        raise CredentialError("authentication profile version must be 1")
+    strategy = value.get("strategy")
+    if strategy not in _AUTH_PROFILE_STRATEGIES:
+        raise CredentialError("authentication profile strategy must be browser or http")
+    login_url = _profile_url(value.get("login_url"), label="login URL")
+    verify_url = _profile_url(value.get("verify_url"), label="verification URL")
+    login_origin = normalize_origin(login_url)
+    if normalize_origin(verify_url) != login_origin:
+        raise CredentialError(
+            "authentication profile URLs must use the same exact origin"
+        )
+    success_marker = _profile_text(
+        value.get("success_marker"), label="success marker", maximum=200
+    )
+    transform = value.get("username_transform", "stored")
+    if transform not in _USERNAME_TRANSFORMS:
+        raise CredentialError("username transform must be stored or iran-e164")
+    timeout = value.get("timeout", 45 if strategy == "browser" else 30)
+    minimum_timeout = 5 if strategy == "browser" else 1
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or not minimum_timeout <= timeout <= 120:
+        raise CredentialError(
+            f"authentication profile timeout must be {minimum_timeout}-120 seconds"
+        )
+
+    canonical = {
+        "version": 1,
+        "strategy": strategy,
+        "login_url": login_url,
+        "verify_url": verify_url,
+        "success_marker": success_marker,
+        "username_transform": transform,
+        "timeout": timeout,
+    }
+    if strategy == "browser":
+        if value.get("http") is not None:
+            raise CredentialError("browser authentication profile cannot contain HTTP settings")
+        browser = _profile_object(value.get("browser"), label="browser settings")
+        _reject_unknown_keys(browser, {
+            "username_selector", "password_selector", "submit_selector",
+            "verify_headers",
+        }, label="browser settings")
+        canonical["browser"] = {
+            "username_selector": _profile_text(
+                browser.get("username_selector"), label="username selector", maximum=500
+            ),
+            "password_selector": _profile_text(
+                browser.get("password_selector"), label="password selector", maximum=500
+            ),
+            "submit_selector": _profile_text(
+                browser.get("submit_selector"), label="submit selector", maximum=500
+            ),
+            "verify_headers": _profile_headers(
+                browser.get("verify_headers", {}),
+                label="browser verification headers", origin=login_origin,
+                maximum=32,
+            ),
+        }
+    else:
+        if value.get("browser") is not None:
+            raise CredentialError("HTTP authentication profile cannot contain browser settings")
+        http = _profile_object(value.get("http"), label="HTTP settings")
+        _reject_unknown_keys(http, {
+            "encoding", "username_field", "password_field", "fields", "headers",
+        }, label="HTTP settings")
+        encoding = http.get("encoding", "json")
+        if encoding not in {"json", "form"}:
+            raise CredentialError("HTTP encoding must be json or form")
+        username_field = http.get("username_field", "username")
+        password_field = http.get("password_field", "password")
+        if not isinstance(username_field, str) or not _FIELD_NAME.fullmatch(username_field):
+            raise CredentialError("HTTP username field name is invalid")
+        if not isinstance(password_field, str) or not _FIELD_NAME.fullmatch(password_field):
+            raise CredentialError("HTTP password field name is invalid")
+        if username_field == password_field:
+            raise CredentialError("HTTP credential field names must be distinct")
+        fields = _profile_object(http.get("fields", {}), label="HTTP fields")
+        if len(fields) > 50:
+            raise CredentialError("HTTP fields may contain at most 50 values")
+        clean_fields: dict[str, str] = {}
+        for key, item in fields.items():
+            if not isinstance(key, str) or not _FIELD_NAME.fullmatch(key):
+                raise CredentialError("HTTP fields contain an invalid field name")
+            if key in {username_field, password_field}:
+                raise CredentialError("HTTP fields cannot replace credential fields")
+            if not isinstance(item, str) or len(item) > 4096:
+                raise CredentialError("HTTP field values must be strings up to 4096 characters")
+            clean_fields[key] = item
+        canonical["http"] = {
+            "encoding": encoding,
+            "username_field": username_field,
+            "password_field": password_field,
+            "fields": clean_fields,
+            "headers": _profile_headers(
+                http.get("headers", {}), label="HTTP headers", origin=login_origin
+            ),
+        }
+    return canonical
+
+
+def auth_profile_revision(profile: dict) -> str:
+    canonical = validate_auth_profile(profile)
+    payload = json.dumps(
+        canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:12]
+
+
+def save_auth_profile(target: str, name: str, profile: object) -> dict:
+    """Save validated routing metadata beside, but separate from, a credential."""
+    alias = _safe_name(name, label="credential name")
+    load_credential(target, alias)
+    canonical = validate_auth_profile(profile)
+    path = auth_profile_path(target, alias)
+    if path.is_symlink():
+        raise CredentialError("authentication profile must not be a symlink")
+    if path.exists() and not path.is_file():
+        raise CredentialError("authentication profile must be a regular file")
+    _atomic_private_json(path, canonical)
+    return canonical
+
+
+def load_auth_profile_optional(target: str, name: str) -> dict | None:
+    path = auth_profile_path(target, name)
+    if not path.exists() and not path.is_symlink():
+        return None
+    return validate_auth_profile(
+        _read_private_json(path, label="authentication profile")
+    )
+
+
+def delete_auth_profile(target: str, name: str) -> bool:
+    path = auth_profile_path(target, name)
+    if path.is_symlink():
+        raise CredentialError("authentication profile must not be a symlink")
+    if not path.exists():
+        return False
+    if not path.is_file():
+        raise CredentialError("authentication profile must be a regular file")
+    path.unlink()
+    return True
+
+
+def auth_profile_summary(target: str, name: str) -> dict[str, object]:
+    profile = load_auth_profile_optional(target, name)
+    if profile is None:
+        return {"configured": False}
+    return {
+        "configured": True,
+        "valid": True,
+        "strategy": profile["strategy"],
+        "username_transform": profile["username_transform"],
+        "login_origin": normalize_origin(profile["login_url"]),
+        "verification_origin": normalize_origin(profile["verify_url"]),
+        "revision": auth_profile_revision(profile),
+    }
 
 
 def normalize_origin(url: str) -> str:
@@ -382,7 +651,7 @@ def cookie_fingerprints(target: str, name: str) -> set[str]:
     return cookie_jar_fingerprints(_session_dir(target) / (alias + ".cookies"))
 
 
-def session_status(target: str, name: str) -> dict[str, bool | str | int]:
+def session_status(target: str, name: str) -> dict[str, object]:
     alias = _safe_name(name, label="credential name")
     cookie_path = _session_dir(target) / (alias + ".cookies")
     cookie_rows = _cookie_rows(cookie_path)
@@ -406,6 +675,12 @@ def session_status(target: str, name: str) -> dict[str, bool | str | int]:
         username_kind = classify_username(load_credential(target, alias)["username"])
     except CredentialError:
         username_kind = "opaque"
+    try:
+        profile_status = auth_profile_summary(target, alias)
+    except CredentialError:
+        # Status is deliberately metadata-only. A corrupt private profile is
+        # visible as a state fact without reflecting any of its content.
+        profile_status = {"configured": True, "valid": False}
     return {
         "name": alias,
         "username_kind": username_kind,
@@ -418,6 +693,7 @@ def session_status(target: str, name: str) -> dict[str, bool | str | int]:
         "established": attempt["established"],
         "blocked_reason": attempt["blocked_reason"],
         "origin": attempt["origin"],
+        "auth_profile": profile_status,
     }
 
 

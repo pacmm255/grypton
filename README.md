@@ -555,13 +555,46 @@ read without echo. To see aliases and safe session state:
 ./bin/grypton auth list https-app-example-test --json
 ```
 
-The list shows names such as `primary` and the states `stored`, `authenticated`,
-`exhausted`, or `blocked`. It never prints a username, password, cookie, or
-token. Running `auth add` again with the same name replaces that credential and
-clears its previous session state.
+For a rendered login, save its form and verification details once:
 
-Kraude receives only the alias. It can use either login tool without receiving
-the saved username or password:
+```bash
+./bin/grypton auth configure https-app-example-test \
+  --name primary \
+  --strategy browser \
+  --login-url 'https://app.example.test/login' \
+  --verify-url 'https://app.example.test/profile' \
+  --success-marker 'Account overview' \
+  --username-selector "[data-testid='login-username']" \
+  --password-selector "[data-testid='login-password']" \
+  --submit-selector "[data-testid='login-submit']"
+```
+
+`--username-transform iran-e164` handles a stored Iranian mobile identifier.
+`--verify-headers` accepts a JSON object containing static protocol headers such
+as `Accept`, `Origin`, `Referer`, `X-Platform`, or `X-Client-Version`. Origin and
+Referer values are limited to the login origin. Authentication, cookie, CSRF,
+destination, browser-controlled `Sec-*`, and hop-by-hop headers are rejected.
+
+An HTTP login profile uses the same command with `--strategy http`. Its optional
+settings are `--encoding`, `--username-field`, `--password-field`, `--fields`,
+and `--headers`; the two JSON options accept objects. Remove a saved route with:
+
+```bash
+./bin/grypton auth clear-profile https-app-example-test --name primary
+```
+
+The list shows names such as `primary` and the states `stored`, `authenticated`,
+`exhausted`, or `blocked`, along with the configured strategy, exact origin,
+username representation, and an opaque profile revision. It never prints a
+username, password, cookie, token, selector, marker, static header value, or URL
+path. Running `auth add` again with the same name replaces that credential and
+clears its previous session state. Updating or removing a profile preserves the
+attempt and session state.
+
+Kraude receives only the alias. Both login tools remain available with the full
+Grypton tool set. A saved per-alias profile selects the effective HTTP or browser
+transport automatically, whichever login tool initiates the request. An alias
+without a profile keeps the explicitly requested tool behavior:
 
 1. `credential_status` checks which aliases and safe session states exist.
 2. `credential_login` sends one scoped HTTP login request. Use it for an API or
@@ -600,13 +633,15 @@ successful state and records the blocker.
 Named credentials and session material live under
 `.state/credentials/<engagement>/`, outside the engagement workspace. Private
 directories use mode `0700`; credential, cookie, token, and attempt-state files
-use mode `0600`. The tool inserts secrets only at transport time and removes
-them from returned results, captures, ledgers, prompts, normal logs, and
-reports. Browser captures also redact the stored and transformed username,
-password, cookies, bearer tokens, and encoded forms of those values from the
-rendered DOM, relevant application responses, console messages, blocked-route
-records, tool results, and audit rows. Every authenticated URL still has to
-pass the engagement's scope rules.
+use mode `0600`. Authentication profiles are stored separately under the
+private `.profiles/` directory with the same file permissions. The tool inserts
+secrets only at transport time and removes them from returned results, captures,
+ledgers, prompts, normal logs, and reports. Browser captures also redact the
+stored and transformed username, password, cookies, bearer tokens, and encoded
+forms of those values from the rendered DOM, relevant application responses,
+console messages, blocked-route records, tool results, and audit rows. Profile
+URLs are checked against the current engagement scope when configured and again
+when used.
 
 ---
 
@@ -1040,12 +1075,11 @@ Check only the safe session state:
 ./bin/grypton auth list ENGAGEMENT
 ```
 
-The worker must call `credential_login` with the correct scoped login endpoint,
-field names, encoding, verification endpoint, and a non-secret success marker.
-A login response alone is not proof. If the alias is blocked by MFA, CAPTCHA,
-rate limiting, rejection, or its two-attempt limit, Grypton waits for operator
-action instead of retrying. Re-run `auth add ENGAGEMENT --name ALIAS` when you
-intend to replace the login and reset its saved session.
+For a known login, save its transport details with `auth configure`. Grypton
+then applies that private profile when either login tool receives the alias. An
+HTTP response alone is not proof; the configured verification marker has to be
+session-dependent. Re-run `auth add ENGAGEMENT --name ALIAS` when replacing the
+login and resetting its saved session.
 
 ## A local analyzer or install request is rejected
 
