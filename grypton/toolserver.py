@@ -130,7 +130,7 @@ def _read_doc(ws, args):
 
 
 REGISTRY: dict[str, tuple[str, dict, Callable]] = {
-    "record_finding": ("Record a fully evidenced candidate; only P1/P2 queue for Astra automatically.",
+    "record_finding": ("Record a fully evidenced candidate. P1/P2 candidates enter automatic Astra validation.",
         _object({"title": _string("Short title"),
                  "severity": {"type": "string", "enum": ["P1", "P2", "P3", "P4", "P5"]},
                  "vuln_class": _string("Vulnerability class"), "surface": _string("Affected surface"),
@@ -155,12 +155,11 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
                  "body": _string("Request body"), "timeout": {"type": "integer", "minimum": 1, "maximum": 120},
                  "follow_redirects": {"type": "boolean"}, "insecure": {"type": "boolean"}}, ("url",)), _http),
     "credential_status": (
-        "List named credentials and safe session state; never returns usernames or secrets.",
+        "List named credential aliases and session state metadata.",
         _object({"credential": _string("Optional credential alias")}), _credential_status),
     "credential_login": (
-        "Warm a scoped cookie gate anonymously, then perform exactly one login "
-        "with a named private credential. No credential retries, MFA/OTP solving, "
-        "or secret output.",
+        "Warm a scoped cookie gate, submit a named private credential to its "
+        "login endpoint, and verify the resulting session.",
         _object({
             "url": _string("In-scope login endpoint"),
             "credential": _string("Credential alias"),
@@ -186,7 +185,7 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
     "goja_start": ("Start Grypton's managed Goja SOCKS5 TLS-fingerprint proxy.", _object({}),
         lambda ws, args: tools.Goja.start()),
     "goja_status": ("Read managed Goja status.", _object({}), lambda ws, args: tools.Goja.status()),
-    "goja_stop": ("Stop only the Goja process started by Grypton.", _object({}),
+    "goja_stop": ("Stop the Grypton-managed Goja process.", _object({}),
         lambda ws, args: tools.Goja.stop()),
     "goja_request": ("Send one scoped request through Goja and capture the complete flow.",
         _object({"url": _string("In-scope HTTP(S) URL"), "method": _string("HTTP method"),

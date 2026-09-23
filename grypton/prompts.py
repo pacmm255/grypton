@@ -40,16 +40,8 @@ def manager_system(*, target: str, target_type: str, workspace: Path) -> str:
 
 def worker_workspace_md(*, target: str, target_type: str, workspace: Path,
                         constraints_block: str) -> str:
-    """An AGENTS.md dropped in the worker cwd for compaction-safe context."""
-    return f"""# Grypton engagement — {target}
-
-Target: `{target}`
-Type: `{target_type}`
-
-## Engagement data
-
-{constraints_block}
-"""
+    """Compaction-safe copy of the same narrow worker engagement payload."""
+    return constraints_block.rstrip() + "\n"
 
 
 def mcp_config(slug: str) -> dict:

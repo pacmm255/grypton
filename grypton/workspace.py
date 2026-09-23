@@ -107,8 +107,7 @@ class Ledger:
 
 @dataclass
 class Constraints:
-    """Hard user instructions that BOTH agents must obey every turn and never
-    forget (e.g. "only P1/P2", "never test CORS")."""
+    """Recorded engagement scope and finding acceptance data."""
 
     # If non-empty, ONLY these severities may be surfaced as findings.
     included_severities: list[str] = field(default_factory=list)
@@ -118,6 +117,10 @@ class Constraints:
     included_classes: list[str] = field(default_factory=list)
     in_scope: list[str] = field(default_factory=list)
     out_of_scope: list[str] = field(default_factory=list)
+    # Optional per-URL severity labels shown to the worker alongside scope.
+    url_severities: dict[str, str] = field(default_factory=dict)
+    # Conditional finding exclusions kept separate from free-form manager rules.
+    conditional_exclusions: list[str] = field(default_factory=list)
     # Free-form imperative rules, verbatim from the user, never dropped.
     hard_rules: list[str] = field(default_factory=list)
     # Anything the user says during the chat, remembered for the whole engagement.
@@ -167,6 +170,32 @@ class Constraints:
                 self.included_classes or self.excluded_classes or self.in_scope or
                 self.out_of_scope or self.hard_rules or self.notes):
             lines.append("- No additional engagement parameters were supplied.")
+        return "\n".join(lines)
+
+    def to_worker_prompt_block(self) -> str:
+        """Project model-visible worker context to scope and finding policy.
+
+        Operator chat history, manager notes, and free-form orchestration rules
+        stay out of Kraude's static prompt. Runtime enforcement remains in code.
+        """
+        lines = ["=== ENGAGEMENT DATA ==="]
+        for item in self.in_scope:
+            severity = str(self.url_severities.get(item) or "").strip()
+            if severity:
+                lines.append(f"- In scope: {item} — severity: {severity}")
+            else:
+                lines.append(f"- In scope: {item}")
+        if self.excluded_classes:
+            lines.append(
+                "- Out-of-scope finding categories: "
+                + ", ".join(self.excluded_classes)
+            )
+        for exclusion in self.conditional_exclusions:
+            value = str(exclusion or "").strip()
+            if value:
+                lines.append(f"- Conditional out-of-scope finding: {value}")
+        if len(lines) == 1:
+            lines.append("- No scope data supplied.")
         return "\n".join(lines)
 
 
