@@ -621,8 +621,9 @@ The list shows names such as `primary` and the states `stored`, `authenticated`,
 username representation, and an opaque profile revision. It never prints a
 username, password, cookie, token, selector, marker, static header value, or URL
 path. Running `auth add` again with the same name replaces that credential and
-clears its previous session state. Updating or removing a profile preserves the
-attempt and session state.
+atomically clears its previous session state after any in-flight authenticated
+transaction finishes. Updating or removing a profile preserves the attempt and
+session state.
 
 Kraude receives only the alias. Both login tools remain available with the full
 Grypton tool set. A saved per-alias profile selects the effective HTTP or browser

@@ -80,6 +80,9 @@ Transport exceptions, unknown statuses, and non-2xx/3xx responses must also
 restore the exact prior files, including preserving an absent cookie jar. Their
 response remains observable, and a valid 400 verifier contract does not clear
 the established state.
+Replacing a named credential must wait for an in-flight authenticated
+transaction, then clear cookies, tokens, and attempt state without allowing a
+late rollback or attempt write to resurrect the previous credential's state.
 Tool results, captures, rendered HTML, response bodies, console messages, and
 audit rows must omit the stored username, transformed username, password,
 cookie, bearer token, and their encoded forms.

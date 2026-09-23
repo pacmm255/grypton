@@ -1043,6 +1043,165 @@ class CredentialIsolationTests(unittest.TestCase):
                 credentials.session_status(ws.slug, alias)["established"]
             )
 
+    def test_credential_replacement_waits_for_transaction_then_clears_material(self):
+        with isolated_runtime():
+            ws = Workspace("credential-replacement")
+            origin = "https://app.example.test"
+            ws.create(origin, "web")
+            ws.save_constraints(Constraints(in_scope=[origin]))
+            alias = "primary"
+            credentials.save_credential(ws.slug, alias, "old-user", "old-password")
+            jar = credentials.cookie_jar_path(ws.slug, alias)
+            jar.write_text(
+                "# Netscape HTTP Cookie File\n"
+                "app.example.test\tFALSE\t/\tTRUE\t0\tapp_session\t"
+                "old-session-material\n"
+            )
+            credentials.save_tokens(
+                ws.slug, alias, {"access_token": "old-access-token"},
+                origin=origin,
+            )
+            credentials.record_login_outcome(
+                ws.slug, alias, established=True, origin=origin
+            )
+
+            request_entered = threading.Event()
+            allow_request_return = threading.Event()
+            replacement_done = threading.Event()
+            results: dict[str, dict | str] = {}
+            errors: list[BaseException] = []
+
+            def denied_http(_workspace, _url, **kwargs):
+                Path(kwargs["_cookie_jar"]).write_text("denied-cookie-material")
+                credentials.save_tokens(
+                    ws.slug, alias, {"access_token": "denied-access-token"},
+                    origin=origin,
+                )
+                request_entered.set()
+                if not allow_request_return.wait(5):
+                    raise RuntimeError("timed out waiting to release request")
+                return {
+                    "ok": True,
+                    "summary": "HTTP 401",
+                    "data": {
+                        "status_line": "HTTP/1.1 401 Unauthorized",
+                        "response": '{"error":"denied"}',
+                        "auth_blocker": "endpoint denied the request",
+                    },
+                }
+
+            def request() -> None:
+                try:
+                    results["request"] = tools.authenticated_http_request(
+                        ws, origin + "/denied", credential=alias
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            def replace() -> None:
+                try:
+                    results["alias"] = credentials.save_credential(
+                        ws.slug, alias, "new-user", "new-password"
+                    )
+                    replacement_done.set()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with patch("grypton.tools.http_request", side_effect=denied_http):
+                request_thread = threading.Thread(target=request, daemon=True)
+                request_thread.start()
+                self.assertTrue(request_entered.wait(5))
+                replacement_thread = threading.Thread(target=replace, daemon=True)
+                replacement_thread.start()
+                self.assertFalse(replacement_done.wait(0.2))
+                allow_request_return.set()
+                request_thread.join(5)
+                replacement_thread.join(5)
+
+            self.assertFalse(request_thread.is_alive())
+            self.assertFalse(replacement_thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertFalse(results["request"]["ok"])
+            self.assertEqual(results["alias"], alias)
+            self.assertEqual(
+                credentials.load_credential(ws.slug, alias),
+                {"username": "new-user", "password": "new-password"},
+            )
+            self.assertFalse(
+                credentials.cookie_jar_storage_path(ws.slug, alias).exists()
+            )
+            self.assertFalse(credentials.token_path(ws.slug, alias).exists())
+            self.assertFalse(credentials.attempt_path(ws.slug, alias).exists())
+            status = credentials.session_status(ws.slug, alias)
+            self.assertFalse(status["established"])
+            self.assertFalse(status["has_cookies"])
+            self.assertFalse(status["has_bearer_token"])
+
+    def test_credential_replacement_cannot_resurrect_in_flight_attempt_state(self):
+        with isolated_runtime():
+            target = "attempt-replacement"
+            alias = "primary"
+            credentials.save_credential(target, alias, "old-user", "old-password")
+            attempt_file = credentials.attempt_path(target, alias)
+            atomic_write = credentials._atomic_private_json
+            attempt_write_entered = threading.Event()
+            allow_attempt_write = threading.Event()
+            replacement_done = threading.Event()
+            results: dict[str, int | str] = {}
+            errors: list[BaseException] = []
+
+            def gated_atomic(path, value):
+                if path == attempt_file and threading.current_thread().name == "reserve":
+                    attempt_write_entered.set()
+                    if not allow_attempt_write.wait(5):
+                        raise RuntimeError("timed out waiting to write attempt state")
+                return atomic_write(path, value)
+
+            def reserve() -> None:
+                try:
+                    results["attempt"] = credentials.begin_login_attempt(
+                        target, alias
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            def replace() -> None:
+                try:
+                    results["alias"] = credentials.save_credential(
+                        target, alias, "new-user", "new-password"
+                    )
+                    replacement_done.set()
+                except BaseException as exc:
+                    errors.append(exc)
+
+            with patch(
+                "grypton.credentials._atomic_private_json",
+                side_effect=gated_atomic,
+            ):
+                reserve_thread = threading.Thread(
+                    target=reserve, name="reserve", daemon=True
+                )
+                reserve_thread.start()
+                self.assertTrue(attempt_write_entered.wait(5))
+                replacement_thread = threading.Thread(target=replace, daemon=True)
+                replacement_thread.start()
+                self.assertFalse(replacement_done.wait(0.2))
+                allow_attempt_write.set()
+                reserve_thread.join(5)
+                replacement_thread.join(5)
+
+            self.assertFalse(reserve_thread.is_alive())
+            self.assertFalse(replacement_thread.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(results["attempt"], 1)
+            self.assertEqual(results["alias"], alias)
+            self.assertFalse(attempt_file.exists())
+            self.assertEqual(credentials.load_attempt_state(target, alias)["attempts"], 0)
+            self.assertEqual(
+                credentials.load_credential(target, alias),
+                {"username": "new-user", "password": "new-password"},
+            )
+
     def test_non_success_http_responses_roll_back_poisoned_material(self):
         with isolated_runtime():
             ws = Workspace("credential-error-material")

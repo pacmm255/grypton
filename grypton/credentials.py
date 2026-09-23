@@ -220,14 +220,15 @@ def save_credential(target: str, name: str, username: str, password: str) -> str
         raise CredentialError("username must not be empty")
     if not str(password):
         raise CredentialError("password must not be empty")
-    _atomic_private_json(_credential_path(target, alias), {
-        "version": 1,
-        "username": str(username),
-        "password": str(password),
-    })
-    for path in (token_path(target, alias), attempt_path(target, alias),
-                 _session_dir(target) / (alias + ".cookies")):
-        path.unlink(missing_ok=True)
+    with session_material_lock(target, alias):
+        _atomic_private_json(_credential_path(target, alias), {
+            "version": 1,
+            "username": str(username),
+            "password": str(password),
+        })
+        for path in (token_path(target, alias), attempt_path(target, alias),
+                     cookie_jar_storage_path(target, alias)):
+            path.unlink(missing_ok=True)
     return alias
 
 
@@ -700,17 +701,18 @@ def save_tokens(target: str, name: str, tokens: dict[str, str], *, origin: str) 
         if str(key) and isinstance(value, str) and value
     }
     if safe:
-        bound_origin = normalize_origin(origin)
-        existing_origin = token_origin(target, name)
-        if existing_origin and existing_origin != bound_origin:
-            raise CredentialError(
-                "refusing to move bearer tokens to a different session origin"
-            )
-        _atomic_private_json(token_path(target, name), {
-            "version": 2,
-            "origin": bound_origin,
-            "tokens": safe,
-        })
+        with session_material_lock(target, name):
+            bound_origin = normalize_origin(origin)
+            existing_origin = token_origin(target, name)
+            if existing_origin and existing_origin != bound_origin:
+                raise CredentialError(
+                    "refusing to move bearer tokens to a different session origin"
+                )
+            _atomic_private_json(token_path(target, name), {
+                "version": 2,
+                "origin": bound_origin,
+                "tokens": safe,
+            })
 
 
 def load_tokens(target: str, name: str) -> dict[str, str]:
@@ -778,33 +780,35 @@ def ensure_login_attempt_available(target: str, name: str) -> None:
 
 def begin_login_attempt(target: str, name: str) -> int:
     """Atomically reserve one login attempt; never retry internally."""
-    lock_path = attempt_path(target, name).with_suffix(".lock")
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "r+", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        state = load_attempt_state(target, name)
-        _assert_login_attempt_available(state)
-        state["attempts"] += 1
-        _atomic_private_json(attempt_path(target, name), {"version": 1, **state})
-        return state["attempts"]
+    with session_material_lock(target, name):
+        lock_path = attempt_path(target, name).with_suffix(".lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "r+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            state = load_attempt_state(target, name)
+            _assert_login_attempt_available(state)
+            state["attempts"] += 1
+            _atomic_private_json(attempt_path(target, name), {"version": 1, **state})
+            return state["attempts"]
 
 
 def record_login_outcome(target: str, name: str, *, established: bool = False,
                          blocked_reason: str = "", origin: str | None = None) -> None:
-    lock_path = attempt_path(target, name).with_suffix(".lock")
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-    with os.fdopen(fd, "r+", encoding="utf-8") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        state = load_attempt_state(target, name)
-        state["established"] = bool(established)
-        state["blocked_reason"] = str(blocked_reason or "")
-        if origin is not None:
-            state["origin"] = normalize_origin(origin)
-        if state["established"] and not state["origin"]:
-            raise CredentialError(
-                "an authenticated session requires an exact origin binding"
-            )
-        _atomic_private_json(attempt_path(target, name), {"version": 1, **state})
+    with session_material_lock(target, name):
+        lock_path = attempt_path(target, name).with_suffix(".lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "r+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            state = load_attempt_state(target, name)
+            state["established"] = bool(established)
+            state["blocked_reason"] = str(blocked_reason or "")
+            if origin is not None:
+                state["origin"] = normalize_origin(origin)
+            if state["established"] and not state["origin"]:
+                raise CredentialError(
+                    "an authenticated session requires an exact origin binding"
+                )
+            _atomic_private_json(attempt_path(target, name), {"version": 1, **state})
 
 
 def _cookie_rows(path: Path) -> list[tuple[str, ...]]:
