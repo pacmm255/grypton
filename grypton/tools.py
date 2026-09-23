@@ -1454,6 +1454,24 @@ def httpx_probe(workspace: Workspace, targets: str) -> dict:
 _BROWSER_ACCOUNT = "grypton-browser"
 
 
+def _browser_executable() -> str:
+    """Prefer the real Chrome ELF over local wrapper scripts.
+
+    Some CI images replace ``/opt/google/chrome/chrome`` with a convenience
+    shell wrapper that points into root's Playwright cache and adds sandbox-
+    disabling flags.  The dedicated browser identity cannot use that private
+    cache.  The packaged ``chrome.real`` keeps Chrome's normal setuid sandbox
+    and its adjacent resources.
+    """
+    candidates = (
+        Path("/opt/google/chrome/chrome.real"),
+        Path("/opt/google/chrome/chrome"),
+        Path(config.find_binary("google-chrome") or ""),
+        Path(config.find_binary("chromium") or ""),
+    )
+    return next((str(path) for path in candidates if path.is_file()), "")
+
+
 @contextmanager
 def _isolated_browser_profile(executable: str):
     """Yield a Chromium profile that never executes the browser as root."""
@@ -1557,11 +1575,7 @@ def browse(workspace: Workspace, url: str, *, timeout: int = 45) -> dict:
         from playwright.sync_api import sync_playwright
     except ImportError:
         return _err("Python Playwright is not installed; use the scoped http_request or httpx_probe tool.")
-    executable = next((str(path) for path in (
-        Path("/opt/google/chrome/chrome"),
-        Path(config.find_binary("google-chrome") or ""),
-        Path(config.find_binary("chromium") or ""),
-    ) if path.is_file()), "")
+    executable = _browser_executable()
     if not executable:
         return _err("No Playwright-compatible Chromium or Chrome executable is installed.")
     output = workspace.scratch_dir / f"page-{time.time_ns()}.html"

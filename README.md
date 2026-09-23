@@ -755,6 +755,15 @@ useradd --system --no-create-home --home-dir /nonexistent \
 ./bin/grypton doctor
 ```
 
+If `doctor` reports that this identity cannot traverse the browser path on a
+host whose filesystem root is private, grant that account traverse-only access
+and rerun the check:
+
+```bash
+setfacl -m u:grypton-browser:x /
+./bin/grypton doctor
+```
+
 Grypton gives that account a fresh private browser profile for each call and
 drops supplementary groups, gid, and uid before Chromium starts. It does not
 reuse `nobody` or another service identity. Until the dedicated account exists,

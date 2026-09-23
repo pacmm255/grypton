@@ -33,7 +33,8 @@ from grypton.providers import (MCP_TIMEOUT_MS, OpenCodeClient, OpenCodeResult,
                                _codex_child_environment)
 from grypton.reporting import audit_workspace, render_report
 from grypton.toolserver import REGISTRY, dispatch
-from grypton.tools import (_isolated_browser_profile, apk_extract_asset, apk_inspect,
+from grypton.tools import (_browser_executable, _isolated_browser_profile,
+                           apk_extract_asset, apk_inspect,
                            artifact_download, browse, check_host_scope, check_port_scope,
                            check_research_scope, check_url_scope, flow_read, flow_replay,
                            http_request, httpx_probe, install_tool, local_analyze, port_scan,
@@ -428,6 +429,19 @@ class ToolTests(unittest.TestCase):
                 with _isolated_browser_profile("/bin/true"):
                     pass
 
+    def test_browser_doctor_checks_execution_as_dedicated_identity(self):
+        account = SimpleNamespace(pw_uid=23456, pw_gid=23456,
+                                  pw_name="grypton-browser")
+        denied = SimpleNamespace(returncode=1, stdout="", stderr="permission denied")
+        with patch("grypton.cli.os.geteuid", return_value=0), \
+                patch("grypton.cli.pwd.getpwnam", return_value=account), \
+                patch("grypton.tools._browser_executable", return_value="/browser"), \
+                patch("grypton.cli.config.find_binary", return_value="/usr/sbin/runuser"), \
+                patch("grypton.cli.subprocess.run", return_value=denied):
+            ok, detail = _browser_sandbox_check()
+        self.assertFalse(ok)
+        self.assertIn("cannot traverse or execute", detail)
+
     def test_root_browser_profile_uses_private_drop_launcher(self):
         account = SimpleNamespace(pw_uid=23456, pw_gid=23456)
         with patch.dict(os.environ, {
@@ -527,6 +541,17 @@ class ToolTests(unittest.TestCase):
             self.assertFalse(unsafe.intersection(observed["args"]))
             self.assertEqual(context.routes[0][0], "**/*")
             self.assertEqual(result["data"]["browser_identity"], "grypton-browser")
+
+    def test_browser_prefers_packaged_real_binary_over_private_cache_wrapper(self):
+        def exists(path):
+            return str(path) in {
+                "/opt/google/chrome/chrome.real",
+                "/opt/google/chrome/chrome",
+            }
+
+        with patch("grypton.tools.Path.is_file", autospec=True, side_effect=exists), \
+                patch("grypton.tools.config.find_binary", return_value="/usr/bin/google-chrome"):
+            self.assertEqual(_browser_executable(), "/opt/google/chrome/chrome.real")
 
     def test_curl_ignores_user_config_proxy_and_unrelated_environment(self):
         with isolated_runtime():

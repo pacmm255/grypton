@@ -1100,9 +1100,28 @@ def _browser_sandbox_check() -> tuple[bool, str]:
         )
     if account.pw_uid == 0 or account.pw_gid == 0:
         return False, "grypton-browser must have a non-root uid and gid"
+    from .tools import _browser_executable
+    executable = _browser_executable()
+    runuser = config.find_binary("runuser")
+    if not executable or not runuser:
+        return False, "browser executable or runuser probe is unavailable"
+    try:
+        probe = subprocess.run(
+            [runuser, "-u", account.pw_name, "--", executable, "--version"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, timeout=10, text=True,
+            env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent",
+                 "LANG": "C", "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False, "grypton-browser could not execute the configured browser"
+    if probe.returncode != 0:
+        return False, (
+            "grypton-browser cannot traverse or execute the configured browser path"
+        )
     return True, (
         f"root launcher drops to grypton-browser uid={account.pw_uid}; "
-        "Chromium sandbox enabled"
+        f"Chromium sandbox enabled ({Path(executable).name})"
     )
 
 
