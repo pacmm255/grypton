@@ -921,12 +921,16 @@ in-memory line or one oversized model result.
 
 `local_analyze` performs `file`, `strings`, SHA-256, literal search, or
 byte-oriented regular-expression search. Its input
-must be a regular file of at most 64 MB inside the engagement workspace. It
-accepts a workspace-relative path, OpenCode's exact `engagement/` alias, or the
-exact absolute engagement prefix. Every form is reduced to a relative path and
-opened component by component without following symlinks. Paths outside the
-engagement, traversal, symlinks, unsupported analyzers, and oversized output
-are rejected. Searches return byte offsets, one-based line numbers,
+must be a regular file of at most 64 MB inside the engagement workspace or the
+current engagement's private OpenCode worker tool-output directory. It accepts
+a workspace-relative path, the `engagement/` alias, the
+`opencode-tool-output/` alias, or an exact allowed absolute path returned after
+a large tool result. Absolute provider paths are returned to the worker as the
+reusable `opencode-tool-output/` alias. Every form is opened component by
+component without following symlinks. Non-regular files, other engagements,
+manager/provider state, traversal, symlinks, unsupported analyzers, and inputs
+above 64 MB are rejected. Analyzer output is bounded and truncated. Searches
+return byte offsets, one-based line numbers,
 zero-based byte offsets within each line, and small context windows. Match
 count, context size, match previews, total returned context, and regex runtime
 are capped, so a match in a single-line minified bundle cannot flood the model.
@@ -1216,10 +1220,11 @@ login and resetting its saved session.
 ## A local analyzer or install request is rejected
 
 `local_analyze` accepts `file`, `strings`, `sha256`, `literal`, and `regex` on
-a regular file inside the engagement. Literal and regex searches require
-`--pattern` and enforce bounded match counts and context. `install_tool` accepts only the exact reviewed apt
-packages listed in the tool section. These boundaries are fixed; changing the
-spelling, package manager, path, or command does not bypass them.
+a regular engagement or `opencode-tool-output/` file. Literal and regex
+searches require `--pattern` and enforce bounded match counts and context.
+`install_tool` accepts only the exact reviewed apt packages listed in the tool
+section. These boundaries are fixed; changing the spelling, package manager,
+path, or command does not bypass them.
 
 ## The console is too busy
 

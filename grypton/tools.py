@@ -6523,52 +6523,106 @@ def install_tool(spec: str, *, manager: str = "auto", timeout: int = 900) -> dic
     return _ok(f"Installed curated package {spec!r} with apt.")
 
 
-def _workspace_relative_file_path(workspace: Workspace, path: str) -> str:
-    """Translate transport-visible workspace paths to the canonical relative form.
+def _local_analysis_file_reference(
+    workspace: Workspace, path: str,
+) -> tuple[Path, tuple[str, ...], str, str]:
+    """Resolve one model-visible path to an anchored local-analysis root.
 
     OpenCode runs from a private transport directory where the engagement is
     exposed as ``engagement/``. Kraude can therefore copy either that alias or
-    the exact absolute engagement path from a tool result. Normalize only those
-    two representations; the component-by-component no-symlink opener remains
-    the authority for traversal and file-type checks.
+    the exact absolute engagement path from a tool result. OpenCode also writes
+    oversized worker tool results beneath its private ``tool-output`` directory
+    and gives Kraude that absolute path. Normalize only those representations;
+    the component-by-component no-symlink opener remains the authority for
+    traversal and file-type checks.
     """
     raw = str(path or "").strip()
     candidate = Path(raw)
+    tool_output_parts = (
+        workspace.slug, "worker", "data", "opencode", "tool-output",
+    )
+    tool_output_root = config.PROVIDER_DIR.joinpath(*tool_output_parts)
+
+    def workspace_display(relative: str) -> str:
+        relative_parts = Path(relative).parts
+        if relative_parts and relative_parts[0] in {
+            "engagement", "opencode-tool-output",
+        }:
+            return str(Path("engagement") / relative)
+        return relative
+
     if candidate.is_absolute():
-        try:
-            return str(candidate.relative_to(workspace.root))
-        except ValueError:
-            return raw
+        for root, anchor_parts, prefix in (
+            (workspace.root, (), ""),
+            (tool_output_root, tool_output_parts, "opencode-tool-output"),
+        ):
+            try:
+                relative = str(candidate.relative_to(root))
+            except ValueError:
+                continue
+            display = (
+                str(Path(prefix) / relative)
+                if prefix else workspace_display(relative)
+            )
+            anchor = config.PROVIDER_DIR if anchor_parts else root
+            return anchor, anchor_parts, relative, display
+        return workspace.root, (), raw, raw
     parts = candidate.parts
     if parts and parts[0] == "engagement":
-        return str(Path(*parts[1:])) if len(parts) > 1 else ""
-    return raw
+        relative = str(Path(*parts[1:])) if len(parts) > 1 else ""
+        return workspace.root, (), relative, workspace_display(relative)
+    if parts and parts[0] == "opencode-tool-output":
+        relative = str(Path(*parts[1:])) if len(parts) > 1 else ""
+        return (
+            config.PROVIDER_DIR,
+            tool_output_parts,
+            relative,
+            str(Path("opencode-tool-output") / relative),
+        )
+    return workspace.root, (), raw, raw
 
 
-def _open_workspace_regular_file(workspace: Workspace, relative_path: str) -> tuple[int, int]:
-    """Open a workspace file without following any path-component symlink."""
+def _open_regular_file_beneath(
+    root: Path, relative_path: str, *, root_parts: tuple[str, ...] = (),
+) -> tuple[int, int]:
+    """Open a regular file beneath one anchored root without following symlinks."""
     relative = Path(str(relative_path or ""))
     parts = relative.parts
     if relative.is_absolute() or not parts or any(part in {"", ".", ".."} for part in parts):
-        raise ValueError("path must be a relative file beneath the engagement workspace")
+        raise ValueError("path must be a relative file beneath an allowed analysis root")
     directory_fds: list[int] = []
+    close_on_exec = getattr(os, "O_CLOEXEC", 0)
     try:
         directory_fds.append(os.open(
-            workspace.root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | close_on_exec
         ))
-        for part in parts[:-1]:
+        for part in (*root_parts, *parts[:-1]):
+            if part in {"", ".", ".."} or Path(part).is_absolute():
+                raise ValueError(
+                    "path must be a relative file beneath an allowed analysis root"
+                )
             directory_fds.append(os.open(
-                part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | close_on_exec,
                 dir_fd=directory_fds[-1],
             ))
-        fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fds[-1])
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            os.close(fd)
-            raise ValueError("analysis input must be a regular file")
-        if info.st_size > _MAX_LOCAL_ANALYZE_BYTES:
-            os.close(fd)
-            raise ValueError("analysis input exceeds the 64 MB limit")
+        fd = os.open(
+            parts[-1],
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | close_on_exec,
+            dir_fd=directory_fds[-1],
+        )
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("analysis input must be a regular file")
+            if info.st_size > _MAX_LOCAL_ANALYZE_BYTES:
+                raise ValueError("analysis input exceeds the 64 MB limit")
+        except BaseException:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
         return fd, info.st_size
     finally:
         for directory_fd in reversed(directory_fds):
@@ -6706,11 +6760,17 @@ def local_analyze(workspace: Workspace, path: str, *, analyzer: str = "file",
     analyzer = str(analyzer or "").lower()
     if analyzer not in {"file", "strings", "sha256", "literal", "regex"}:
         return _err("Analyzer must be one of: file, strings, sha256, literal, regex.")
-    path = _workspace_relative_file_path(workspace, path)
+    root, root_parts, relative_path, display_path = _local_analysis_file_reference(
+        workspace, path
+    )
     try:
-        fd, size = _open_workspace_regular_file(workspace, path)
-    except (OSError, ValueError) as exc:
+        fd, size = _open_regular_file_beneath(
+            root, relative_path, root_parts=root_parts
+        )
+    except ValueError as exc:
         return _err(f"Local analysis input was rejected: {exc}")
+    except OSError:
+        return _err("Local analysis input was rejected.")
     try:
         if analyzer in {"literal", "regex"}:
             try:
@@ -6748,10 +6808,10 @@ def local_analyze(workspace: Workspace, path: str, *, analyzer: str = "file",
             truncated = more_matches or response_truncated or len(matches) < len(selected)
             qualifier = "; additional matches omitted" if truncated else ""
             return _ok(
-                f"Found {len(matches)} {analyzer} match(es) in {path}{qualifier}.",
+                f"Found {len(matches)} {analyzer} match(es) in {display_path}{qualifier}.",
                 {
                     "analyzer": analyzer,
-                    "path": path,
+                    "path": display_path,
                     "bytes": size,
                     "matches_returned": len(matches),
                     "truncated": truncated,
@@ -6764,8 +6824,8 @@ def local_analyze(workspace: Workspace, path: str, *, analyzer: str = "file",
             digest = hashlib.sha256()
             while block := os.read(fd, 1024 * 1024):
                 digest.update(block)
-            return _ok(f"Computed SHA-256 for {path} ({size} bytes).", {
-                "analyzer": analyzer, "path": path, "bytes": size,
+            return _ok(f"Computed SHA-256 for {display_path} ({size} bytes).", {
+                "analyzer": analyzer, "path": display_path, "bytes": size,
                 "sha256": digest.hexdigest(),
             })
 
@@ -6774,7 +6834,7 @@ def local_analyze(workspace: Workspace, path: str, *, analyzer: str = "file",
             return _err(f"The fixed offline analyzer {analyzer!r} is unavailable.")
         fd_path = f"/proc/self/fd/{fd}"
         if analyzer == "file":
-            argv = [binary, "--brief", "--mime-type", "--", fd_path]
+            argv = [binary, "-L", "--brief", "--mime-type", "--", fd_path]
         else:
             minimum = max(4, min(int(min_length), 64))
             argv = [binary, "-a", "-n", str(minimum), "--", fd_path]
@@ -6791,8 +6851,8 @@ def local_analyze(workspace: Workspace, path: str, *, analyzer: str = "file",
                 result.stderr.decode("utf-8", "replace")[-2000:]
             )
             return _err(f"{analyzer} exited {result.returncode}: {detail}")
-        return _ok(f"Ran offline {analyzer} analysis on {path} ({size} bytes).", {
-            "analyzer": analyzer, "path": path, "bytes": size,
+        return _ok(f"Ran offline {analyzer} analysis on {display_path} ({size} bytes).", {
+            "analyzer": analyzer, "path": display_path, "bytes": size,
             "output": output, "truncated": truncated,
         })
     except (OSError, subprocess.SubprocessError, TypeError, ValueError) as exc:

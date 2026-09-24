@@ -141,6 +141,10 @@ class LocalAnalyzeSearchTests(unittest.TestCase):
             self.assertIn("literal", schema["properties"]["analyzer"]["enum"])
             self.assertIn("regex", schema["properties"]["analyzer"]["enum"])
             self.assertIn("engagement/", schema["properties"]["path"]["description"])
+            self.assertIn(
+                "opencode-tool-output/",
+                schema["properties"]["path"]["description"],
+            )
 
             dispatched = dispatch(workspace, "local_analyze", {
                 "path": "loot/sample.txt", "analyzer": "literal",

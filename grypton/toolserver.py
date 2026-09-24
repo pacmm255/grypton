@@ -701,9 +701,9 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
     "subdomain_enum": ("Run passive subfinder enumeration for an in-scope domain.",
         _object({"domain": _string("In-scope base domain"), "timeout": {"type": "integer"}}, ("domain",)),
         lambda ws, a: tools.subdomain_enum(ws, a["domain"], timeout=a.get("timeout", 180))),
-    "local_analyze": ("Inspect or search one regular file inside this engagement with bounded output.",
+    "local_analyze": ("Inspect or search one engagement or worker tool-output file with bounded output.",
         _object({"path": _string(
-                    "Engagement-relative path, OpenCode engagement/... alias, or exact in-workspace absolute path"
+                    "Engagement-relative path, engagement/... alias, opencode-tool-output/... alias, or an exact allowed absolute path"
                  ),
                  "analyzer": {"type": "string", "enum": ["file", "strings", "sha256", "literal", "regex"]},
                  "min_length": {"type": "integer", "minimum": 4, "maximum": 64},

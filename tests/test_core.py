@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -1011,6 +1012,9 @@ class ToolTests(unittest.TestCase):
             hashed = local_analyze(ws, "loot/sample.bin", analyzer="sha256")
             self.assertTrue(hashed["ok"], hashed)
             self.assertEqual(len(hashed["data"]["sha256"]), 64)
+            identified = local_analyze(ws, "loot/sample.bin", analyzer="file")
+            self.assertTrue(identified["ok"], identified)
+            self.assertEqual(identified["data"]["output"].strip(), "text/plain")
             transport_alias = local_analyze(
                 ws, "engagement/loot/sample.bin", analyzer="sha256"
             )
@@ -1019,6 +1023,235 @@ class ToolTests(unittest.TestCase):
             absolute_inside = local_analyze(ws, str(artifact), analyzer="sha256")
             self.assertTrue(absolute_inside["ok"], absolute_inside)
             self.assertEqual(absolute_inside["data"]["path"], "loot/sample.bin")
+
+            tool_output_root = (
+                config.PROVIDER_DIR / ws.slug / "worker" / "data" /
+                "opencode" / "tool-output"
+            )
+            tool_output_root.mkdir(parents=True)
+            tool_output = tool_output_root / "tool_fixture"
+            tool_output.write_bytes(b"bounded provider tool output")
+            absolute_tool_output = local_analyze(
+                ws, str(tool_output), analyzer="sha256"
+            )
+            self.assertTrue(absolute_tool_output["ok"], absolute_tool_output)
+            self.assertEqual(
+                absolute_tool_output["data"]["path"],
+                "opencode-tool-output/tool_fixture",
+            )
+            aliased_tool_output = local_analyze(
+                ws, "opencode-tool-output/tool_fixture", analyzer="sha256"
+            )
+            self.assertTrue(aliased_tool_output["ok"], aliased_tool_output)
+            self.assertEqual(
+                aliased_tool_output["data"]["sha256"],
+                absolute_tool_output["data"]["sha256"],
+            )
+
+            manager_output = (
+                config.PROVIDER_DIR / ws.slug / "manager" / "data" /
+                "opencode" / "tool-output" / "tool_fixture"
+            )
+            manager_output.parent.mkdir(parents=True)
+            manager_output.write_bytes(b"manager-private output")
+            other_output = (
+                config.PROVIDER_DIR / "other-engagement" / "worker" / "data" /
+                "opencode" / "tool-output" / "tool_fixture"
+            )
+            other_output.parent.mkdir(parents=True)
+            other_output.write_bytes(b"other engagement output")
+            self.assertFalse(local_analyze(
+                ws, str(manager_output), analyzer="sha256"
+            )["ok"])
+            self.assertFalse(local_analyze(
+                ws, str(other_output), analyzer="sha256"
+            )["ok"])
+            tool_output_link = tool_output_root / "tool_link"
+            tool_output_link.symlink_to(tool_output)
+            self.assertFalse(local_analyze(
+                ws, str(tool_output_link), analyzer="sha256"
+            )["ok"])
+            outside_provider_dir = config.PROVIDER_DIR / "outside-provider-dir"
+            outside_provider_dir.mkdir()
+            outside_provider_file = outside_provider_dir / "outside.txt"
+            outside_provider_file.write_bytes(b"outside provider root")
+            intermediate_link = tool_output_root / "linked-directory"
+            intermediate_link.symlink_to(outside_provider_dir, target_is_directory=True)
+            self.assertFalse(local_analyze(
+                ws, "opencode-tool-output/linked-directory/outside.txt",
+                analyzer="sha256",
+            )["ok"])
+
+            sibling_output = (
+                config.PROVIDER_DIR / ws.slug / "worker" / "data" /
+                "opencode" / "tool-output-sibling" / "tool_fixture"
+            )
+            sibling_output.parent.mkdir(parents=True)
+            sibling_output.write_bytes(b"provider sibling output")
+            config_output = (
+                config.PROVIDER_DIR / ws.slug / "worker" / "config" /
+                "opencode" / "tool_fixture"
+            )
+            config_output.parent.mkdir(parents=True)
+            config_output.write_bytes(b"provider config output")
+            for denied_path in (
+                sibling_output,
+                config_output,
+            ):
+                self.assertFalse(local_analyze(
+                    ws, str(denied_path), analyzer="sha256"
+                )["ok"])
+            self.assertFalse(local_analyze(
+                ws, "opencode-tool-output/../tool-output-sibling/tool_fixture",
+                analyzer="sha256",
+            )["ok"])
+
+            oversized_output = tool_output_root / "oversized"
+            with oversized_output.open("wb") as stream:
+                stream.truncate((64 * 1024 * 1024) + 1)
+            self.assertFalse(local_analyze(
+                ws, str(oversized_output), analyzer="sha256"
+            )["ok"])
+
+            symlink_root_ws = Workspace("local-analysis-symlink-root")
+            symlink_root_ws.create("analysis.test", "web")
+            symlink_root_parent = (
+                config.PROVIDER_DIR / symlink_root_ws.slug / "worker" /
+                "data" / "opencode"
+            )
+            symlink_root_parent.mkdir(parents=True)
+            (symlink_root_parent / "tool-output").symlink_to(
+                outside_provider_dir, target_is_directory=True
+            )
+            self.assertFalse(local_analyze(
+                symlink_root_ws, "opencode-tool-output/outside.txt",
+                analyzer="sha256",
+            )["ok"])
+
+            worker_link_ws = Workspace("local-analysis-worker-link")
+            worker_link_ws.create("analysis.test", "web")
+            worker_link_provider = config.PROVIDER_DIR / worker_link_ws.slug
+            manager_tool_output = (
+                worker_link_provider / "manager" / "data" / "opencode" /
+                "tool-output"
+            )
+            manager_tool_output.mkdir(parents=True)
+            (manager_tool_output / "private-result").write_bytes(b"manager only")
+            (worker_link_provider / "worker").symlink_to(
+                worker_link_provider / "manager", target_is_directory=True
+            )
+            worker_link_result = local_analyze(
+                worker_link_ws,
+                "opencode-tool-output/private-result",
+                analyzer="sha256",
+            )
+            self.assertFalse(worker_link_result["ok"])
+            self.assertNotIn(
+                str(config.PROVIDER_DIR), worker_link_result["summary"]
+            )
+
+            slug_link_ws = Workspace("local-analysis-slug-link")
+            slug_link_ws.create("analysis.test", "web")
+            redirected_provider = config.PROVIDER_DIR / "redirected-engagement"
+            redirected_tool_output = (
+                redirected_provider / "worker" / "data" / "opencode" /
+                "tool-output"
+            )
+            redirected_tool_output.mkdir(parents=True)
+            (redirected_tool_output / "private-result").write_bytes(b"other engagement")
+            (config.PROVIDER_DIR / slug_link_ws.slug).symlink_to(
+                redirected_provider, target_is_directory=True
+            )
+            slug_link_result = local_analyze(
+                slug_link_ws,
+                "opencode-tool-output/private-result",
+                analyzer="sha256",
+            )
+            self.assertFalse(slug_link_result["ok"])
+            self.assertNotIn(
+                str(config.PROVIDER_DIR), slug_link_result["summary"]
+            )
+
+            missing_root_ws = Workspace("local-analysis-missing-provider-root")
+            missing_root_ws.create("analysis.test", "web")
+            missing_root_result = local_analyze(
+                missing_root_ws,
+                "opencode-tool-output/missing",
+                analyzer="sha256",
+            )
+            self.assertFalse(missing_root_result["ok"])
+            self.assertNotIn(
+                str(config.PROVIDER_DIR), missing_root_result["summary"]
+            )
+
+            engagement_alias_file = ws.root / "opencode-tool-output" / "engagement.txt"
+            engagement_alias_file.parent.mkdir()
+            engagement_alias_file.write_bytes(b"engagement namespace")
+            (tool_output_root / "engagement.txt").write_bytes(b"provider namespace")
+            engagement_alias_result = local_analyze(
+                ws,
+                "engagement/opencode-tool-output/engagement.txt",
+                analyzer="sha256",
+            )
+            self.assertTrue(engagement_alias_result["ok"], engagement_alias_result)
+            self.assertEqual(
+                engagement_alias_result["data"]["path"],
+                "engagement/opencode-tool-output/engagement.txt",
+            )
+            engagement_alias_reused = local_analyze(
+                ws,
+                engagement_alias_result["data"]["path"],
+                analyzer="sha256",
+            )
+            self.assertTrue(engagement_alias_reused["ok"], engagement_alias_reused)
+            self.assertEqual(
+                engagement_alias_reused["data"]["sha256"],
+                engagement_alias_result["data"]["sha256"],
+            )
+            absolute_engagement_alias = local_analyze(
+                ws, str(engagement_alias_file), analyzer="sha256"
+            )
+            self.assertEqual(
+                absolute_engagement_alias["data"]["path"],
+                "engagement/opencode-tool-output/engagement.txt",
+            )
+
+            nested_engagement_file = ws.root / "engagement" / "nested.txt"
+            nested_engagement_file.parent.mkdir()
+            nested_engagement_file.write_bytes(b"nested engagement namespace")
+            nested_engagement_result = local_analyze(
+                ws, "engagement/engagement/nested.txt", analyzer="sha256"
+            )
+            self.assertTrue(nested_engagement_result["ok"], nested_engagement_result)
+            self.assertEqual(
+                nested_engagement_result["data"]["path"],
+                "engagement/engagement/nested.txt",
+            )
+            nested_engagement_reused = local_analyze(
+                ws, nested_engagement_result["data"]["path"], analyzer="sha256"
+            )
+            self.assertEqual(
+                nested_engagement_reused["data"]["sha256"],
+                nested_engagement_result["data"]["sha256"],
+            )
+
+            fds_before = len(os.listdir("/proc/self/fd"))
+            with patch("grypton.tools.os.fstat", side_effect=OSError("fixture")):
+                for _ in range(8):
+                    failed_stat = local_analyze(
+                        ws, "loot/sample.bin", analyzer="sha256"
+                    )
+                    self.assertFalse(failed_stat["ok"])
+            self.assertEqual(len(os.listdir("/proc/self/fd")), fds_before)
+
+            fifo = ws.loot_dir / "analysis.fifo"
+            os.mkfifo(fifo)
+            fifo_started = time.monotonic()
+            fifo_result = local_analyze(ws, "loot/analysis.fifo", analyzer="sha256")
+            fifo_elapsed = time.monotonic() - fifo_started
+            self.assertFalse(fifo_result["ok"])
+            self.assertLess(fifo_elapsed, 1.0)
+
             self.assertFalse(local_analyze(ws, "../outside", analyzer="sha256")["ok"])
             self.assertFalse(local_analyze(
                 ws, str(ws.root.parent / "outside.bin"), analyzer="sha256"
