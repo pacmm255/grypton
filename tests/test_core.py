@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import contextmanager
 from contextlib import redirect_stderr, redirect_stdout
+import gzip
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
@@ -35,7 +36,7 @@ from grypton.providers import (MCP_TIMEOUT_MS, OpenCodeClient, OpenCodeResult, P
 from grypton.reporting import audit_workspace, render_report
 from grypton.toolserver import REGISTRY, dispatch
 from grypton.tools import (_browser_executable, _isolated_browser_profile,
-                           apk_extract_asset, apk_inspect,
+                           Goja, apk_extract_asset, apk_inspect,
                            artifact_download, browse, check_host_scope, check_port_scope,
                            check_research_scope, check_url_scope, flow_read, flow_replay,
                            http_request, httpx_probe, install_tool, local_analyze, port_scan,
@@ -80,10 +81,14 @@ class _Handler(BaseHTTPRequestHandler):
             payload = b"H" * (MAX_RESPONSE_BYTES + 4096)
         elif self.path == "/large":
             payload = ("A" * 20_000 + "END-MARKER").encode()
+        elif self.path == "/gzip":
+            payload = gzip.compress(b"compressed-local-lab")
         else:
             payload = json.dumps({"path": self.path, "marker": "local-lab"}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        if self.path == "/gzip":
+            self.send_header("Content-Encoding", "gzip")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
@@ -578,6 +583,87 @@ class ToolTests(unittest.TestCase):
             self.assertNotIn("AWS_SECRET_ACCESS_KEY", child_env)
             self.assertNotIn("HTTPS_PROXY", child_env)
             self.assertEqual(run.call_args.kwargs["umask"], 0o077)
+
+    def test_goja_does_not_decode_an_already_decoded_proxy_body_twice(self):
+        with isolated_runtime():
+            ws = Workspace("goja-decoding")
+            ws.create("https://example.test", "web")
+            ws.save_constraints(Constraints(in_scope=["example.test"]))
+
+            def fake_run(argv, **kwargs):
+                Path(argv[argv.index("--dump-header") + 1]).write_bytes(
+                    b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n"
+                    b"Content-Length: 17\r\n\r\n"
+                )
+                kwargs["stdout"].write(b"already decoded\n")
+                if "--compressed" in argv:
+                    return SimpleNamespace(
+                        returncode=61,
+                        stderr=b"curl: (61) incorrect header check",
+                    )
+                return SimpleNamespace(returncode=0, stderr=b"")
+
+            with patch.object(Goja, "start", return_value={"ok": True}), \
+                    patch("grypton.tools.config.find_binary", return_value="/usr/bin/curl"), \
+                    patch("grypton.tools.subprocess.run", side_effect=fake_run) as run:
+                result = Goja.request(ws, "https://example.test/")
+
+            self.assertTrue(result["ok"], result)
+            self.assertIn("already decoded", result["data"]["response"])
+            self.assertNotIn("--compressed", run.call_args.args[0])
+
+    def test_goja_plain_http_tunnel_keeps_curl_content_decoding(self):
+        with isolated_runtime():
+            ws = Workspace("goja-http-decoding")
+            ws.create("http://example.test", "web")
+            ws.save_constraints(Constraints(in_scope=["example.test"]))
+
+            def fake_run(argv, **kwargs):
+                Path(argv[argv.index("--dump-header") + 1]).write_bytes(
+                    b"HTTP/1.1 200 OK\r\n\r\n"
+                )
+                kwargs["stdout"].write(b"decoded by curl\n")
+                return SimpleNamespace(returncode=0, stderr=b"")
+
+            with patch.object(Goja, "start", return_value={"ok": True}), \
+                    patch("grypton.tools.config.find_binary", return_value="/usr/bin/curl"), \
+                    patch("grypton.tools.subprocess.run", side_effect=fake_run) as run:
+                result = Goja.request(ws, "http://example.test/")
+
+            self.assertTrue(result["ok"], result)
+            self.assertIn("--compressed", run.call_args.args[0])
+
+    def test_goja_decoding_switch_matches_its_intercepted_https_ports(self):
+        with isolated_runtime():
+            ws = Workspace("goja-port-decoding")
+            ws.create("https://example.test", "web")
+            ws.save_constraints(Constraints(in_scope=["example.test"]))
+
+            with patch.object(Goja, "start", return_value={"ok": True}), \
+                    patch("grypton.tools.http_request", return_value={"ok": True}) as request:
+                for url, expected in (
+                    ("https://example.test/", True),
+                    ("https://example.test:8443/", True),
+                    ("https://example.test:9443/", False),
+                    ("http://example.test/", False),
+                ):
+                    with self.subTest(url=url):
+                        Goja.request(ws, url)
+                        self.assertEqual(
+                            request.call_args.kwargs["_response_body_already_decoded"],
+                            expected,
+                        )
+
+    def test_direct_curl_still_negotiates_and_decodes_compression(self):
+        with isolated_runtime(), local_server() as port:
+            target = f"http://127.0.0.1:{port}"
+            ws = Workspace("curl-decoding")
+            ws.create(target, "web")
+            ws.save_constraints(Constraints(in_scope=[target]))
+            result = http_request(ws, target + "/gzip")
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn("compressed-local-lab", result["data"]["response"])
 
     def test_scope_capture_and_replay(self):
         with isolated_runtime(), local_server() as port:

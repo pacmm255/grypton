@@ -1038,6 +1038,7 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
                  headers: Optional[dict] = None, body: Optional[str] = None,
                  timeout: int = 30, follow_redirects: bool = False,
                  insecure: bool = False, transport: str = "curl", proxy: str = "",
+                 _response_body_already_decoded: bool = False,
                  _secret_values: Iterable[str] = (),
                  _cookie_jar: Optional[Path] = None,
                  _bearer_token: str = "", _bearer_origin: str = "",
@@ -1091,8 +1092,15 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
     if _bearer_token and not any(key.lower() == "authorization" for key in clean_headers):
         clean_headers["Authorization"] = f"Bearer {_bearer_token}"
 
-    argv = [curl, "--disable", "--silent", "--show-error", "--compressed",
-            "--max-time", str(timeout), "--connect-timeout", str(min(timeout, 15))]
+    argv = [curl, "--disable", "--silent", "--show-error"]
+    # The managed Goja HTTPS replay path decodes supported compressed bodies
+    # before relaying them. Its relay can retain the upstream Content-Encoding
+    # header, so asking curl to decode that plaintext a second time fails with
+    # curl error 61. Direct curl requests still negotiate and decode compression.
+    if not _response_body_already_decoded:
+        argv.append("--compressed")
+    argv += ["--max-time", str(timeout),
+             "--connect-timeout", str(min(timeout, 15))]
     if method == "HEAD":
         argv.append("--head")
     else:
@@ -2293,9 +2301,24 @@ class Goja:
         started = cls.start()
         if not started["ok"]:
             return started
+        scheme = ""
+        try:
+            parsed = urlsplit(url)
+            scheme = parsed.scheme.lower()
+            destination_port = parsed.port or (443 if scheme == "https" else 80)
+        except ValueError:
+            destination_port = 0
+        # The managed Goja proxy only intercepts and replays TLS on its HTTPS
+        # ports. Plain HTTP and other ports remain byte-for-byte tunnels.
+        response_body_already_decoded = (
+            scheme == "https" and destination_port in {443, 8443}
+        )
         return http_request(workspace, url, transport="goja",
                             proxy=f"socks5h://{config.GOJA_SOCKS}",
-                            insecure=not cls.CA.is_file(), **kwargs)
+                            insecure=not cls.CA.is_file(),
+                            _response_body_already_decoded=(
+                                response_body_already_decoded
+                            ), **kwargs)
 
 
 def _flow_contains_text(path: Path, query: str) -> bool:
