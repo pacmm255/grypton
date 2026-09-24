@@ -300,6 +300,17 @@ class FindingFamilyTests(unittest.TestCase):
             with self.assertRaises(LedgerFormatError):
                 ws.finding_family_catalog()
 
+    def test_catalog_rejects_semantically_invalid_family_state(self):
+        with isolated_runtime():
+            ws = workspace("invalid-family-catalog")
+            ws.findings.append(structured("F001", "F999"))
+            before = ws.findings.path.read_bytes()
+
+            with self.assertRaisesRegex(ValueError, "missing family anchor F999"):
+                ws.finding_family_catalog()
+
+            self.assertEqual(ws.findings.path.read_bytes(), before)
+
     def test_length_and_history_bounds_fail_before_mutation(self):
         with isolated_runtime():
             ws = workspace("family-bounds")

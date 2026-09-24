@@ -435,6 +435,27 @@ class FindingFamilyRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(degraded["finding_cases"], 3)
             self.assertEqual(degraded["finding_families"], 0)
 
+    def test_runtime_health_fails_closed_on_invalid_family_links(self):
+        with isolated_runtime():
+            ws = Workspace("invalid-family-runtime-health")
+            ws.create("example.test", "web")
+            finding = record_family(ws, "Broken child", "Shared cache parser")
+            rows = ws.findings.all()
+            rows[0]["family_id"] = "F999"
+            rows[0]["family_history"][-1]["to_family_id"] = "F999"
+            ws.findings.path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(finding["id"], "F001")
+            with self.assertRaisesRegex(ValueError, "missing family anchor F999"):
+                ws.finding_family_catalog()
+            health = _health(ws.slug, 0)
+            self.assertEqual(health["findings"], 1)
+            self.assertEqual(health["finding_cases"], 1)
+            self.assertEqual(health["finding_families"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

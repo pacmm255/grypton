@@ -682,7 +682,11 @@ class Workspace:
 
     def finding_family_catalog(self) -> list[dict]:
         with _file_lock(self.finding_family_lock):
-            return self._finding_family_index(self.findings.all_strict())[2]
+            rows = self.findings.all_strict()
+            errors = self._finding_family_errors(rows)
+            if errors:
+                raise ValueError(f"finding family state is invalid: {errors[0]}")
+            return self._finding_family_index(rows)[2]
 
     def record_finding(self, *, title: str, severity: str, vuln_class: str = "",
                        surface: str = "", description: str = "", poc: str = "",
