@@ -328,6 +328,7 @@ class TargetMeta:
     validator_model: str = ""
     last_directive: str = ""         # seed for resume
     turn_index: int = 0
+    coverage_rotation_cursor: int = 0  # durable autonomous scenario cursor
     notes: str = ""
 
 
@@ -1061,14 +1062,17 @@ class Workspace:
         verdict: dict,
         *,
         expected_revalidation_revision: str = "",
+        replace_degraded: bool = False,
     ) -> tuple[Optional[dict], bool]:
-        """Atomically persist a verdict only when the finding has none.
+        """Atomically persist a verdict when no durable Astra result exists.
 
         Automatic Astra validation can overlap an explicit ``grypton validate``
         process. The condition must be checked while holding the finding ledger's
         file lock so an already-recorded verdict cannot be overwritten by the
         automatic result.  A revalidation result must also match the evidence
         revision it reviewed so newer evidence cannot receive a stale verdict.
+        A caller retrying a validator transport failure may replace only a
+        degraded result; a decisive or evidence-gap verdict remains immutable.
         """
         applied = False
         expected_revision = str(expected_revalidation_revision or "").strip()
@@ -1080,8 +1084,10 @@ class Workspace:
             ).strip()
             if current_revision != expected_revision:
                 return
-            if isinstance(record.get("manager_verdict"), dict):
-                return
+            current = record.get("manager_verdict")
+            if isinstance(current, dict):
+                if not (replace_degraded and current.get("degraded") is True):
+                    return
             self._apply_severity_verdict(record, verdict)
             applied = True
 

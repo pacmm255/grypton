@@ -82,6 +82,9 @@ class ManagerContext:
     new_findings: list[dict] = field(default_factory=list)
     new_finding_cases: list[dict] = field(default_factory=list)
     novel_finding_families: int = 0
+    family_stagnation_streak: int = 0
+    coverage_priority: str = ""
+    validation_backlog: list[dict] = field(default_factory=list)
     p1_count: int = 0
 
 
@@ -450,7 +453,16 @@ class KryptexManager:
 
     def _fallback_directive(self, ctx: ManagerContext, reason: str) -> Directive:
         surface = "the highest-impact unresolved lead in the recorded attack surface"
-        if ctx.worker_was_idle:
+        if ctx.coverage_priority:
+            action = ctx.coverage_priority
+        elif ctx.validation_backlog:
+            finding = ctx.validation_backlog[0]
+            finding_id = str(finding.get("id") or "the highest-severity candidate")
+            action = (
+                f"Collect the next missing proof for {finding_id}, save a positive/control "
+                "evidence pair, and attach the revised evidence with revise_finding."
+            )
+        elif ctx.worker_was_idle:
             action = (
                 f"The last turn made no tool call. Select {surface}; issue one bounded "
                 "request or local analysis tool call now; record the observation and tested technique."
@@ -482,6 +494,9 @@ class KryptexManager:
         new_cases = json.dumps(
             ctx.new_finding_cases, ensure_ascii=False, separators=(",", ":")
         )
+        validation_backlog = json.dumps(
+            ctx.validation_backlog, ensure_ascii=False, separators=(",", ":")
+        )
         activity = (
             f"No worker tool call in the last turn; idle streak {ctx.worker_idle_streak}."
             if ctx.worker_was_idle else "Worker tool activity was recorded."
@@ -509,6 +524,12 @@ ENGINE FLAGS:
 NEW FINDING CASES JSON:
 {new_cases}
 
+HIGH-SEVERITY PROOF BACKLOG JSON:
+{validation_backlog}
+
+COVERAGE PRIORITY:
+{ctx.coverage_priority or '(use the strongest unresolved lead)'}
+
 FINDING FAMILIES JSON:
 {family_json}
 
@@ -529,6 +550,7 @@ PASSIVE STAGNATION STREAK: {ctx.passive_stagnation_streak}
 REPETITIVE PROBE TURN STREAK: {ctx.repetitive_probe_streak}
 CONVERGENCE GUARD: {ctx.convergence_reason or '(not reached)'}
 NEW FINDING FAMILIES THIS TURN: {ctx.novel_finding_families}
+TURNS SINCE A NEW FINDING FAMILY: {ctx.family_stagnation_streak}
 CONFIRMED P1 CASE COUNT: {ctx.p1_count}
 
 JSON SCHEMA:

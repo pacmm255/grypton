@@ -3,90 +3,157 @@
     "id": "web-surface-bootstrap",
     "title": "Web surface bootstrap",
     "target_types": ["web", "api", "auto"],
+    "priority_action": "Build a fresh route and operation inventory from live responses, scripts, specifications, and linked resources; select the highest-impact untested state-changing operation and exercise it with a control pair.",
     "moves": [
-      "capture the root and redirects with http_request",
-      "inspect robots, security.txt, linked scripts, and response headers",
-      "record routes, parameters, technologies, and negative results"
+      "capture the root, redirects, linked resources, and response headers",
+      "derive routes and operations from scripts, specifications, forms, and runtime traffic",
+      "record parameters, technologies, trust boundaries, and tested controls"
     ]
   },
   {
     "id": "identity-boundary-diff",
-    "title": "Identity and object-boundary differential",
+    "title": "Identity, role, and object boundaries",
     "target_types": ["web", "api", "auto"],
+    "priority_action": "Choose one consequential authenticated operation and compare owner, peer, lower-role, anonymous, stale, and structurally altered references while preserving a known-valid control.",
     "moves": [
-      "identify existing anonymous or supplied test identities",
-      "compare self, peer, missing, and malformed object references with controls",
-      "capture each request pair and avoid creating accounts when a local fixture suffices"
+      "map identities, roles, tenants, object ownership, and action-level permissions",
+      "compare owner, peer, lower-role, anonymous, missing, stale, and malformed references",
+      "capture request and response pairs that prove the authorization boundary"
     ]
   },
   {
-    "id": "frontend-source-map",
-    "title": "Frontend intelligence",
+    "id": "defense-aware-authentication",
+    "title": "Session and account lifecycle",
     "target_types": ["web", "api", "auto"],
+    "priority_action": "Trace login, refresh, logout, recovery, enrollment, and identity-change transitions; test whether an old, alternate, or partially completed state retains access to a consequential account action.",
     "moves": [
-      "read JavaScript and source-map references",
-      "extract routes, schemas, feature flags, and role assumptions",
-      "test only extracted leads that match scope"
+      "trace session creation, renewal, revocation, recovery, and identity changes",
+      "compare concurrent, stale, partially completed, and alternate-channel states",
+      "prove account impact with the smallest reversible authenticated action"
     ]
   },
   {
     "id": "workflow-state",
     "title": "Workflow and state transitions",
     "target_types": ["web", "api", "auto"],
+    "priority_action": "Model one high-value workflow as states and invariants, then vary order, repetition, concurrency, stale identifiers, and server-trusted values against a valid baseline.",
     "moves": [
-      "map valid state transitions before varying order, repetition, and stale identifiers",
-      "compare responses against a valid control",
-      "avoid destructive actions and sustained load"
+      "map valid transitions and server-side invariants",
+      "vary order, repetition, concurrency, stale identifiers, and server-trusted values",
+      "compare durable state before and after each reversible control pair"
+    ]
+  },
+  {
+    "id": "server-fetch-parser-boundary",
+    "title": "Server fetch and parser boundaries",
+    "target_types": ["web", "api", "auto"],
+    "priority_action": "Locate one server-side URL, webhook, import, preview, proxy, redirect, or document parser and use controlled destinations plus response differentials to establish its trust and network boundary.",
+    "moves": [
+      "inventory URL consumers, callbacks, webhooks, imports, previews, redirects, and document parsers",
+      "compare canonical, redirected, encoded, alternate-address, and protocol-shaped inputs",
+      "use controlled endpoints and response differentials to prove server-side behavior"
+    ]
+  },
+  {
+    "id": "file-content-boundary",
+    "title": "File and active-content boundaries",
+    "target_types": ["web", "api", "binary", "auto"],
+    "priority_action": "Trace an upload, export, attachment, archive, media transform, or rendered document from ingestion to retrieval and test whether content type, name, metadata, processing, or access control crosses a higher-impact boundary.",
+    "moves": [
+      "map ingestion, transformation, storage, rendering, and retrieval",
+      "vary content signatures, metadata, names, nesting, and retrieval context",
+      "prove execution, disclosure, overwrite, or authorization impact with paired evidence"
+    ]
+  },
+  {
+    "id": "browser-origin-boundary",
+    "title": "Browser origin and cross-site state",
+    "target_types": ["web", "auto"],
+    "priority_action": "Select a sensitive browser-mediated action or data response and test origin, preflight, credential, redirect, framing, and cross-window behavior with an authenticated control.",
+    "moves": [
+      "map credentialed cross-origin reads and state changes",
+      "compare origin, preflight, redirect, framing, postMessage, and navigation contexts",
+      "demonstrate impact in an actual browser session"
+    ]
+  },
+  {
+    "id": "cache-proxy-boundary",
+    "title": "Cache, proxy, and routing boundaries",
+    "target_types": ["web", "api", "network", "auto"],
+    "priority_action": "Pick a cacheable or routed response and compare cache keys, host and forwarding metadata, path normalization, authorization context, and intermediary behavior using unique markers and clean controls.",
+    "moves": [
+      "map cache keys, host routing, forwarding metadata, normalization, and authenticated variance",
+      "use unique markers and clean controls across intermediary and origin paths",
+      "separate one root cause from route variants before recording another case"
+    ]
+  },
+  {
+    "id": "frontend-source-map",
+    "title": "Frontend and runtime intelligence",
+    "target_types": ["web", "api", "auto"],
+    "priority_action": "Extract an untested privileged route, hidden operation, schema, feature path, realtime channel, or trust assumption from shipped client artifacts and verify it against the live service.",
+    "moves": [
+      "inspect shipped scripts, maps, manifests, schemas, and runtime requests",
+      "extract routes, operations, realtime channels, feature paths, and role assumptions",
+      "turn the strongest live lead into a controlled request pair"
+    ]
+  },
+  {
+    "id": "integration-secret-boundary",
+    "title": "Integrations and delegated trust",
+    "target_types": ["web", "api", "auto"],
+    "priority_action": "Trace one OAuth, SSO, invitation, sharing, webhook, support, partner, or delegated-admin flow and test binding of identity, tenant, destination, state, audience, and lifecycle.",
+    "moves": [
+      "inventory delegated identities, invitations, shares, callbacks, partners, and support paths",
+      "compare tenant, identity, destination, state, audience, and lifecycle binding",
+      "prove cross-boundary access or action with reversible evidence"
+    ]
+  },
+  {
+    "id": "network-inventory",
+    "title": "Network service and control-plane inventory",
+    "target_types": ["network", "cidr", "web", "api", "auto"],
+    "priority_action": "Resolve the recorded hosts, identify reachable protocols and alternate service planes, then select one exposed administrative, metadata, datastore, debug, or trust service for protocol-aware validation.",
+    "moves": [
+      "resolve recorded hosts and identify reachable protocols and certificates",
+      "enumerate alternate service planes, virtual hosts, administrative paths, and trust relationships",
+      "establish protocol grammar with a valid control before testing authorization and exposure"
+    ]
+  },
+  {
+    "id": "mobile-artifact-boundary",
+    "title": "Mobile artifact and trust boundaries",
+    "target_types": ["web", "api", "binary", "auto"],
+    "requires": ["mobile_artifact"],
+    "priority_action": "Inspect the published APK as a binary artifact, extract backend and component trust assumptions, and validate the strongest credential, deep-link, exported-component, storage, or protocol hypothesis against the scoped system.",
+    "moves": [
+      "inspect package metadata, manifest, certificate, resources, assets, and bytecode behavior",
+      "map exported components, deep links, local storage, transport, and backend protocols",
+      "validate the strongest artifact-derived hypothesis against the scoped system"
+    ]
+  },
+  {
+    "id": "finding-proof",
+    "title": "High-severity proof completion",
+    "target_types": ["auto", "web", "api", "network", "cidr", "binary", "contract"],
+    "requires": ["validation_backlog"],
+    "priority_action": "Take the highest-severity unresolved candidate, perform the next independent check Astra requested with a positive and negative control, and attach the resulting evidence through revise_finding.",
+    "moves": [
+      "save positive, negative, and fresh-session controls",
+      "state preconditions, affected trust boundary, repeatability, and durable impact",
+      "attach exact artifacts and revisions for independent Astra grading"
     ]
   },
   {
     "id": "blocked-path-recovery",
     "title": "Operational blocker recovery",
     "target_types": ["auto", "web", "api", "network", "cidr", "binary", "contract"],
+    "requires": ["blocker"],
+    "priority_action": "Resolve the current prerequisite with the available tool inventory, authenticated browser state, a local dependency, or an alternate evidence path, then execute the strongest unblocked high-impact test.",
     "moves": [
-      "use tool_inventory before declaring a dependency missing",
-      "install a local dependency or build a synthetic local fixture when appropriate",
-      "pivot to another recorded in-scope lead when a real prerequisite is unavailable"
-    ]
-  },
-  {
-    "id": "network-inventory",
-    "title": "Bounded network inventory",
-    "target_types": ["network", "cidr", "web", "api", "auto"],
-    "moves": [
-      "resolve only recorded in-scope hosts",
-      "check a bounded port set and identify the reachable protocol before deeper work",
-      "use tcp_exchange only after a valid control frame establishes the service grammar"
-    ]
-  },
-  {
-    "id": "mobile-artifact-boundary",
-    "title": "Mobile artifact and trust-boundary analysis",
-    "target_types": ["web", "api", "binary", "auto"],
-    "moves": [
-      "download a published APK with artifact_download and inspect its package, manifest, certificate, and asset inventory",
-      "treat manifest and bytecode behavior as binary evidence; do not inspect application source or evaluator files",
-      "test a mobile-derived credential, protocol claim, or exported-component hypothesis only against the recorded in-scope lab"
-    ]
-  },
-  {
-    "id": "finding-proof",
-    "title": "Finding proof and validation handoff",
-    "target_types": ["auto", "web", "api", "network", "cidr", "binary", "contract"],
-    "moves": [
-      "save the positive and control evidence",
-      "state preconditions, affected boundary, and realistic impact",
-      "reference exact artifacts so Astra can independently grade the claim"
-    ]
-  },
-  {
-    "id": "defense-aware-authentication",
-    "title": "Defense-aware authentication checks",
-    "target_types": ["auto", "web", "api", "network"],
-    "moves": [
-      "budget invalid-authentication controls cumulatively across the engagement",
-      "stop the probe family at the first CAPTCHA, 429, WAF challenge, temporary block, or lockout",
-      "record the defense response and pivot to passive or unrelated read-only evidence"
+      "inspect tool inventory and durable authenticated state",
+      "satisfy local dependencies and derive alternate evidence paths",
+      "resume the strongest high-impact test after resolving the prerequisite"
     ]
   }
 ]
