@@ -1026,6 +1026,14 @@ def _final_http_response_header_block(value: str) -> str:
     return re.split(r"\r?\n\r?\n", value[starts[-1].start():], maxsplit=1)[0]
 
 
+def _http_header_value(header_block: str, name: str) -> str:
+    """Read one value from an already isolated HTTP response header block."""
+    matches = re.findall(
+        rf"(?im)^{re.escape(name)}\s*:\s*([^\r\n]*)\r?$", header_block
+    )
+    return matches[-1].strip() if matches else ""
+
+
 def http_request(workspace: Workspace, url: str, *, method: str = "GET",
                  headers: Optional[dict] = None, body: Optional[str] = None,
                  timeout: int = 30, follow_redirects: bool = False,
@@ -1170,10 +1178,14 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
         os.chmod(_cookie_jar, 0o600)
 
     output = raw_output.decode("utf-8", "replace")
+    response_header_text = raw_response_headers.decode("utf-8", "replace")
+    incomplete_headers = response_header_bytes > len(raw_response_headers)
+    final_header_block = (
+        "" if incomplete_headers
+        else _final_http_response_header_block(response_header_text)
+    )
+    response_location = _http_header_value(final_header_block, "Location")
     if isinstance(_response_observation, dict):
-        response_header_text = raw_response_headers.decode("utf-8", "replace")
-        incomplete_headers = response_header_bytes > len(raw_response_headers)
-        final_header_block = _final_http_response_header_block(response_header_text)
         _response_observation["set_cookie"] = bool(
             incomplete_headers
             or re.search(r"(?im)^\s*set-cookie\s*:", final_header_block)
@@ -1182,6 +1194,7 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
             incomplete_headers
             or re.search(r"(?im)^\s*clear-site-data\s*:", final_header_block)
         )
+        _response_observation["location"] = response_location
     extracted = _extract_auth_tokens(output) if _session_identity else {}
     if _session_identity and extracted:
         saved = credentials.load_tokens(target_slug, credential_name)
@@ -1194,6 +1207,10 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
             return _err(f"Refused unsafe bearer-token state: {exc}")
     secrets_to_hide = tuple(str(value) for value in _secret_values if str(value))
     secrets_to_hide += tuple(extracted.values())
+    if response_location:
+        secrets_to_hide += _serialized_secret_variants(
+            _browser_private_response_values("", {"Location": response_location})
+        )
     if _bearer_token:
         secrets_to_hide += (_bearer_token,)
     safe_output = redact_sensitive_text(output, secrets_to_hide)
@@ -1207,10 +1224,12 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
         transport=transport, returncode=result.returncode, stderr=stderr,
         secret_values=secrets_to_hide, response_bytes=response_bytes,
     )
-    status_lines = [
-        line.strip() for line in output.splitlines() if line.startswith("HTTP/")
-    ]
-    status = status_lines[-1] if status_lines else "no HTTP status"
+    status_lines = final_header_block.splitlines()
+    status = (
+        status_lines[0].strip()
+        if status_lines and status_lines[0].startswith("HTTP/")
+        else "no HTTP status"
+    )
     data = {
         "status_line": status,
         "response": safe_output[:MAX_INLINE_RESPONSE_CHARS],
@@ -1236,22 +1255,6 @@ def _http_result_status(result: dict) -> int:
     data = result.get("data") if isinstance(result.get("data"), dict) else {}
     match = re.search(r"\b(\d{3})\b", str(data.get("status_line") or ""))
     return int(match.group(1)) if match else 0
-
-
-def _http_result_header(result: dict, name: str) -> str:
-    """Read one response header from the final captured HTTP header block."""
-    data = result.get("data") if isinstance(result.get("data"), dict) else {}
-    response = str(data.get("response") or "")
-    status_starts = list(re.finditer(r"(?im)^HTTP/[^\r\n]+", response))
-    if not status_starts:
-        return ""
-    header_block = re.split(
-        r"\r?\n\r?\n", response[status_starts[-1].start():], maxsplit=1
-    )[0]
-    matches = re.findall(
-        rf"(?im)^{re.escape(name)}\s*:\s*([^\r\n]*)\r?$", header_block
-    )
-    return matches[-1].strip() if matches else ""
 
 
 def _request_url_identity(url: str) -> tuple[str, str, str]:
@@ -1379,9 +1382,11 @@ def _credential_bootstrap(workspace: Workspace, url: str, *, credential: str,
     redirect_codes = {301, 302, 303, 307, 308}
     for request_number in range(2):
         cookies_before = credentials.cookie_jar_fingerprints(cookie_jar)
+        response_observation: dict[str, object] = {}
         response = http_request(
             workspace, url, method="GET", timeout=timeout,
             transport=f"credential-bootstrap:{credential}", _cookie_jar=cookie_jar,
+            _response_observation=response_observation,
         )
         data = response.get("data") if isinstance(response.get("data"), dict) else {}
         if data.get("flow"):
@@ -1397,7 +1402,7 @@ def _credential_bootstrap(workspace: Workspace, url: str, *, credential: str,
 
         status = _http_result_status(response)
         if status in redirect_codes:
-            location = _http_result_header(response, "Location")
+            location = str(response_observation.get("location") or "")
             if not location:
                 return _err(
                     "Anonymous login bootstrap stopped at a redirect without a "
@@ -1779,7 +1784,7 @@ def authenticated_http_request(workspace: Workspace, url: str, *, credential: st
                 token_snapshot = _snapshot_private_material(token_file)
                 storage_snapshot = _snapshot_private_material(storage_file)
                 cookie_digest_before = credentials.cookie_jar_digest(jar_storage)
-                response_observation: dict[str, bool] = {}
+                response_observation: dict[str, object] = {}
                 commit_material = False
                 material_restored = False
                 try:

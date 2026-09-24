@@ -67,9 +67,12 @@ class _BrowserRequestHandler(BaseHTTPRequestHandler):
     authorization_echo = "authorization-echo-secret-123456"
     cookie_echo_one = "cookie-echo-one-secret-123456"
     cookie_echo_two = "cookie-echo-two-secret-123456"
+    status_200_rotated = "status-200-rotated-session-never-log"
+    status_401_poison = "status-401-poison-session-never-log"
     exfil_url = ""
     hostile_gets = 0
     bootstrap_network_gets = 0
+    bootstrap_spoof_gets = 0
     api_posts = 0
     redirect_gets = 0
     observed: list[dict] = []
@@ -86,6 +89,22 @@ class _BrowserRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlsplit(self.path).path
+        if path == "/bootstrap-body-fake-location":
+            type(self).bootstrap_spoof_gets += 1
+            if "edge_ready=1" not in self.headers.get("Cookie", ""):
+                self._send(
+                    307,
+                    b"HTTP/1.1 307 Temporary Redirect\n"
+                    b"Location: https://outside.invalid/login\n",
+                    content_type="text/plain",
+                    headers=(
+                        ("Location", "/bootstrap-body-fake-location"),
+                        ("Set-Cookie", "edge_ready=1; HttpOnly; Path=/"),
+                    ),
+                )
+                return
+            self._send(200, b"ready", content_type="text/plain")
+            return
         if path == "/hostile":
             if "__grypton_context__" in self.path:
                 type(self).bootstrap_network_gets += 1
@@ -140,6 +159,28 @@ class _BrowserRequestHandler(BaseHTTPRequestHandler):
                 200,
                 b'Set-Cookie: body-only=fake\nClear-Site-Data: "cookies"\n',
                 content_type="text/plain",
+            )
+            return
+        if path == "/http-200-body-401":
+            self._send(
+                200,
+                b"HTTP/1.1 401 Unauthorized\nbody status is untrusted\n",
+                content_type="text/plain",
+                headers=((
+                    "Set-Cookie",
+                    f"app_session={type(self).status_200_rotated}; HttpOnly; Path=/",
+                ),),
+            )
+            return
+        if path == "/http-401-body-200":
+            self._send(
+                401,
+                b"HTTP/1.1 200 OK\nbody status is untrusted\n",
+                content_type="text/plain",
+                headers=((
+                    "Set-Cookie",
+                    f"app_session={type(self).status_401_poison}; HttpOnly; Path=/",
+                ),),
             )
             return
         if path == "/http-token-rotate":
@@ -368,6 +409,24 @@ class HttpTransportCaptureTests(unittest.TestCase):
             temporary = config.RUNTIME_DIR / "http-tmp" / ws.slug
             self.assertEqual(list(temporary.iterdir()), [])
 
+    def test_bootstrap_uses_actual_location_instead_of_body_lookalike(self):
+        with isolated_runtime(), local_server(_BrowserRequestHandler) as port:
+            origin = f"http://127.0.0.1:{port}"
+            url = origin + "/bootstrap-body-fake-location"
+            ws = Workspace("bootstrap-location-capture")
+            ws.create(origin, "web")
+            ws.save_constraints(Constraints(in_scope=[origin]))
+            _BrowserRequestHandler.bootstrap_spoof_gets = 0
+
+            with tools._temporary_cookie_jar(ws) as jar:
+                result = tools._credential_bootstrap(
+                    ws, url, credential="primary", cookie_jar=jar, timeout=5
+                )
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(_BrowserRequestHandler.bootstrap_spoof_gets, 2)
+            self.assertEqual(len(result["data"]["bootstrap_flows"]), 2)
+
 
 @unittest.skipUnless(tools._browser_executable(), "Chromium is unavailable")
 class AuthenticatedBrowserRequestTests(unittest.TestCase):
@@ -375,6 +434,7 @@ class AuthenticatedBrowserRequestTests(unittest.TestCase):
         _ExfilHandler.requests = 0
         _BrowserRequestHandler.hostile_gets = 0
         _BrowserRequestHandler.bootstrap_network_gets = 0
+        _BrowserRequestHandler.bootstrap_spoof_gets = 0
         _BrowserRequestHandler.api_posts = 0
         _BrowserRequestHandler.redirect_gets = 0
         _BrowserRequestHandler.observed = []
@@ -801,6 +861,51 @@ class AuthenticatedBrowserRequestTests(unittest.TestCase):
             self.assertEqual(storage_path.read_bytes(), before)
             self.assertTrue(
                 credentials.load_browser_storage(ws.slug, "primary")["available"]
+            )
+
+    def test_actual_200_cannot_be_spoofed_by_body_401(self):
+        with isolated_runtime(), local_server(_BrowserRequestHandler) as port:
+            ws = self._workspace(port)
+            self._seed_rich_session(ws, port)
+
+            result = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/http-200-body-401",
+                "credential": "primary",
+            })
+
+            self.assertTrue(result["ok"], result)
+            self.assertIn(" 200 ", f" {result['data']['status_line']} ")
+            self.assertFalse(
+                credentials.browser_storage_path(ws.slug, "primary").exists()
+            )
+            self.assertIn(
+                _BrowserRequestHandler.status_200_rotated,
+                credentials.cookie_jar_storage_path(
+                    ws.slug, "primary"
+                ).read_text(encoding="utf-8"),
+            )
+
+    def test_actual_401_cannot_be_spoofed_by_body_200(self):
+        with isolated_runtime(), local_server(_BrowserRequestHandler) as port:
+            ws = self._workspace(port)
+            self._seed_rich_session(ws, port)
+            storage_path = credentials.browser_storage_path(ws.slug, "primary")
+            jar_path = credentials.cookie_jar_storage_path(ws.slug, "primary")
+            storage_before = storage_path.read_bytes()
+            jar_before = jar_path.read_bytes()
+
+            result = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/http-401-body-200",
+                "credential": "primary",
+            })
+
+            self.assertFalse(result["ok"], result)
+            self.assertIn(" 401 ", f" {result['data']['status_line']} ")
+            self.assertEqual(storage_path.read_bytes(), storage_before)
+            self.assertEqual(jar_path.read_bytes(), jar_before)
+            self.assertNotIn(
+                _BrowserRequestHandler.status_401_poison,
+                jar_path.read_text(encoding="utf-8"),
             )
 
     def test_special_storage_keys_round_trip_and_headers_fail_closed(self):
