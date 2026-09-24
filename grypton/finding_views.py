@@ -19,27 +19,54 @@ _TERMINAL_CONTROL_RE = re.compile(
     r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]"
 )
 _JSON_SECRET_RE = re.compile(
-    r'(?i)("(?:password|passwd|secret|token|api[_-]?key|hmac[_-]?key|authorization|cookie)"'
+    r'(?i)("(?:authorization|proxy[_-]?authorization|cookie|set[_-]?cookie|credentials?|'
+    r'password|passwd|secret|token|(?:access|auth|id|refresh|session)[_-]?token|'
+    r'api[_-]?key|client[_-]?secret|private[_-]?key|hmac[_-]?key|'
+    r'x[_-]?api[_-]?key|x[_-]?auth[_-]?token|user[_-]?name|email(?:[_-]?address)?)"'
     r'\s*:\s*")([^"\\]*(?:\\.[^"\\]*)*)(")'
 )
 _INLINE_SECRET_RE = re.compile(
-    r"(?i)(\b(?:password|passwd|secret|token|api[_-]?key|cookie)\b"
-    r"\s*[:=]\s*)([^\s,;&}\]\)]+)"
+    r"(?i)(\b(?:authorization|proxy[_-]?authorization|cookie|set[_-]?cookie|credentials?|"
+    r"password|passwd|secret|token|(?:access|auth|id|refresh|session)[_-]?token|"
+    r"api[_-]?key|client[_-]?secret|private[_-]?key|hmac[_-]?key|"
+    r"x[_-]?api[_-]?key|x[_-]?auth[_-]?token|user[_-]?name|email(?:[_-]?address)?)\b"
+    r"\s*[:=]\s*)(?!\[REDACTED\])([^\s,;&}\]\)]+)"
 )
 _AUTHORIZATION_RE = re.compile(
-    r"(?i)(\bauthorization\b\s*[:=]\s*)"
+    r"(?i)(\b(?:authorization|proxy[_-]?authorization)\b\s*[:=]\s*)"
     r"(?:[a-z][\w-]*\s+)?[^\s,;&}\]\)]+"
 )
-_BEARER_RE = re.compile(r"(?i)(\bbearer\s+)[\w.\-+/=]+")
+_AUTH_SCHEME_RE = re.compile(
+    r"(?i)(\b(?:bearer|basic)\s+)([A-Za-z0-9._~+/=-]{8,})"
+)
+_URL_CREDENTIAL_RE = re.compile(
+    r"(?i)\b((?:https?|wss?|ftp)://)[^/\s@?#]*@"
+)
 _MARKDOWN_META_RE = re.compile(r"([\\`*_{}\[\]()#+!|>])")
+
+
+def _redact_auth_scheme(match: re.Match) -> str:
+    prefix, token = match.group(1), match.group(2)
+    punctuation_or_digit = any(
+        character.isdigit() or character in "._~+/=-" for character in token
+    )
+    unpadded_basic = (
+        prefix.strip().lower() == "basic"
+        and len(token) % 4 == 0
+        and bool(re.fullmatch(r"[A-Za-z0-9+/]+", token))
+        and any(character.islower() for character in token)
+        and any(character.isupper() for character in token)
+    )
+    return prefix + "[REDACTED]" if punctuation_or_digit or unpadded_basic else match.group(0)
 
 
 def safe_display_text(value: object, limit: int = 300) -> str:
     """Return one bounded terminal-safe line with common secret forms redacted."""
     text = _TERMINAL_CONTROL_RE.sub("", str(value or ""))
     text = _JSON_SECRET_RE.sub(r"\1[REDACTED]\3", text)
+    text = _URL_CREDENTIAL_RE.sub(r"\1[REDACTED]@", text)
     text = _AUTHORIZATION_RE.sub(r"\1[REDACTED]", text)
-    text = _BEARER_RE.sub(r"\1[REDACTED]", text)
+    text = _AUTH_SCHEME_RE.sub(_redact_auth_scheme, text)
     text = _INLINE_SECRET_RE.sub(r"\1[REDACTED]", text)
     text = " ".join(text.split())
     if len(text) > limit:
@@ -75,8 +102,14 @@ def finding_case_severity(case: dict) -> str:
     return safe_display_text(astra.get("severity") or case.get("severity") or "?", 16)
 
 
-def _legacy_family(finding: dict) -> dict:
+def finding_case_verdict(finding: dict) -> dict:
+    """Return a verdict object without trusting externally edited JSONL types."""
     verdict = finding.get("manager_verdict")
+    return verdict if isinstance(verdict, dict) else {}
+
+
+def _legacy_family(finding: dict) -> dict:
+    verdict = finding_case_verdict(finding)
     astra = ({key: str(verdict[key])[:32] for key in ("verdict", "severity")
               if key in verdict} if isinstance(verdict, dict) else {})
     finding_id = str(finding.get("id") or "")[:32]
@@ -116,7 +149,7 @@ def confirmed_finding_cases(findings: Iterable[dict]) -> list[dict]:
     return [
         finding for finding in findings
         if finding.get("status") != "suppressed-by-scope"
-        and str((finding.get("manager_verdict") or {}).get("verdict") or "").lower()
+        and str(finding_case_verdict(finding).get("verdict") or "").lower()
         in decisive
     ]
 
@@ -125,7 +158,7 @@ def confirmed_p1_cases(findings: Iterable[dict]) -> list[dict]:
     return [
         finding for finding in confirmed_finding_cases(findings)
         if str(
-            (finding.get("manager_verdict") or {}).get("severity")
+            finding_case_verdict(finding).get("severity")
             or finding.get("severity") or ""
         ).upper() in {"P1", "CRITICAL"}
     ]
@@ -185,6 +218,49 @@ def bounded_family_catalog(
         omitted_cases += omitted
         remaining = max(0, remaining - len(shown))
     return list(reversed(visible_reversed)), len(catalog) - len(selected), omitted_cases
+
+
+def display_family_catalog(catalog: Iterable[dict]) -> list[dict]:
+    """Whitelist and redact the family projection returned by the web API."""
+    rendered: list[dict] = []
+    for family in catalog:
+        cases = []
+        for case in family.get("cases") or []:
+            if not isinstance(case, dict):
+                continue
+            astra = case.get("astra") if isinstance(case.get("astra"), dict) else {}
+            cases.append({
+                "id": safe_display_text(case.get("id"), 32),
+                "title": safe_display_text(case.get("title"), 300),
+                "severity": safe_display_text(case.get("severity"), 16),
+                "status": safe_display_text(case.get("status"), 64),
+                "vuln_class": safe_display_text(case.get("vuln_class"), 200),
+                "surface": safe_display_text(case.get("surface"), 300),
+                "case_kind": safe_display_text(case.get("case_kind"), 200),
+                "astra": {
+                    key: safe_display_text(astra.get(key), 32)
+                    for key in ("verdict", "severity") if astra.get(key) is not None
+                },
+            })
+
+        def count(name: str, fallback: int = 0) -> int:
+            try:
+                return max(0, int(family.get(name, fallback)))
+            except (TypeError, ValueError):
+                return max(0, fallback)
+
+        rendered.append({
+            "family_id": safe_display_text(family.get("family_id"), 32),
+            "root_cause": safe_display_text(family.get("root_cause"), 500),
+            "separate_reason": safe_display_text(family.get("separate_reason"), 500),
+            "virtual": bool(family.get("virtual")),
+            "cases": cases,
+            "case_ids": [case["id"] for case in cases],
+            "case_count": count("case_count", len(cases)),
+            "visible_case_count": len(cases),
+            "cases_omitted": count("cases_omitted"),
+        })
+    return rendered
 
 
 def terminal_family_lines(catalog: list[dict], *, limit: int) -> list[str]:

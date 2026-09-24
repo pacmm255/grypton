@@ -14,7 +14,9 @@ from .finding_views import (
     WEB_FAMILY_LIMIT,
     bounded_family_catalog,
     confirmed_finding_cases,
+    display_family_catalog,
     finding_case_rows,
+    finding_case_verdict,
     finding_family_counts,
     finding_family_view,
     safe_display_text,
@@ -66,7 +68,7 @@ def engagement_summary(slug: str) -> dict:
             "findings": len(findings), "finding_cases": family_case_count,
             "finding_families": family_count, "confirmed": len(confirmed),
             "needs_more_evidence": sum(
-                (row.get("manager_verdict") or {}).get("verdict") == "needs-more-evidence"
+                finding_case_verdict(row).get("verdict") == "needs-more-evidence"
                 for row in findings
             ),
             "validation_not_requested": sum(
@@ -114,7 +116,7 @@ def engagement_detail(slug: str) -> dict:
                       "notes": constraints.notes},
             "surface_rows": ws.surface.all()[-100:], "tested_rows": ws.tested.all()[-100:],
             "finding_rows": finding_case_rows(ws)[-100:],
-            "finding_family_rows": visible_families,
+            "finding_family_rows": display_family_catalog(visible_families),
             "finding_family_rows_omitted": omitted_families,
             "finding_case_rows_omitted": omitted_cases,
             "finding_family_integrity_errors": [

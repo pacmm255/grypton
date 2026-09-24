@@ -13,6 +13,7 @@ from .finding_views import (
     finding_case_rows,
     finding_case_astra_state,
     finding_case_severity,
+    finding_case_verdict,
     finding_family_counts,
     finding_family_view,
     markdown_cell,
@@ -62,7 +63,7 @@ def _urls(value) -> list[str]:
 
 
 def final_severity(finding: dict) -> str:
-    verdict = finding.get("manager_verdict") or {}
+    verdict = finding_case_verdict(finding)
     return str(verdict.get("severity") or finding.get("severity") or "?").upper()
 
 
@@ -148,10 +149,8 @@ def audit_workspace(ws) -> dict:
     unvalidated = []
     validation_not_requested = []
     for finding in findings:
-        verdict = finding.get("manager_verdict") or {}
-        explicitly_reviewed = (
-            isinstance(finding.get("manager_verdict"), dict) and bool(verdict)
-        )
+        verdict = finding_case_verdict(finding)
+        explicitly_reviewed = bool(verdict)
         if finding.get("status") == "suppressed-by-scope" and not explicitly_reviewed:
             continue
         automatic = (

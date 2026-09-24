@@ -27,6 +27,7 @@ from .finding_views import (
     confirmed_finding_cases,
     confirmed_p1_cases,
     finding_case_rows,
+    finding_case_verdict,
     finding_family_counts,
     finding_family_for_case,
     finding_family_view,
@@ -707,7 +708,7 @@ def _redact_program_value(value):
 def _finding_overview(row: dict | None, *, family_id: str = "") -> dict | None:
     if not isinstance(row, dict) or not row:
         return None
-    verdict = row.get("manager_verdict") or {}
+    verdict = finding_case_verdict(row)
     return {
         "id": row.get("id"),
         "title": row.get("title"),
@@ -827,7 +828,7 @@ def cmd_overview(ns) -> int:
     print(f"  model calls  Kraude={calls['worker']} Kryptex={calls['manager']} Astra={calls['validator']}")
     print(f"  scope        {', '.join(constraints.in_scope) or '—'}")
     if latest:
-        verdict = latest.get("manager_verdict") or {}
+        verdict = finding_case_verdict(latest)
         family_id = finding_family_for_case(families, latest.get("id"))
         print(f"  latest       {latest.get('id')} (family {family_id}) · "
               f"{verdict.get('severity') or latest.get('severity', '?')} · "
@@ -926,11 +927,17 @@ def cmd_findings(ns) -> int:
     if ns.json:
         print(json.dumps(rows, ensure_ascii=False, indent=2))
         return 0
-    if not rows:
-        print("No findings recorded.")
-        return 0
     families, errors = finding_family_view(ws)
     family_count, case_count = finding_family_counts(families)
+    if not case_count:
+        if errors:
+            print(
+                f"Finding family catalog integrity: {len(errors)} error(s); "
+                "no valid evidence cases can be displayed."
+            )
+            return 1
+        print("No findings recorded.")
+        return 0
     print(f"Finding families: {family_count} · evidence cases: {case_count}")
     if errors:
         print(f"Family catalog integrity: {len(errors)} error(s); showing safe singleton cases.")

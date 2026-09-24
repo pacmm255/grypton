@@ -23,6 +23,7 @@ from .finding_views import (
     confirmed_finding_cases,
     confirmed_p1_cases,
     finding_case_rows,
+    finding_case_verdict,
     finding_family_counts,
     finding_family_for_case,
     finding_family_view,
@@ -522,7 +523,7 @@ def _print_summary(engine, renderer: Renderer) -> None:
           f"· families={family_count} · cases={case_count} · confirmed-cases={len(confirmed)}")
     print(f"│ scope       {', '.join(constraints.in_scope) or '—'}")
     if latest:
-        verdict = latest.get("manager_verdict") or {}
+        verdict = finding_case_verdict(latest)
         state = verdict.get("verdict") or latest.get("status", "recorded")
         severity = verdict.get("severity") or latest.get("severity", "?")
         family_id = finding_family_for_case(families, latest.get("id"))
@@ -623,15 +624,18 @@ def _print_context(engine) -> None:
 def _print_findings(engine, limit: int) -> None:
     families, errors = finding_family_view(engine.ws)
     family_count, case_count = finding_family_counts(families)
-    if not case_count:
-        print(dim("No findings recorded."))
-        return
-    print(bold(f"Finding families: {family_count} · evidence cases: {case_count}"))
     if errors:
         print(yellow(
             f"Family catalog integrity has {len(errors)} error(s); "
             "showing safe singleton cases."
         ))
+    if not case_count:
+        print(dim(
+            "No valid finding cases can be displayed."
+            if errors else "No findings recorded."
+        ))
+        return
+    print(bold(f"Finding families: {family_count} · evidence cases: {case_count}"))
     for line in terminal_family_lines(families, limit=limit):
         print(line)
 

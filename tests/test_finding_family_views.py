@@ -328,6 +328,58 @@ class FindingFamilyViewTests(unittest.TestCase):
             self.assertEqual(payload["finding_families"], [])
             self.assertFalse(payload["audit"]["ok"])
 
+    def test_invalid_only_ledger_is_visible_in_terminal_and_chat(self):
+        with isolated_runtime():
+            ws = Workspace("invalid-only-view")
+            ws.create("https://example.test", "web")
+            ws.findings.path.write_text("{\n", encoding="utf-8")
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = cmd_findings(SimpleNamespace(
+                    target=ws.slug, json=False, limit=100,
+                ))
+            self.assertEqual(result, 1)
+            self.assertIn("integrity", output.getvalue().lower())
+            self.assertIn("no valid evidence cases", output.getvalue().lower())
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                _print_findings(SimpleNamespace(ws=ws), 20)
+            self.assertIn("integrity", output.getvalue().lower())
+            self.assertIn("no valid finding cases", output.getvalue().lower())
+
+    def test_truthy_non_object_verdict_does_not_crash_operator_views(self):
+        with isolated_runtime():
+            ws = Workspace("invalid-verdict-view")
+            ws.create("https://example.test", "web")
+            row = ws.record_finding(title="Legacy case", severity="P3")
+            rows = ws.findings.all()
+            rows[0]["manager_verdict"] = [1]
+            ws.findings.path.write_text(
+                json.dumps(rows[0]) + "\n", encoding="utf-8"
+            )
+
+            status = _status(ws.slug)
+            self.assertEqual(status["confirmed_findings"], 0)
+            self.assertEqual(status["confirmed_p1"], 0)
+            audit = audit_workspace(ws)
+            self.assertTrue(audit["ok"], audit)
+            self.assertEqual(audit["validation_not_requested"], [row["id"]])
+            summary = engagement_summary(ws.slug)
+            self.assertEqual(summary["confirmed"], 0)
+            self.assertEqual(summary["needs_more_evidence"], 0)
+            self.assertEqual(len(engagement_detail(ws.slug)["finding_family_rows"]), 1)
+
+            output = io.StringIO()
+            with redirect_stdout(output):
+                self.assertEqual(cmd_overview(SimpleNamespace(
+                    target=ws.slug, json=True, limit=10,
+                )), 0)
+            self.assertEqual(
+                json.loads(output.getvalue())["latest_finding"]["id"], row["id"]
+            )
+
     def test_family_views_are_bounded_and_terminal_markdown_safe(self):
         with isolated_runtime():
             ws = Workspace("escaped-view")
@@ -353,6 +405,14 @@ class FindingFamilyViewTests(unittest.TestCase):
                 self.assertNotIn("supersecret", rendered)
                 self.assertNotIn("abc.def", rendered)
                 self.assertIn("REDACTED", rendered)
+            web_families = json.dumps(
+                engagement_detail(ws.slug)["finding_family_rows"],
+                ensure_ascii=False,
+            )
+            for secret in ("secret-value", "supersecret", "abc.def"):
+                self.assertNotIn(secret, web_families)
+            self.assertIn("REDACTED", web_families)
+            self.assertNotIn("root_cause_key", web_families)
             self.assertIn("\\|", markdown)
             self.assertIn("\\[split\\]\\(javascript:alert\\(1\\)\\)", markdown)
             self.assertIn("&lt;tag&gt;", markdown)
@@ -372,6 +432,26 @@ class FindingFamilyViewTests(unittest.TestCase):
                 safe_display_text('{"api_key": "abc123"}'),
                 '{"api_key": "[REDACTED]"}',
             )
+            for value, secret in (
+                ("client_secret=client-value", "client-value"),
+                ("access_token=access-value", "access-value"),
+                ("refresh_token=refresh-value", "refresh-value"),
+                ("session_token=session-value", "session-value"),
+                ("private_key=private-value", "private-value"),
+                ("Basic dXNlcjpwYXNz==", "dXNlcjpwYXNz"),
+                ("Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+                ("https://user:pass@example.test/path", "user:pass"),
+            ):
+                with self.subTest(value=value):
+                    self.assertNotIn(secret, safe_display_text(value))
+                    self.assertIn("REDACTED", safe_display_text(value))
+            for prose in (
+                "Basic authentication bypass",
+                "Bearer token handling",
+                "Use basic request normalization",
+            ):
+                with self.subTest(prose=prose):
+                    self.assertEqual(safe_display_text(prose), prose)
 
             synthetic = []
             for family_number in range(3):
