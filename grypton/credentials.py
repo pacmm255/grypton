@@ -11,6 +11,7 @@ import json
 import fcntl
 import hashlib
 import ipaddress
+import math
 import os
 from pathlib import Path
 import re
@@ -44,6 +45,11 @@ _PROFILE_TRANSPORT_HEADERS = frozenset({
 _PROFILE_THREAD_LOCKS: dict[str, threading.RLock] = {}
 _PROFILE_THREAD_LOCKS_GUARD = threading.Lock()
 _PROFILE_LOCK_STATE = threading.local()
+_BROWSER_STORAGE_MAX_ITEMS = 100
+_BROWSER_STORAGE_MAX_KEY_CHARS = 512
+_BROWSER_STORAGE_MAX_VALUE_CHARS = 65_536
+_BROWSER_STORAGE_MAX_TOTAL_CHARS = 1_000_000
+_BROWSER_STORAGE_MAX_COOKIES = 200
 
 
 class CredentialError(ValueError):
@@ -194,6 +200,12 @@ def token_path(target: str, name: str) -> Path:
     return _session_dir(target) / (alias + ".tokens.json")
 
 
+def browser_storage_path(target: str, name: str) -> Path:
+    """Return the private origin-bound browser storage record path."""
+    alias = _safe_name(name, label="credential name")
+    return _session_dir(target) / (alias + ".browser-storage.json")
+
+
 def attempt_path(target: str, name: str) -> Path:
     alias = _safe_name(name, label="credential name")
     return _session_dir(target) / (alias + ".attempts.json")
@@ -227,8 +239,10 @@ def save_credential(target: str, name: str, username: str, password: str) -> str
             "username": str(username),
             "password": str(password),
         })
-        for path in (token_path(target, alias), attempt_path(target, alias),
-                     cookie_jar_storage_path(target, alias)):
+        for path in (
+            token_path(target, alias), browser_storage_path(target, alias),
+            attempt_path(target, alias), cookie_jar_storage_path(target, alias),
+        ):
             path.unlink(missing_ok=True)
     return alias
 
@@ -351,6 +365,23 @@ def provider_redaction_values(target: str) -> tuple[str, ...]:
         try:
             for token in load_tokens(target, alias).values():
                 add(token)
+        except (CredentialError, OSError):
+            pass
+        try:
+            stored = _read_private_json(
+                browser_storage_path(target, alias),
+                label="browser storage record",
+            )
+            for area in ("local_storage", "session_storage"):
+                values_in_area = stored.get(area)
+                if isinstance(values_in_area, dict):
+                    for item in values_in_area.values():
+                        add(item)
+            stored_cookies = stored.get("cookies")
+            if isinstance(stored_cookies, list):
+                for cookie in stored_cookies:
+                    if isinstance(cookie, dict):
+                        add(cookie.get("value"))
         except (CredentialError, OSError):
             pass
         try:
@@ -851,6 +882,236 @@ def load_attempt_state(target: str, name: str) -> dict:
         ),
     }
 
+
+def _canonical_web_storage(value: object, *, label: str) -> dict[str, str]:
+    if not isinstance(value, dict) or len(value) > _BROWSER_STORAGE_MAX_ITEMS:
+        raise CredentialError(
+            f"{label} must contain at most {_BROWSER_STORAGE_MAX_ITEMS} entries"
+        )
+    output: dict[str, str] = {}
+    total = 0
+    for raw_key, raw_value in value.items():
+        if not isinstance(raw_key, str) or not isinstance(raw_value, str):
+            raise CredentialError(f"{label} keys and values must be strings")
+        if len(raw_key) > _BROWSER_STORAGE_MAX_KEY_CHARS:
+            raise CredentialError(f"{label} contains an invalid key")
+        if len(raw_value) > _BROWSER_STORAGE_MAX_VALUE_CHARS:
+            raise CredentialError(f"{label} contains an oversized value")
+        total += len(raw_key) + len(raw_value)
+        if total > _BROWSER_STORAGE_MAX_TOTAL_CHARS:
+            raise CredentialError(f"{label} exceeds the private size limit")
+        output[raw_key] = raw_value
+    return output
+
+
+def _canonical_browser_cookies(value: object, *, origin: str) -> list[dict]:
+    if not isinstance(value, list) or len(value) > _BROWSER_STORAGE_MAX_COOKIES:
+        raise CredentialError(
+            f"browser cookies must contain at most {_BROWSER_STORAGE_MAX_COOKIES} entries"
+        )
+    host = (urlsplit(origin).hostname or "").lower().rstrip(".")
+    output: list[dict] = []
+    for raw in value:
+        if not isinstance(raw, dict):
+            raise CredentialError("browser cookie entries must be objects")
+        name = raw.get("name")
+        cookie_value = raw.get("value")
+        domain = str(raw.get("domain") or "").lower().rstrip(".")
+        path = raw.get("path", "/")
+        if (
+            not isinstance(name, str) or not name or len(name) > 512
+            or not isinstance(cookie_value, str) or len(cookie_value) > 8192
+            or not isinstance(path, str) or not path.startswith("/") or len(path) > 4096
+            or any("\t" in item or "\r" in item or "\n" in item
+                   for item in (name, cookie_value, domain, path))
+        ):
+            raise CredentialError("browser cookie entry is invalid")
+        plain_domain = domain.lstrip(".")
+        if not plain_domain or not (
+            host == plain_domain
+            or (domain.startswith(".") and host.endswith("." + plain_domain))
+        ):
+            raise CredentialError("browser cookie is outside the proven session host")
+        expires = raw.get("expires", -1)
+        if (
+            isinstance(expires, bool)
+            or not isinstance(expires, (int, float))
+            or not math.isfinite(float(expires))
+            or float(expires) < -1
+        ):
+            raise CredentialError("browser cookie expiry is invalid")
+        if not isinstance(raw.get("httpOnly"), bool):
+            raise CredentialError("browser cookie HttpOnly value is invalid")
+        if not isinstance(raw.get("secure"), bool):
+            raise CredentialError("browser cookie Secure value is invalid")
+        same_site = raw.get("sameSite")
+        if same_site not in {"Strict", "Lax", "None"}:
+            raise CredentialError("browser cookie SameSite value is invalid")
+        canonical = {
+            "name": name,
+            "value": cookie_value,
+            "domain": domain,
+            "path": path,
+            "expires": float(expires),
+            "httpOnly": bool(raw.get("httpOnly")),
+            "secure": bool(raw.get("secure")),
+            "sameSite": same_site,
+        }
+        if "partitionKey" in raw:
+            partition_key = raw.get("partitionKey")
+            if (
+                not isinstance(partition_key, str)
+                or not partition_key
+                or len(partition_key) > 2048
+                or any(ord(char) < 0x20 or ord(char) == 0x7f
+                       for char in partition_key)
+            ):
+                raise CredentialError("browser cookie partition key is invalid")
+            canonical["partitionKey"] = partition_key
+        output.append(canonical)
+    return output
+
+
+def canonical_browser_storage(*, origin: str, cookies: object,
+                              local_storage: object,
+                              session_storage: object) -> dict[str, object]:
+    """Validate a complete rich browser state before a proof-state mutation."""
+    bound_origin = normalize_origin(origin)
+    browser_cookies = _canonical_browser_cookies(cookies, origin=bound_origin)
+    local = _canonical_web_storage(local_storage, label="localStorage")
+    session = _canonical_web_storage(session_storage, label="sessionStorage")
+    canonical = {
+        "origin": bound_origin,
+        "cookies": browser_cookies,
+        "local_storage": local,
+        "session_storage": session,
+    }
+    if len(json.dumps(
+        canonical, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")) > _BROWSER_STORAGE_MAX_TOTAL_CHARS:
+        raise CredentialError("browser storage exceeds the private size limit")
+    return canonical
+
+
+def cookie_jar_digest(path: Path) -> str:
+    """Return a stable digest of the semantic cookie-jar contents."""
+    rows: list[tuple[str, ...]] = []
+    for record in _cookie_records(path):
+        columns = record.get("columns")
+        if not isinstance(columns, tuple):
+            continue
+        rows.append(("1" if record.get("http_only") else "0", *columns))
+    payload = json.dumps(
+        sorted(rows), ensure_ascii=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def save_browser_storage(target: str, name: str, *, origin: str,
+                         cookies: object,
+                         local_storage: object,
+                         session_storage: object) -> None:
+    """Persist exact browser storage for the currently proven session generation."""
+    alias = _safe_name(name, label="credential name")
+    canonical = canonical_browser_storage(
+        origin=origin, cookies=cookies, local_storage=local_storage,
+        session_storage=session_storage,
+    )
+    bound_origin = str(canonical["origin"])
+    with session_material_lock(target, alias):
+        state = load_attempt_state(target, alias)
+        if not state["established"] or state["origin"] != bound_origin:
+            raise CredentialError(
+                "browser storage requires the current proven session origin"
+            )
+        record = {
+            "version": 1,
+            "origin": bound_origin,
+            "proof_generation": int(state["proof_generation"]),
+            "profile_revision": str(state["proof_profile_revision"] or ""),
+            # The curl jar and rich browser state represent one proof.  Binding
+            # them prevents either transport from silently reviving stale
+            # cookies after the other transport rotates or deletes them.
+            "cookie_jar_digest": cookie_jar_digest(
+                cookie_jar_storage_path(target, alias)
+            ),
+            "cookies": canonical["cookies"],
+            "local_storage": canonical["local_storage"],
+            "session_storage": canonical["session_storage"],
+        }
+        if len(json.dumps(
+            record, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")) > _BROWSER_STORAGE_MAX_TOTAL_CHARS:
+            raise CredentialError("browser storage exceeds the private size limit")
+        _atomic_private_json(browser_storage_path(target, alias), record)
+
+
+def load_browser_storage(target: str, name: str) -> dict[str, object]:
+    """Load browser storage only when it matches the active proof generation."""
+    alias = _safe_name(name, label="credential name")
+    empty = {
+        "available": False,
+        "cookies": [],
+        "local_storage": {},
+        "session_storage": {},
+    }
+    with session_material_lock(target, alias):
+        path = browser_storage_path(target, alias)
+        if not path.exists() and not path.is_symlink():
+            return empty
+        value = _read_private_json(path, label="browser storage record")
+        if value.get("version") != 1:
+            raise CredentialError("browser storage record has an unsupported version")
+        try:
+            origin = normalize_origin(value.get("origin"))
+        except CredentialError as exc:
+            raise CredentialError("browser storage record has an invalid origin") from exc
+        generation = value.get("proof_generation")
+        if isinstance(generation, bool) or not isinstance(generation, int):
+            raise CredentialError("browser storage record has an invalid proof generation")
+        revision = value.get("profile_revision")
+        if not isinstance(revision, str) or (
+            revision and not re.fullmatch(r"[0-9a-f]{12}", revision)
+        ):
+            raise CredentialError("browser storage record has an invalid profile revision")
+        jar_digest = value.get("cookie_jar_digest")
+        if not isinstance(jar_digest, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", jar_digest
+        ):
+            # A rich-state record without a jar binding predates the fidelity
+            # contract.  Treat it as unavailable rather than guessing how its
+            # cookies relate to the currently proven curl session.
+            return empty
+        local = _canonical_web_storage(
+            value.get("local_storage"), label="localStorage"
+        )
+        session = _canonical_web_storage(
+            value.get("session_storage"), label="sessionStorage"
+        )
+        browser_cookies = _canonical_browser_cookies(
+            value.get("cookies"), origin=origin
+        )
+        state = load_attempt_state(target, alias)
+        if (
+            not state["established"]
+            or origin != state["origin"]
+            or generation != state["proof_generation"]
+            or revision != str(state["proof_profile_revision"] or "")
+            or jar_digest != cookie_jar_digest(
+                cookie_jar_storage_path(target, alias)
+            )
+        ):
+            return empty
+        return {
+            "available": True,
+            "origin": origin,
+            "proof_generation": generation,
+            "profile_revision": revision,
+            "cookies": browser_cookies,
+            "local_storage": local,
+            "session_storage": session,
+        }
+
 def _assert_login_attempt_available(state: dict) -> None:
     if state["established"]:
         raise CredentialError(
@@ -964,16 +1225,18 @@ def record_session_revalidated(target: str, name: str, *, generation: int,
                 raise CredentialError("authenticated session origin changed during revalidation")
             # A stale generation that later proves valid has earned a new proof
             # generation.  This is the only way, short of a successful renewal,
-            # to reopen its one-submission renewal allowance.
+            # to reopen its one-submission renewal allowance.  Revalidating an
+            # already-established generation must retain any consumed upgrade
+            # reservation for that same generation.
             if not state["established"]:
                 state["proof_generation"] += 1
+                state["refresh_attempted_generation"] = 0
             state["established"] = True
             state["ever_established"] = True
             state["origin"] = normalized_origin
             state["blocked_reason"] = ""
             state["verified_at"] = time.time()
             state["proof_profile_revision"] = str(profile_revision)
-            state["refresh_attempted_generation"] = 0
             state["refresh_blocked_reason"] = ""
             _atomic_private_json(attempt_path(target, name), {"version": 2, **state})
 
@@ -999,6 +1262,71 @@ def begin_refresh_attempt(target: str, name: str, *, generation: int) -> int:
             state["refresh_blocked_reason"] = ""
             _atomic_private_json(attempt_path(target, name), {"version": 2, **state})
             return state["refresh_submissions"]
+
+
+def begin_browser_state_upgrade(target: str, name: str, *, generation: int) -> int:
+    """Reserve one explicit rich-state upgrade for an established proof."""
+    with session_material_lock(target, name):
+        lock_path = attempt_path(target, name).with_suffix(".lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "r+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            state = load_attempt_state(target, name)
+            if (
+                not state["ever_established"]
+                or not state["established"]
+                or state["proof_generation"] != generation
+            ):
+                raise CredentialError("browser-state upgrade requires the established proof")
+            if load_browser_storage(target, name).get("available"):
+                raise CredentialError("exact private browser state is already available")
+            if state["refresh_attempted_generation"] == generation:
+                raise CredentialError(
+                    "credential submission was already attempted for this session proof"
+                )
+            state["refresh_attempted_generation"] = generation
+            state["refresh_submissions"] += 1
+            state["refresh_blocked_reason"] = ""
+            _atomic_private_json(attempt_path(target, name), {"version": 2, **state})
+            return state["refresh_submissions"]
+
+
+def record_browser_state_upgrade_outcome(
+    target: str, name: str, *, generation: int, established: bool = False,
+    blocked_reason: str = "", origin: str | None = None,
+    profile_revision: str = "",
+) -> None:
+    """Finish an explicit upgrade while retaining a prior proven session on failure."""
+    with session_material_lock(target, name):
+        lock_path = attempt_path(target, name).with_suffix(".lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "r+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            state = load_attempt_state(target, name)
+            if (
+                not state["ever_established"]
+                or not state["established"]
+                or state["proof_generation"] != generation
+                or state["refresh_attempted_generation"] != generation
+            ):
+                raise CredentialError("browser-state upgrade proof changed during submission")
+            state["blocked_reason"] = ""
+            state["refresh_blocked_reason"] = str(blocked_reason or "")
+            if established:
+                if origin is None:
+                    raise CredentialError("browser-state upgrade requires an origin binding")
+                if not re.fullmatch(r"[0-9a-f]{12}", str(profile_revision or "")):
+                    raise CredentialError("authentication profile revision is invalid")
+                normalized_origin = normalize_origin(origin)
+                if state["origin"] and state["origin"] != normalized_origin:
+                    raise CredentialError("browser-state upgrade changed the session origin")
+                state["origin"] = normalized_origin
+                state["proof_generation"] += 1
+                state["verified_at"] = time.time()
+                state["proof_profile_revision"] = str(profile_revision)
+                state["refresh_attempted_generation"] = 0
+                state["refresh_blocked_reason"] = ""
+            _atomic_private_json(attempt_path(target, name), {"version": 2, **state})
 
 
 def record_refresh_outcome(target: str, name: str, *, generation: int,
@@ -1035,25 +1363,35 @@ def record_refresh_outcome(target: str, name: str, *, generation: int,
             _atomic_private_json(attempt_path(target, name), {"version": 2, **state})
 
 
-def _cookie_rows(path: Path) -> list[tuple[str, ...]]:
-    """Read valid Netscape cookie rows, including the curl HttpOnly extension."""
+def _cookie_records(path: Path) -> list[dict[str, object]]:
+    """Read Netscape cookie rows while preserving curl's HttpOnly extension."""
     if not path.is_file() or path.is_symlink():
         return []
-    rows: list[tuple[str, ...]] = []
+    records: list[dict[str, object]] = []
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return []
     for raw in lines:
         line = raw.strip()
+        http_only = False
         if line.startswith("#HttpOnly_"):
             line = line[len("#HttpOnly_"):]
+            http_only = True
         elif not line or line.startswith("#"):
             continue
         columns = tuple(line.split(chr(9)))
         if len(columns) >= 7 and columns[5]:
-            rows.append(columns)
-    return rows
+            records.append({"columns": columns, "http_only": http_only})
+    return records
+
+
+def _cookie_rows(path: Path) -> list[tuple[str, ...]]:
+    """Read valid Netscape cookie rows, including the curl HttpOnly extension."""
+    return [
+        record["columns"] for record in _cookie_records(path)
+        if isinstance(record.get("columns"), tuple)
+    ]
 
 
 def cookie_jar_fingerprints(path: Path) -> set[str]:
@@ -1106,6 +1444,12 @@ def session_status(target: str, name: str) -> dict[str, object]:
         # Status is deliberately metadata-only. A corrupt private profile is
         # visible as a state fact without reflecting any of its content.
         profile_status = {"configured": True, "valid": False}
+    try:
+        has_browser_storage = bool(
+            load_browser_storage(target, alias).get("available")
+        )
+    except CredentialError:
+        has_browser_storage = False
     return {
         "name": alias,
         "username_kind": username_kind,
@@ -1113,6 +1457,7 @@ def session_status(target: str, name: str) -> dict[str, object]:
         "has_cookies": has_cookies,
         "has_auth_cookies": has_auth_cookies,
         "has_bearer_token": bool(select_bearer(load_tokens(target, alias))),
+        "has_browser_storage": has_browser_storage,
         "attempts": attempt["attempts"],
         "exhausted": state == "exhausted",
         "established": attempt["established"],

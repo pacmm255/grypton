@@ -1011,7 +1011,10 @@ class BrowserCredentialTests(unittest.TestCase):
                 ("example.test", "TRUE", "/", "TRUE", "0", "domain_cookie", "domain-cookie-value"),
                 ("app.example.test", "FALSE", "/", "TRUE", "0", "exact_cookie", "exact-cookie-value"),
             ]
-            with patch("grypton.credentials._cookie_rows", return_value=rows):
+            records = [
+                {"columns": row, "http_only": False} for row in rows
+            ]
+            with patch("grypton.credentials._cookie_records", return_value=records):
                 loaded = _browser_auth_persisted_cookies(
                     ws, "primary", "https://app.example.test/login"
                 )

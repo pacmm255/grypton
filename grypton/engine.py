@@ -1247,12 +1247,20 @@ class Engine:
         network_tools = {
             "http_request", "goja_request", "flow_replay", "httpx_probe",
             "browse", "dns_lookup", "tls_certificate", "port_scan",
-            "subdomain_enum",
+            "subdomain_enum", "credential_login", "credential_browser_login",
+            "authenticated_http_request", "authenticated_browser_request",
+            "artifact_download", "tcp_exchange", "research",
         }
         if name not in network_tools:
             return ""
         args = tool_use.get("input") if isinstance(tool_use.get("input"), dict) else {}
-        method = str(args.get("method") or ("GET" if name == "browse" else name)).upper()
+        request_tools = {
+            "http_request", "goja_request", "flow_replay", "browse",
+            "authenticated_http_request", "authenticated_browser_request",
+        }
+        method = str(
+            args.get("method") or ("GET" if name in request_tools else name)
+        ).upper()
         raw_url = str(args.get("url") or "")
         if raw_url:
             split = urlsplit(raw_url if "://" in raw_url else "//" + raw_url)

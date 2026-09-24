@@ -6,6 +6,7 @@ import codecs
 from contextlib import contextmanager
 import fcntl
 import hashlib
+from html.parser import HTMLParser
 import http.client
 import ipaddress
 import json
@@ -23,7 +24,8 @@ import sys
 import tempfile
 import time
 from typing import Iterable, Optional
-from urllib.parse import quote, quote_plus, unquote, urlencode, urljoin, urlsplit
+from urllib.parse import (parse_qsl, quote, quote_plus, unquote, urlencode,
+                          urljoin, urlsplit, urlunsplit)
 import zipfile
 
 from . import config, credentials
@@ -49,11 +51,19 @@ _SENSITIVE_HEADER_RE = re.compile(
 )
 _SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"""(?ix)
-    ((?:["']?(?:password|passwd|secret|access[_-]?token|refresh[_-]?token|
-       id[_-]?token|auth[_-]?token|session[_-]?token|api[_-]?key)["']?)
+    ((?:["']?(?:authorization|proxy[_-]?authorization|cookie|set[_-]?cookie|
+       credentials?|password|passwd|secret|token|access[_-]?token|refresh[_-]?token|
+       id[_-]?token|auth[_-]?token|session[_-]?token|api[_-]?key|client[_-]?secret|
+       private[_-]?key|x[_-]?api[_-]?key|x[_-]?auth[_-]?token|
+       x[_-]?(?:csrf|xsrf)[_-]?token)["']?)
        \s*[:=]\s*)
     (?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^&\s,;}\]]+)
     """
+)
+_AUTH_SCHEME_RE = re.compile(
+    r"(?i)(\b(?:bearer|basic)\s+)"
+    r"(?=[A-Za-z0-9._~+/=-]{8,})(?=[A-Za-z0-9._~+/=-]*[0-9._~+/=-])"
+    r"[A-Za-z0-9._~+/=-]+"
 )
 
 _BROWSER_IDENTITY_KEYS = frozenset({
@@ -86,6 +96,7 @@ def redact_sensitive_text(value: object, secret_values: Iterable[str] = ()) -> s
                          key=len, reverse=True):
         text = text.replace(secret, "[REDACTED]")
     text = _SENSITIVE_HEADER_RE.sub(r"\1[REDACTED]", text)
+    text = _AUTH_SCHEME_RE.sub(r"\1[REDACTED]", text)
     return _SENSITIVE_ASSIGNMENT_RE.sub(r"\1[REDACTED]", text)
 
 
@@ -610,6 +621,227 @@ def _browser_auth_verify_headers(headers: Optional[dict]) -> dict[str, str]:
             "destination, or hop-by-hop headers: " + ", ".join(rejected)
         )
     return output
+
+
+def _browser_request_headers(headers: Optional[dict]) -> dict[str, str]:
+    """Validate caller headers that are applied only to one browser fetch."""
+    if headers is None:
+        return {}
+    if not isinstance(headers, dict) or len(headers) > 32:
+        raise ValueError("Browser request headers must be an object with at most 32 entries.")
+    forbidden = _SENSITIVE_HEADERS | {
+        "connection", "content-length", "host", "origin", "proxy-connection",
+        "referer", "te", "trailer", "transfer-encoding", "upgrade",
+    }
+    output: dict[str, str] = {}
+    normalized_names: set[str] = set()
+    for raw_key, raw_value in headers.items():
+        if not isinstance(raw_key, str) or not isinstance(raw_value, str):
+            raise ValueError("Browser request header names and values must be strings.")
+        key = raw_key.strip()
+        if (
+            not key or len(key) > 128
+            or not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", key)
+        ):
+            raise ValueError("Browser request contains an invalid header name.")
+        normalized = key.lower()
+        if normalized in normalized_names:
+            raise ValueError("Browser request headers contain a case-insensitive duplicate.")
+        if normalized in forbidden or normalized.startswith(
+            ("proxy-", "sec-", "x-grypton-")
+        ):
+            raise ValueError(
+                f"Browser request header {key!r} cannot set session, routing, or "
+                "hop-by-hop state."
+            )
+        if (
+            len(raw_value) > 8192 or "\r" in raw_value or "\n" in raw_value
+            or any(ord(char) < 0x20 and char != "\t" for char in raw_value)
+            or "\x7f" in raw_value
+        ):
+            raise ValueError(f"Browser request header {key!r} has an invalid value.")
+        normalized_names.add(normalized)
+        output[key] = raw_value
+    return output
+
+
+def _browser_request_header_sources(value: Optional[dict],
+                                    caller_headers: dict) -> list[dict]:
+    """Validate declarative browser-state lookups without accepting script."""
+    if value is None:
+        return []
+    if not isinstance(value, dict) or len(value) > 16:
+        raise ValueError("Browser header sources must be an object with at most 16 entries.")
+    forbidden = {
+        "connection", "content-length", "cookie", "host", "origin",
+        "proxy-authorization", "proxy-connection", "referer", "te", "trailer",
+        "transfer-encoding", "upgrade",
+    }
+    seen = {key.lower() for key in caller_headers}
+    output: list[dict] = []
+    for raw_header, raw_source in value.items():
+        if not isinstance(raw_header, str) or not re.fullmatch(
+            r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}", raw_header
+        ):
+            raise ValueError("Browser header sources contain an invalid header name.")
+        normalized = raw_header.lower()
+        if normalized in seen:
+            raise ValueError("Browser request headers contain a case-insensitive duplicate.")
+        if normalized in forbidden or normalized.startswith(
+            ("proxy-", "sec-", "x-grypton-")
+        ):
+            raise ValueError(
+                f"Derived browser header {raw_header!r} cannot alter cookie, routing, "
+                "or hop-by-hop state."
+            )
+        if not isinstance(raw_source, dict) or set(raw_source) - {
+            "source", "name", "prefix", "url_decode",
+        }:
+            raise ValueError("Each browser header source must be a bounded lookup object.")
+        source = raw_source.get("source")
+        name = raw_source.get("name")
+        prefix = raw_source.get("prefix", "")
+        url_decode = raw_source.get("url_decode", False)
+        if source not in {"localStorage", "sessionStorage", "cookie", "meta"}:
+            raise ValueError("Browser header source type is invalid.")
+        if not isinstance(name, str) or len(name) > 512:
+            raise ValueError("Browser header source names must be strings up to 512 characters.")
+        if source in {"cookie", "meta"} and (
+            not name or any(ord(char) < 0x20 or ord(char) == 0x7f for char in name)
+        ):
+            raise ValueError("Cookie and meta header source names must be printable.")
+        if (
+            not isinstance(prefix, str) or len(prefix) > 128
+            or "\r" in prefix or "\n" in prefix
+            or any(ord(char) < 0x20 and char != "\t" for char in prefix)
+            or "\x7f" in prefix
+        ):
+            raise ValueError("Browser header source prefix is invalid.")
+        if not isinstance(url_decode, bool):
+            raise ValueError("Browser header source url_decode must be a boolean.")
+        seen.add(normalized)
+        output.append({
+            "header": raw_header, "source": source, "name": name,
+            "prefix": prefix, "url_decode": url_decode,
+        })
+    return output
+
+
+def _browser_private_response_values(body: str, headers: dict) -> tuple[str, ...]:
+    """Find response-side token/CSRF values before any observable artifact is written."""
+    values: set[str] = set()
+    sensitive_names = {
+        "token", "tokens", "accesstoken", "refreshtoken", "idtoken",
+        "authtoken", "bearertoken", "bearer", "jwt", "secret", "secrets",
+        "csrf", "csrftoken", "xsrf", "xsrftoken", "session", "sessionid",
+        "sessiontoken", "authorization", "authorizationcode", "cookie",
+        "cookies", "setcookie", "apikey", "credential", "credentials", "password",
+        "passwd", "oauth", "oauthcode", "code",
+    }
+
+    def key_is_sensitive(key: object) -> bool:
+        normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+        return (
+            normalized in sensitive_names
+            or normalized.endswith(("token", "secret", "password", "credential"))
+        )
+
+    def remember(value: object) -> None:
+        if isinstance(value, str) and value:
+            values.add(value)
+
+    class PrivateHTMLValues(HTMLParser):
+        def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+            if tag.lower() not in {"input", "meta"}:
+                return
+            row = {
+                str(key).lower(): str(value)
+                for key, value in attrs[:64] if value is not None
+            }
+            if tag.lower() == "input" and key_is_sensitive(row.get("name", "")):
+                remember(row.get("value", ""))
+            elif tag.lower() == "meta" and key_is_sensitive(
+                row.get("name") or row.get("property") or row.get("http-equiv") or ""
+            ):
+                remember(row.get("content", ""))
+
+    for key, value in headers.items():
+        if key_is_sensitive(key):
+            remember(value)
+        if isinstance(value, str):
+            try:
+                parsed_header_url = urlsplit(value)
+            except ValueError:
+                parsed_header_url = None
+            if parsed_header_url is not None:
+                for query_key, query_value in parse_qsl(
+                    parsed_header_url.query, keep_blank_values=True
+                ):
+                    if key_is_sensitive(query_key):
+                        remember(query_value)
+                for fragment_key, fragment_value in parse_qsl(
+                    parsed_header_url.fragment, keep_blank_values=True
+                ):
+                    if key_is_sensitive(fragment_key):
+                        remember(fragment_value)
+    try:
+        parsed = json.loads(body)
+    except (TypeError, ValueError):
+        parsed = None
+
+    def walk(item, depth: int = 0, inherited_sensitive: bool = False) -> None:
+        if depth > 8:
+            return
+        if isinstance(item, dict):
+            for key, child in list(item.items())[:200]:
+                child_sensitive = inherited_sensitive or key_is_sensitive(key)
+                if child_sensitive and isinstance(child, (str, int, float)):
+                    remember(str(child))
+                elif isinstance(child, (dict, list)):
+                    walk(child, depth + 1, child_sensitive)
+        elif isinstance(item, list):
+            for child in item[:200]:
+                if inherited_sensitive and isinstance(child, (str, int, float)):
+                    remember(str(child))
+                else:
+                    walk(child, depth + 1, inherited_sensitive)
+
+    walk(parsed)
+    # Browser responses commonly return form/query bodies or put one-use values
+    # in inert HTML.  Extract those values before any response or flow is made
+    # observable; the input is already bounded by MAX_RESPONSE_BYTES.
+    try:
+        for form_key, form_value in parse_qsl(body, keep_blank_values=True):
+            if key_is_sensitive(form_key):
+                remember(form_value)
+            for match in re.finditer(
+                r"(?i)\b(?:bearer|basic)\s+([A-Za-z0-9._~+/=-]{8,})",
+                form_value,
+            ):
+                remember(match.group(1))
+    except (TypeError, ValueError):
+        pass
+    assignment = re.compile(
+        r'''(?ix)(?<![A-Za-z0-9_])
+        (["']?[A-Za-z][A-Za-z0-9_.-]{0,127}["']?)\s*[:=]\s*
+        ("(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^&\s,;}\]<>]+)'''
+    )
+    for match in assignment.finditer(body):
+        if not key_is_sensitive(match.group(1).strip("\"'")):
+            continue
+        raw = match.group(2)
+        remember(raw[1:-1] if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in "\"'" else raw)
+    for match in re.finditer(
+        r"(?i)\b(?:bearer|basic)\s+([A-Za-z0-9._~+/=-]{8,})", body
+    ):
+        remember(match.group(1))
+    try:
+        parser = PrivateHTMLValues(convert_charrefs=True)
+        parser.feed(body)
+        parser.close()
+    except (TypeError, ValueError):
+        pass
+    return tuple(values)
 
 
 def _extract_auth_tokens(response: str) -> dict[str, str]:
@@ -1456,8 +1688,13 @@ def authenticated_http_request(workspace: Workspace, url: str, *, credential: st
                     workspace.slug, credential
                 )
                 token_file = credentials.token_path(workspace.slug, credential)
+                storage_file = credentials.browser_storage_path(
+                    workspace.slug, credential
+                )
                 cookie_snapshot = _snapshot_private_material(jar_storage)
                 token_snapshot = _snapshot_private_material(token_file)
+                storage_snapshot = _snapshot_private_material(storage_file)
+                cookie_digest_before = credentials.cookie_jar_digest(jar_storage)
                 commit_material = False
                 material_restored = False
                 try:
@@ -1479,14 +1716,34 @@ def authenticated_http_request(workspace: Workspace, url: str, *, credential: st
                     )
                     status = _http_result_status(result)
                     blocker = str(data.get("auth_blocker") or "") if data else ""
-                    commit_material = bool(
+                    candidate_commit = bool(
                         result.get("ok")
                         and not blocker
                         and (200 <= status < 400 or status in accepted_statuses)
                     )
-                    if not commit_material:
+                    if candidate_commit:
+                        try:
+                            if (
+                                credentials.cookie_jar_digest(jar_storage)
+                                != cookie_digest_before
+                            ):
+                                # curl cannot preserve the richer HttpOnly,
+                                # SameSite and partition metadata.  A committed
+                                # cookie mutation therefore invalidates the
+                                # browser artifact instead of leaving stale
+                                # same-generation cookies available.
+                                storage_file.unlink(missing_ok=True)
+                            commit_material = True
+                        except Exception:
+                            _restore_private_material(jar_storage, cookie_snapshot)
+                            _restore_private_material(token_file, token_snapshot)
+                            _restore_private_material(storage_file, storage_snapshot)
+                            material_restored = True
+                            raise
+                    else:
                         _restore_private_material(jar_storage, cookie_snapshot)
                         _restore_private_material(token_file, token_snapshot)
+                        _restore_private_material(storage_file, storage_snapshot)
                         material_restored = True
 
                     if data is not None:
@@ -1538,6 +1795,7 @@ def authenticated_http_request(workspace: Workspace, url: str, *, credential: st
                     if not commit_material and not material_restored:
                         _restore_private_material(jar_storage, cookie_snapshot)
                         _restore_private_material(token_file, token_snapshot)
+                        _restore_private_material(storage_file, storage_snapshot)
     except (OSError, credentials.CredentialError) as exc:
         return _err(str(exc))
     except Exception:
@@ -2310,8 +2568,14 @@ def _launch_scoped_browser_context(playwright, launch_profile: dict,
                                    bound_header_origin: str = "",
                                    bound_headers: Optional[dict] = None,
                                    bound_header_state: Optional[dict] = None,
-                                   credential_submission_state: Optional[dict] = None):
+                                   credential_submission_state: Optional[dict] = None,
+                                   exact_origin: str = "",
+                                   network_state: Optional[dict] = None,
+                                   launch_timeout_ms: Optional[int] = None):
     """Launch the shared browser boundary and scope-check every network route."""
+    launch_options = {}
+    if launch_timeout_ms is not None:
+        launch_options["timeout"] = max(1, int(launch_timeout_ms))
     context = playwright.chromium.launch_persistent_context(
         user_data_dir=launch_profile["profile"],
         headless=True,
@@ -2323,7 +2587,10 @@ def _launch_scoped_browser_context(playwright, launch_profile: dict,
         service_workers="block",
         args=["--disable-gpu", "--disable-software-rasterizer",
               "--disable-gpu-compositing", "--disable-dev-shm-usage",
-              "--disable-background-networking"],
+              "--disable-background-networking", "--disable-webrtc-multiple-routes",
+              "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+              "--disable-features=WebTransport"],
+        **launch_options,
     )
     if hasattr(context, "route_web_socket"):
         # Browser WebSockets do not carry an HTTP path that Grypton's request
@@ -2336,7 +2603,23 @@ def _launch_scoped_browser_context(playwright, launch_profile: dict,
         if scheme in {"about", "blob", "data"}:
             route.continue_()
             return
+        if network_state is not None:
+            network_state["count"] = int(network_state.get("count") or 0) + 1
+            limit = max(1, min(int(network_state.get("limit") or 100), 100))
+            if network_state["count"] > limit:
+                network_state["blocked"] = int(
+                    network_state.get("blocked") or 0
+                ) + 1
+                if len(denied_requests) < 100:
+                    denied_requests.append(request_url)
+                route.abort("blockedbyclient")
+                return
         allowed, _ = check_url_scope(workspace, request_url)
+        if allowed and exact_origin:
+            try:
+                allowed = credentials.normalize_origin(request_url) == exact_origin
+            except credentials.CredentialError:
+                allowed = False
         if allowed:
             if (
                 credential_submission_state
@@ -2389,6 +2672,10 @@ def _launch_scoped_browser_context(playwright, launch_profile: dict,
             else:
                 route.continue_(headers=request_headers)
         else:
+            if network_state is not None:
+                network_state["blocked"] = int(
+                    network_state.get("blocked") or 0
+                ) + 1
             if len(denied_requests) < 100:
                 denied_requests.append(request_url)
             route.abort("blockedbyclient")
@@ -2847,7 +3134,7 @@ def _browser_auth_persistable_cookies(cookies: list[dict], login_url: str) -> li
         path = str(cookie.get("path") or "/")
         name = str(cookie.get("name") or "")
         value = str(cookie.get("value") or "")
-        if (not name or not 8 <= len(value) <= 8192
+        if (not name or len(value) > 8192
                 or any("\t" in item or "\r" in item or "\n" in item
                            for item in (domain, path, name, value))):
             continue
@@ -2877,42 +3164,99 @@ def _browser_auth_has_cookie_delta(before: list[dict], after: list[dict]) -> boo
     return False
 
 
-def _browser_auth_local_storage(page) -> dict:
+class _BrowserStorageCaptureError(ValueError):
+    """Raised when browser storage cannot be represented exactly and safely."""
+
+
+def _browser_auth_storage(page, area: str) -> dict:
+    if area not in {"localStorage", "sessionStorage"}:
+        raise _BrowserStorageCaptureError("browser storage area is invalid")
     try:
         value = page.evaluate(
-            """() => {
+            """area => {
+              const storage = area === 'localStorage' ? localStorage : sessionStorage;
+              if (storage.length > 100) return {valid: false};
               const output = {}; let total = 0;
-              const count = Math.min(localStorage.length, 100);
-              for (let i = 0; i < count && total < 1000000; i++) {
-                const rawKey = localStorage.key(i);
-                if (rawKey === null) continue;
-                const key = rawKey.slice(0, 512);
-                const rawValue = localStorage.getItem(rawKey) || '';
-                const remaining = Math.max(0, 1000000 - total - key.length);
-                const value = rawValue.slice(0, Math.min(65536, remaining));
-                output[key] = value; total += key.length + value.length;
+              for (let i = 0; i < storage.length; i++) {
+                const key = storage.key(i);
+                if (key === null) continue;
+                const item = storage.getItem(key) ?? '';
+                if (key.length > 512 || item.length > 65536) return {valid: false};
+                total += key.length + item.length;
+                if (total > 1000000) return {valid: false};
+                output[key] = item;
               }
-              return output;
-            }"""
+              return {valid: true, values: output};
+            }""",
+            area,
         )
-    except Exception:
-        return {}
-    return value if isinstance(value, dict) else {}
+    except Exception as exc:
+        raise _BrowserStorageCaptureError(
+            "exact browser storage capture failed"
+        ) from exc
+    if (
+        not isinstance(value, dict)
+        or value.get("valid") is not True
+        or not isinstance(value.get("values"), dict)
+    ):
+        raise _BrowserStorageCaptureError(
+            "browser storage exceeds the exact private capture limits"
+        )
+    return value["values"]
 
 
-def _browser_auth_tokens(response_bodies: Iterable[str], local_storage: dict) -> dict[str, str]:
+def _browser_auth_local_storage(page) -> dict:
+    return _browser_auth_storage(page, "localStorage")
+
+
+def _browser_auth_session_storage(page) -> dict:
+    return _browser_auth_storage(page, "sessionStorage")
+
+
+def _browser_auth_restore_storage(context, url: str, storage: dict) -> None:
+    """Install bounded origin-scoped web storage before page scripts execute."""
+    local = storage.get("local_storage")
+    session = storage.get("session_storage")
+    payload = {
+        "url": url,
+        "local": local if isinstance(local, dict) else {},
+        "session": session if isinstance(session, dict) else {},
+    }
+    encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+    context.add_init_script(script=f"""(() => {{
+      const state = {encoded};
+      try {{
+        if (location.origin !== new URL(state.url).origin) return;
+        for (const [key, value] of Object.entries(state.local)) {{
+          localStorage.setItem(key, value);
+        }}
+        for (const [key, value] of Object.entries(state.session)) {{
+          sessionStorage.setItem(key, value);
+        }}
+      }} catch (_) {{}}
+    }})()""")
+
+
+def _browser_auth_tokens(response_bodies: Iterable[str], local_storage: dict,
+                         session_storage: Optional[dict] = None) -> dict[str, str]:
     tokens: dict[str, str] = {}
     for body in response_bodies:
         tokens.update(_extract_auth_tokens(str(body)))
-    tokens.update(_extract_auth_tokens(json.dumps(local_storage, ensure_ascii=False)))
-    for value in local_storage.values():
-        if isinstance(value, str):
-            tokens.update(_extract_auth_tokens(value))
+    for area in (local_storage, session_storage or {}):
+        tokens.update(_extract_auth_tokens(json.dumps(area, ensure_ascii=False)))
+        for value in area.values():
+            if isinstance(value, str):
+                tokens.update(_extract_auth_tokens(value))
     return {
         key: value for key, value in tokens.items()
         if 12 <= len(value) <= 16_384
         and not any(ord(char) < 0x20 or ord(char) == 0x7f for char in value)
     }
+
+
+def _browser_auth_has_storage_delta(before: dict, after: dict) -> bool:
+    """Return whether bounded browser storage changed across login."""
+    return before != after
 
 
 def _browser_auth_install_cookies(workspace: Workspace, credential: str,
@@ -2976,6 +3320,27 @@ def _browser_auth_url_matches(observed: str, expected: str) -> bool:
             expected
         )
     except (ValueError, credentials.CredentialError):
+        return False
+
+
+def _browser_inert_bootstrap_matches(
+    request_url: str, *, method: str, resource_type: str,
+    origin: str, nonce: str,
+) -> bool:
+    """Identify the private inert navigation after browser URL normalization."""
+    try:
+        return bool(
+            str(method or "").upper() == "GET"
+            and str(resource_type or "").lower() == "document"
+            and credentials.normalize_origin(request_url) == origin
+            and any(
+                key == "__grypton_context__" and value == nonce
+                for key, value in parse_qsl(
+                    urlsplit(request_url).query, keep_blank_values=True
+                )
+            )
+        )
+    except (TypeError, ValueError, credentials.CredentialError):
         return False
 
 
@@ -3084,6 +3449,7 @@ def _browser_auth_fresh_probe(
     cookies: Optional[list[dict]] = None,
     bearer_token: str = "",
     verify_headers: Optional[dict] = None,
+    browser_storage: Optional[dict] = None,
 ) -> dict:
     """Load one proof URL in a fresh browser with only supplied session material."""
     with _isolated_browser_profile(executable) as launch_profile:
@@ -3098,6 +3464,8 @@ def _browser_auth_fresh_probe(
         try:
             if cookies:
                 context.add_cookies(cookies)
+            if browser_storage:
+                _browser_auth_restore_storage(context, url, browser_storage)
             page = context.new_page()
             page.on("console", lambda message: console.append({
                 "phase": phase,
@@ -3131,6 +3499,7 @@ def _browser_auth_fresh_probe(
                 "source": "\n".join((body, visible, dom)),
                 "cookies": list(context.cookies()),
                 "local_storage": _browser_auth_local_storage(page),
+                "session_storage": _browser_auth_session_storage(page),
             }
         finally:
             context.close()
@@ -3144,8 +3513,9 @@ def _browser_auth_persisted_cookies(
     path = credentials.cookie_jar_storage_path(workspace.slug, credential)
     now = int(time.time())
     output: list[dict] = []
-    for columns in credentials._cookie_rows(path):
-        if len(columns) < 7:
+    for record in credentials._cookie_records(path):
+        columns = record.get("columns")
+        if not isinstance(columns, tuple) or len(columns) < 7:
             continue
         domain = str(columns[0] or "").lower().rstrip(".")
         plain_domain = domain.lstrip(".")
@@ -3174,6 +3544,11 @@ def _browser_auth_persisted_cookies(
             "domain": domain,
             "path": str(columns[2] or "/"),
             "secure": str(columns[3]).upper() == "TRUE",
+            "httpOnly": bool(record.get("http_only")),
+            # Netscape jars cannot represent SameSite.  Strict is the only
+            # conservative legacy import; new browser sessions use the exact
+            # rich private browser-state record instead.
+            "sameSite": "Strict",
         }
         if expires:
             cookie["expires"] = expires
@@ -3209,6 +3584,19 @@ def _browser_session_revalidation_due(
     """Use time and cookie expiry only to schedule the authoritative proof."""
     if not state.get("established"):
         return True
+    rich_state = credentials.load_browser_storage(workspace.slug, credential)
+    has_rich_storage = bool(
+        rich_state.get("available")
+        and (
+            rich_state.get("cookies")
+            or any(str(value) for value in dict(
+                rich_state.get("local_storage") or {}
+            ).values())
+            or any(str(value) for value in dict(
+                rich_state.get("session_storage") or {}
+            ).values())
+        )
+    )
     if (
         not _browser_auth_persisted_cookies(
             workspace, credential, str(state.get("origin") or "")
@@ -3216,6 +3604,7 @@ def _browser_session_revalidation_due(
         and not credentials.select_bearer(
             credentials.load_tokens(workspace.slug, credential)
         )
+        and not has_rich_storage
     ):
         return True
     if str(state.get("proof_profile_revision") or "") != profile_revision:
@@ -3300,8 +3689,16 @@ def ensure_browser_status_session(
                 token_file = credentials.token_path(
                     workspace.slug, credential
                 )
+                storage_file = credentials.browser_storage_path(
+                    workspace.slug, credential
+                )
+                attempt_file = credentials.attempt_path(
+                    workspace.slug, credential
+                )
                 cookie_snapshot = _snapshot_private_material(jar_path)
                 token_snapshot = _snapshot_private_material(token_file)
+                storage_snapshot = _snapshot_private_material(storage_file)
+                attempt_snapshot = _snapshot_private_material(attempt_file)
                 material_committed = False
                 try:
                     try:
@@ -3321,8 +3718,18 @@ def ensure_browser_status_session(
                     tokens = credentials.load_tokens(
                         workspace.slug, credential
                     )
-                    cookies = _browser_auth_persisted_cookies(
-                        workspace, credential, profile["login_url"]
+                    browser_storage = credentials.load_browser_storage(
+                        workspace.slug, credential
+                    )
+                    requires_rich_state = not bool(
+                        browser_storage.get("available")
+                    )
+                    cookies = (
+                        list(browser_storage.get("cookies") or [])
+                        if not requires_rich_state
+                        else _browser_auth_persisted_cookies(
+                            workspace, credential, profile["login_url"]
+                        )
                     )
                     with sync_playwright() as playwright:
                         current = _browser_auth_fresh_probe(
@@ -3332,6 +3739,7 @@ def ensure_browser_status_session(
                             timeout_ms=timeout_ms, cookies=cookies,
                             bearer_token=credentials.select_bearer(tokens),
                             verify_headers=profile["browser"]["verify_headers"],
+                            browser_storage=browser_storage,
                         )
                         control = _browser_auth_fresh_probe(
                             playwright, executable, workspace,
@@ -3368,12 +3776,13 @@ def ensure_browser_status_session(
                             "anonymous_redirect_statuses", ()
                         ),
                     )
-                    authenticated = control_matches and _browser_status_probe_matches(
+                    current_matches = _browser_status_probe_matches(
                         current,
                         status=verification["authenticated_status"],
                         verify_url=profile["verify_url"],
                         redirect_statuses=(),
                     )
+                    authenticated = bool(control_matches and current_matches)
                     stale_chain = list(current.get("redirect_chain") or [])
                     # A fresh anonymous client must match the configured redirect
                     # chain.  The stored session can retain the anonymous edge-gate
@@ -3404,7 +3813,6 @@ def ensure_browser_status_session(
                             profile["verify_url"],
                         )
                     )
-
                     if authenticated:
                         refreshed_cookies = _browser_auth_persistable_cookies(
                             list(current.get("cookies") or []),
@@ -3416,9 +3824,26 @@ def ensure_browser_status_session(
                             current.get("local_storage")
                             if isinstance(current.get("local_storage"), dict)
                             else {},
+                            current.get("session_storage")
+                            if isinstance(current.get("session_storage"), dict)
+                            else {},
                         ))
+                        refreshed_local = (
+                            current.get("local_storage")
+                            if isinstance(current.get("local_storage"), dict)
+                            else {}
+                        )
+                        refreshed_session = (
+                            current.get("session_storage")
+                            if isinstance(current.get("session_storage"), dict)
+                            else {}
+                        )
                         if not refreshed_cookies and not credentials.select_bearer(
                             refreshed_tokens
+                        ) and not any(
+                            str(value)
+                            for area in (refreshed_local, refreshed_session)
+                            for value in area.values()
                         ):
                             return _err(
                                 "Configured session revalidation produced no reusable "
@@ -3434,22 +3859,39 @@ def ensure_browser_status_session(
                                     ),
                                 },
                             )
+                        if not requires_rich_state:
+                            credentials.canonical_browser_storage(
+                                origin=login_origin, cookies=refreshed_cookies,
+                                local_storage=refreshed_local,
+                                session_storage=refreshed_session,
+                            )
                         # Commit the exact resulting jar, including an empty jar
                         # when the verifier expired its last cookie.
-                        _browser_auth_install_cookies(
-                            workspace, credential, refreshed_cookies,
-                            profile["login_url"],
-                        )
-                        if refreshed_tokens:
-                            credentials.save_tokens(
-                                workspace.slug, credential, refreshed_tokens,
-                                origin=login_origin,
+                        try:
+                            _browser_auth_install_cookies(
+                                workspace, credential, refreshed_cookies,
+                                profile["login_url"],
                             )
-                        credentials.record_session_revalidated(
-                            workspace.slug, credential, generation=generation,
-                            origin=login_origin,
-                            profile_revision=profile_revision,
-                        )
+                            if refreshed_tokens:
+                                credentials.save_tokens(
+                                    workspace.slug, credential, refreshed_tokens,
+                                    origin=login_origin,
+                                )
+                            credentials.record_session_revalidated(
+                                workspace.slug, credential, generation=generation,
+                                origin=login_origin,
+                                profile_revision=profile_revision,
+                            )
+                            if not requires_rich_state:
+                                credentials.save_browser_storage(
+                                    workspace.slug, credential, origin=login_origin,
+                                    cookies=refreshed_cookies,
+                                    local_storage=refreshed_local,
+                                    session_storage=refreshed_session,
+                                )
+                        except Exception:
+                            _restore_private_material(attempt_file, attempt_snapshot)
+                            raise
                         material_committed = True
                         return _ok(
                             f"Authenticated session {credential!r} passed its configured "
@@ -3457,7 +3899,10 @@ def ensure_browser_status_session(
                             {
                                 "credential": credential,
                                 "session_maintenance": {
-                                    "action": "revalidated",
+                                    "action": (
+                                        "revalidated-legacy"
+                                        if requires_rich_state else "revalidated"
+                                    ),
                                     "credential_submission": False,
                                 },
                                 "session": credentials.session_status(
@@ -3573,6 +4018,7 @@ def ensure_browser_status_session(
                     if not material_committed:
                         _restore_private_material(jar_path, cookie_snapshot)
                         _restore_private_material(token_file, token_snapshot)
+                        _restore_private_material(storage_file, storage_snapshot)
     except (OSError, ValueError, credentials.CredentialError) as exc:
         return _err(str(exc))
     except Exception:
@@ -3636,6 +4082,7 @@ def _credential_browser_login_locked(
     verification: Optional[dict] = None,
     timeout: int = 45,
     _refresh_generation: Optional[int] = None,
+    _upgrade_generation: Optional[int] = None,
     _profile_revision: str = "",
 ) -> dict:
     """Submit one private credential through a scoped rendered login form."""
@@ -3698,11 +4145,17 @@ def _credential_browser_login_locked(
         login_username = credentials.normalize_login_username(
             secret["username"], username_transform
         )
-        if _refresh_generation is None:
+        if _refresh_generation is not None and _upgrade_generation is not None:
+            return _err("Browser login maintenance mode is invalid.")
+        maintenance_generation = (
+            _refresh_generation
+            if _refresh_generation is not None else _upgrade_generation
+        )
+        if maintenance_generation is None:
             credentials.ensure_login_attempt_available(workspace.slug, credential)
         elif status_verification is None:
             return _err(
-                "Automatic session renewal requires status-differential verification."
+                "Browser session maintenance requires status-differential verification."
             )
     except (ValueError, credentials.CredentialError) as exc:
         return _err(str(exc))
@@ -3764,7 +4217,9 @@ def _credential_browser_login_locked(
     control_redirected = False
     cookies: list[dict] = []
     observed_cookie_sets: list[list[dict]] = []
+    observed_storage_sets: list[dict] = []
     local_storage: dict = {}
+    session_storage: dict = {}
     observed_token_sets: list[dict[str, str]] = []
     tokens: dict[str, str] = {}
     identity_sources: list[str] = []
@@ -3836,7 +4291,7 @@ def _credential_browser_login_locked(
                         "credential submission"
                     )
                 if blocker:
-                    if _refresh_generation is None:
+                    if maintenance_generation is None:
                         credentials.record_login_outcome(
                             workspace.slug, credential, blocked_reason=blocker
                         )
@@ -3854,13 +4309,19 @@ def _credential_browser_login_locked(
                         list(context.cookies()), url
                     )
                     baseline_storage = _browser_auth_local_storage(page)
-                    baseline_tokens = _browser_auth_tokens((), baseline_storage)
+                    baseline_session_storage = _browser_auth_session_storage(page)
+                    baseline_tokens = _browser_auth_tokens(
+                        (), baseline_storage, baseline_session_storage
+                    )
                     observed_cookie_sets.append(baseline_cookies)
+                    observed_storage_sets.extend(
+                        (baseline_storage, baseline_session_storage)
+                    )
                     observed_token_sets.append(baseline_tokens)
                     phase["name"] = "login"
                     capture_session = None
                     try:
-                        if _refresh_generation is not None:
+                        if maintenance_generation is not None:
                             # Renewal persists its one-submission reservation and
                             # starts capture before secrets enter the form.  Input
                             # handlers can submit without a click.
@@ -3871,15 +4332,21 @@ def _credential_browser_login_locked(
                                     _serialized_secret_variants((secret["password"],)),
                                 )
                             )
-                            attempt = credentials.begin_refresh_attempt(
-                                workspace.slug, credential,
-                                generation=_refresh_generation,
-                            )
+                            if _upgrade_generation is not None:
+                                attempt = credentials.begin_browser_state_upgrade(
+                                    workspace.slug, credential,
+                                    generation=_upgrade_generation,
+                                )
+                            else:
+                                attempt = credentials.begin_refresh_attempt(
+                                    workspace.slug, credential,
+                                    generation=_refresh_generation,
+                                )
                             credential_submission_state["active"] = True
                         username.fill(login_username, timeout=timeout_ms)
                         password.fill(secret["password"], timeout=timeout_ms)
                         submission_seen = False
-                        if _refresh_generation is not None:
+                        if maintenance_generation is not None:
                             # Let Playwright dispatch any request synchronously
                             # triggered by the input/change handler.  The route
                             # guard observes the request before its response,
@@ -3893,7 +4360,7 @@ def _credential_browser_login_locked(
                             _browser_auth_wait_for_submit(
                                 page, submit, timeout_ms
                             )
-                            if _refresh_generation is None:
+                            if maintenance_generation is None:
                                 capture_session, pending_responses = (
                                     _browser_auth_enable_response_capture(
                                         context, page, workspace, denied_requests,
@@ -3993,10 +4460,12 @@ def _credential_browser_login_locked(
                         list(context.cookies()), url
                     )
                     local_storage = _browser_auth_local_storage(page)
+                    session_storage = _browser_auth_session_storage(page)
                     tokens = _browser_auth_tokens(
-                        raw_response_bodies, local_storage
+                        raw_response_bodies, local_storage, session_storage
                     )
                     observed_cookie_sets.append(cookies)
+                    observed_storage_sets.extend((local_storage, session_storage))
                     observed_token_sets.append(tokens)
                     login_changed_cookie = _browser_auth_has_cookie_delta(
                         baseline_cookies, cookies
@@ -4006,8 +4475,17 @@ def _credential_browser_login_locked(
                         value not in baseline_token_values
                         for value in tokens.values()
                     )
-                    login_material_delta = (
+                    login_changed_storage = (
+                        _browser_auth_has_storage_delta(
+                            baseline_storage, local_storage
+                        )
+                        or _browser_auth_has_storage_delta(
+                            baseline_session_storage, session_storage
+                        )
+                    )
+                    login_material_delta = bool(
                         login_changed_cookie or login_changed_token
+                        or login_changed_storage
                     )
                     if not blocker:
                         phase["name"] = "verify"
@@ -4051,10 +4529,13 @@ def _credential_browser_login_locked(
                             list(context.cookies()), url
                         )
                         local_storage = _browser_auth_local_storage(page)
+                        session_storage = _browser_auth_session_storage(page)
                         tokens = _browser_auth_tokens(
-                            (*raw_response_bodies, verify_body), local_storage
+                            (*raw_response_bodies, verify_body), local_storage,
+                            session_storage,
                         )
                         observed_cookie_sets.append(cookies)
+                        observed_storage_sets.extend((local_storage, session_storage))
                         observed_token_sets.append(tokens)
                         changed_cookie = _browser_auth_has_cookie_delta(
                             baseline_cookies, cookies
@@ -4063,7 +4544,17 @@ def _credential_browser_login_locked(
                             value not in baseline_token_values
                             for value in tokens.values()
                         )
-                        material_delta = changed_cookie or changed_token
+                        changed_storage = (
+                            _browser_auth_has_storage_delta(
+                                baseline_storage, local_storage
+                            )
+                            or _browser_auth_has_storage_delta(
+                                baseline_session_storage, session_storage
+                            )
+                        )
+                        material_delta = bool(
+                            changed_cookie or changed_token or changed_storage
+                        )
 
                     context.close()
                     context = None
@@ -4080,6 +4571,10 @@ def _credential_browser_login_locked(
                             cookies=cookies,
                             bearer_token=credentials.select_bearer(tokens),
                             verify_headers=clean_verify_headers,
+                            browser_storage={
+                                "local_storage": local_storage,
+                                "session_storage": session_storage,
+                            },
                         )
                         replay_status = int(replay.get("status") or 0)
                         replay_response_url = str(
@@ -4102,11 +4597,26 @@ def _credential_browser_login_locked(
                             (replay_body,),
                             replay.get("local_storage")
                             if isinstance(replay.get("local_storage"), dict) else {},
+                            replay.get("session_storage")
+                            if isinstance(replay.get("session_storage"), dict) else {},
                         ))
                         observed_cookie_sets.append(replay_cookies)
                         observed_token_sets.append(replay_tokens)
                         cookies = replay_cookies
                         tokens = replay_tokens
+                        local_storage = (
+                            replay.get("local_storage")
+                            if isinstance(replay.get("local_storage"), dict)
+                            else local_storage
+                        )
+                        session_storage = (
+                            replay.get("session_storage")
+                            if isinstance(replay.get("session_storage"), dict)
+                            else session_storage
+                        )
+                        observed_storage_sets.extend(
+                            (local_storage, session_storage)
+                        )
 
                         phase["name"] = "control"
                         control = _browser_auth_fresh_probe(
@@ -4137,7 +4647,37 @@ def _credential_browser_login_locked(
                             (control_body,),
                             control.get("local_storage")
                             if isinstance(control.get("local_storage"), dict) else {},
+                            control.get("session_storage")
+                            if isinstance(control.get("session_storage"), dict) else {},
                         ))
+                        observed_storage_sets.extend((
+                            control.get("local_storage")
+                            if isinstance(control.get("local_storage"), dict) else {},
+                            control.get("session_storage")
+                            if isinstance(control.get("session_storage"), dict) else {},
+                        ))
+    except _BrowserStorageCaptureError:
+        # The unknown tail of an oversized state value cannot be safely
+        # redacted.  Discard every browser-derived observable and fail closed;
+        # private proof/session snapshots below remain uncommitted or rollback.
+        failure = "Exact browser storage capture exceeded its private limits."
+        console = []
+        pending_responses = []
+        response_rows = []
+        raw_response_bodies = []
+        response_statuses = []
+        rendered_dom = ""
+        visible_text = ""
+        verify_source = verify_body = ""
+        replay_source = replay_body = ""
+        control_source = control_body = ""
+        identity_sources = []
+        cookies = []
+        local_storage = {}
+        session_storage = {}
+        tokens = {}
+        material_delta = False
+        login_material_delta = False
     except Exception as exc:
         failure = failure or f"Headless browser authentication failed: {exc}"
     finally:
@@ -4205,7 +4745,12 @@ def _credential_browser_login_locked(
     for observed_cookies in observed_cookie_sets:
         runtime_secrets.extend(
             value for cookie in observed_cookies
-            if 8 <= len(value := str(cookie.get("value") or "")) <= 8192
+            if 0 < len(value := str(cookie.get("value") or "")) <= 8192
+        )
+    for observed_storage in observed_storage_sets:
+        runtime_secrets.extend(
+            value for value in observed_storage.values()
+            if isinstance(value, str) and value
         )
     secret_values = tuple(sorted({
         *secret_values,
@@ -4217,9 +4762,14 @@ def _credential_browser_login_locked(
 
     established = False
     if attempt and blocker:
-        if _refresh_generation is None:
+        if maintenance_generation is None:
             credentials.record_login_outcome(
                 workspace.slug, credential, blocked_reason=blocker
+            )
+        elif _upgrade_generation is not None:
+            credentials.record_browser_state_upgrade_outcome(
+                workspace.slug, credential,
+                generation=_upgrade_generation, blocked_reason=blocker,
             )
         else:
             credentials.record_refresh_outcome(
@@ -4229,11 +4779,27 @@ def _credential_browser_login_locked(
     elif attempt and not failure and (
         status_proved if status_mode else material_delta and marker_proved
     ):
+        commit_snapshots: list[tuple[Path, tuple[bool, bytes, int]]] = []
         try:
+            credentials.canonical_browser_storage(
+                origin=login_origin, cookies=cookies,
+                local_storage=local_storage,
+                session_storage=session_storage,
+            )
+            commit_paths = (
+                credentials.cookie_jar_storage_path(workspace.slug, credential),
+                credentials.token_path(workspace.slug, credential),
+                credentials.browser_storage_path(workspace.slug, credential),
+                credentials.attempt_path(workspace.slug, credential),
+            )
+            commit_snapshots = [
+                (path, _snapshot_private_material(path))
+                for path in commit_paths
+            ]
             _browser_auth_install_cookies(
                 workspace, credential, cookies, url
             )
-            if _refresh_generation is not None:
+            if maintenance_generation is not None:
                 # A renewed browser proof is a replacement session.  Keeping a
                 # bearer from the stale generation could override the newly
                 # proven cookie on subsequent HTTP requests.
@@ -4244,9 +4810,15 @@ def _credential_browser_login_locked(
                 credentials.save_tokens(
                     workspace.slug, credential, tokens, origin=login_origin
                 )
-            if _refresh_generation is None:
+            if maintenance_generation is None:
                 credentials.record_login_outcome(
                     workspace.slug, credential, established=True,
+                    origin=login_origin, profile_revision=_profile_revision,
+                )
+            elif _upgrade_generation is not None:
+                credentials.record_browser_state_upgrade_outcome(
+                    workspace.slug, credential,
+                    generation=_upgrade_generation, established=True,
                     origin=login_origin, profile_revision=_profile_revision,
                 )
             else:
@@ -4255,18 +4827,26 @@ def _credential_browser_login_locked(
                     generation=_refresh_generation, established=True,
                     origin=login_origin, profile_revision=_profile_revision,
                 )
+            credentials.save_browser_storage(
+                workspace.slug, credential, origin=login_origin,
+                cookies=cookies, local_storage=local_storage,
+                session_storage=session_storage,
+            )
             established = True
-        except (OSError, credentials.CredentialError) as exc:
+        except Exception as exc:
+            for path, snapshot in reversed(commit_snapshots):
+                try:
+                    _restore_private_material(path, snapshot)
+                except (OSError, credentials.CredentialError):
+                    pass
             failure = failure or f"Private browser session could not be saved: {exc}"
-            if _refresh_generation is None:
-                credentials.record_login_outcome(workspace.slug, credential)
-            else:
-                credentials.record_refresh_outcome(
-                    workspace.slug, credential, generation=_refresh_generation
-                )
     elif attempt:
-        if _refresh_generation is None:
+        if maintenance_generation is None:
             credentials.record_login_outcome(workspace.slug, credential)
+        elif _upgrade_generation is not None:
+            credentials.record_browser_state_upgrade_outcome(
+                workspace.slug, credential, generation=_upgrade_generation
+            )
         else:
             credentials.record_refresh_outcome(
                 workspace.slug, credential, generation=_refresh_generation
@@ -4407,6 +4987,11 @@ def _credential_browser_login_locked(
             "attempted": bool(attempt),
             "proof_completed": established,
         }
+    if _upgrade_generation is not None:
+        data["browser_state_upgrade"] = {
+            "attempted": bool(attempt),
+            "proof_completed": established,
+        }
     if established:
         proof_kind = (
             "status-differential proof" if status_mode
@@ -4492,6 +5077,979 @@ def _credential_browser_login_locked(
         f"Capture saved to {flow.name}.",
         data,
     )
+
+
+def credential_browser_state_upgrade(workspace: Workspace,
+                                     credential: str) -> dict:
+    """Explicitly create exact rich state for one proven legacy browser session."""
+    try:
+        with credentials.auth_profile_lock(workspace.slug, credential):
+            profile = credentials.load_auth_profile_optional(
+                workspace.slug, credential
+            )
+            if not isinstance(profile, dict) or profile.get("strategy") != "browser":
+                return _err("Browser-state upgrade requires a browser authentication profile.")
+            browser = profile["browser"]
+            verification = browser.get("verification")
+            if not isinstance(verification, dict):
+                return _err(
+                    "Browser-state upgrade requires status-differential verification."
+                )
+            profile_revision = credentials.auth_profile_revision(profile)
+            with credentials.session_material_lock(workspace.slug, credential):
+                state = credentials.load_attempt_state(
+                    workspace.slug, credential
+                )
+                if not state["established"]:
+                    return _err("Browser-state upgrade requires an established session.")
+                if state["proof_profile_revision"] != profile_revision:
+                    return _err(
+                        "Browser-state upgrade requires the current authentication profile proof."
+                    )
+                if credentials.load_browser_storage(
+                    workspace.slug, credential
+                ).get("available"):
+                    return _ok(
+                        f"Exact private browser state is already available for {credential!r}.",
+                        {
+                            "credential": credential,
+                            "browser_state_upgrade": {
+                                "attempted": False, "proof_completed": True,
+                            },
+                            "session": credentials.session_status(
+                                workspace.slug, credential
+                            ),
+                        },
+                    )
+                generation = int(state["proof_generation"])
+                if state["refresh_attempted_generation"] == generation:
+                    return _err(
+                        "Credential submission was already attempted for this session proof."
+                    )
+                return _credential_browser_login_locked(
+                    workspace, profile["login_url"], credential=credential,
+                    username_transform=profile["username_transform"],
+                    username_selector=browser["username_selector"],
+                    password_selector=browser["password_selector"],
+                    submit_selector=browser["submit_selector"],
+                    verify_url=profile["verify_url"], success_marker="",
+                    verify_headers=browser["verify_headers"],
+                    verification=verification, timeout=profile["timeout"],
+                    _upgrade_generation=generation,
+                    _profile_revision=profile_revision,
+                )
+    except (OSError, ValueError, credentials.CredentialError) as exc:
+        return _err(str(exc))
+
+
+def authenticated_browser_request(
+    workspace: Workspace, url: str, *, credential: str,
+    method: str = "GET", headers: Optional[dict] = None,
+    body: Optional[str] = None, page_url: str = "",
+    header_sources: Optional[dict] = None, timeout: int = 30,
+    _profile_headers: Optional[dict] = None,
+) -> dict:
+    """Issue one exact-origin fetch from a private authenticated browser context."""
+    try:
+        clean_headers = _browser_request_headers(headers)
+        sources = _browser_request_header_sources(header_sources, clean_headers)
+        private_headers = _browser_auth_verify_headers(_profile_headers)
+        normalized_method = str(method or "GET").strip().upper()
+        if not normalized_method or not re.fullmatch(
+            r"[!#$%&'*+.^_`|~0-9A-Z-]{1,32}", normalized_method
+        ):
+            raise ValueError("Browser request method is invalid.")
+        if normalized_method in {"CONNECT", "TRACE", "TRACK"}:
+            raise ValueError("Browser request method is not supported by browser fetch.")
+        if body is not None and not isinstance(body, str):
+            raise ValueError("Browser request body must be a string.")
+        if len((body or "").encode("utf-8")) > 1_000_000:
+            raise ValueError("Browser request body exceeds the 1,000,000-byte limit.")
+        if normalized_method in {"GET", "HEAD"} and body not in {None, ""}:
+            raise ValueError(f"Browser {normalized_method} requests cannot contain a body.")
+        timeout_seconds = max(5, min(int(timeout), 120))
+        overall_deadline = time.monotonic() + timeout_seconds
+    except (TypeError, ValueError) as exc:
+        return _err(str(exc))
+
+    try:
+        if urlsplit(url).fragment or (page_url and urlsplit(page_url).fragment):
+            return _err("Authenticated browser request URLs cannot contain fragments.")
+    except ValueError:
+        return _err("Authenticated browser request URL is invalid.")
+
+    for candidate in (url, page_url):
+        if candidate:
+            blocked = _scope_error(workspace, candidate)
+            if blocked:
+                return blocked
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return _err("Python Playwright is not installed.")
+    executable = _browser_executable()
+    if not executable:
+        return _err("No Playwright-compatible Chromium or Chrome executable is installed.")
+
+    try:
+        with credentials.auth_profile_lock(workspace.slug, credential):
+            profile = credentials.load_auth_profile_optional(
+                workspace.slug, credential
+            )
+            with credentials.session_material_lock(workspace.slug, credential):
+                secret = credentials.load_credential(workspace.slug, credential)
+                state = credentials.load_attempt_state(workspace.slug, credential)
+                if not state["established"]:
+                    return _err(
+                        f"Named credential {credential!r} has no established session."
+                    )
+                if not isinstance(profile, dict) or profile.get("strategy") != "browser":
+                    return _err(
+                        "Authenticated browser requests require the current configured "
+                        "browser authentication profile."
+                    )
+                current_profile_revision = credentials.auth_profile_revision(profile)
+                if str(state.get("proof_profile_revision") or "") != current_profile_revision:
+                    return _err(
+                        "The browser authentication profile changed after the current "
+                        "session proof; reauthenticate before a browser-context request."
+                    )
+                bound_origin = credentials.normalize_origin(
+                    str(state.get("origin") or "")
+                )
+                if credentials.normalize_origin(url) != bound_origin:
+                    return _err(
+                        f"Refused authenticated browser request for {credential!r}: "
+                        "the URL does not match the session's exact origin."
+                    )
+                if not page_url:
+                    if isinstance(profile, dict) and profile.get("strategy") == "browser":
+                        verification = profile.get("browser", {}).get("verification")
+                        page_url = str(
+                            verification.get("expected_post_login_url")
+                            if isinstance(verification, dict)
+                            else profile.get("verify_url") or ""
+                        )
+                    if not page_url:
+                        return _err(
+                            "Authenticated browser request requires a same-origin page_url "
+                            "when no browser profile page is available."
+                        )
+                blocked = _scope_error(workspace, page_url)
+                if blocked:
+                    return blocked
+                if credentials.normalize_origin(page_url) != bound_origin:
+                    return _err(
+                        "Authenticated browser page_url must match the session's exact origin."
+                    )
+                rich_state = credentials.load_browser_storage(
+                    workspace.slug, credential
+                )
+                if not rich_state.get("available"):
+                    return _err(
+                        "Exact private browser state is unavailable for this proven legacy "
+                        "session; call credential_browser_login with "
+                        "upgrade_browser_state=true once before using browser-context "
+                        "requests.",
+                        {
+                            "credential": credential,
+                            "migration_required": True,
+                            "session": credentials.session_status(
+                                workspace.slug, credential
+                            ),
+                        },
+                    )
+                if (
+                    rich_state.get("origin") != bound_origin
+                    or rich_state.get("proof_generation") != state["proof_generation"]
+                    or rich_state.get("profile_revision")
+                    != current_profile_revision
+                ):
+                    return _err("Private browser state no longer matches the session proof.")
+                tokens = credentials.load_tokens(workspace.slug, credential)
+                bearer = credentials.select_bearer(tokens)
+                if bearer and credentials.token_origin(
+                    workspace.slug, credential
+                ) != bound_origin:
+                    return _err("Private bearer state no longer matches the session origin.")
+
+                source_names = {item["header"].lower() for item in sources}
+                caller_names = {key.lower() for key in clean_headers}
+                profile_names = {key.lower() for key in private_headers}
+                if (caller_names | source_names) & profile_names:
+                    return _err(
+                        "Browser request headers duplicate a private profile header."
+                    )
+                route_headers = dict(private_headers)
+                if bearer and "authorization" not in source_names:
+                    route_headers["Authorization"] = f"Bearer {bearer}"
+
+                denied_requests: list[str] = []
+                network_state = {"count": 0, "blocked": 0, "limit": 4}
+                request_rows: list[dict] = []
+                request_indexes: dict[int, int] = {}
+                cdp_requests: dict[str, tuple[str, str]] = {}
+                fetch_window = {"active": False, "primary": None}
+                bootstrap_nonce = ""
+                context = None
+                page = None
+                browser_identity = ""
+                fetch_result: dict = {}
+                failure = ""
+                final_cookies = list(rich_state.get("cookies") or [])
+                final_local = dict(rich_state.get("local_storage") or {})
+                final_session = dict(rich_state.get("session_storage") or {})
+
+                def remember_request(request) -> None:
+                    if len(request_rows) >= 100:
+                        return
+                    if bootstrap_nonce and _browser_inert_bootstrap_matches(
+                        str(request.url or ""),
+                        method=str(request.method or ""),
+                        resource_type=str(request.resource_type or ""),
+                        origin=bound_origin, nonce=bootstrap_nonce,
+                    ):
+                        # This document is locally synthesized transport setup,
+                        # not target evidence or a network request.
+                        return
+                    try:
+                        request_headers = dict(request.all_headers())
+                    except Exception:
+                        request_headers = dict(request.headers or {})
+                    request_headers = {
+                        key: value for key, value in request_headers.items()
+                        if str(key).lower() != "x-grypton-private-marker"
+                    }
+                    row = {
+                        "method": str(request.method or "GET").upper(),
+                        "url": str(request.url or ""),
+                        "headers": request_headers,
+                        "body": str(request.post_data or "")[:1_000_000],
+                        "resource_type": str(request.resource_type or ""),
+                        "status": 0,
+                        "response_headers": {},
+                        "failed": False,
+                        "response_seen": False,
+                    }
+                    index = len(request_rows)
+                    request_rows.append(row)
+                    request_indexes[id(request)] = index
+                    if (
+                        fetch_window["active"]
+                        and row["method"] == normalized_method
+                        and (
+                            (
+                                row["method"] == fetch_window.get("primary_method")
+                                and row["url"] == fetch_window.get("primary_url")
+                            )
+                            or _browser_auth_url_matches(row["url"], url)
+                        )
+                    ):
+                        fetch_window["primary"] = index
+
+                def remember_response(response) -> None:
+                    index = request_indexes.get(id(response.request))
+                    if index is None:
+                        response_url = str(response.request.url or "")
+                        response_method = str(response.request.method or "GET").upper()
+                        index = next((
+                            candidate for candidate in range(len(request_rows) - 1, -1, -1)
+                            if not request_rows[candidate].get("response_seen")
+                            and request_rows[candidate]["method"] == response_method
+                            and request_rows[candidate]["url"] == response_url
+                        ), None)
+                    if index is None:
+                        return
+                    try:
+                        response_headers = dict(response.all_headers())
+                    except Exception:
+                        response_headers = dict(response.headers or {})
+                    request_rows[index]["status"] = int(response.status or 0)
+                    request_rows[index]["response_headers"] = response_headers
+                    request_rows[index]["response_seen"] = True
+
+                def remember_failure(request) -> None:
+                    index = request_indexes.get(id(request))
+                    if index is None:
+                        request_url = str(request.url or "")
+                        request_method = str(request.method or "GET").upper()
+                        index = next((
+                            candidate for candidate in range(len(request_rows) - 1, -1, -1)
+                            if request_rows[candidate]["method"] == request_method
+                            and request_rows[candidate]["url"] == request_url
+                        ), None)
+                    if index is not None:
+                        request_rows[index]["failed"] = True
+
+                def remember_cdp_response(url_value: str, method_value: str,
+                                          response_value: dict) -> None:
+                    index = next((
+                        candidate for candidate in range(len(request_rows) - 1, -1, -1)
+                        if request_rows[candidate]["method"] == method_value
+                        and request_rows[candidate]["url"] == url_value
+                    ), None)
+                    if index is None:
+                        return
+                    request_rows[index]["status"] = int(
+                        response_value.get("status") or 0
+                    )
+                    raw_headers = response_value.get("headers")
+                    if isinstance(raw_headers, dict):
+                        request_rows[index]["response_headers"] = {
+                            str(key): str(value) for key, value in raw_headers.items()
+                        }
+                    request_rows[index]["response_seen"] = True
+
+                try:
+                    with _isolated_browser_profile(executable) as launch_profile:
+                        browser_identity = str(launch_profile["identity"])
+                        with sync_playwright() as playwright:
+                            context = _launch_scoped_browser_context(
+                                playwright, launch_profile, workspace,
+                                denied_requests,
+                                bound_header_origin=bound_origin,
+                                bound_headers=route_headers,
+                                exact_origin=bound_origin,
+                                network_state=network_state,
+                                launch_timeout_ms=max(
+                                    1, int((overall_deadline - time.monotonic()) * 1000)
+                                ),
+                            )
+                            context.add_cookies(
+                                list(rich_state.get("cookies") or [])
+                            )
+                            _browser_auth_restore_storage(
+                                context, bound_origin,
+                                {
+                                    "local_storage": rich_state.get("local_storage") or {},
+                                    "session_storage": rich_state.get("session_storage") or {},
+                                },
+                            )
+                            context.on("request", remember_request)
+                            context.on("response", remember_response)
+                            context.on("requestfailed", remember_failure)
+                            bootstrap_parts = urlsplit(page_url)
+                            bootstrap_query = parse_qsl(
+                                bootstrap_parts.query, keep_blank_values=True
+                            )
+                            bootstrap_nonce = hashlib.sha256(
+                                f"{time.time_ns()}:{credential}".encode()
+                            ).hexdigest()[:24]
+                            bootstrap_query.append((
+                                "__grypton_context__", bootstrap_nonce,
+                            ))
+                            bootstrap_url = urlunsplit((
+                                bootstrap_parts.scheme, bootstrap_parts.netloc,
+                                bootstrap_parts.path, urlencode(bootstrap_query), "",
+                            ))
+                            request_marker = hashlib.sha256(
+                                f"request:{time.time_ns()}:{credential}".encode()
+                            ).hexdigest()
+                            marker_header = "X-Grypton-Private-Marker"
+
+                            def private_context_route(route) -> None:
+                                request = route.request
+                                if _browser_inert_bootstrap_matches(
+                                    str(request.url or ""),
+                                    method=str(request.method or ""),
+                                    resource_type=str(request.resource_type or ""),
+                                    origin=bound_origin, nonce=bootstrap_nonce,
+                                ):
+                                    route.fulfill(
+                                    status=200,
+                                    headers={
+                                        "Content-Type": "text/html; charset=utf-8",
+                                        "Content-Security-Policy": (
+                                            "default-src 'none'; connect-src 'self'; "
+                                            "img-src 'none'; media-src 'none'; object-src 'none'; "
+                                            "frame-src 'none'; worker-src 'none'; form-action 'none'; "
+                                            "base-uri 'none'; script-src 'none'"
+                                        ),
+                                        "Referrer-Policy": "no-referrer",
+                                        "X-Content-Type-Options": "nosniff",
+                                    },
+                                    body="<!doctype html><meta charset=utf-8><title>Grypton</title>",
+                                    )
+                                    return
+                                request_headers = dict(request.headers or {})
+                                observed_marker = next((
+                                    str(value) for key, value in request_headers.items()
+                                    if str(key).lower() == marker_header.lower()
+                                ), "")
+                                if observed_marker == request_marker:
+                                    fetch_window["primary_method"] = str(
+                                        request.method or "GET"
+                                    ).upper()
+                                    fetch_window["primary_url"] = str(request.url or "")
+                                    request_headers = {
+                                        key: value for key, value in request_headers.items()
+                                        if str(key).lower() != marker_header.lower()
+                                    }
+                                    route.fallback(headers=request_headers)
+                                    return
+                                route.fallback()
+
+                            # This route runs before the generic exact-origin
+                            # boundary and falls back into it for real traffic.
+                            context.route("**/*", private_context_route)
+                            page = context.new_page()
+                            cdp = context.new_cdp_session(page)
+
+                            def cdp_request(event) -> None:
+                                request_id = str(event.get("requestId") or "")
+                                request_value = event.get("request") or {}
+                                method_value = str(
+                                    request_value.get("method") or "GET"
+                                ).upper()
+                                url_value = str(request_value.get("url") or "")
+                                redirected = event.get("redirectResponse")
+                                prior = cdp_requests.get(request_id)
+                                if isinstance(redirected, dict) and prior:
+                                    remember_cdp_response(prior[1], prior[0], redirected)
+                                cdp_requests[request_id] = (method_value, url_value)
+
+                            def cdp_response(event) -> None:
+                                request_id = str(event.get("requestId") or "")
+                                response_value = event.get("response") or {}
+                                prior = cdp_requests.get(request_id)
+                                if prior and isinstance(response_value, dict):
+                                    remember_cdp_response(
+                                        prior[1], prior[0], response_value
+                                    )
+
+                            cdp.on("Network.requestWillBeSent", cdp_request)
+                            cdp.on("Network.responseReceived", cdp_response)
+                            cdp.send("Network.enable")
+                            navigation_timeout_ms = int(
+                                (overall_deadline - time.monotonic()) * 1000
+                            )
+                            if navigation_timeout_ms <= 0:
+                                raise TimeoutError(
+                                    "authenticated browser request deadline expired"
+                                )
+                            navigation = page.goto(
+                                bootstrap_url, wait_until="domcontentloaded",
+                                timeout=navigation_timeout_ms,
+                            )
+                            if navigation is None or not 200 <= int(navigation.status) < 400:
+                                failure = "Authenticated browser bootstrap page did not load successfully."
+                            elif credentials.normalize_origin(page.url) != bound_origin:
+                                failure = "Authenticated browser bootstrap ended outside its exact origin."
+                            else:
+                                fetch_window["active"] = True
+                                fetch_timeout_ms = int(
+                                    (overall_deadline - time.monotonic()) * 1000
+                                )
+                                if fetch_timeout_ms <= 0:
+                                    raise TimeoutError(
+                                        "authenticated browser request deadline expired"
+                                    )
+                                fetch_result = page.evaluate(
+                                    """async (input) => {
+                                      const overallStarted = Date.now();
+                                      const privateHeaders = {};
+                                      const missing = [];
+                                      let metaDocument = null;
+                                      if (input.sources.some((item) => item.source === 'meta')) {
+                                        const metaController = new AbortController();
+                                        const metaTimer = setTimeout(
+                                          () => metaController.abort(), input.timeout_ms
+                                        );
+                                        try {
+                                          const metaResponse = await fetch(input.meta_url, {
+                                            method: 'GET', credentials: 'include', redirect: 'manual',
+                                            signal: metaController.signal
+                                          });
+                                          if (!metaResponse.ok || !metaResponse.body) {
+                                            return {ok: false, kind: 'meta-fetch-failed'};
+                                          }
+                                          const reader = metaResponse.body.getReader();
+                                          const chunks = [];
+                                          let size = 0;
+                                          while (true) {
+                                            const next = await reader.read();
+                                            if (next.done) break;
+                                            size += next.value.byteLength;
+                                            if (size > 524288) {
+                                              await reader.cancel();
+                                              return {ok: false, kind: 'meta-fetch-failed'};
+                                            }
+                                            chunks.push(next.value);
+                                          }
+                                          const bytes = new Uint8Array(size);
+                                          let offset = 0;
+                                          for (const chunk of chunks) {
+                                            bytes.set(chunk, offset); offset += chunk.byteLength;
+                                          }
+                                          metaDocument = new DOMParser().parseFromString(
+                                            new TextDecoder().decode(bytes), 'text/html'
+                                          );
+                                        } catch (_) {
+                                          return {ok: false, kind: 'meta-fetch-failed'};
+                                        } finally {
+                                          clearTimeout(metaTimer);
+                                        }
+                                      }
+                                      for (const item of input.sources) {
+                                        let value = null;
+                                        if (item.source === 'localStorage') {
+                                          value = localStorage.getItem(item.name);
+                                        } else if (item.source === 'sessionStorage') {
+                                          value = sessionStorage.getItem(item.name);
+                                        } else if (item.source === 'cookie') {
+                                          for (const part of document.cookie.split(';')) {
+                                            const trimmed = part.trim();
+                                            const split = trimmed.indexOf('=');
+                                            const key = split < 0 ? trimmed : trimmed.slice(0, split);
+                                            if (key === item.name) {
+                                              value = split < 0 ? '' : trimmed.slice(split + 1);
+                                              break;
+                                            }
+                                          }
+                                        } else if (item.source === 'meta') {
+                                          for (const meta of metaDocument.getElementsByTagName('meta')) {
+                                            if (meta.getAttribute('name') === item.name) {
+                                              value = meta.getAttribute('content');
+                                              break;
+                                            }
+                                          }
+                                        }
+                                        if (value === null) {
+                                          missing.push(item.header);
+                                          continue;
+                                        }
+                                        if (item.url_decode) {
+                                          try { value = decodeURIComponent(value); }
+                                          catch (_) { missing.push(item.header); continue; }
+                                        }
+                                        privateHeaders[item.header] = item.prefix + value;
+                                      }
+                                      if (missing.length) {
+                                        return {ok: false, kind: 'missing-header-source', missing};
+                                      }
+                                      const requestHeaders = Object.assign({}, input.headers, privateHeaders);
+                                      requestHeaders[input.marker_header] = input.marker;
+                                      const controller = new AbortController();
+                                      const remainingMs = Math.max(
+                                        1, input.timeout_ms - (Date.now() - overallStarted)
+                                      );
+                                      const timer = setTimeout(() => controller.abort(), remainingMs);
+                                      try {
+                                        const options = {
+                                          method: input.method,
+                                          headers: requestHeaders,
+                                          credentials: 'include',
+                                          redirect: 'manual',
+                                          signal: controller.signal,
+                                        };
+                                        if (input.body !== null && input.method !== 'GET' && input.method !== 'HEAD') {
+                                          options.body = input.body;
+                                        }
+                                        const response = await fetch(input.url, options);
+                                        const chunks = [];
+                                        let captured = 0;
+                                        let observed = 0;
+                                        let truncated = false;
+                                        if (response.body) {
+                                          const reader = response.body.getReader();
+                                          while (true) {
+                                            const next = await reader.read();
+                                            if (next.done) break;
+                                            observed += next.value.byteLength;
+                                            const remaining = Math.max(0, input.max_bytes - captured);
+                                            if (remaining > 0) {
+                                              const piece = next.value.slice(0, remaining);
+                                              chunks.push(piece);
+                                              captured += piece.byteLength;
+                                            }
+                                            if (next.value.byteLength > remaining || captured >= input.max_bytes) {
+                                              if (next.value.byteLength > remaining) truncated = true;
+                                              const probe = await reader.read();
+                                              if (!probe.done) {
+                                                observed += probe.value.byteLength;
+                                                truncated = true;
+                                              }
+                                              await reader.cancel();
+                                              break;
+                                            }
+                                          }
+                                        }
+                                        const bytes = new Uint8Array(captured);
+                                        let offset = 0;
+                                        for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.length; }
+                                        let binary = '';
+                                        for (let i = 0; i < bytes.length; i += 32768) {
+                                          binary += String.fromCharCode(...bytes.subarray(i, i + 32768));
+                                        }
+                                        return {
+                                          ok: true,
+                                          status: response.status,
+                                          status_text: response.statusText,
+                                          url: response.url,
+                                          redirected: response.redirected,
+                                          headers: Object.fromEntries(response.headers.entries()),
+                                          body_base64: btoa(binary),
+                                          captured_bytes: captured,
+                                          observed_bytes: observed,
+                                          truncated,
+                                        };
+                                      } catch (_) {
+                                        return {ok: false, kind: 'fetch-failed'};
+                                      } finally {
+                                        clearTimeout(timer);
+                                      }
+                                    }""",
+                                    {
+                                        "url": url, "method": normalized_method,
+                                        "headers": clean_headers,
+                                        "body": body if body is not None else None,
+                                        "sources": sources,
+                                        "meta_url": page_url,
+                                        "timeout_ms": fetch_timeout_ms,
+                                        "max_bytes": MAX_RESPONSE_BYTES,
+                                        "marker_header": marker_header,
+                                        "marker": request_marker,
+                                    },
+                                )
+                                fetch_window["active"] = False
+                                if not isinstance(fetch_result, dict):
+                                    fetch_result = {"ok": False, "kind": "fetch-failed"}
+                                page.wait_for_timeout(50)
+                            if page is not None:
+                                final_local = _browser_auth_local_storage(page)
+                                final_session = _browser_auth_session_storage(page)
+                            final_cookies = _browser_auth_persistable_cookies(
+                                list(context.cookies()), bound_origin
+                            )
+                            context.close()
+                            context = None
+                except Exception:
+                    failure = failure or "Authenticated browser request failed inside Chromium."
+                finally:
+                    if context is not None:
+                        try:
+                            if page is not None:
+                                final_local = _browser_auth_local_storage(page)
+                                final_session = _browser_auth_session_storage(page)
+                            final_cookies = _browser_auth_persistable_cookies(
+                                list(context.cookies()), bound_origin
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            context.close()
+                        except Exception:
+                            pass
+
+                try:
+                    body_bytes = base64.b64decode(
+                        str(fetch_result.get("body_base64") or ""), validate=True
+                    )
+                except (ValueError, TypeError):
+                    body_bytes = b""
+                    failure = failure or "Authenticated browser response capture was invalid."
+                if len(body_bytes) > MAX_RESPONSE_BYTES:
+                    body_bytes = body_bytes[:MAX_RESPONSE_BYTES]
+                    failure = failure or "Authenticated browser response exceeded its capture bound."
+                response_body = body_bytes.decode("utf-8", "replace")
+                response_headers = (
+                    dict(fetch_result.get("headers") or {})
+                    if isinstance(fetch_result.get("headers"), dict) else {}
+                )
+                status = int(fetch_result.get("status") or 0)
+                primary_index = fetch_window.get("primary")
+                if not isinstance(primary_index, int):
+                    primary_index = next((
+                        candidate for candidate in range(len(request_rows) - 1, -1, -1)
+                        if request_rows[candidate]["method"]
+                        == fetch_window.get("primary_method")
+                        and request_rows[candidate]["url"]
+                        == fetch_window.get("primary_url")
+                    ), None)
+                    fetch_window["primary"] = primary_index
+                if (
+                    status == 0 and isinstance(primary_index, int)
+                    and 0 <= primary_index < len(request_rows)
+                    and 300 <= int(request_rows[primary_index].get("status") or 0) < 400
+                ):
+                    # Chromium exposes a manually handled cross-origin redirect
+                    # as an opaque response.  The routed network event remains
+                    # authoritative and no redirect request was issued.
+                    status = int(request_rows[primary_index]["status"])
+                    response_headers = dict(
+                        request_rows[primary_index].get("response_headers") or {}
+                    )
+                final_url = str(fetch_result.get("url") or url)
+                if fetch_result.get("ok"):
+                    try:
+                        if credentials.normalize_origin(final_url) != bound_origin:
+                            failure = failure or "Authenticated browser fetch ended outside its exact origin."
+                    except credentials.CredentialError:
+                        failure = failure or "Authenticated browser fetch returned an invalid final URL."
+
+                new_tokens = dict(tokens)
+                new_tokens.update(_browser_auth_tokens(
+                    (response_body,), final_local, final_session
+                ))
+                runtime_values: list[str] = [
+                    secret["username"], secret["password"], *tokens.values(),
+                    *new_tokens.values(), *private_headers.values(),
+                ]
+                for browser_cookies in (
+                    rich_state.get("cookies") or [], final_cookies,
+                ):
+                    runtime_values.extend(
+                        str(cookie.get("value") or "")
+                        for cookie in browser_cookies
+                        if isinstance(cookie, dict) and cookie.get("value") is not None
+                    )
+                for area in (
+                    rich_state.get("local_storage") or {},
+                    rich_state.get("session_storage") or {},
+                    final_local, final_session,
+                ):
+                    runtime_values.extend(
+                        value for value in area.values()
+                        if isinstance(value, str) and value
+                    )
+                if isinstance(primary_index, int) and primary_index < len(request_rows):
+                    primary_headers = request_rows[primary_index].get("headers") or {}
+                    for source in sources:
+                        for key, value in primary_headers.items():
+                            if key.lower() == source["header"].lower() and value:
+                                runtime_values.append(str(value))
+                runtime_values.extend(
+                    _browser_private_response_values(response_body, response_headers)
+                )
+                for row in request_rows:
+                    runtime_values.extend(_browser_private_response_values(
+                        "", dict(row.get("response_headers") or {})
+                    ))
+                    runtime_values.extend(_browser_private_response_values(
+                        "", {"location": str(row.get("url") or "")}
+                    ))
+                secret_values = _serialized_secret_variants(runtime_values)
+                identity_values = _browser_identity_values((response_body,))
+
+                commit_material = bool(
+                    fetch_result.get("ok") and not failure and 200 <= status < 400
+                )
+                commit_error = False
+                commit_snapshots: list[
+                    tuple[Path, tuple[bool, bytes, int]]
+                ] = []
+                if commit_material:
+                    try:
+                        credentials.canonical_browser_storage(
+                            origin=bound_origin, cookies=final_cookies,
+                            local_storage=final_local,
+                            session_storage=final_session,
+                        )
+                        current_state = credentials.load_attempt_state(
+                            workspace.slug, credential
+                        )
+                        if (
+                            not current_state["established"]
+                            or current_state["proof_generation"] != state["proof_generation"]
+                            or str(current_state.get("proof_profile_revision") or "")
+                            != str(state.get("proof_profile_revision") or "")
+                        ):
+                            raise credentials.CredentialError(
+                                "authenticated session proof changed during browser request"
+                            )
+                        paths = (
+                            credentials.cookie_jar_storage_path(workspace.slug, credential),
+                            credentials.token_path(workspace.slug, credential),
+                            credentials.browser_storage_path(workspace.slug, credential),
+                            credentials.attempt_path(workspace.slug, credential),
+                        )
+                        commit_snapshots = [
+                            (path, _snapshot_private_material(path)) for path in paths
+                        ]
+                        _browser_auth_install_cookies(
+                            workspace, credential, final_cookies, bound_origin
+                        )
+                        if new_tokens:
+                            credentials.save_tokens(
+                                workspace.slug, credential, new_tokens,
+                                origin=bound_origin,
+                            )
+                        credentials.save_browser_storage(
+                            workspace.slug, credential, origin=bound_origin,
+                            cookies=final_cookies, local_storage=final_local,
+                            session_storage=final_session,
+                        )
+                    except Exception:
+                        commit_error = True
+                        commit_material = False
+                        for path, snapshot in reversed(commit_snapshots):
+                            try:
+                                _restore_private_material(path, snapshot)
+                            except (OSError, credentials.CredentialError):
+                                pass
+
+                safe_denied = [
+                    redact_sensitive_text(value, secret_values)
+                    for value in denied_requests[:100]
+                ]
+                derived_names = {item["header"].lower() for item in sources}
+                flow_paths: list[str] = []
+                primary_flow = ""
+                capture_failed = False
+                for index, row in enumerate(request_rows):
+                    request_headers = {
+                        str(key): (
+                            "[REDACTED]" if str(key).lower() in derived_names
+                            else str(value)
+                        )
+                        for key, value in dict(row.get("headers") or {}).items()
+                        if str(key).lower() not in {
+                            "host", "proxy-authorization", "proxy-connection",
+                        }
+                    }
+                    row_response_headers = dict(row.get("response_headers") or {})
+                    response_text = "HTTP " + str(int(row.get("status") or 0))
+                    if row_response_headers:
+                        response_text += "\n" + "\n".join(
+                            f"{key}: {value}"
+                            for key, value in row_response_headers.items()
+                        )
+                    response_bytes = None
+                    if index == primary_index:
+                        response_text += "\n\n" + response_body
+                        response_bytes = int(
+                            fetch_result.get("observed_bytes") or len(body_bytes)
+                        )
+                    try:
+                        flow = _save_flow(
+                            workspace, str(row.get("method") or "GET"),
+                            str(row.get("url") or ""), request_headers,
+                            str(row.get("body") or "") or None,
+                            response_text,
+                            transport=f"credential-playwright:{credential}",
+                            returncode=1 if row.get("failed") else 0,
+                            secret_values=secret_values,
+                            response_bytes=response_bytes,
+                        )
+                    except OSError:
+                        capture_failed = True
+                        break
+                    flow_paths.append(str(flow))
+                    if index == primary_index:
+                        primary_flow = str(flow)
+
+                if capture_failed and commit_material:
+                    for path, snapshot in reversed(commit_snapshots):
+                        try:
+                            _restore_private_material(path, snapshot)
+                        except (OSError, credentials.CredentialError):
+                            pass
+                    commit_material = False
+
+                safe_body = _browser_redact_identity_text(
+                    response_body[:MAX_INLINE_RESPONSE_CHARS],
+                    secret_values, identity_values,
+                )
+                safe_headers = {
+                    str(key): (
+                        "[REDACTED]"
+                        if str(key).lower() in _SENSITIVE_HEADERS
+                        else _browser_redact_identity_text(
+                            value, secret_values, identity_values
+                        )
+                    )
+                    for key, value in response_headers.items()
+                }
+                safe_final_url = _browser_redact_identity_text(
+                    final_url, secret_values, identity_values
+                )
+                network_summary = [
+                    {
+                        "method": str(row.get("method") or "GET"),
+                        "url": redact_sensitive_text(
+                            str(row.get("url") or ""), secret_values
+                        ),
+                        "status": int(row.get("status") or 0),
+                        "failed": bool(row.get("failed")),
+                        "flow": flow_paths[index] if index < len(flow_paths) else "",
+                    }
+                    for index, row in enumerate(request_rows)
+                ]
+                data = {
+                    "credential": credential,
+                    "status": status,
+                    "status_text": redact_sensitive_text(
+                        fetch_result.get("status_text") or "", secret_values
+                    ),
+                    "final_url": safe_final_url,
+                    "redirected": bool(fetch_result.get("redirected")),
+                    "headers": safe_headers,
+                    "response": safe_body,
+                    "response_bytes": int(
+                        fetch_result.get("observed_bytes") or len(body_bytes)
+                    ),
+                    "response_truncated": bool(fetch_result.get("truncated")),
+                    "flow": primary_flow,
+                    "flows": flow_paths,
+                    "network_requests": network_summary,
+                    "network_request_count": int(network_state.get("count") or 0),
+                    "blocked_requests": safe_denied,
+                    "blocked_request_count": int(network_state.get("blocked") or 0),
+                    "derived_headers": [item["header"] for item in sources],
+                    "browser_identity": browser_identity,
+                    "session_material_committed": commit_material,
+                    "session_material_rollback": not commit_material,
+                    "session": credentials.session_status(
+                        workspace.slug, credential
+                    ),
+                }
+                if capture_failed:
+                    return _err(
+                        "Authenticated browser request completed, but its request capture "
+                        "could not be saved.", data,
+                    )
+                if commit_error:
+                    return _err(
+                        "Authenticated browser request completed, but rotated private "
+                        "session material could not be committed and was restored.", data,
+                    )
+                if failure:
+                    return _err(failure, data)
+                if fetch_result.get("kind") == "missing-header-source":
+                    missing = fetch_result.get("missing")
+                    safe_missing = [
+                        str(item) for item in missing[:16]
+                    ] if isinstance(missing, list) else []
+                    data["missing_header_sources"] = safe_missing
+                    return _err(
+                        "Authenticated browser request did not start because a private "
+                        "header source was unavailable.", data,
+                    )
+                if not fetch_result.get("ok"):
+                    return _err(
+                        "Authenticated browser fetch failed; private session material "
+                        "was retained.", data,
+                    )
+                if status in {401, 403}:
+                    data["auth_observation"] = _endpoint_auth_observation(
+                        response_body, f"HTTP {status}"
+                    )
+                    return _err(
+                        f"Browser-context request returned HTTP {status}; the proven "
+                        "session and its prior private material were retained.", data,
+                    )
+                return _ok(
+                    f"Browser-context request returned HTTP {status}; "
+                    f"{len(flow_paths)} browser request capture(s) were saved.",
+                    data,
+                )
+    except (OSError, ValueError, credentials.CredentialError) as exc:
+        return _err(str(exc))
+    except Exception:
+        return _err(
+            "Authenticated browser request failed; private session material was retained."
+        )
 
 
 def dns_lookup(workspace: Workspace, host: str) -> dict:

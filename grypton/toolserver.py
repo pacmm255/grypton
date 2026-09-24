@@ -176,7 +176,8 @@ def _browser_login_from_args(ws: Workspace, args: dict) -> dict:
 
 
 def _profiled_auth_login(ws: Workspace, requested: str,
-                         credential: object, profile: dict) -> dict:
+                         credential: object, profile: dict,
+                         *, upgrade_browser_state: bool = False) -> dict:
     effective = (
         "credential_browser_login"
         if profile["strategy"] == "browser" else "credential_login"
@@ -205,8 +206,15 @@ def _profiled_auth_login(ws: Workspace, requested: str,
         verification = browser.get("verification")
         state = credentials.load_attempt_state(ws.slug, str(credential or ""))
         if isinstance(verification, dict) and state["ever_established"]:
-            result = tools.ensure_browser_status_session(
-                ws, str(credential or "")
+            result = (
+                tools.credential_browser_state_upgrade(
+                    ws, str(credential or "")
+                )
+                if requested == "credential_browser_login"
+                and upgrade_browser_state
+                else tools.ensure_browser_status_session(
+                    ws, str(credential or "")
+                )
             )
             return _with_auth_dispatch(result, metadata)
         browser_args = {
@@ -242,6 +250,14 @@ def _profiled_auth_login(ws: Workspace, requested: str,
 
 def _auth_login(ws: Workspace, args: dict, *, requested: str) -> dict:
     credential = str(args.get("credential") or "")
+    if (
+        "upgrade_browser_state" in args
+        and not isinstance(args.get("upgrade_browser_state"), bool)
+    ):
+        return _with_auth_dispatch({
+            "ok": False,
+            "summary": "upgrade_browser_state must be a literal boolean.",
+        }, _auth_dispatch_metadata(requested, "", configured=False))
     configured = False
     try:
         with credentials.auth_profile_lock(ws.slug, credential):
@@ -263,7 +279,8 @@ def _auth_login(ws: Workspace, args: dict, *, requested: str) -> dict:
                 # Keep the canonical profile snapshot stable through routing,
                 # proof, and the revision recorded with that proof.
                 return _profiled_auth_login(
-                    ws, requested, credential, profile
+                    ws, requested, credential, profile,
+                    upgrade_browser_state=args.get("upgrade_browser_state") is True,
                 )
     except credentials.CredentialError:
         metadata = _auth_dispatch_metadata(
@@ -363,6 +380,70 @@ def _authenticated_http(ws, args):
                     data["session_maintenance"] = maintenance
                     result["data"] = data
                 return result
+    except credentials.CredentialError as exc:
+        return {"ok": False, "summary": str(exc)}
+
+
+def _authenticated_browser(ws, args):
+    credential = str(args.get("credential") or "")
+    try:
+        with credentials.auth_profile_lock(ws.slug, credential):
+            profile = credentials.load_auth_profile_optional(
+                ws.slug, credential
+            )
+            verification = (
+                profile.get("browser", {}).get("verification")
+                if isinstance(profile, dict)
+                and profile.get("strategy") == "browser" else None
+            )
+            maintenance = None
+            state = credentials.load_attempt_state(ws.slug, credential)
+            if isinstance(verification, dict) and state["ever_established"]:
+                ensured = tools.ensure_browser_status_session(ws, credential)
+                ensured_data = (
+                    ensured.get("data")
+                    if isinstance(ensured.get("data"), dict) else {}
+                )
+                maintenance = ensured_data.get("session_maintenance")
+                if not ensured.get("ok"):
+                    state_after = credentials.load_attempt_state(
+                        ws.slug, credential
+                    )
+                    if not state_after["established"]:
+                        return ensured
+                    if not isinstance(maintenance, dict):
+                        maintenance = {
+                            "action": "revalidation-deferred",
+                            "credential_submission": False,
+                        }
+            profile_headers = None
+            if (
+                isinstance(profile, dict)
+                and profile.get("strategy") == "browser"
+                and str(args.get("method") or "GET").strip().upper() == "GET"
+                and tools._browser_auth_url_matches(
+                    str(args.get("url") or ""),
+                    str(profile.get("verify_url") or ""),
+                )
+            ):
+                profile_headers = profile.get("browser", {}).get("verify_headers")
+            result = tools.authenticated_browser_request(
+                ws, args["url"], credential=credential,
+                method=args.get("method", "GET"),
+                headers=args.get("headers"), body=args.get("body"),
+                page_url=args.get("page_url", ""),
+                header_sources=args.get("header_sources"),
+                timeout=args.get("timeout", 30),
+                _profile_headers=profile_headers,
+            )
+            if isinstance(maintenance, dict):
+                data = (
+                    dict(result.get("data"))
+                    if isinstance(result.get("data"), dict) else {}
+                )
+                data["session_maintenance"] = maintenance
+                result["data"] = data
+            return result
     except credentials.CredentialError as exc:
         return {"ok": False, "summary": str(exc)}
 
@@ -492,6 +573,10 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
                 "description": "Same-origin protocol headers for session proof",
             },
             "timeout": {"type": "integer", "minimum": 5, "maximum": 120},
+            "upgrade_browser_state": {
+                "type": "boolean",
+                "description": "Explicit one-attempt upgrade for a proven legacy session",
+            },
         }, ("credential",)),
         _credential_browser_login),
     "authenticated_http_request": (
@@ -504,6 +589,46 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
             "body": _string("Optional non-secret request body"),
             "timeout": {"type": "integer", "minimum": 1, "maximum": 120},
         }, ("url", "credential")), _authenticated_http),
+    "authenticated_browser_request": (
+        "Send one scoped request from a named private authenticated browser context "
+        "and save bounded request captures.",
+        _object({
+            "url": _string("In-scope HTTP(S) URL on the proven session origin"),
+            "credential": _string("Credential alias"),
+            "method": _string("HTTP method"),
+            "headers": {
+                "type": "object", "maxProperties": 32,
+                "additionalProperties": {"type": "string"},
+            },
+            "body": _string("Optional request body up to 1,000,000 bytes"),
+            "page_url": _string(
+                "Same-origin URL used for an inert browser context; its HTML is "
+                "fetched and parsed without scripts only when a meta header source is used"
+            ),
+            "header_sources": {
+                "type": "object", "maxProperties": 16,
+                "description": (
+                    "Headers resolved privately from browser state; meta sources add one "
+                    "bounded same-origin HTML fetch before the primary request"
+                ),
+                "additionalProperties": {
+                    "type": "object", "additionalProperties": False,
+                    "properties": {
+                        "source": {
+                            "type": "string",
+                            "enum": [
+                                "localStorage", "sessionStorage", "cookie", "meta",
+                            ],
+                        },
+                        "name": {"type": "string", "maxLength": 512},
+                        "prefix": {"type": "string", "maxLength": 128},
+                        "url_decode": {"type": "boolean"},
+                    },
+                    "required": ["source", "name"],
+                },
+            },
+            "timeout": {"type": "integer", "minimum": 5, "maximum": 120},
+        }, ("url", "credential")), _authenticated_browser),
     "goja_start": ("Start Grypton's managed Goja SOCKS5 TLS-fingerprint proxy.", _object({}),
         lambda ws, args: tools.Goja.start()),
     "goja_status": ("Read managed Goja status.", _object({}), lambda ws, args: tools.Goja.status()),
