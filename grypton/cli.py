@@ -899,10 +899,9 @@ def cmd_plan(ns) -> int:
     except (ValueError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
-    from .scenarios import load_scenarios
+    from .scenarios import selected_scenarios
     selected_type = ns.type
-    scenarios = [row["id"] for row in load_scenarios()
-                 if selected_type == "auto" or selected_type in row.get("target_types", [])]
+    scenarios = [row["id"] for row in selected_scenarios(selected_type)]
     try:
         models = _requested_role_models(ns, validate=True)
     except (ValueError, RuntimeError, OSError) as exc:
@@ -1215,7 +1214,10 @@ def cmd_run_status(ns) -> int:
         print(f"  health  turns={health.get('turns', 0)} tools={health.get('tool_calls', 0)} "
               f"surface={health.get('surface', 0)} tested={health.get('tested', 0)} "
               f"finding-families={state.get('finding_families', 0)} "
-              f"cases={state.get('finding_cases', health.get('findings', 0))}")
+              f"cases={state.get('finding_cases', health.get('findings', 0))} "
+              f"family-stagnation={health.get('family_stagnation_streak', 0)} "
+              f"rotation={health.get('coverage_rotation_cursor', 0)} "
+              f"proofs={health.get('proof_rotation_cursor', 0)}")
     if state.get("events"):
         print(f"  logs    {state['events']}")
     return 0
@@ -1861,7 +1863,7 @@ def build_parser() -> argparse.ArgumentParser:
     init = sub.add_parser("init", help="Create and immediately run an engagement")
     init.add_argument("target", nargs="?")
     init.add_argument("--target", dest="target_option")
-    init.add_argument("--type", choices=["auto", "web", "api", "network", "cidr", "binary", "contract"], default="auto")
+    init.add_argument("--type", choices=["auto", "web", "api", "apk", "network", "cidr", "binary", "contract"], default="auto")
     init.add_argument("--only", default=""); init.add_argument("--exclude", default="")
     init.add_argument("--include", default=""); init.add_argument("--in-scope", default="")
     init.add_argument("--out-scope", default=""); init.add_argument("--rule", action="append", default=[])
@@ -1871,7 +1873,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan = sub.add_parser("plan", help="Preview scope, models, and playbooks without starting a run")
     plan.add_argument("target", nargs="?")
     plan.add_argument("--target", dest="target_option")
-    plan.add_argument("--type", choices=["auto", "web", "api", "network", "cidr", "binary", "contract"],
+    plan.add_argument("--type", choices=["auto", "web", "api", "apk", "network", "cidr", "binary", "contract"],
                       default="auto")
     plan.add_argument("-m", "--brief", default="", help="Proposed engagement mission")
     plan.add_argument("--only", default=""); plan.add_argument("--exclude", default="")

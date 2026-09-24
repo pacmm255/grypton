@@ -78,6 +78,8 @@ class ValidationOrderTests(unittest.IsolatedAsyncioTestCase):
                     "severity": "P2",
                     "confidence": 0.88,
                     "reasoning": "Existing independent verdict.",
+                    "validator_model": config.VALIDATOR_MODEL,
+                    "validator_effort": config.VALIDATOR_EFFORT,
                 })
                 engine.ws.record_finding(
                     title="Medium candidate",
@@ -195,6 +197,8 @@ class ValidationOrderTests(unittest.IsolatedAsyncioTestCase):
                         "severity": "P2",
                         "confidence": 0.91,
                         "reasoning": "Explicit validation completed concurrently.",
+                        "validator_model": config.VALIDATOR_MODEL,
+                        "validator_effort": config.VALIDATOR_EFFORT,
                     })
                 return {
                     "finding_id": finding["id"],
@@ -202,6 +206,8 @@ class ValidationOrderTests(unittest.IsolatedAsyncioTestCase):
                     "severity": finding["severity"],
                     "confidence": 0.95,
                     "reasoning": "Automatic validation completed.",
+                    "validator_model": config.VALIDATOR_MODEL,
+                    "validator_effort": config.VALIDATOR_EFFORT,
                 }
 
             engine.worker.script = worker_script
@@ -245,6 +251,8 @@ class ValidationOrderTests(unittest.IsolatedAsyncioTestCase):
                     "verdict": "needs-more-evidence",
                     "severity": "P2",
                     "reasoning": "Add a positive/control pair.",
+                    "validator_model": config.VALIDATOR_MODEL,
+                    "validator_effort": config.VALIDATOR_EFFORT,
                 })
 
             engine = Engine("validation-revision", backend="mock")
@@ -277,6 +285,8 @@ class ValidationOrderTests(unittest.IsolatedAsyncioTestCase):
                     "verdict": "confirm", "severity": "P2",
                     "confidence": 0.94,
                     "reasoning": "The revised evidence is sufficient.",
+                    "validator_model": config.VALIDATOR_MODEL,
+                    "validator_effort": config.VALIDATOR_EFFORT,
                 }
 
             contexts = []

@@ -232,6 +232,8 @@ class FindingFamilyRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "confidence": 0.61,
                     "reasoning": "ASTRA_REASONING_MUST_NOT_REACH_SPARK",
                     "independent_checks": [exact_check],
+                    "validator_model": config.VALIDATOR_MODEL,
+                    "validator_effort": config.VALIDATOR_EFFORT,
                 }
 
             manager_contexts = []

@@ -19,7 +19,7 @@ from grypton import config
 from grypton.cli import (_duration_seconds, _run_engagement,
                          _run_engagement_unlocked, build_parser, cmd_run_stop)
 from grypton.engine import Engine
-from grypton.worker import TurnResult
+from grypton.worker import TurnResult, WorkerError
 from grypton.runtime import (
     _ProcessIdentity,
     _ProcessSnapshot,
@@ -328,6 +328,65 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(run_engine(ws.slug, run_id), 0)
             self.assertIn("--run-until-deadline", cli_main.call_args.args[0])
 
+    def test_restarted_engine_does_not_replay_original_brief(self):
+        with runtime_home():
+            ws = Workspace("restart-brief")
+            ws.create("example.test", "web")
+            ws.update_meta(
+                turn_index=1,
+                last_directive="resume with a fresh recorded lead",
+            )
+            run_id = "20260923T000000Z-00000020"
+            paths = _paths(ws.slug, run_id)
+            _write_json(paths["spec"], {
+                "slug": ws.slug,
+                "run_id": run_id,
+                "deadline_at": time.time() + 60,
+                "backend": "mock",
+                "brief": "one-time login mission",
+                "starting_turn_index": 0,
+            })
+
+            with patch("grypton.cli.main", return_value=0) as cli_main:
+                self.assertEqual(run_engine(ws.slug, run_id), 0)
+
+            argv = cli_main.call_args.args[0]
+            self.assertNotIn("--brief", argv)
+            self.assertNotIn("one-time login mission", argv)
+
+            ws.update_meta(turn_index=0)
+            with patch("grypton.cli.main", return_value=0) as first_cli:
+                self.assertEqual(run_engine(ws.slug, run_id), 0)
+            first_argv = first_cli.call_args.args[0]
+            brief_index = first_argv.index("--brief")
+            self.assertEqual(first_argv[brief_index + 1], "one-time login mission")
+
+    def test_legacy_supervisor_restart_does_not_replay_original_brief(self):
+        with runtime_home():
+            ws = Workspace("legacy-restart-brief")
+            ws.create("example.test", "web")
+            run_id = "20260923T000000Z-00000022"
+            paths = _paths(ws.slug, run_id)
+            _write_json(paths["spec"], {
+                "slug": ws.slug,
+                "run_id": run_id,
+                "deadline_at": time.time() + 60,
+                "backend": "mock",
+                "brief": "legacy one-time login mission",
+            })
+            _write_json(paths["state"], {
+                "slug": ws.slug,
+                "run_id": run_id,
+                "restarts": 1,
+            })
+
+            with patch("grypton.cli.main", return_value=0) as cli_main:
+                self.assertEqual(run_engine(ws.slug, run_id), 0)
+
+            argv = cli_main.call_args.args[0]
+            self.assertNotIn("--brief", argv)
+            self.assertNotIn("legacy one-time login mission", argv)
+
     def test_background_start_rejects_held_foreground_engine_lock(self):
         with runtime_home():
             ws = Workspace("foreground-active")
@@ -525,7 +584,7 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(popen.call_count, 1)
             self.assertEqual(public_status(ws.slug)["status"], "completed")
 
-    def test_abnormal_exit_with_in_flight_effectful_call_is_not_restarted(self):
+    def test_abnormal_exit_after_completed_effectful_turn_is_restarted(self):
         with runtime_home():
             ws = Workspace("no-replay")
             ws.create("example.test", "web")
@@ -543,21 +602,26 @@ class RuntimeTests(unittest.TestCase):
             })
             _write_json(config.RUNTIME_DIR / "supervisors/no-replay/current.json",
                         {"run_id": run_id})
-            process = _Process(pid=44660, returncode=7)
-            # The effectful pre-dispatch marker exists even though the handler
-            # never returned and no completed-call audit was written.
+            processes = [
+                _Process(pid=44660, returncode=7),
+                _Process(pid=44661, returncode=0),
+            ]
+            # A cumulative effect count can describe already-completed work.
+            # With no active provider window, the durable resume cursor makes
+            # this abnormal exit safe to restart.
             after = {
                 "workspace_status": "running",
                 "tool_calls": 0,
                 "effectful_tool_starts": 1,
             }
-            with patch("grypton.runtime.subprocess.Popen", return_value=process) as popen, \
-                    patch("grypton.runtime._health", return_value=after):
-                self.assertEqual(supervise(ws.slug, run_id), 1)
-            self.assertEqual(popen.call_count, 1)
+            with patch("grypton.runtime.subprocess.Popen", side_effect=processes) as popen, \
+                    patch("grypton.runtime._health", return_value=after), \
+                    patch("grypton.runtime.time.sleep"):
+                self.assertEqual(supervise(ws.slug, run_id), 0)
+            self.assertEqual(popen.call_count, 2)
             state = public_status(ws.slug)
-            self.assertEqual(state["status"], "failed")
-            self.assertIn("replay disabled", state["stop_reason"])
+            self.assertEqual(state["status"], "completed")
+            self.assertEqual(state["restarts"], 1)
 
     def test_abnormal_exit_with_active_native_provider_window_is_not_restarted(self):
         with runtime_home():
@@ -707,6 +771,102 @@ class RuntimeTests(unittest.TestCase):
             self.assertEqual(marker["nonce"], first)
             self.assertEqual(marker["attempt"], 1)
 
+    def test_explicit_replay_safe_failure_releases_window_before_retry(self):
+        with runtime_home():
+            ws = Workspace("native-window-safe-retry")
+            ws.create("example.test", "web")
+            run_id = "20260923T000000Z-00000019"
+            paths = _paths(ws.slug, run_id)
+            _write_json(paths["spec"], {
+                "slug": ws.slug,
+                "run_id": run_id,
+                "deadline_at": time.time() + 60,
+            })
+            engine = Engine(ws.slug, backend="real")
+            with patch.dict(os.environ, {_SUPERVISED_RUN_ENV: run_id}):
+                first = engine._begin_worker_provider_window(turn=1, attempt=1)
+                engine._release_replay_safe_worker_provider_window(first)
+                self.assertFalse(_provider_call_window_active(ws.slug, run_id))
+                second = engine._begin_worker_provider_window(turn=1, attempt=2)
+
+            self.assertNotEqual(first, second)
+            self.assertTrue(_provider_call_window_active(ws.slug, run_id))
+
+            # A later pre-tool failure cannot erase uncertainty from an earlier
+            # attempt covered by the same provider window.
+            engine._worker_provider_window_tainted = True
+            with patch.dict(os.environ, {_SUPERVISED_RUN_ENV: run_id}):
+                self.assertFalse(
+                    engine._release_replay_safe_worker_provider_window(second)
+                )
+            self.assertTrue(_provider_call_window_active(ws.slug, run_id))
+
+    def test_real_loop_releases_replay_safe_window_during_backoff(self):
+        with runtime_home(), patch.multiple(
+            config.CONFIG,
+            max_turns=1,
+            max_run_seconds=0,
+            exhaustion_threshold=99,
+            passive_stagnation_limit=99,
+            repetitive_probe_turn_limit=99,
+        ):
+            ws = Workspace("native-window-safe-loop")
+            ws.create("example.test", "web")
+            run_id = "20260923T000000Z-00000021"
+            paths = _paths(ws.slug, run_id)
+            _write_json(paths["spec"], {
+                "slug": ws.slug,
+                "run_id": run_id,
+                "deadline_at": time.time() + 60,
+            })
+            engine = Engine(ws.slug, backend="real", run_until_stopped=True)
+            engine.worker = SimpleNamespace(
+                session_id="worker-session",
+                ensure_started=AsyncMock(),
+                aclose=AsyncMock(),
+            )
+            engine.manager = SimpleNamespace(session_id="", aclose=AsyncMock())
+            engine._opening_directive = AsyncMock(return_value="exercise native tool")
+            engine._apply_pending_model_switches = AsyncMock()
+            engine._user_chat_loop = AsyncMock(return_value=None)
+            active_during_provider = []
+
+            async def provider(_directive):
+                active_during_provider.append(
+                    _provider_call_window_active(ws.slug, run_id)
+                )
+                if len(active_during_provider) == 1:
+                    raise WorkerError(
+                        "provider failed before tools",
+                        metadata={"tool_count": 0, "replay_safe": True},
+                    )
+                return TurnResult(
+                    assistant_text="completed",
+                    tool_uses=[{"name": "bash"}],
+                    result={},
+                )
+
+            async def wait_for_retry(_seconds):
+                self.assertFalse(
+                    _provider_call_window_active(ws.slug, run_id)
+                )
+                return True
+
+            engine._run_turn_with_heartbeat = provider
+            engine._wait_for_worker_retry = wait_for_retry
+            persist_turn = engine._persist_turn
+
+            def persist_then_stop(turn):
+                persist_turn(turn)
+                engine.stop_requested = True
+
+            engine._persist_turn = persist_then_stop
+            with patch.dict(os.environ, {_SUPERVISED_RUN_ENV: run_id}):
+                asyncio.run(engine.run())
+
+            self.assertEqual(active_during_provider, [True, True])
+            self.assertFalse(_provider_call_window_active(ws.slug, run_id))
+
     def test_successful_real_turn_clears_window_after_turn_and_resume_state(self):
         with runtime_home():
             ws = Workspace("native-window-persisted")
@@ -752,15 +912,34 @@ class RuntimeTests(unittest.TestCase):
                 engine.stop_requested = True
 
             engine._persist_turn = persist_then_stop
+            complete_window = engine._complete_worker_provider_window
+
+            def complete_after_checkpoint(nonce):
+                meta = ws.load_meta()
+                checkpoints.append((
+                    "complete",
+                    _provider_call_window_active(ws.slug, run_id),
+                ))
+                self.assertEqual(meta.turn_index, 1)
+                self.assertEqual(meta.family_stagnation_streak, 1)
+                self.assertNotEqual(meta.last_directive, "exercise native tool")
+                complete_window(nonce)
+
+            engine._complete_worker_provider_window = complete_after_checkpoint
             with patch.dict(os.environ, {_SUPERVISED_RUN_ENV: run_id}):
                 asyncio.run(engine.run())
 
             self.assertEqual(checkpoints, [
                 ("provider", True),
                 ("persist", True),
+                ("complete", True),
             ])
             self.assertFalse(_provider_call_window_active(ws.slug, run_id))
-            self.assertEqual(ws.load_meta().turn_index, 1)
+            meta = ws.load_meta()
+            self.assertEqual(meta.turn_index, 1)
+            self.assertEqual(meta.family_stagnation_streak, 1)
+            self.assertNotEqual(meta.last_directive, "exercise native tool")
+            self.assertIn("highest-impact unresolved lead", meta.last_directive)
             turns = (ws.transcripts_dir / "turns.jsonl").read_text(encoding="utf-8")
             self.assertIn('"turn": 1', turns)
 

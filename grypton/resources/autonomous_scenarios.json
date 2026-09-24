@@ -57,7 +57,7 @@
   {
     "id": "file-content-boundary",
     "title": "File and active-content boundaries",
-    "target_types": ["web", "api", "binary", "auto"],
+    "target_types": ["web", "api", "apk", "binary", "auto"],
     "priority_action": "Trace an upload, export, attachment, archive, media transform, or rendered document from ingestion to retrieval and test whether content type, name, metadata, processing, or access control crosses a higher-impact boundary.",
     "moves": [
       "map ingestion, transformation, storage, rendering, and retrieval",
@@ -123,7 +123,7 @@
   {
     "id": "mobile-artifact-boundary",
     "title": "Mobile artifact and trust boundaries",
-    "target_types": ["web", "api", "binary", "auto"],
+    "target_types": ["web", "api", "apk", "binary", "auto"],
     "requires": ["mobile_artifact"],
     "priority_action": "Inspect the published APK as a binary artifact, extract backend and component trust assumptions, and validate the strongest credential, deep-link, exported-component, storage, or protocol hypothesis against the scoped system.",
     "moves": [
@@ -135,7 +135,7 @@
   {
     "id": "finding-proof",
     "title": "High-severity proof completion",
-    "target_types": ["auto", "web", "api", "network", "cidr", "binary", "contract"],
+    "target_types": ["auto", "web", "api", "network", "cidr", "apk", "binary", "contract"],
     "requires": ["validation_backlog"],
     "priority_action": "Take the highest-severity unresolved candidate, perform the next independent check Astra requested with a positive and negative control, and attach the resulting evidence through revise_finding.",
     "moves": [
@@ -147,7 +147,7 @@
   {
     "id": "blocked-path-recovery",
     "title": "Operational blocker recovery",
-    "target_types": ["auto", "web", "api", "network", "cidr", "binary", "contract"],
+    "target_types": ["auto", "web", "api", "network", "cidr", "apk", "binary", "contract"],
     "requires": ["blocker"],
     "priority_action": "Resolve the current prerequisite with the available tool inventory, authenticated browser state, a local dependency, or an alternate evidence path, then execute the strongest unblocked high-impact test.",
     "moves": [

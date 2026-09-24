@@ -303,6 +303,13 @@ restart budget. Grypton still fails closed if an interrupted effectful action
 cannot be replayed safely or if verified process cleanup fails. `run stop`
 remains available at any time.
 
+Grypton measures progress by new root-cause families as well as routes. After
+three completed turns without a new family, Kryptex rotates through the web,
+identity, session, workflow, parser, file, browser, cache, integration, and
+network playbooks. New URLs from an already-known defect do not reset this
+rotation. The cursor is saved, so a safe supervisor restart continues from the
+next playbook.
+
 A detached finite run keeps requesting new Kryptex-directed pivots when its
 current leads converge, using the deadline as its normal completion boundary.
 The opening mission still reaches Kraude verbatim. After that one-shot mission
@@ -820,6 +827,12 @@ flowchart TD
 ```
 
 Astra reviews the saved evidence snapshot. It does not perform live target actions during validation.
+When Astra requests more evidence for a P1/P2 candidate, its bounded independent
+checks remain in Kryptex's proof backlog across turns and restarts. Kraude is
+periodically sent every requested check for the next fairly rotated case and
+attaches new proof with `revise_finding`.
+If Astra itself has a provider or transport error, Grypton retries Astra instead;
+that outage is not presented to Kraude as an evidence gap.
 
 ---
 

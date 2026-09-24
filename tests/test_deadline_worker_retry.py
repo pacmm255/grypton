@@ -136,6 +136,51 @@ class DeadlineWorkerRetryTests(unittest.IsolatedAsyncioTestCase):
             progress = (ws.root / "progress.md").read_text(encoding="utf-8")
             self.assertEqual(progress.count("transient Kraude provider failure"), 5)
 
+    async def test_forever_mode_retries_explicitly_safe_worker_errors_past_limit(self):
+        with isolated_runtime():
+            config.CONFIG.max_turns = 1
+            config.CONFIG.max_run_seconds = 0
+            config.CONFIG.exhaustion_threshold = 99
+            config.CONFIG.passive_stagnation_limit = 99
+            config.CONFIG.repetitive_probe_turn_limit = 99
+
+            ws = Workspace("forever-safe-worker-retry")
+            ws.create("https://example.test", "web")
+            engine = Engine(
+                ws.slug,
+                backend="mock",
+                run_until_stopped=True,
+            )
+            await engine.setup(
+                brief="exercise the scoped application",
+                target="https://example.test",
+                target_type="web",
+            )
+            safe_failure = lambda: WorkerError(
+                "provider exited before starting a tool",
+                metadata={"tool_count": 0, "replay_safe": True},
+            )
+            engine.worker.run_turn = AsyncMock(side_effect=[
+                *(safe_failure() for _ in range(6)),
+                TurnResult(
+                    assistant_text="provider recovered",
+                    tool_uses=[{"name": "http_request", "input": {}}],
+                    result={"is_error": False},
+                ),
+            ])
+            engine.worker.ensure_started = AsyncMock()
+            engine._wait_for_worker_retry = AsyncMock(return_value=True)
+
+            await engine.run()
+
+            self.assertEqual(engine.turn_index, 1)
+            self.assertIn("max_turns safety ceiling", engine.stop_reason)
+            self.assertEqual(engine.worker.run_turn.await_count, 7)
+            self.assertEqual(
+                engine._wait_for_worker_retry.await_args_list,
+                [call(2), call(4), call(8), call(16), call(30), call(30)],
+            )
+
     async def test_partial_tool_failure_resets_session_and_suppresses_replay(self):
         with isolated_runtime():
             config.CONFIG.max_turns = 1

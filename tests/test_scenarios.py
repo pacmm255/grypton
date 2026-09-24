@@ -46,6 +46,15 @@ class AutonomousScenarioTests(unittest.TestCase):
         self.assertIn("blocked-path-recovery", enabled)
         self.assertIn("mobile-artifact-boundary", enabled)
 
+        apk = {
+            row["id"] for row in scenarios.selected_scenarios(
+                "apk",
+                capabilities={"validation_backlog", "blocker"},
+            )
+        }
+        self.assertIn("finding-proof", apk)
+        self.assertIn("blocked-path-recovery", apk)
+
     def test_catalog_validation_rejects_missing_priority_action(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "scenarios.json"

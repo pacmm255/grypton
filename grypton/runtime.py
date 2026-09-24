@@ -407,6 +407,9 @@ def _health(slug: str, engine_pid: int) -> dict[str, Any]:
     ws = Workspace(slug)
     meta_status = "missing"
     turns = 0
+    family_stagnation = 0
+    coverage_rotation = 0
+    proof_rotation = 0
     if ws.exists():
         try:
             meta = ws.load_meta()
@@ -414,6 +417,15 @@ def _health(slug: str, engine_pid: int) -> dict[str, Any]:
             turns = int(meta.turn_index)
         except (OSError, ValueError, TypeError):
             meta_status = "unreadable"
+        else:
+            try:
+                family_stagnation = max(0, int(meta.family_stagnation_streak))
+                coverage_rotation = max(0, int(meta.coverage_rotation_cursor))
+                proof_rotation = max(0, int(meta.proof_rotation_cursor))
+            except (ValueError, TypeError):
+                family_stagnation = 0
+                coverage_rotation = 0
+                proof_rotation = 0
     ledger = ws.root / ".ledger"
     finding_cases = _line_count(ledger / "findings.jsonl")
     finding_families = 0
@@ -430,6 +442,9 @@ def _health(slug: str, engine_pid: int) -> dict[str, Any]:
                                     _current(slug)[0]) if engine_pid else False,
         "workspace_status": meta_status,
         "turns": turns,
+        "family_stagnation_streak": family_stagnation,
+        "coverage_rotation_cursor": coverage_rotation,
+        "proof_rotation_cursor": proof_rotation,
         "tool_calls": _line_count(ledger / "tool-calls.jsonl"),
         "effectful_tool_starts": _line_count(
             ledger / "effectful-tool-starts.jsonl"
@@ -545,6 +560,7 @@ def _start_background_locked(
         "brief": str(brief or ""),
         "backend": str(backend),
         "deadline_at": deadline,
+        "starting_turn_index": int(ws.load_meta().turn_index),
         "run_mode": "until-finding" if indefinite else "finite",
         "until_severity": threshold,
         "max_turns": int(max_turns or 0),
@@ -1102,9 +1118,6 @@ def supervise(slug: str, run_id: str) -> int:
             env = os.environ.copy()
             env["GRYPTON_HOME"] = str(config.GRYPTON_HOME)
             env["GRYPTON_SUPERVISED"] = "1"
-            effectful_starts_before = _line_count(
-                Workspace(slug).root / ".ledger" / "effectful-tool-starts.jsonl"
-            )
             try:
                 child = subprocess.Popen(
                     _engine_argv(slug, run_id),
@@ -1228,19 +1241,6 @@ def supervise(slug: str, run_id: str) -> int:
                          or after.get("workspace_status") == "stopped")):
                 exit_status, stop_reason = "completed", "persisted engine stop"
                 break
-            effectful_delta = (
-                int(after.get("effectful_tool_starts") or 0)
-                - effectful_starts_before
-            )
-            if returncode != 0 and effectful_delta > 0:
-                exit_status = "failed"
-                stop_reason = (
-                    "abnormal exit after an effectful tool began; replay disabled"
-                )
-                _append_event(paths["events"], "restart_suppressed",
-                              reason="effectful_tool_started",
-                              effectful_tool_starts=effectful_delta)
-                break
             if _provider_call_window_active(slug, run_id):
                 exit_status = "failed"
                 stop_reason = (
@@ -1324,7 +1324,25 @@ def run_engine(slug: str, run_id: str) -> int:
     ]
     if remaining is not None:
         arguments.extend(("--max-seconds", str(remaining)))
-    if spec.get("brief"):
+    starting_turn = spec.get("starting_turn_index")
+    if isinstance(starting_turn, bool) or not isinstance(starting_turn, int):
+        # A supervisor created by an older release has no starting-turn
+        # checkpoint. Its private restart count still distinguishes the first
+        # child from a replacement, so never replay a one-shot login/mission
+        # brief merely because the spec predates this field.
+        legacy_state = _read_json(_paths(slug, run_id)["state"])
+        legacy_restarts = legacy_state.get("restarts")
+        brief_pending = bool(
+            isinstance(legacy_restarts, int)
+            and not isinstance(legacy_restarts, bool)
+            and legacy_restarts == 0
+        )
+    else:
+        try:
+            brief_pending = Workspace(slug).load_meta().turn_index == starting_turn
+        except (OSError, TypeError, ValueError):
+            return 2
+    if spec.get("brief") and brief_pending:
         arguments.extend(("--brief", str(spec["brief"])))
     if int(spec.get("max_turns") or 0):
         arguments.extend(("--max-turns", str(int(spec["max_turns"]))))

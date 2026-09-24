@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+from dataclasses import dataclass
 import json
 import time
 import traceback
@@ -27,8 +28,9 @@ from urllib.parse import parse_qsl, urlsplit
 import re
 
 from . import antifab, config, prompts
-from .finding_views import astra_confirmed_cases_at_or_above
+from .finding_views import astra_confirmed_cases_at_or_above, safe_display_text
 from .manager import ManagerContext
+from .scenarios import priority_action
 from .worker import WorkerError
 from .workspace import ASTRA_REVALIDATION_REVISION_FIELD, Workspace
 
@@ -114,11 +116,22 @@ _DEFAULT_WORKER_PROVIDER_RETRY_S = 60
 _MAX_WORKER_PROVIDER_RETRY_S = 300
 _WORKER_RETRY_POLL_S = 1.0
 _MAX_WORKER_FAILURE_TOOL_COUNT = 10_000
+_FAMILY_PRIORITY_THRESHOLD = 3
+_PROOF_PRIORITY_FREQUENCY = 3
+_MAX_PROOF_BACKLOG = 6
 _PARTIAL_TOOL_RECOVERY_ACTION = (
     "Continue from the durable results already recorded. Select a different "
     "highest-impact unresolved lead in the recorded attack surface, test it "
     "with an available tool, and record the observed result."
 )
+
+
+@dataclass(frozen=True)
+class _PrioritySelection:
+    action: str = ""
+    kind: str = ""
+    record_id: str = ""
+    epoch_max_id: str = ""
 
 
 # Detached deadline runs treat the supervisor deadline as their completion
@@ -226,6 +239,16 @@ class Engine:
         self._network_signatures: Counter[str] = Counter()
         self._passive_stagnation_streak = 0
         self._repetitive_probe_streak = 0
+        self._family_stagnation_streak = 0
+        self._coverage_rotation_cursor = 0
+        self._proof_rotation_cursor = 0
+        self._proof_rotation_after_id = ""
+        self._proof_rotation_epoch_max_id = ""
+        self._validation_retry_cursor = 0
+        self._validation_retry_after_id = ""
+        self._validation_retry_epoch_max_id = ""
+        self._selected_validation_retry_id = ""
+        self._selected_validation_retry_epoch_max_id = ""
         self._convergence_alerted = False
         self._last_network_metrics = {
             "calls": 0, "novel": 0, "repeated": 0, "over_limit": 0,
@@ -235,6 +258,7 @@ class Engine:
         # One supervised marker spans provider retries until a completed Kraude
         # turn and the resume cursor are both durable.
         self._worker_provider_window_nonce = ""
+        self._worker_provider_window_tainted = False
 
     # ---------------------------------------------------------------- setup
 
@@ -301,6 +325,63 @@ class Engine:
             } if reset_worker_context else {}),
         )
         self.turn_index = meta.turn_index
+        raw_cursor = getattr(meta, "coverage_rotation_cursor", 0)
+        raw_proof_cursor = getattr(meta, "proof_rotation_cursor", 0)
+        raw_proof_after_id = getattr(meta, "proof_rotation_after_id", "")
+        raw_proof_epoch_max_id = getattr(meta, "proof_rotation_epoch_max_id", "")
+        raw_family_streak = getattr(meta, "family_stagnation_streak", 0)
+        raw_validation_cursor = getattr(meta, "validation_retry_cursor", 0)
+        raw_validation_after_id = getattr(meta, "validation_retry_after_id", "")
+        raw_validation_epoch_max_id = getattr(
+            meta, "validation_retry_epoch_max_id", ""
+        )
+        self._coverage_rotation_cursor = (
+            min(raw_cursor, 1_000_000_000)
+            if isinstance(raw_cursor, int) and not isinstance(raw_cursor, bool)
+            and raw_cursor >= 0 else 0
+        )
+        self._proof_rotation_cursor = (
+            min(raw_proof_cursor, 1_000_000_000)
+            if isinstance(raw_proof_cursor, int)
+            and not isinstance(raw_proof_cursor, bool)
+            and raw_proof_cursor >= 0 else 0
+        )
+        self._proof_rotation_after_id = (
+            raw_proof_after_id
+            if isinstance(raw_proof_after_id, str)
+            and re.fullmatch(r"F\d+", raw_proof_after_id)
+            else ""
+        )
+        self._proof_rotation_epoch_max_id = (
+            raw_proof_epoch_max_id
+            if isinstance(raw_proof_epoch_max_id, str)
+            and re.fullmatch(r"F\d+", raw_proof_epoch_max_id)
+            else ""
+        )
+        self._family_stagnation_streak = (
+            min(raw_family_streak, 1_000_000_000)
+            if isinstance(raw_family_streak, int)
+            and not isinstance(raw_family_streak, bool)
+            and raw_family_streak >= 0 else 0
+        )
+        self._validation_retry_cursor = (
+            min(raw_validation_cursor, 1_000_000_000)
+            if isinstance(raw_validation_cursor, int)
+            and not isinstance(raw_validation_cursor, bool)
+            and raw_validation_cursor >= 0 else 0
+        )
+        self._validation_retry_after_id = (
+            raw_validation_after_id
+            if isinstance(raw_validation_after_id, str)
+            and re.fullmatch(r"F\d+", raw_validation_after_id)
+            else ""
+        )
+        self._validation_retry_epoch_max_id = (
+            raw_validation_epoch_max_id
+            if isinstance(raw_validation_epoch_max_id, str)
+            and re.fullmatch(r"F\d+", raw_validation_epoch_max_id)
+            else ""
+        )
         if not fresh_clone:
             if not self._worker_model_explicit and meta.worker_model:
                 self.worker_model = meta.worker_model
@@ -461,7 +542,13 @@ class Engine:
                 self.emit("error", text=f"Worker fault ({self._fault_count}): {e}")
                 tool_count = self._worker_failure_tool_count(e)
                 replay_unsafe = self._worker_failure_replay_unsafe(e)
+                replay_safe = bool(
+                    isinstance(e, WorkerError)
+                    and not replay_unsafe
+                    and tool_count == 0
+                )
                 if tool_count or replay_unsafe:
+                    self._worker_provider_window_tainted = True
                     # The failed conversation may end between a tool call and
                     # its model-visible result.  Absence of an observed event is
                     # not proof that a native command did not run: OpenCode can
@@ -469,6 +556,14 @@ class Engine:
                     # session before any wait or provider retry; durable evidence
                     # and Kryptex state stay untouched.
                     self._reset_worker_after_partial_failure()
+                elif replay_safe:
+                    # The provider explicitly proved that no native tool could
+                    # have run. Release this attempt's marker before backoff so
+                    # a supervisor restart during the wait cannot mistake an
+                    # idle, replay-safe engine for an in-flight action.
+                    self._release_replay_safe_worker_provider_window(
+                        provider_window_nonce
+                    )
                 retry = (
                     self._deadline_worker_retry(e)
                     if self.run_until_deadline else None
@@ -514,12 +609,17 @@ class Engine:
                 # than spending the remaining deadline in a retry loop.
                 if self.run_until_deadline and not isinstance(e, WorkerError):
                     raise
-                if self._fault_count >= 5:
+                if self._fault_count >= 5 and not (
+                    self.run_until_deadline and replay_safe
+                ):
                     if self.run_until_deadline:
                         raise
                     self._stop(f"unrecoverable worker fault: {e}")
                     break
-                backoff_s = min(2 ** self._fault_count, 30)
+                backoff_s = (
+                    30 if self._fault_count >= 5
+                    else min(2 ** self._fault_count, 30)
+                )
                 if self.run_until_deadline:
                     if not await self._wait_for_worker_retry(backoff_s):
                         break
@@ -547,11 +647,27 @@ class Engine:
                       tools=turn.tool_uses, cost=turn.cost_usd, dur=turn.duration_s)
             self._persist_turn(turn)
             self._rollover_worker_session_if_needed(turn)
+
+            # Detect ledger deltas before publishing the completed-turn cursor.
+            # On restart the current ledger becomes the new baseline, so the
+            # family reset/increment must be checkpointed with that cursor or a
+            # crash could silently turn a new family into a stagnating turn.
+            new_findings, new_family_ids, new_surface = self._deltas()
+            if new_family_ids:
+                self._family_stagnation_streak = 0
+            else:
+                self._family_stagnation_streak += 1
+
             # Status readers should see the completed worker turn while Spark or
             # Astra are still processing, rather than lagging a whole cycle.
+            # Replace the consumed directive in the same atomic metadata write;
+            # if the child exits before Kryptex chooses the next action, resume
+            # advances with this recovery action instead of replaying it.
             self.ws.update_meta(
                 turn_index=self.turn_index,
                 worker_uuid=getattr(self.worker, "session_id", "") or "",
+                family_stagnation_streak=self._family_stagnation_streak,
+                last_directive=_RECOVERY_ACTION,
             )
             # The provider may have executed native tools that do not appear in
             # Grypton's MCP effect ledger. Clear the fail-closed supervisor
@@ -559,8 +675,7 @@ class Engine:
             # are durable.
             self._complete_worker_provider_window(provider_window_nonce)
 
-            # ---- detect deltas ----
-            new_findings, new_family_ids, new_surface = self._deltas()
+            # ---- report deltas ----
             network = self._network_novelty(turn.tool_uses or [])
             for f in new_findings:
                 self.emit("finding", finding=f)
@@ -698,6 +813,8 @@ class Engine:
                     self.ws.set_severity_verdict_if_absent(
                         fid, verdict,
                         expected_revalidation_revision=expected_revision,
+                        replace_degraded=True,
+                        replace_untrusted_validator=True,
                     )
                     if fid else (None, False)
                 )
@@ -710,6 +827,21 @@ class Engine:
                     ))
                 self.emit("validation_complete", finding_id=finding.get("id"),
                           verdict=verdict)
+                if fid and fid == self._selected_validation_retry_id:
+                    self._validation_retry_cursor += 1
+                    self._validation_retry_after_id = fid
+                    self._validation_retry_epoch_max_id = (
+                        self._selected_validation_retry_epoch_max_id
+                    )
+                    self.ws.update_meta(
+                        validation_retry_cursor=self._validation_retry_cursor,
+                        validation_retry_after_id=self._validation_retry_after_id,
+                        validation_retry_epoch_max_id=(
+                            self._validation_retry_epoch_max_id
+                        ),
+                    )
+                    self._selected_validation_retry_id = ""
+                    self._selected_validation_retry_epoch_max_id = ""
                 # `--stop-on-p1` applies as soon as Astra's decisive verdict is
                 # durable. Do not spend another provider call on Kryptex first.
                 self._handle_p1s()
@@ -756,12 +888,19 @@ class Engine:
             # Rebuild after verdict persistence so the raw new cases, compact
             # family catalog, and confirmed-P1 case count all carry Astra's
             # result into the exact ManagerContext used for this direction.
+            priority_selection = self._next_coverage_priority(
+                exhausted=exhausted,
+                worker_was_idle=worker_was_idle,
+                convergence_reason=convergence_reason,
+            )
+            coverage_priority = priority_selection.action
             ctx = self._build_context(
                 turn, new_findings, flags, exhausted, [],
                 worker_was_idle=worker_was_idle,
                 worker_idle_streak=self._idle_streak,
                 convergence_reason=convergence_reason,
                 novel_finding_families=len(new_family_ids),
+                coverage_priority=coverage_priority,
             )
             try:
                 async with self._mgr_lock:
@@ -773,6 +912,15 @@ class Engine:
                 if directive is None:
                     directive_text = "Continue hunting with full depth; expand the surface if blocked."
                     continue
+
+            # Once family stagnation selects a durable rotation action, Spark's
+            # assessment cannot silently consume or replace it. Kryptex still
+            # reviews the full context and reports its assessment, while the
+            # selected affirmative action is the one Kraude receives.
+            if coverage_priority:
+                directive.directive = coverage_priority
+                directive.cont = True
+                directive.stop_reason = ""
 
             # Kryptex does not grade findings. Ignore any model-produced
             # severity verdicts; automatic P1/P2 verdicts are already durable,
@@ -850,10 +998,44 @@ class Engine:
                 except Exception as e:
                     self.emit("error", text=f"Rewind failed ({e}) — sending reframe anyway.")
 
-            self.ws.update_meta(turn_index=self.turn_index,
-                                last_directive=directive_text,
-                                worker_uuid=getattr(self.worker, "session_id", "") or "",
-                                manager_session_id=getattr(self.manager, "session_id", "") or "")
+            meta_changes = {
+                "turn_index": self.turn_index,
+                "last_directive": directive_text,
+                "worker_uuid": getattr(self.worker, "session_id", "") or "",
+                "manager_session_id": getattr(self.manager, "session_id", "") or "",
+            }
+            if priority_selection.kind == "coverage":
+                self._coverage_rotation_cursor += 1
+                meta_changes["coverage_rotation_cursor"] = (
+                    self._coverage_rotation_cursor
+                )
+            elif priority_selection.kind == "proof":
+                self._proof_rotation_cursor += 1
+                meta_changes["proof_rotation_cursor"] = (
+                    self._proof_rotation_cursor
+                )
+                self._proof_rotation_after_id = priority_selection.record_id
+                self._proof_rotation_epoch_max_id = (
+                    priority_selection.epoch_max_id
+                )
+                meta_changes["proof_rotation_after_id"] = (
+                    self._proof_rotation_after_id
+                )
+                meta_changes["proof_rotation_epoch_max_id"] = (
+                    self._proof_rotation_epoch_max_id
+                )
+            self.ws.update_meta(**meta_changes)
+            if coverage_priority:
+                self.emit(
+                    "coverage_priority",
+                    family_stagnation_streak=self._family_stagnation_streak,
+                    rotation=(
+                        self._proof_rotation_cursor
+                        if priority_selection.kind == "proof"
+                        else self._coverage_rotation_cursor
+                    ),
+                    proof_focus=priority_selection.kind == "proof",
+                )
 
     # ------------------------------------------------------- loop helpers
 
@@ -931,6 +1113,7 @@ class Engine:
             attempt=attempt,
         )
         self._worker_provider_window_nonce = nonce
+        self._worker_provider_window_tainted = False
         return nonce
 
     def _complete_worker_provider_window(self, nonce: str) -> None:
@@ -946,6 +1129,17 @@ class Engine:
         _sync_file_and_parent(self.ws.meta_path)
         _provider_call_window_complete(self.slug, nonce)
         self._worker_provider_window_nonce = ""
+        self._worker_provider_window_tainted = False
+
+    def _release_replay_safe_worker_provider_window(self, nonce: str) -> bool:
+        """Release a wholly replay-safe provider window before retry backoff."""
+        if not nonce or self._worker_provider_window_tainted:
+            return False
+        from .runtime import _provider_call_window_complete
+        _provider_call_window_complete(self.slug, nonce)
+        self._worker_provider_window_nonce = ""
+        self._worker_provider_window_tainted = False
+        return True
 
     def _reset_worker_after_partial_failure(self) -> None:
         """Forget only Kraude's incomplete provider conversation."""
@@ -1117,7 +1311,8 @@ class Engine:
 
     def _build_context(self, turn, new_findings, flags, exhausted, user_msgs,
                        worker_was_idle=False, worker_idle_streak=0,
-                       convergence_reason="", novel_finding_families=0) -> ManagerContext:
+                       convergence_reason="", novel_finding_families=0,
+                       coverage_priority="") -> ManagerContext:
         c = self.ws.load_constraints()
         return ManagerContext(
             target=self.target, target_type=self.target_type, turn_index=self.turn_index,
@@ -1142,15 +1337,41 @@ class Engine:
             user_messages=user_msgs, new_findings=new_findings,
             new_finding_cases=self._manager_case_projection(new_findings),
             novel_finding_families=novel_finding_families,
+            family_stagnation_streak=self._family_stagnation_streak,
+            coverage_priority=coverage_priority,
+            validation_backlog=self._bounded_proof_backlog(),
             p1_count=len(self.ws.confirmed_p1s()),
         )
 
     @staticmethod
-    def _automatic_validation_candidates(findings: list[dict]) -> list[dict]:
+    def _trusted_astra_verdict(verdict: object) -> bool:
+        return bool(
+            isinstance(verdict, dict)
+            and verdict.get("degraded", False) is False
+            and str(verdict.get("validator_model") or "")
+            == config.VALIDATOR_MODEL
+            and str(verdict.get("validator_effort") or "")
+            == config.VALIDATOR_EFFORT
+        )
+
+    @classmethod
+    def _automatic_validation_candidates(cls, findings: list[dict]) -> list[dict]:
+        terminal = {
+            "confirm", "agree", "upgrade", "downgrade", "reject",
+            "needs-more-evidence", "pending",
+        }
         return [
             finding for finding in findings
             if finding.get("status") != "suppressed-by-scope"
-            and not isinstance(finding.get("manager_verdict"), dict)
+            and (
+                not isinstance(finding.get("manager_verdict"), dict)
+                or finding.get("manager_verdict", {}).get("degraded") is True
+                or not cls._trusted_astra_verdict(
+                    finding.get("manager_verdict")
+                )
+                or str(finding.get("manager_verdict", {}).get(
+                    "verdict") or "").strip().lower() not in terminal
+            )
             and config.astra_auto_validation_required(finding.get("severity", ""))
         ]
 
@@ -1164,7 +1385,9 @@ class Engine:
         return [current.get(str(finding.get("id")), finding) for finding in findings]
 
     def _validation_turn_findings(self, new_findings: list[dict]) -> list[dict]:
-        """Include reopened evidence revisions in this turn's validation set."""
+        """Include revisions and one durable Astra transport retry per turn."""
+        self._selected_validation_retry_id = ""
+        self._selected_validation_retry_epoch_max_id = ""
         current = self.ws.findings.all()
         by_id = {
             str(finding.get("id")): finding
@@ -1188,7 +1411,188 @@ class Engine:
             ):
                 ordered.append(finding)
                 seen.add(fid)
+        # A validator/provider outage or provenance-free legacy verdict is not
+        # an Astra result. Retry one stranded candidate per completed worker
+        # turn, including after an engine restart. Rotate durably so one
+        # repeatable failure cannot starve later candidates. Trusted evidence
+        # gaps stay out until Kraude attaches a material revision.
+        retryable = []
+        for finding in current:
+            fid = str(finding.get("id") or "")
+            if (
+                fid and fid not in seen
+                and self._automatic_validation_candidates([finding])
+            ):
+                retryable.append(finding)
+        if retryable:
+            selected_index, epoch_max_id = self._next_id_slot(
+                retryable,
+                self._validation_retry_after_id,
+                self._validation_retry_epoch_max_id,
+            )
+            selected = retryable[selected_index]
+            selected_id = str(selected.get("id") or "")
+            ordered.append(selected)
+            seen.add(selected_id)
+            self._selected_validation_retry_id = selected_id
+            self._selected_validation_retry_epoch_max_id = epoch_max_id
         return ordered
+
+    @classmethod
+    def _high_severity_proof_backlog(cls, findings: list[dict]) -> list[dict]:
+        """Project durable Astra evidence gaps without forwarding case evidence."""
+        backlog = []
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            if finding.get("status") == "suppressed-by-scope":
+                continue
+            claimed = str(finding.get("severity") or "").strip().upper()
+            if not config.astra_auto_validation_required(claimed):
+                continue
+            verdict = finding.get("manager_verdict")
+            if not cls._trusted_astra_verdict(verdict):
+                continue
+            if str(verdict.get("verdict") or "").strip().lower() not in {
+                "needs-more-evidence", "pending",
+            }:
+                continue
+            raw_checks = verdict.get("independent_checks")
+            checks = raw_checks if isinstance(raw_checks, list) else []
+            backlog.append({
+                "id": safe_display_text(finding.get("id"), 32),
+                "title": safe_display_text(finding.get("title"), 160),
+                "claimed_severity": safe_display_text(claimed, 16),
+                "astra_severity": safe_display_text(
+                    verdict.get("severity"), 16,
+                ),
+                "surface": safe_display_text(finding.get("surface"), 180),
+                "independent_checks": [
+                    rendered for check in checks[:4]
+                    if (rendered := safe_display_text(check, 240))
+                ],
+            })
+        # Finding IDs are allocated monotonically. Keeping one stable order for
+        # P1 and P2 prevents a stream of newly inserted P1 claims from starving
+        # an older P2 evidence gap forever.
+        backlog.sort(
+            key=lambda row: Workspace._finding_id_sort_key(row["id"])
+        )
+        return backlog
+
+    def _bounded_proof_backlog(self) -> list[dict]:
+        """Return a rotating, prompt-sized view of every durable proof gap."""
+        backlog = self._high_severity_proof_backlog(self.ws.findings.all())
+        if not backlog:
+            return []
+        start, _epoch_max_id = self._next_proof_slot(backlog)
+        return [
+            backlog[(start + offset) % len(backlog)]
+            for offset in range(min(len(backlog), _MAX_PROOF_BACKLOG))
+        ]
+
+    def _next_proof_slot(self, backlog: list[dict]) -> tuple[int, str]:
+        """Select the next case inside a fixed round, then admit new IDs."""
+        return self._next_id_slot(
+            backlog,
+            self._proof_rotation_after_id,
+            self._proof_rotation_epoch_max_id,
+        )
+
+    @staticmethod
+    def _next_id_slot(
+        rows: list[dict],
+        after_id: str,
+        epoch_max_id: str,
+    ) -> tuple[int, str]:
+        """Advance within one fixed ID epoch so new arrivals cannot starve wrap."""
+        if not rows:
+            return 0, ""
+        current_max_id = str(rows[-1].get("id") or "")
+        active_epoch = epoch_max_id or current_max_id
+        anchor = Workspace._finding_id_sort_key(after_id)
+        epoch_tail = Workspace._finding_id_sort_key(active_epoch)
+        for index, row in enumerate(rows):
+            row_key = Workspace._finding_id_sort_key(row.get("id"))
+            if row_key > anchor and row_key <= epoch_tail:
+                return index, active_epoch
+        # Every still-present row in the old epoch has received a slot. Freeze
+        # the current tail for the next round, then revisit the oldest gap.
+        return 0, current_max_id
+
+    def _has_mobile_artifact(self) -> bool:
+        if str(self.target_type or "").lower() in {"apk", "binary"}:
+            return True
+        if ".apk" in str(self.target or "").lower():
+            return True
+        for row in self.ws.surface.all()[-200:]:
+            if not isinstance(row, dict):
+                continue
+            value = " ".join(str(row.get(key) or "") for key in (
+                "kind", "item", "detail", "interesting",
+            )).lower()
+            if re.search(r"(?:\bapk\b|\.apk(?:\b|\?))", value):
+                return True
+        return False
+
+    @staticmethod
+    def _proof_priority(candidate: dict) -> str:
+        if not candidate:
+            return ""
+        checks = candidate.get("independent_checks") or []
+        if checks:
+            rendered = "; ".join(
+                f"({index}) {check}"
+                for index, check in enumerate(checks, start=1)
+            )
+            action = f"perform every requested independent check: {rendered}"
+        else:
+            action = "capture the missing positive and control proof"
+        return (
+            f"For {candidate['id']}, {action}. Save the paired evidence and attach "
+            "the material revision with revise_finding."
+        )
+
+    def _next_coverage_priority(
+        self,
+        *,
+        exhausted: bool,
+        worker_was_idle: bool,
+        convergence_reason: str,
+    ) -> _PrioritySelection:
+        backlog = self._high_severity_proof_backlog(self.ws.findings.all())
+        # Proof acquisition has its own cadence. New lower-severity families do
+        # not reset it, so a P1/P2 evidence request cannot be starved by endless
+        # discovery. The cursor advances only when the selected directive and
+        # next resume state are committed together below.
+        if (
+            backlog
+            and self.turn_index > 0
+            and self.turn_index % _PROOF_PRIORITY_FREQUENCY == 0
+        ):
+            candidate_index, epoch_max_id = self._next_proof_slot(backlog)
+            candidate = backlog[candidate_index]
+            candidate_id = str(candidate.get("id") or "")
+            return _PrioritySelection(
+                self._proof_priority(candidate),
+                "proof",
+                candidate_id,
+                epoch_max_id,
+            )
+        if self._family_stagnation_streak < _FAMILY_PRIORITY_THRESHOLD:
+            return _PrioritySelection()
+        cursor = self._coverage_rotation_cursor
+        capabilities = set()
+        if exhausted or worker_was_idle or convergence_reason:
+            capabilities.add("blocker")
+        if self._has_mobile_artifact():
+            capabilities.add("mobile_artifact")
+        action = priority_action(
+            self.target_type,
+            cursor,
+            capabilities=capabilities,
+        )
+        return _PrioritySelection(action, "coverage" if action else "")
 
     @staticmethod
     def _manager_case_projection(findings: list[dict]) -> list[dict]:
@@ -1356,6 +1760,7 @@ class Engine:
         return {
             family_id
             for finding in findings
+            if finding.get("status") != "suppressed-by-scope"
             if (family_id := str(
                 finding.get("family_id") or finding.get("id") or ""
             ).strip())

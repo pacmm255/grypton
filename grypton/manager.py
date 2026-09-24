@@ -456,11 +456,22 @@ class KryptexManager:
         if ctx.coverage_priority:
             action = ctx.coverage_priority
         elif ctx.validation_backlog:
-            finding = ctx.validation_backlog[0]
+            index = max(0, int(ctx.turn_index or 1) - 1)
+            finding = ctx.validation_backlog[index % len(ctx.validation_backlog)]
             finding_id = str(finding.get("id") or "the highest-severity candidate")
+            checks = finding.get("independent_checks")
+            checks = checks if isinstance(checks, list) else []
+            requested = (
+                "perform every requested independent check: "
+                + "; ".join(
+                    f"({number}) {check}"
+                    for number, check in enumerate(checks, start=1)
+                )
+                if checks else "capture the missing positive and control proof"
+            )
             action = (
-                f"Collect the next missing proof for {finding_id}, save a positive/control "
-                "evidence pair, and attach the revised evidence with revise_finding."
+                f"For {finding_id}, {requested}. Save the paired evidence and attach "
+                "the material revision with revise_finding."
             )
         elif ctx.worker_was_idle:
             action = (

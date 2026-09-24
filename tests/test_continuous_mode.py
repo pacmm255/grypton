@@ -16,8 +16,10 @@ from grypton.cli import _configure_run, build_parser, cmd_run_start
 from grypton.engine import Engine
 from grypton.manager import Directive
 from grypton.runtime import (
+    _SUPERVISED_RUN_ENV,
     _astra_completion_count,
     _paths,
+    _provider_call_window_begin,
     _write_json,
     public_status,
     run_engine,
@@ -282,6 +284,8 @@ class ContinuousRuntimeTests(unittest.TestCase):
             ws.create("example.test", "web")
             run_id = "20260924T000000Z-33333333"
             _write_supervisor_fixture(ws, run_id)
+            with patch.dict(os.environ, {_SUPERVISED_RUN_ENV: run_id}):
+                _provider_call_window_begin(ws.slug, turn=1, attempt=1)
             process = _Process(returncode=7)
             after = {
                 "workspace_status": "running",
@@ -298,7 +302,7 @@ class ContinuousRuntimeTests(unittest.TestCase):
             self.assertEqual(popen.call_count, 1)
             status = public_status(ws.slug)
             self.assertEqual(status["status"], "failed")
-            self.assertIn("replay disabled", status["stop_reason"])
+            self.assertIn("Kraude provider call", status["stop_reason"])
 
     def test_safe_abnormal_exit_uses_unlimited_restart_policy(self):
         with isolated_runtime():
@@ -419,7 +423,7 @@ class ContinuousEngineTests(unittest.IsolatedAsyncioTestCase):
             engine.manager.direct.assert_awaited_once()
             self.assertEqual(engine.stop_reason, "max_turns safety ceiling reached")
 
-    async def test_non_astra_existing_p2_does_not_stop_before_worker(self):
+    async def test_non_astra_existing_p2_is_revalidated_after_worker(self):
         with isolated_runtime(), patch.multiple(
             config.CONFIG,
             max_turns=1,
@@ -446,6 +450,9 @@ class ContinuousEngineTests(unittest.IsolatedAsyncioTestCase):
             )
             calls = []
             engine.worker.script = lambda *_: calls.append("worker") or "No new candidate."
+            engine.manager.validate_severity = AsyncMock(
+                wraps=engine.manager.validate_severity
+            )
             engine.manager.direct = AsyncMock(return_value=Directive(
                 directive="Continue with the next lead."
             ))
@@ -453,7 +460,9 @@ class ContinuousEngineTests(unittest.IsolatedAsyncioTestCase):
             await engine.run()
 
             self.assertEqual(calls, ["worker"])
-            engine.manager.direct.assert_awaited_once()
+            engine.manager.validate_severity.assert_awaited_once()
+            engine.manager.direct.assert_not_awaited()
+            self.assertIn("Astra-confirmed", engine.stop_reason)
 
     def test_indefinite_engine_ignores_manager_completion_requests(self):
         with isolated_runtime():

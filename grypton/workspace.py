@@ -329,6 +329,13 @@ class TargetMeta:
     last_directive: str = ""         # seed for resume
     turn_index: int = 0
     coverage_rotation_cursor: int = 0  # durable autonomous scenario cursor
+    proof_rotation_cursor: int = 0     # durable P1/P2 evidence-gap cursor
+    proof_rotation_after_id: str = ""  # last proof case selected for fair resume
+    proof_rotation_epoch_max_id: str = ""  # fixed tail for the active proof round
+    family_stagnation_streak: int = 0  # completed turns without a new family
+    validation_retry_cursor: int = 0   # fair cursor for stranded Astra work
+    validation_retry_after_id: str = ""  # last stranded case attempted
+    validation_retry_epoch_max_id: str = ""  # fixed tail for retry round
     notes: str = ""
 
 
@@ -1063,6 +1070,7 @@ class Workspace:
         *,
         expected_revalidation_revision: str = "",
         replace_degraded: bool = False,
+        replace_untrusted_validator: bool = False,
     ) -> tuple[Optional[dict], bool]:
         """Atomically persist a verdict when no durable Astra result exists.
 
@@ -1071,8 +1079,10 @@ class Workspace:
         file lock so an already-recorded verdict cannot be overwritten by the
         automatic result.  A revalidation result must also match the evidence
         revision it reviewed so newer evidence cannot receive a stale verdict.
-        A caller retrying a validator transport failure may replace only a
-        degraded result; a decisive or evidence-gap verdict remains immutable.
+        A caller retrying validator work may replace a degraded result, a
+        verdict that lacks the configured Astra model and effort provenance,
+        or a malformed verdict value. A trusted decisive or evidence-gap
+        verdict remains immutable.
         """
         applied = False
         expected_revision = str(expected_revalidation_revision or "").strip()
@@ -1086,7 +1096,27 @@ class Workspace:
                 return
             current = record.get("manager_verdict")
             if isinstance(current, dict):
-                if not (replace_degraded and current.get("degraded") is True):
+                recognized_verdicts = {
+                    "confirm", "agree", "upgrade", "downgrade", "reject",
+                    "needs-more-evidence", "pending",
+                }
+                current_value = str(
+                    current.get("verdict") or ""
+                ).strip().lower()
+                replace_current = (
+                    replace_degraded
+                    and current.get("degraded", False) is not False
+                ) or (
+                    replace_untrusted_validator
+                    and (
+                        str(current.get("validator_model") or "")
+                        != config.VALIDATOR_MODEL
+                        or str(current.get("validator_effort") or "")
+                        != config.VALIDATOR_EFFORT
+                        or current_value not in recognized_verdicts
+                    )
+                )
+                if not replace_current:
                     return
             self._apply_severity_verdict(record, verdict)
             applied = True
