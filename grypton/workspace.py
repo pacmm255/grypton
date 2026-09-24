@@ -629,7 +629,8 @@ class Workspace:
             elif len(case_kind) > FINDING_FAMILY_LIMITS["case_kind"]:
                 errors.append(f"finding {finding_id} case kind is too long")
             separate = row.get("family_separate_reason")
-            if (separate is not None and (not isinstance(separate, str)
+            if ("family_separate_reason" in row and (
+                    not isinstance(separate, str) or not separate.strip()
                     or len(separate) > FINDING_FAMILY_LIMITS["separate_reason"])):
                 errors.append(f"finding {finding_id} separate reason is invalid")
             if not isinstance(history, list) or not history:
@@ -679,7 +680,7 @@ class Workspace:
                     previous = target
                 if previous != family_id:
                     errors.append(f"finding {finding_id} history target is inconsistent")
-        by_id, groups, _ = cls._finding_family_index(rows)
+        by_id, groups, catalog = cls._finding_family_index(rows)
         for family_id, members in groups.items():
             anchor = by_id.get(family_id)
             if anchor is None:
@@ -697,6 +698,27 @@ class Workspace:
             roots.discard("")
             if len(roots) > 1:
                 errors.append(f"finding family {family_id} has conflicting root causes")
+        families_by_root: dict[str, list[dict]] = {}
+        for family in catalog:
+            root_key = family.get("root_cause_key")
+            if root_key:
+                families_by_root.setdefault(root_key, []).append(family)
+        for families in families_by_root.values():
+            for family in families[1:]:
+                family_id = family["family_id"]
+                anchor = by_id.get(family_id)
+                separate_reason = (
+                    anchor.get("family_separate_reason")
+                    if isinstance(anchor, dict) else None
+                )
+                if (not isinstance(separate_reason, str)
+                        or not separate_reason.strip()
+                        or len(separate_reason)
+                        > FINDING_FAMILY_LIMITS["separate_reason"]):
+                    errors.append(
+                        f"finding family {family_id} duplicates a normalized root cause "
+                        "without a separate reason"
+                    )
         return list(dict.fromkeys(errors))
 
     def finding_family_integrity_errors(self) -> list[str]:

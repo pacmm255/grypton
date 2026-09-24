@@ -171,6 +171,11 @@ class FindingFamilyTests(unittest.TestCase):
             self.assertEqual(separate["family_id"], "F002")
             self.assertEqual(separate["family_separate_reason"],
                              "Different trust boundary")
+            self.assertEqual(ws.finding_family_integrity_errors(), [])
+            self.assertEqual(
+                [row["family_id"] for row in ws.finding_family_catalog()],
+                ["F001", "F002"],
+            )
 
     def test_relink_is_audited_idempotent_and_preserves_evidence_and_verdict(self):
         with isolated_runtime():
@@ -310,6 +315,37 @@ class FindingFamilyTests(unittest.TestCase):
                 ws.finding_family_catalog()
 
             self.assertEqual(ws.findings.path.read_bytes(), before)
+
+    def test_duplicate_normalized_root_requires_separate_family_reason(self):
+        with isolated_runtime():
+            ws = workspace("duplicate-family-root")
+            ws.findings.append(structured("F001", "F001", "same parser bug"))
+            ws.findings.append(structured("F002", "F002", " Same_parser BUG!! "))
+            before = ws.findings.path.read_bytes()
+
+            errors = ws.finding_family_integrity_errors()
+            self.assertIn(
+                "finding family F002 duplicates a normalized root cause "
+                "without a separate reason",
+                errors,
+            )
+            with self.assertRaisesRegex(
+                    ValueError, "F002 duplicates a normalized root cause"):
+                ws.finding_family_catalog()
+            self.assertEqual(ws.findings.path.read_bytes(), before)
+
+        with isolated_runtime():
+            ws = workspace("separate-duplicate-family-root")
+            ws.findings.append(structured("F001", "F001", "same parser bug"))
+            separate = structured("F002", "F002", " Same_parser BUG!! ")
+            separate["family_separate_reason"] = "Different trust boundary"
+            ws.findings.append(separate)
+
+            self.assertEqual(ws.finding_family_integrity_errors(), [])
+            self.assertEqual(
+                [row["family_id"] for row in ws.finding_family_catalog()],
+                ["F001", "F002"],
+            )
 
     def test_integrity_is_total_over_arbitrary_family_json_types(self):
         invalid_values = ([], {}, True, 7, 1.5)
