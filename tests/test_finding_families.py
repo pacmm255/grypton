@@ -354,7 +354,8 @@ class FindingFamilyTests(unittest.TestCase):
             "action": invalid_values,
             "from_family_id": invalid_values,
             "to_family_id": invalid_values,
-            "reason": invalid_values,
+            "reason": (*invalid_values, None, "", "   ",
+                       "x" * (FINDING_FAMILY_LIMITS["reason"] + 1)),
             "ts": ([], {}, True, "invalid", -1, float("nan"), float("inf")),
         }
         for field, values in event_values.items():
@@ -381,6 +382,11 @@ class FindingFamilyTests(unittest.TestCase):
         huge_timestamp = structured("F001", "F001")
         huge_timestamp["family_history"][0]["ts"] = 10 ** 1000
         self.assertEqual(Workspace._finding_family_errors([huge_timestamp]), [])
+        bounded_reason = structured("F001", "F001")
+        bounded_reason["family_history"][0]["reason"] = (
+            "x" * FINDING_FAMILY_LIMITS["reason"]
+        )
+        self.assertEqual(Workspace._finding_family_errors([bounded_reason]), [])
 
         with isolated_runtime():
             ws = workspace("unhashable-family-action")
@@ -390,6 +396,34 @@ class FindingFamilyTests(unittest.TestCase):
             errors = ws.finding_family_integrity_errors()
             self.assertIn("family event action is invalid", errors[0])
             with self.assertRaisesRegex(ValueError, "event action is invalid"):
+                ws.finding_family_catalog()
+
+    def test_child_separate_reason_and_blank_event_reason_fail_integrity(self):
+        with isolated_runtime():
+            ws = workspace("child-separate-reason")
+            ws.findings.append(structured("F001", "F001"))
+            child = structured("F002", "F001")
+            child["family_separate_reason"] = "child claims separate"
+            ws.findings.append(child)
+            before = ws.findings.path.read_bytes()
+
+            errors = ws.finding_family_integrity_errors()
+            self.assertIn(
+                "finding F002 child case cannot carry a separate reason", errors
+            )
+            with self.assertRaisesRegex(ValueError, "child case cannot carry"):
+                ws.finding_family_catalog()
+            self.assertEqual(ws.findings.path.read_bytes(), before)
+
+        with isolated_runtime():
+            ws = workspace("blank-family-event-reason")
+            row = structured("F001", "F001")
+            row["family_history"][0]["reason"] = "   "
+            ws.findings.append(row)
+
+            errors = ws.finding_family_integrity_errors()
+            self.assertIn("finding F001 family event reason is invalid", errors)
+            with self.assertRaisesRegex(ValueError, "event reason is invalid"):
                 ws.finding_family_catalog()
 
     def test_catalog_sorts_family_and_case_ids_numerically_past_999(self):

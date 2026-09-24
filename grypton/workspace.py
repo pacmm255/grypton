@@ -629,10 +629,16 @@ class Workspace:
             elif len(case_kind) > FINDING_FAMILY_LIMITS["case_kind"]:
                 errors.append(f"finding {finding_id} case kind is too long")
             separate = row.get("family_separate_reason")
-            if ("family_separate_reason" in row and (
+            separate_present = "family_separate_reason" in row
+            if (separate_present and (
                     not isinstance(separate, str) or not separate.strip()
                     or len(separate) > FINDING_FAMILY_LIMITS["separate_reason"])):
                 errors.append(f"finding {finding_id} separate reason is invalid")
+            if (separate_present and isinstance(family_id, str)
+                    and family_id.strip() != finding_id):
+                errors.append(
+                    f"finding {finding_id} child case cannot carry a separate reason"
+                )
             if not isinstance(history, list) or not history:
                 errors.append(f"finding {finding_id} has no family history")
             else:
@@ -672,7 +678,7 @@ class Workspace:
                             or not re.fullmatch(r"F\d+", origin)
                             or len(origin) > FINDING_FAMILY_LIMITS["family_id"])):
                         errors.append(f"finding {finding_id} family event origin is invalid")
-                    if (not isinstance(event_reason, str)
+                    if (not isinstance(event_reason, str) or not event_reason.strip()
                             or len(event_reason) > FINDING_FAMILY_LIMITS["reason"]):
                         errors.append(f"finding {finding_id} family event reason is invalid")
                     if number > 1 and origin != previous:
