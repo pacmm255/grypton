@@ -85,7 +85,7 @@ class WorkerPromptProjectionTests(unittest.TestCase):
         self.assertEqual(workspace.strip(), block)
 
     def test_all_tools_remain_visible_with_neutral_auth_descriptions(self):
-        self.assertEqual(len(REGISTRY), 34)
+        self.assertEqual(len(REGISTRY), 36)
         self.assertIn("authenticated_browser_request", REGISTRY)
         descriptions = {name: value[0] for name, value in REGISTRY.items()}
         self.assertEqual(set(descriptions), set(REGISTRY))

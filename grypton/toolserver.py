@@ -12,7 +12,8 @@ from typing import Callable
 
 from . import config, credentials, tools
 from .providers import append_jsonl
-from .workspace import FINDING_NARRATIVE_FIELDS, Workspace
+from .workspace import (FINDING_FAMILY_LIMITS, FINDING_NARRATIVE_FIELDS,
+                        FindingFamilyCollision, Workspace)
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "grypton", "version": "3.4.0"}
@@ -27,14 +28,30 @@ def _string(description: str) -> dict:
     return {"type": "string", "description": description}
 
 
+def _family_string(description: str, field: str) -> dict:
+    return {**_string(description), "minLength": 1,
+            "maxLength": FINDING_FAMILY_LIMITS[field]}
+
+
 def _object(properties: dict, required=()) -> dict:
     return {"type": "object", "additionalProperties": False,
             "properties": properties, "required": list(required)}
 
 
+def _family_preview(row: dict) -> dict:
+    item = dict(row)
+    item["cases"], item["case_ids"] = row["cases"][:20], row["case_ids"][:20]
+    item["cases_returned"] = len(item["cases"])
+    return item
+
+
 def _record_finding(ws, args):
-    required = ("title", "severity", "vuln_class", "surface", "description", "poc", "evidence")
+    required = ("title", "severity", "vuln_class", "surface", "description",
+                "poc", "evidence", "case_kind")
     missing = [key for key in required if not str(args.get(key) or "").strip()]
+    if not any(str(args.get(key) or "").strip()
+               for key in ("root_cause", "family_id")):
+        missing.append("root_cause or family_id")
     if missing:
         return {
             "ok": False,
@@ -44,15 +61,62 @@ def _record_finding(ws, args):
                 + ". Keep incomplete hypotheses in tested_technique_log."
             ),
         }
-    record = ws.record_finding(title=args["title"], severity=args["severity"],
-        vuln_class=args.get("vuln_class", ""), surface=args.get("surface", ""),
-        description=args.get("description", ""), poc=args.get("poc", ""),
-        evidence=args.get("evidence", ""), source="worker")
+    try:
+        record = ws.record_finding(title=args["title"], severity=args["severity"],
+            vuln_class=args.get("vuln_class", ""), surface=args.get("surface", ""),
+            description=args.get("description", ""), poc=args.get("poc", ""),
+            evidence=args.get("evidence", ""), source="worker",
+            root_cause=args.get("root_cause", ""), family_id=args.get("family_id", ""),
+            case_kind=args.get("case_kind", ""),
+            separate_reason=args.get("separate_reason", ""))
+    except FindingFamilyCollision as exc:
+        catalog = {row["family_id"]: row for row in ws.finding_family_catalog()}
+        candidates = [_family_preview(catalog[family_id])
+                      for family_id in exc.family_ids[:20] if family_id in catalog]
+        return {"ok": False, "summary": str(exc), "data": {
+            "candidate_families": candidates,
+            "total_candidates": len(exc.family_ids),
+        }}
     if config.astra_auto_validation_required(record["severity"]):
         summary = f"Recorded {record['id']} for independent Astra validation."
     else:
         summary = f"Recorded {record['id']}; automatic Astra validation is not requested for {record['severity']}."
     return {"ok": True, "summary": summary,
+            "data": record}
+
+
+def _family_catalog(ws, _args):
+    offset, limit = _args.get("offset", 0), _args.get("limit", 20)
+    if (not isinstance(offset, int) or isinstance(offset, bool) or offset < 0
+            or not isinstance(limit, int) or isinstance(limit, bool)
+            or not 1 <= limit <= 50):
+        return {"ok": False, "summary": "offset must be nonnegative and limit must be 1..50."}
+    integrity_errors = ws.finding_family_integrity_errors()
+    if integrity_errors:
+        return {"ok": False, "summary": "Finding family state is invalid.",
+                "data": {"integrity_errors": integrity_errors}}
+    rows = ws.finding_family_catalog()
+    page = []
+    for row in rows[offset:offset + limit]:
+        page.append(_family_preview(row))
+    return {"ok": True, "summary": f"{len(page)} of {len(rows)} finding families.",
+            "data": {"families": page, "offset": offset, "limit": limit,
+                     "returned": len(page), "total_families": len(rows),
+                     "total_cases": sum(row["case_count"] for row in rows),
+                     "integrity_errors": []}}
+
+
+def _family_link(ws, args):
+    try:
+        record = ws.link_finding_family(
+            args.get("finding_id", ""), args.get("family_id", ""),
+            reason=args.get("reason", ""), root_cause=args.get("root_cause", ""),
+            case_kind=args.get("case_kind", ""),
+            separate_reason=args.get("separate_reason", ""), source="worker")
+    except (KeyError, ValueError) as exc:
+        return {"ok": False, "summary": str(exc).strip("'")}
+    return {"ok": True, "summary":
+            f"{record['id']} belongs to finding family {record['family_id']}.",
             "data": record}
 
 
@@ -480,14 +544,32 @@ def _read_doc(ws, args):
 
 
 REGISTRY: dict[str, tuple[str, dict, Callable]] = {
-    "record_finding": ("Record a fully evidenced candidate. P1/P2 candidates enter automatic Astra validation.",
-        _object({"title": _string("Short title"),
+    "record_finding": ("Record an evidenced case in a root-cause family. P1/P2 cases enter automatic Astra validation.",
+        {**_object({"title": _string("Short title"),
                  "severity": {"type": "string", "enum": ["P1", "P2", "P3", "P4", "P5"]},
                  "vuln_class": _string("Vulnerability class"), "surface": _string("Affected surface"),
                  "description": _string("Impact and behavior"), "poc": _string("Reproduction steps"),
-                 "evidence": _string("Capture path or concrete evidence")},
-                ("title", "severity", "vuln_class", "surface", "description", "poc", "evidence")),
+                 "evidence": _string("Capture path or concrete evidence"),
+                 "root_cause": _family_string("Canonical technical root cause", "root_cause"),
+                 "family_id": _family_string("Existing anchor finding ID", "family_id"),
+                 "case_kind": _family_string("Distinct exploit, delivery, or impact case", "case_kind"),
+                 "separate_reason": _family_string("Reason an exact root match is a distinct family", "separate_reason")},
+                ("title", "severity", "vuln_class", "surface", "description",
+                 "poc", "evidence", "case_kind")),
+         "anyOf": [{"required": ["root_cause"]}, {"required": ["family_id"]}]},
         _record_finding),
+    "finding_family_catalog": ("List compact finding families without evidence or PoC text.",
+        _object({"offset": {"type": "integer", "minimum": 0},
+                 "limit": {"type": "integer", "minimum": 1, "maximum": 50,
+                           "default": 20}}), _family_catalog),
+    "link_finding_family": ("Auditably link one existing finding to an anchor finding.",
+        _object({"finding_id": _family_string("Finding case to link", "family_id"),
+                 "family_id": _family_string("Existing anchor finding ID", "family_id"),
+                 "reason": _family_string("Reason for this relationship", "reason"),
+                 "root_cause": _family_string("Root cause when a legacy family has none", "root_cause"),
+                 "case_kind": _family_string("Distinct exploit, delivery, or impact case", "case_kind"),
+                 "separate_reason": _family_string("Reason a matching self-family remains distinct", "separate_reason")},
+                ("finding_id", "family_id", "reason", "case_kind")), _family_link),
     "revise_finding": ("Correct or narrow a finding narrative with durable before/after history.",
         {**_object({
             "finding_id": _string("Existing finding ID"),
@@ -750,6 +832,7 @@ _SENSITIVE_AUDIT_KEYS = {
 # accidentally reopen the supervisor replay race.
 _RESTART_SAFE_READ_ONLY_TOOLS = frozenset({
     "prior_attempts",
+    "finding_family_catalog",
     "credential_status",
     "goja_status",
     "proxy_flows",
@@ -987,6 +1070,8 @@ def cli_main(argv=None) -> int:
     finding = sub.add_parser("finding"); finding.add_argument("title"); finding.add_argument("severity")
     finding.add_argument("--class", dest="vuln_class", default=""); finding.add_argument("--surface", default="")
     finding.add_argument("--description", default=""); finding.add_argument("--poc", default=""); finding.add_argument("--evidence", default="")
+    finding.add_argument("--root-cause", default=""); finding.add_argument("--family-id", default="")
+    finding.add_argument("--case-kind", default=""); finding.add_argument("--separate-reason", default="")
     revision = sub.add_parser("finding-revise"); revision.add_argument("finding_id")
     revision.add_argument("--reason", required=True)
     revision.add_argument("--title"); revision.add_argument("--class", dest="vuln_class")
@@ -1026,7 +1111,22 @@ def cli_main(argv=None) -> int:
     elif ns.command == "browse": mapping = {ns.command: ("browse", {"url": ns.url})}
     elif ns.command == "surface": mapping = {ns.command: ("attack_surface_add", {"item": ns.item, "kind": ns.kind, "detail": ns.detail, "interesting": ns.interesting})}
     elif ns.command == "tested": mapping = {ns.command: ("tested_technique_log", {"surface": ns.surface, "technique": ns.technique, "result": ns.result, "evidence": ns.evidence})}
-    elif ns.command == "finding": mapping = {ns.command: ("record_finding", {"title": ns.title, "severity": ns.severity, "vuln_class": ns.vuln_class, "surface": ns.surface, "description": ns.description, "poc": ns.poc, "evidence": ns.evidence})}
+    elif ns.command == "finding":
+        family_args = {"root_cause": ns.root_cause, "family_id": ns.family_id,
+                       "case_kind": ns.case_kind, "separate_reason": ns.separate_reason}
+        if not any(family_args.values()):
+            root = str(ns.vuln_class or ns.title).strip()[:FINDING_FAMILY_LIMITS["root_cause"]]
+            kind = str(ns.surface or ns.vuln_class or ns.title).strip()[:
+                FINDING_FAMILY_LIMITS["case_kind"]]
+            family_args = {
+                "root_cause": root if re.search(r"\w", root) else "Legacy CLI finding",
+                "family_id": "", "case_kind": kind or "legacy CLI finding",
+                "separate_reason": "Compatibility record from grypton-tool finding.",
+            }
+        mapping = {ns.command: ("record_finding", {"title": ns.title,
+            "severity": ns.severity, "vuln_class": ns.vuln_class,
+            "surface": ns.surface, "description": ns.description,
+            "poc": ns.poc, "evidence": ns.evidence, **family_args})}
     elif ns.command == "finding-revise":
         revision_args = {"finding_id": ns.finding_id, "reason": ns.reason}
         for field_name in FINDING_NARRATIVE_FIELDS:

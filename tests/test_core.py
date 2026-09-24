@@ -1377,9 +1377,11 @@ class ToolTests(unittest.TestCase):
             ws.create("127.0.0.1", "web")
             common = {"vuln_class": "test", "surface": "/local",
                       "description": "Synthetic impact", "poc": "1. Send request",
-                      "evidence": "flows/synthetic.http"}
-            low = dispatch(ws, "record_finding", {"title": "Low", "severity": "P5", **common})
-            high = dispatch(ws, "record_finding", {"title": "High", "severity": "P2", **common})
+                      "evidence": "flows/synthetic.http", "case_kind": "request"}
+            low = dispatch(ws, "record_finding", {"title": "Low", "severity": "P5",
+                                                   "root_cause": "low fixture", **common})
+            high = dispatch(ws, "record_finding", {"title": "High", "severity": "P2",
+                                                    "root_cause": "high fixture", **common})
             self.assertIn("not requested for P5", low["summary"])
             self.assertIn("independent Astra validation", high["summary"])
 

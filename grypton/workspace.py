@@ -12,7 +12,9 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import time
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -29,6 +31,47 @@ SEVERITY_RANK = {"P1": 1, "P2": 2, "P3": 3, "P4": 4, "P5": 5,
 FINDING_NARRATIVE_FIELDS = (
     "title", "vuln_class", "surface", "description", "poc", "evidence",
 )
+FINDING_FAMILY_FIELDS = (
+    "family_id", "family_root_cause", "family_case_kind",
+    "family_separate_reason", "family_history",
+)
+FINDING_FAMILY_LIMITS = {
+    "family_id": 32, "root_cause": 500, "case_kind": 200,
+    "separate_reason": 1000, "reason": 1000,
+}
+FINDING_FAMILY_HISTORY_LIMIT = 64
+
+
+def normalize_finding_root_cause(value: str) -> str:
+    value = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return re.sub(r"[_\W]+", " ", value, flags=re.UNICODE).strip()
+
+
+def _family_text(name: str, value: object, *, required: bool = False) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    value = value.strip()
+    if required and not value:
+        raise ValueError(f"{name} is required")
+    if len(value) > FINDING_FAMILY_LIMITS[name]:
+        raise ValueError(f"{name} exceeds {FINDING_FAMILY_LIMITS[name]} characters")
+    return value
+
+
+class FindingFamilyCollision(ValueError):
+    def __init__(self, family_ids: Iterable[str]):
+        self.family_ids = tuple(sorted(set(family_ids)))
+        shown = ", ".join(self.family_ids[:10])
+        if len(self.family_ids) > 10:
+            shown += f" (+{len(self.family_ids) - 10} more)"
+        super().__init__(
+            "root cause already belongs to " + shown
+            + "; supply family_id to link or separate_reason to keep it distinct"
+        )
+
+
+class LedgerFormatError(ValueError):
+    pass
 
 
 # --------------------------------------------------------------------------
@@ -88,12 +131,34 @@ class Ledger:
                     continue
         return out
 
+    def all_strict(self) -> list[dict]:
+        if not self.path.exists():
+            return []
+        out = []
+        with self.path.open(encoding="utf-8") as f:
+            for number, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError as exc:
+                    raise LedgerFormatError(
+                        f"{self.path.name} line {number} is invalid JSON"
+                    ) from exc
+                if not isinstance(record, dict):
+                    raise LedgerFormatError(
+                        f"{self.path.name} line {number} is not an object"
+                    )
+                out.append(record)
+        return out
+
     def find(self, _id: str) -> Optional[dict]:
         return next((r for r in self.all() if r.get("id") == _id), None)
 
-    def update(self, _id: str, mutate: Callable[[dict], None]) -> Optional[dict]:
+    def update(self, _id: str, mutate: Callable[[dict], None], *,
+               strict: bool = False) -> Optional[dict]:
         with _file_lock(self.lock):
-            records = self.all()
+            records = self.all_strict() if strict else self.all()
             hit = None
             for r in records:
                 if r.get("id") == _id:
@@ -266,6 +331,7 @@ class Workspace:
         self.transcripts_dir = self.root / "transcripts"
         # ledgers (source of truth)
         self.findings = Ledger(self.root / ".ledger" / "findings.jsonl")
+        self.finding_family_lock = self.root / ".ledger" / "finding-family.lock"
         self.surface = Ledger(self.root / ".ledger" / "attack-surface.jsonl")
         self.tested = Ledger(self.root / ".ledger" / "tested-techniques.jsonl")
 
@@ -470,28 +536,313 @@ class Workspace:
 
     # ---- findings (R22, R28) --------------------------------------------
 
+    @staticmethod
+    def _finding_family_id(record: dict) -> str:
+        return str(record.get("family_id") or record.get("id") or "").strip()
+
+    @classmethod
+    def _finding_family_index(cls, rows: list[dict]) -> tuple[dict, dict, list]:
+        by_id = {str(row.get("id") or ""): row for row in rows}
+        groups: dict[str, list[dict]] = {}
+        for row in rows:
+            groups.setdefault(cls._finding_family_id(row), []).append(row)
+        catalog = []
+        for family_id, members in sorted(groups.items()):
+            members.sort(key=lambda row: str(row.get("id") or ""))
+            anchor = by_id.get(family_id)
+            root_rows = ([anchor] if anchor else []) + members
+            root_cause = next((
+                str(row.get("family_root_cause") or "").strip()
+                for row in root_rows if row
+                and str(row.get("family_root_cause") or "").strip()
+            ), "")
+            separate_reason = next((
+                str(row.get("family_separate_reason") or "").strip()
+                for row in root_rows if row
+                and str(row.get("family_separate_reason") or "").strip()
+            ), "")
+            cases = []
+            for row in members:
+                verdict = row.get("manager_verdict")
+                astra = ({key: str(verdict[key])[:32] for key in ("verdict", "severity")
+                          if key in verdict} if isinstance(verdict, dict) else {})
+                cases.append({
+                    "id": str(row.get("id") or "")[:32],
+                    "title": str(row.get("title") or "")[:300],
+                    "severity": str(row.get("severity") or "")[:16],
+                    "status": str(row.get("status") or "")[:64],
+                    "vuln_class": str(row.get("vuln_class") or "")[:200],
+                    "surface": str(row.get("surface") or "")[:300],
+                    "case_kind": str(row.get("family_case_kind") or "")[:200],
+                    "astra": astra,
+                })
+            catalog.append({
+                "family_id": family_id, "root_cause": root_cause,
+                "root_cause_key": normalize_finding_root_cause(root_cause),
+                "separate_reason": separate_reason,
+                "virtual": len(members) == 1 and not any(
+                    key in members[0] for key in FINDING_FAMILY_FIELDS
+                ),
+                "cases": cases, "case_ids": [case["id"] for case in cases],
+                "case_count": len(cases),
+            })
+        return by_id, groups, catalog
+
+    @classmethod
+    def _finding_family_errors(cls, rows: list[dict]) -> list[str]:
+        errors, seen = [], set()
+        for row in rows:
+            finding_id = str(row.get("id") or "")
+            if (not re.fullmatch(r"F\d+", finding_id)
+                    or len(finding_id) > FINDING_FAMILY_LIMITS["family_id"]):
+                errors.append(f"finding has invalid ID {finding_id!r}")
+            elif finding_id in seen:
+                errors.append(f"duplicate finding ID {finding_id}")
+            seen.add(finding_id)
+            if not any(key in row for key in FINDING_FAMILY_FIELDS):
+                continue
+            history = row.get("family_history")
+            family_id = row.get("family_id")
+            root_cause = row.get("family_root_cause")
+            case_kind = row.get("family_case_kind")
+            if not isinstance(family_id, str) or not family_id.strip():
+                errors.append(f"finding {finding_id} has no family ID")
+            elif len(family_id) > FINDING_FAMILY_LIMITS["family_id"]:
+                errors.append(f"finding {finding_id} family ID is too long")
+            if (not isinstance(root_cause, str)
+                    or not normalize_finding_root_cause(root_cause)):
+                errors.append(f"finding {finding_id} has no normalized root cause")
+            elif len(root_cause) > FINDING_FAMILY_LIMITS["root_cause"]:
+                errors.append(f"finding {finding_id} root cause is too long")
+            if not isinstance(case_kind, str) or not case_kind.strip():
+                errors.append(f"finding {finding_id} has no family case kind")
+            elif len(case_kind) > FINDING_FAMILY_LIMITS["case_kind"]:
+                errors.append(f"finding {finding_id} case kind is too long")
+            separate = row.get("family_separate_reason")
+            if (separate is not None and (not isinstance(separate, str)
+                    or len(separate) > FINDING_FAMILY_LIMITS["separate_reason"])):
+                errors.append(f"finding {finding_id} separate reason is invalid")
+            if not isinstance(history, list) or not history:
+                errors.append(f"finding {finding_id} has no family history")
+            else:
+                if len(history) > FINDING_FAMILY_HISTORY_LIMIT:
+                    errors.append(f"finding {finding_id} family history is too long")
+                previous = None
+                for number, event in enumerate(history, 1):
+                    if not isinstance(event, dict):
+                        errors.append(f"finding {finding_id} has an invalid family event")
+                        break
+                    if event.get("id") != f"H{number:03d}":
+                        errors.append(f"finding {finding_id} family event IDs are invalid")
+                    if event.get("action") not in {"create", "link", "relink", "materialize"}:
+                        errors.append(f"finding {finding_id} family event action is invalid")
+                    target = event.get("to_family_id")
+                    origin = event.get("from_family_id")
+                    event_reason = event.get("reason")
+                    if (not isinstance(target, str) or not re.fullmatch(r"F\d+", target)
+                            or len(target) > FINDING_FAMILY_LIMITS["family_id"]):
+                        errors.append(f"finding {finding_id} family event target is invalid")
+                    if (origin is not None and (not isinstance(origin, str)
+                            or not re.fullmatch(r"F\d+", origin)
+                            or len(origin) > FINDING_FAMILY_LIMITS["family_id"])):
+                        errors.append(f"finding {finding_id} family event origin is invalid")
+                    if (not isinstance(event_reason, str)
+                            or len(event_reason) > FINDING_FAMILY_LIMITS["reason"]):
+                        errors.append(f"finding {finding_id} family event reason is invalid")
+                    if number > 1 and origin != previous:
+                        errors.append(f"finding {finding_id} family history is discontinuous")
+                    previous = target
+                if previous != family_id:
+                    errors.append(f"finding {finding_id} history target is inconsistent")
+        by_id, groups, _ = cls._finding_family_index(rows)
+        for family_id, members in groups.items():
+            anchor = by_id.get(family_id)
+            if anchor is None:
+                errors.append(f"missing family anchor {family_id}")
+            elif cls._finding_family_id(anchor) != family_id:
+                errors.append(f"family anchor {family_id} does not anchor itself")
+            elif len(members) > 1 and not any(
+                    key in anchor for key in FINDING_FAMILY_FIELDS):
+                errors.append(f"legacy family anchor {family_id} is not materialized")
+            roots = {
+                normalize_finding_root_cause(row.get("family_root_cause", ""))
+                for row in members if row.get("family_root_cause")
+            }
+            roots.discard("")
+            if len(roots) > 1:
+                errors.append(f"finding family {family_id} has conflicting root causes")
+        return list(dict.fromkeys(errors))
+
+    def finding_family_integrity_errors(self) -> list[str]:
+        try:
+            with _file_lock(self.finding_family_lock):
+                return self._finding_family_errors(self.findings.all_strict())
+        except LedgerFormatError as exc:
+            return [str(exc)]
+
+    def finding_family_catalog(self) -> list[dict]:
+        with _file_lock(self.finding_family_lock):
+            return self._finding_family_index(self.findings.all_strict())[2]
+
     def record_finding(self, *, title: str, severity: str, vuln_class: str = "",
                        surface: str = "", description: str = "", poc: str = "",
-                       evidence: str = "", source: str = "worker") -> dict:
-        fid = f"F{len(self.findings.all()) + 1:03d}"
-        normalized_severity = severity.upper()
-        initial_status = (
-            "validation-pending"
-            if config.astra_auto_validation_required(normalized_severity)
-            else "validation-not-requested"
-        )
-        rec = {"id": fid, "title": title, "severity": normalized_severity,
-               "vuln_class": vuln_class, "surface": surface,
-               "description": description, "poc": poc, "evidence": evidence,
-               "source": source, "status": initial_status,
-               "manager_verdict": None}
-        # scope enforcement (R27): suppress out-of-scope findings from headline
-        c = self.load_constraints()
-        if not c.severity_allowed(severity) or c.class_excluded(vuln_class):
-            rec["status"] = "suppressed-by-scope"
-        self.findings.append(rec)
-        self._append_finding_to_md(rec)
-        return rec
+                       evidence: str = "", source: str = "worker",
+                       root_cause: str = "", family_id: str = "",
+                       case_kind: str = "", separate_reason: str = "") -> dict:
+        structured = any(value != "" for value in (
+            root_cause, family_id, case_kind, separate_reason,
+        ))
+        with _file_lock(self.finding_family_lock):
+            rows = self.findings.all_strict()
+            errors = self._finding_family_errors(rows)
+            if errors:
+                raise ValueError(f"finding family state is invalid: {errors[0]}")
+            by_id, _, catalog = self._finding_family_index(rows)
+            fid = f"F{max((int(row['id'][1:]) for row in rows), default=0) + 1:03d}"
+            normalized_severity = severity.upper()
+            rec = {
+                "id": fid, "title": title, "severity": normalized_severity,
+                "vuln_class": vuln_class, "surface": surface,
+                "description": description, "poc": poc, "evidence": evidence,
+                "source": source,
+                "status": ("validation-pending" if config.astra_auto_validation_required(
+                    normalized_severity) else "validation-not-requested"),
+                "manager_verdict": None,
+            }
+            if structured:
+                root_cause = _family_text("root_cause", root_cause)
+                family_id = _family_text("family_id", family_id)
+                case_kind = _family_text("case_kind", case_kind, required=True)
+                separate_reason = _family_text("separate_reason", separate_reason)
+                if family_id:
+                    anchor = by_id.get(family_id)
+                    if anchor is None or self._finding_family_id(anchor) != family_id:
+                        raise ValueError(f"finding family anchor {family_id!r} was not found")
+                    family = next(row for row in catalog if row["family_id"] == family_id)
+                    if not family["root_cause_key"]:
+                        raise ValueError(
+                            f"legacy family anchor {family_id} must be materialized first"
+                        )
+                    if (root_cause and family["root_cause_key"]
+                            != normalize_finding_root_cause(root_cause)):
+                        raise ValueError(f"root cause does not match family {family_id}")
+                    if separate_reason:
+                        raise ValueError("separate_reason is invalid when linking a family")
+                    root_cause, action, event_reason = (
+                        family["root_cause"], "link", "linked during finding creation"
+                    )
+                else:
+                    root_key = normalize_finding_root_cause(root_cause)
+                    if not root_key:
+                        raise ValueError("root cause must contain letters or numbers")
+                    collisions = [row["family_id"] for row in catalog
+                                  if row["root_cause_key"] == root_key]
+                    if collisions and not separate_reason:
+                        raise FindingFamilyCollision(collisions)
+                    family_id, action, event_reason = (
+                        fid, "create", separate_reason or "new family"
+                    )
+                rec.update({
+                    "family_id": family_id, "family_root_cause": root_cause,
+                    "family_case_kind": case_kind, "family_history": [{
+                        "id": "H001", "ts": time.time(), "action": action,
+                        "from_family_id": None, "to_family_id": family_id,
+                        "reason": event_reason, "source": source,
+                    }],
+                })
+                if separate_reason:
+                    rec["family_separate_reason"] = separate_reason
+            constraints = self.load_constraints()
+            if (not constraints.severity_allowed(severity)
+                    or constraints.class_excluded(vuln_class)):
+                rec["status"] = "suppressed-by-scope"
+            self.findings.append(rec)
+            self._append_finding_to_md(rec)
+            return rec
+
+    def link_finding_family(self, finding_id: str, family_id: str, *,
+                            reason: str, root_cause: str = "",
+                            case_kind: str, separate_reason: str = "",
+                            source: str = "manager") -> dict:
+        finding_id = _family_text("family_id", finding_id, required=True)
+        family_id = _family_text("family_id", family_id, required=True)
+        reason = _family_text("reason", reason, required=True)
+        root_cause = _family_text("root_cause", root_cause)
+        case_kind = _family_text("case_kind", case_kind, required=True)
+        separate_reason = _family_text("separate_reason", separate_reason)
+        with _file_lock(self.finding_family_lock):
+            rows = self.findings.all_strict()
+            errors = self._finding_family_errors(rows)
+            if errors:
+                raise ValueError(f"finding family state is invalid: {errors[0]}")
+            by_id, groups, catalog = self._finding_family_index(rows)
+            record, anchor = by_id.get(finding_id), by_id.get(family_id)
+            if record is None or anchor is None:
+                raise KeyError("finding or family anchor was not found")
+            if self._finding_family_id(anchor) != family_id:
+                raise ValueError(f"finding {family_id} is not a family anchor")
+            current_family = self._finding_family_id(record)
+            if (current_family == finding_id and family_id != finding_id
+                    and len(groups.get(finding_id, [])) > 1):
+                raise ValueError(f"family anchor {finding_id} has child cases")
+            family = next(row for row in catalog if row["family_id"] == family_id)
+            canonical_root = family["root_cause"]
+            if family_id != finding_id and not canonical_root:
+                raise ValueError(
+                    f"legacy family anchor {family_id} must be materialized first"
+                )
+            if canonical_root and root_cause and (
+                    normalize_finding_root_cause(canonical_root)
+                    != normalize_finding_root_cause(root_cause)):
+                raise ValueError(f"root cause does not match family {family_id}")
+            root_cause = canonical_root or root_cause
+            if not normalize_finding_root_cause(root_cause):
+                raise ValueError("root_cause must contain letters or numbers")
+            structured = any(key in record for key in FINDING_FAMILY_FIELDS)
+            desired_separate = separate_reason if family_id == finding_id else ""
+            if family_id != finding_id and separate_reason:
+                raise ValueError("separate_reason is only valid for a self-family")
+            if not structured and family_id == finding_id:
+                collisions = [row["family_id"] for row in catalog
+                              if row["family_id"] != finding_id
+                              and row["root_cause_key"]
+                              == normalize_finding_root_cause(root_cause)]
+                if collisions and not separate_reason:
+                    raise FindingFamilyCollision(collisions)
+            if structured and current_family == family_id:
+                same = (
+                    normalize_finding_root_cause(record["family_root_cause"])
+                    == normalize_finding_root_cause(root_cause)
+                    and record["family_case_kind"] == case_kind
+                    and str(record.get("family_separate_reason") or "")
+                    == desired_separate
+                )
+                if same:
+                    return record
+                raise ValueError("existing family metadata is immutable")
+            history = record.get("family_history") if structured else []
+            if len(history) >= FINDING_FAMILY_HISTORY_LIMIT:
+                raise ValueError("finding family history limit reached")
+            action = "materialize" if not structured and family_id == finding_id \
+                else ("link" if not structured else "relink")
+            event = {
+                "id": f"H{len(history) + 1:03d}", "ts": time.time(),
+                "action": action, "from_family_id": current_family,
+                "to_family_id": family_id, "reason": reason, "source": source,
+            }
+            def apply(row: dict) -> None:
+                row.update({"family_id": family_id,
+                            "family_root_cause": root_cause,
+                            "family_case_kind": case_kind,
+                            "family_history": [*history, event]})
+                if desired_separate:
+                    row["family_separate_reason"] = desired_separate
+                else:
+                    row.pop("family_separate_reason", None)
+            hit = self.findings.update(finding_id, apply, strict=True)
+            if hit is None:
+                raise KeyError(f"finding {finding_id!r} was not found")
+            return hit
 
     def revise_finding(self, finding_id: str, *, reason: str,
                        source: str = "worker", **changes: str) -> dict:
@@ -544,7 +895,7 @@ class Workspace:
             record["revisions"] = [*history, dict(revision)]
             record["last_revised_at"] = revision["ts"]
 
-        hit = self.findings.update(finding_id, apply)
+        hit = self.findings.update(finding_id, apply, strict=True)
         if hit is None:
             raise KeyError(f"finding {finding_id!r} was not found")
         self._append_finding_amendment_to_md(finding_id, hit["severity"], revision)
@@ -553,7 +904,7 @@ class Workspace:
     def set_severity_verdict(self, finding_id: str, verdict: dict) -> Optional[dict]:
         def apply(record: dict) -> None:
             self._apply_severity_verdict(record, verdict)
-        hit = self.findings.update(finding_id, apply)
+        hit = self.findings.update(finding_id, apply, strict=True)
         if hit:
             self._append_verdict_to_md(finding_id, verdict)
         return hit
@@ -579,7 +930,7 @@ class Workspace:
             self._apply_severity_verdict(record, verdict)
             applied = True
 
-        hit = self.findings.update(finding_id, apply)
+        hit = self.findings.update(finding_id, apply, strict=True)
         if hit and applied:
             self._append_verdict_to_md(finding_id, verdict)
         return hit, applied
