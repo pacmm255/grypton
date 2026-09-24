@@ -186,6 +186,9 @@ The acceptance conditions are:
 Repeat classification checks for 401/402, qualifying quota or billing 403,
 and generic 429 results. Verify single-key and multi-key 429 exhaustion ends
 promptly, and that a later request does not revisit a key still in cooldown.
+Verify Kryptex skips autonomous provider calls until the sanitized retry delay
+expires, permits exactly one half-open probe, clears the circuit on success or
+model change, and still permits operator chat while the direction circuit is open.
 Separately verify that connection failures and HTTP 408, 425, and 5xx obey the configured retry window. Invalid
 requests, unknown routes, unsupported effort, ordinary permission denials,
 tool errors, and scope denials must not rotate keys.

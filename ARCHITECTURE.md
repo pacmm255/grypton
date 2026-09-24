@@ -83,6 +83,10 @@ The role gateway keeps its spent-key cooldown state across turns. OpenClaude
 never replays a request after response streaming has begun. This prevents one
 model answer or tool request from being emitted twice. A model switch closes
 the old role gateway, so the new selection gets a clean transport lifecycle.
+Pool exhaustion carries only sanitized status, pool-size, and retry-delay
+metadata. Kryptex uses that delay to skip autonomous provider calls until one
+half-open probe is due; its deterministic direction keeps the engine moving.
+Operator chat bypasses this direction-only circuit and can clear it on success.
 
 Gateway events are sanitized before they reach Grypton. The engine records
 route, protocol, message and tool counts, effective effort, and safe notices

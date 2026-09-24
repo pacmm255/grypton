@@ -308,6 +308,7 @@ class OpenClaudeAdapterTests(unittest.TestCase):
                 "reason": "credential_pool_exhausted",
                 "upstreamStatus": 402,
                 "poolSize": 5,
+                "retryAfterSeconds": 37,
                 "message": "key deadbeef",
             })
             self.assertEqual(terminal, {
@@ -316,6 +317,7 @@ class OpenClaudeAdapterTests(unittest.TestCase):
                 "reason": "credential_pool_exhausted",
                 "upstream_status": 402,
                 "pool_size": 5,
+                "retry_after_s": 37,
             })
 
 
@@ -544,6 +546,7 @@ class ModelSelectionTests(unittest.IsolatedAsyncioTestCase):
                 manager_effort="medium",
             )
             manager.session_id = "manager-session"
+            manager._provider_circuit_until = 1234.0
             old_manager_client = manager.client
             old_manager_client.cancel = AsyncMock()
             replacement_manager_client = SimpleNamespace()
@@ -553,6 +556,7 @@ class ModelSelectionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(manager.manager_model, "fixture/new-manager")
             self.assertEqual(manager.manager_effort, "xhigh")
             self.assertEqual(manager.session_id, "")
+            self.assertEqual(manager._provider_circuit_until, 0.0)
             self.assertIs(manager.client, replacement_manager_client)
 
     async def test_interactive_model_command_applies_at_queue_boundary_and_persists(self):
@@ -795,6 +799,7 @@ class OpenClaudeRotationTests(unittest.IsolatedAsyncioTestCase):
                         "reason": "credential_pool_exhausted",
                         "upstream_status": 429,
                         "pool_size": 2,
+                        "retry_after_s": 30,
                     }])
                     self.assertEqual(calls, [
                         f"Bearer {PRIMARY_KEY}",
@@ -845,6 +850,7 @@ class OpenClaudeRotationTests(unittest.IsolatedAsyncioTestCase):
                         "reason": "credential_pool_exhausted",
                         "upstream_status": 429,
                         "pool_size": 1,
+                        "retry_after_s": 30,
                     }])
                     self.assertEqual(calls, [f"Bearer {PRIMARY_KEY}"])
                     self.assertNotIn(PRIMARY_KEY, json.dumps(events))
@@ -890,6 +896,7 @@ class OpenClaudeRotationTests(unittest.IsolatedAsyncioTestCase):
                         "reason": "credential_pool_exhausted",
                         "upstream_status": 429,
                         "pool_size": 2,
+                        "retry_after_s": 30,
                     }])
                     self.assertEqual(calls, [
                         f"Bearer {PRIMARY_KEY}",
@@ -943,6 +950,7 @@ class OpenClaudeRotationTests(unittest.IsolatedAsyncioTestCase):
                         "reason": "credential_pool_exhausted",
                         "upstream_status": 0,
                         "pool_size": 2,
+                        "retry_after_s": 30,
                     }])
                     self.assertEqual(calls, [
                         f"Bearer {PRIMARY_KEY}",
@@ -1143,6 +1151,7 @@ class OpenClaudeRotationTests(unittest.IsolatedAsyncioTestCase):
                         "reason": "credential_pool_exhausted",
                         "upstream_status": 402,
                         "pool_size": 2,
+                        "retry_after_s": 1,
                     }])
                     serialized = json.dumps(events)
                     self.assertNotIn(PRIMARY_KEY, serialized)

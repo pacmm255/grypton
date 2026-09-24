@@ -5,8 +5,11 @@ Grypton Code is a persistent, tool-using security-testing workspace. You give it
 Use Grypton only for systems you are allowed to assess.
 
 Grypton uses the local OpenClaude installation at `/root/openclaude` as the
-model gateway for Kraude and Kryptex. OpenCode still hosts their sessions and
-tools. Astra validation remains a separate, direct Codex process.
+model gateway for Kraude and Kryptex. OpenCode hosts Kraude's working session
+and tools, plus Kryptex's operator-chat session. Each autonomous Kryptex direction
+uses a fresh session with the complete current turn state so a long run does not
+accumulate an ever-growing manager conversation. Astra validation remains a
+separate, direct Codex process.
 
 ```bash
 cd /root/grypton
@@ -209,7 +212,7 @@ subset; it always runs detached with quiet, non-interactive output.
 | `--background` | Run under the detached private supervisor. A finite time limit is required. |
 | `--health-interval DURATION` | Record background health counters at this interval. Default: `10m`. |
 | `--restart-limit N` | Allow at most `N` safe supervisor restarts after an abnormal exit. Default: `3`. |
-| `--fresh-worker-session` | On `resume` or `run start`, start a new Kraude conversation while keeping the workspace, ledgers, and Kryptex session. |
+| `--fresh-worker-session` | On `resume` or `run start`, start a new Kraude conversation while keeping the workspace, ledgers, and Kryptex operator-chat session. |
 | `--stop-on-p1` | Stop after a confirmed P1. |
 | `--force` | Reuse the existing engagement name and reset its run state. |
 
@@ -242,7 +245,7 @@ Resume quietly and write the stream to a log:
 ./bin/grypton resume https-api-example-test --console quiet -p | tee grypton-run.log
 ```
 
-Resume the same evidence and Kryptex context with a clean Kraude conversation:
+Resume the same evidence and Kryptex operator-chat context with a clean Kraude conversation:
 
 ```bash
 ./bin/grypton resume https-api-example-test --fresh-worker-session
@@ -373,10 +376,12 @@ In the interactive console:
 ❯ /model kryptex go/muse-spark-1.3-contributor xhigh
 ```
 
-The change is queued and applied at the next safe role boundary. Grypton opens
-a fresh provider session for that role so a transcript from one vendor or model
-is not replayed to another. Findings, flows, progress, scope, and other durable
-engagement records remain available. The new selection is saved for resume.
+The change is queued and applied at the next safe role boundary. A Kraude change
+opens a fresh worker session. A Kryptex change clears its persistent operator-chat
+session; autonomous direction calls already start fresh on every turn. This keeps
+one vendor or model's transcript from reaching another. Findings, flows, progress,
+scope, and other durable engagement records remain available. The new selection
+is saved for resume.
 
 ## Automatic API-key failover
 
@@ -397,6 +402,12 @@ key is limited, the role call ends immediately instead of waiting inside
 OpenClaude's retry window or letting OpenCode repeat the request. Temporary
 connection failures and HTTP 408, 425, or 5xx responses are
 retried with bounded delay when the configured retry window permits it.
+
+When every Kryptex key is cooling down, autonomous direction uses its existing
+deterministic fallback until the earliest key is eligible for one half-open
+probe. This avoids a known-doomed provider request on every worker turn.
+Operator chat remains available and a successful chat or model change clears
+the circuit immediately.
 
 Grypton does not rotate keys for a malformed request, an unknown model, an
 unsupported effort, a tool error, or a scope denial because a different key

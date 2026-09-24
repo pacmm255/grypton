@@ -1231,6 +1231,7 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             ws = Workspace("manager")
             ws.create("127.0.0.1", "web")
             manager = KryptexManager(ws, "system")
+            manager.session_id = "ses-operator-chat"
             response = {
                 "assessment": "real tool use", "directive": "capture one control request",
                 "corrections": [], "new_angles": [], "exhaustion_breaker": "",
@@ -1245,20 +1246,153 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             directive = await manager.direct(ManagerContext(
                 target="127.0.0.1", target_type="web", turn_index=1))
             self.assertEqual(directive.severity_validations, [])
-            self.assertEqual(manager.session_id, "ses-manager")
+            self.assertEqual(manager.session_id, "ses-operator-chat")
+            self.assertEqual(manager.client.call.await_args.kwargs["session_id"], "")
 
-    async def test_manager_restarts_session_after_thinking_signature_rejection(self):
+    async def test_manager_direction_schema_repair_remains_stateless(self):
+        with isolated_runtime():
+            ws = Workspace("manager-stateless-repair")
+            ws.create("127.0.0.1", "web")
+            manager = KryptexManager(ws, "system")
+            manager.session_id = "ses-operator-chat"
+            response = {
+                "assessment": "repaired direction", "directive": "check login",
+                "corrections": [], "new_angles": [], "exhaustion_breaker": "",
+                "scope_enforcement": [], "severity_validations": [],
+                "to_user": "working", "continue": True, "stop_reason": "",
+                "confidence": 0.9,
+            }
+            manager.client.call = AsyncMock(side_effect=[
+                OpenCodeResult(
+                    text="not json", session_id="ses-invalid-direction", events=[],
+                    tools=[], usage=[], duration_s=0.1,
+                ),
+                OpenCodeResult(
+                    text=json.dumps(response), session_id="ses-repaired-direction", events=[],
+                    tools=[], usage=[], duration_s=0.1,
+                ),
+            ])
+
+            directive = await manager.direct(ManagerContext(
+                target="127.0.0.1", target_type="web", turn_index=2,
+            ))
+
+            self.assertEqual(directive.directive, "check login")
+            self.assertEqual(manager.session_id, "ses-operator-chat")
+            self.assertEqual(
+                [call.kwargs["session_id"] for call in manager.client.call.await_args_list],
+                ["", ""],
+            )
+
+    async def test_manager_direction_circuit_skips_until_one_half_open_probe(self):
+        with isolated_runtime():
+            ws = Workspace("manager-circuit")
+            ws.create("127.0.0.1", "web")
+            events = []
+            manager = KryptexManager(ws, "system", on_event=events.append)
+            exhausted = ProviderError(
+                "manager OpenClaude credential pool exhausted (upstream HTTP 429).",
+                metadata={
+                    "source": "openclaude",
+                    "type": "openclaude_terminal",
+                    "role": "manager",
+                    "reason": "credential_pool_exhausted",
+                    "upstream_status": 429,
+                    "pool_size": 5,
+                    "retry_after_s": 30,
+                },
+            )
+            response = {
+                "assessment": "provider recovered", "directive": "check login",
+                "corrections": [], "new_angles": [], "exhaustion_breaker": "",
+                "scope_enforcement": [], "severity_validations": [],
+                "to_user": "working", "continue": True, "stop_reason": "",
+                "confidence": 0.9,
+            }
+            manager.client.call = AsyncMock(side_effect=[
+                exhausted,
+                OpenCodeResult(
+                    text=json.dumps(response), session_id="ses-half-open", events=[],
+                    tools=[], usage=[], duration_s=0.1,
+                ),
+            ])
+            context = ManagerContext(
+                target="127.0.0.1", target_type="web", turn_index=2,
+            )
+
+            with patch("grypton.manager.time.monotonic", return_value=100.0):
+                first = await manager.direct(context)
+            with patch("grypton.manager.time.monotonic", return_value=110.0):
+                skipped = await manager.direct(context)
+            with patch("grypton.manager.time.monotonic", return_value=131.0):
+                recovered = await manager.direct(context)
+
+            self.assertTrue(first.degraded)
+            self.assertTrue(skipped.degraded)
+            self.assertIn("20 seconds", skipped.assessment)
+            self.assertFalse(recovered.degraded)
+            self.assertEqual(recovered.directive, "check login")
+            self.assertEqual(manager.client.call.await_count, 2)
+            self.assertEqual(manager._provider_circuit_until, 0.0)
+            self.assertEqual(
+                [event["type"] for event in events],
+                ["manager_fallback", "manager_fallback"],
+            )
+
+    async def test_operator_chat_bypasses_and_clears_direction_circuit(self):
+        with isolated_runtime():
+            ws = Workspace("manager-circuit-chat")
+            ws.create("127.0.0.1", "web")
+            manager = KryptexManager(ws, "system")
+            manager.session_id = "ses-chat"
+            manager._provider_circuit_until = 130.0
+            chat_response = {
+                "reply": "Recorded.", "remember": "", "disposition": "apply-next-turn",
+                "worker_note": "check login",
+            }
+            direction_response = {
+                "assessment": "available", "directive": "check login",
+                "corrections": [], "new_angles": [], "exhaustion_breaker": "",
+                "scope_enforcement": [], "severity_validations": [],
+                "to_user": "working", "continue": True, "stop_reason": "",
+                "confidence": 0.9,
+            }
+            manager.client.call = AsyncMock(side_effect=[
+                OpenCodeResult(
+                    text=json.dumps(chat_response), session_id="ses-chat-next", events=[],
+                    tools=[], usage=[], duration_s=0.1,
+                ),
+                OpenCodeResult(
+                    text=json.dumps(direction_response), session_id="ses-direction", events=[],
+                    tools=[], usage=[], duration_s=0.1,
+                ),
+            ])
+            context = ManagerContext(
+                target="127.0.0.1", target_type="web", turn_index=2,
+            )
+
+            with patch("grypton.manager.time.monotonic", return_value=100.0):
+                reply = await manager.chat("check login", context)
+                directive = await manager.direct(context)
+
+            self.assertFalse(reply["degraded"])
+            self.assertEqual(reply["worker_note"], "check login")
+            self.assertFalse(directive.degraded)
+            self.assertEqual(manager.client.call.await_count, 2)
+            self.assertEqual(manager.client.call.await_args_list[0].kwargs["session_id"],
+                             "ses-chat")
+            self.assertEqual(manager.client.call.await_args_list[1].kwargs["session_id"], "")
+            self.assertEqual(manager._provider_circuit_until, 0.0)
+
+    async def test_manager_chat_restarts_session_after_thinking_signature_rejection(self):
         with isolated_runtime():
             ws = Workspace("manager-signature")
             ws.create("127.0.0.1", "web")
             manager = KryptexManager(ws, "system")
             manager.session_id = "ses-old-key"
             response = {
-                "assessment": "fresh manager session", "directive": "check login",
-                "corrections": [], "new_angles": [], "exhaustion_breaker": "",
-                "scope_enforcement": [], "severity_validations": [],
-                "to_user": "working", "continue": True, "stop_reason": "",
-                "confidence": 0.9,
+                "reply": "I will check login next.", "remember": "",
+                "disposition": "apply-next-turn", "worker_note": "check login",
             }
             manager.client.call = AsyncMock(side_effect=[
                 ProviderError("capability_rejected: thinking_signature"),
@@ -1268,12 +1402,12 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ])
 
-            directive = await manager.direct(ManagerContext(
+            reply = await manager.chat("check login", ManagerContext(
                 target="127.0.0.1", target_type="web", turn_index=2,
             ))
 
-            self.assertFalse(directive.degraded)
-            self.assertEqual(directive.directive, "check login")
+            self.assertFalse(reply["degraded"])
+            self.assertEqual(reply["worker_note"], "check login")
             self.assertEqual(manager.session_id, "ses-fresh-key")
             self.assertEqual(manager.client.call.await_args_list[0].kwargs["session_id"],
                              "ses-old-key")
@@ -2044,6 +2178,52 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                     kind == "status" and "attempted a soft stop" in payload.get("text", "")
                     for kind, payload in events
                 ))
+            finally:
+                for field, value in old.items():
+                    setattr(config.CONFIG, field, value)
+
+    async def test_degraded_manager_preserves_contextual_fallback_action(self):
+        with isolated_runtime():
+            fields = ("max_turns", "max_run_seconds", "passive_stagnation_limit",
+                      "repetitive_probe_turn_limit", "exhaustion_threshold")
+            old = {field: getattr(config.CONFIG, field) for field in fields}
+            config.CONFIG.max_turns = 2
+            config.CONFIG.max_run_seconds = 0
+            config.CONFIG.passive_stagnation_limit = 99
+            config.CONFIG.repetitive_probe_turn_limit = 99
+            config.CONFIG.exhaustion_threshold = 99
+            worker_directives = []
+            try:
+                ws = Workspace("degraded-manager-action")
+                ws.create("https://app.example.test", "web")
+                ws.save_constraints(Constraints(in_scope=["https://app.example.test"]))
+                engine = Engine("degraded-manager-action", backend="mock")
+                await engine.setup(
+                    brief="initial mission", target="https://app.example.test",
+                    target_type="web",
+                )
+
+                def worker_script(_worker, directive):
+                    worker_directives.append(directive)
+                    return "Recorded one concrete request and its control."
+
+                def degraded_direction(ctx):
+                    return KryptexManager._fallback_directive(
+                        engine.manager, ctx, "fixture provider outage"
+                    )
+
+                engine.worker.script = worker_script
+                engine.manager.direct = AsyncMock(side_effect=degraded_direction)
+
+                await engine.run()
+
+                self.assertEqual(worker_directives, [
+                    "initial mission",
+                    "Continue with the highest-impact unresolved lead in the recorded "
+                    "attack surface. Use a concrete tool call, compare the response "
+                    "against a control, and record the result before ending the turn.",
+                ])
+                self.assertTrue(engine.manager.direct.await_args.args[0].turn_index >= 1)
             finally:
                 for field, value in old.items():
                     setattr(config.CONFIG, field, value)

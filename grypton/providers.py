@@ -486,6 +486,11 @@ class OpenCodeClient:
                     if isinstance(event.get("pool_size"), int)
                     and 0 < event["pool_size"] <= 1000 else 0
                 ),
+                "retry_after_s": (
+                    event.get("retry_after_s")
+                    if isinstance(event.get("retry_after_s"), int)
+                    and 0 < event["retry_after_s"] <= 7 * 86400 else 0
+                ),
             }
             if self._terminal_signal is not None:
                 self._terminal_signal.set()
@@ -760,6 +765,10 @@ class OpenCodeClient:
                 pool_size = int(metadata.get("pool_size") or 0)
             except (TypeError, ValueError):
                 pool_size = 0
+            try:
+                retry_after_s = int(metadata.get("retry_after_s") or 0)
+            except (TypeError, ValueError):
+                retry_after_s = 0
 
             record = {
                 "at": time.time(),
@@ -797,6 +806,8 @@ class OpenCodeClient:
                 record["upstream_status"] = upstream_status
             if 0 < pool_size <= 1000:
                 record["pool_size"] = pool_size
+            if 0 < retry_after_s <= 7 * 86400:
+                record["retry_after_s"] = retry_after_s
             try:
                 gateway_events = gateway.drain_events()
             except Exception:

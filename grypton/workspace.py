@@ -226,7 +226,7 @@ class TargetMeta:
     worker_uuid: str = ""
     worker_project_dir: str = ""
     worker_kind: str = ""            # opencode+openclaude
-    manager_session_id: str = ""     # persistent OpenCode Spark session id
+    manager_session_id: str = ""     # persistent Kryptex operator-chat session id
     fallback_manager_session_id: str = ""  # retained for old metadata compatibility
     worker_model: str = ""           # per-target override; empty => config default
     worker_effort: str = ""
@@ -363,22 +363,52 @@ class Workspace:
 
     def set_severity_verdict(self, finding_id: str, verdict: dict) -> Optional[dict]:
         def apply(record: dict) -> None:
-            record["manager_verdict"] = verdict
-            if record.get("status") == "suppressed-by-scope":
-                return
-            value = str(verdict.get("verdict") or "").lower()
-            if verdict.get("degraded"):
-                record["status"] = "validation-pending"
-            elif value in {"confirm", "agree", "upgrade", "downgrade"}:
-                record["status"] = "confirmed"
-            elif value == "reject":
-                record["status"] = "rejected"
-            elif value in {"needs-more-evidence", "pending"}:
-                record["status"] = "needs-more-evidence"
+            self._apply_severity_verdict(record, verdict)
         hit = self.findings.update(finding_id, apply)
         if hit:
             self._append_verdict_to_md(finding_id, verdict)
         return hit
+
+    def set_severity_verdict_if_absent(
+        self,
+        finding_id: str,
+        verdict: dict,
+    ) -> tuple[Optional[dict], bool]:
+        """Atomically persist a verdict only when the finding has none.
+
+        Automatic Astra validation can overlap an explicit ``grypton validate``
+        process. The condition must be checked while holding the finding ledger's
+        file lock so an already-recorded verdict cannot be overwritten by the
+        automatic result.
+        """
+        applied = False
+
+        def apply(record: dict) -> None:
+            nonlocal applied
+            if isinstance(record.get("manager_verdict"), dict):
+                return
+            self._apply_severity_verdict(record, verdict)
+            applied = True
+
+        hit = self.findings.update(finding_id, apply)
+        if hit and applied:
+            self._append_verdict_to_md(finding_id, verdict)
+        return hit, applied
+
+    @staticmethod
+    def _apply_severity_verdict(record: dict, verdict: dict) -> None:
+        record["manager_verdict"] = verdict
+        if record.get("status") == "suppressed-by-scope":
+            return
+        value = str(verdict.get("verdict") or "").lower()
+        if verdict.get("degraded"):
+            record["status"] = "validation-pending"
+        elif value in {"confirm", "agree", "upgrade", "downgrade"}:
+            record["status"] = "confirmed"
+        elif value == "reject":
+            record["status"] = "rejected"
+        elif value in {"needs-more-evidence", "pending"}:
+            record["status"] = "needs-more-evidence"
 
     def confirmed_p1s(self) -> list[dict]:
         out = []

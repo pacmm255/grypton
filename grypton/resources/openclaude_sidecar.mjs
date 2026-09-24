@@ -119,6 +119,9 @@ function safeNotice(kind, value = {}) {
       ? value.upstreamStatus : 0,
     poolSize: Number.isSafeInteger(value.poolSize)
       && value.poolSize > 0 && value.poolSize <= 1000 ? value.poolSize : 0,
+    retryAfterSeconds: Number.isSafeInteger(value.retryAfterSeconds)
+      && value.retryAfterSeconds > 0 && value.retryAfterSeconds <= 7 * 86400
+      ? value.retryAfterSeconds : 0,
   };
   if (kind === 'request') return {
     type: 'openclaude_request',
@@ -245,6 +248,16 @@ async function start(route, effort, port) {
       if (until <= now) credentialFailures.delete(fingerprint);
     }
   };
+  const poolRetryAfterSeconds = () => {
+    pruneCredentialFailures();
+    if (!credentialPool.length) return 0;
+    const deadlines = credentialPool.map(entry => credentialFailures.get(entry?.fingerprint));
+    if (deadlines.some(deadline => !(Number.isFinite(deadline) && deadline > Date.now()))) {
+      return 0;
+    }
+    const remaining = Math.ceil((Math.min(...deadlines) - Date.now()) / 1000);
+    return Math.max(1, Math.min(7 * 86400, remaining));
+  };
   const requestCredential = init => {
     const headers = new Headers(init?.headers || {});
     const bearer = String(headers.get('authorization') || '').replace(/^Bearer\s+/i, '');
@@ -276,6 +289,7 @@ async function start(route, effort, port) {
         reason: 'credential_pool_exhausted',
         upstreamStatus: response.status,
         poolSize: credentialPool.length,
+        retryAfterSeconds: poolRetryAfterSeconds(),
       });
     }
   };
@@ -303,14 +317,19 @@ async function start(route, effort, port) {
       // failure when every key is already benched and the gateway is about to
       // sleep. It also covers classified 403 failures without interpreting or
       // retaining their provider body here.
-      if (!terminalSent && poolSize > 0
-          && /^every key for this provider is spent or limited; waiting\b/i.test(message)) {
+      const exhausted = message.match(
+        /^every key for this provider is spent or limited; waiting (\d+)s\b/i,
+      );
+      if (!terminalSent && poolSize > 0 && exhausted) {
+        const retryAfterSeconds = Number(exhausted[1]);
         terminalSent = true;
         emit('terminal', {
           route: value?.route || selectedRoute,
           reason: 'credential_pool_exhausted',
           upstreamStatus: 0,
           poolSize,
+          retryAfterSeconds: Number.isSafeInteger(retryAfterSeconds)
+            ? Math.max(1, Math.min(7 * 86400, retryAfterSeconds)) : 0,
         });
       }
     },

@@ -814,6 +814,10 @@ class OpenClaudeGateway:
                 pool_size = int(event.get("poolSize") or 0)
             except (TypeError, ValueError):
                 pool_size = 0
+            try:
+                retry_after_s = int(event.get("retryAfterSeconds") or 0)
+            except (TypeError, ValueError):
+                retry_after_s = 0
             return {
                 "type": kind,
                 "route": _clean(event.get("route"), 300),
@@ -824,6 +828,9 @@ class OpenClaudeGateway:
                 ),
                 "upstream_status": status if 100 <= status <= 599 else 0,
                 "pool_size": pool_size if 0 < pool_size <= 1000 else 0,
+                "retry_after_s": (
+                    retry_after_s if 0 < retry_after_s <= 7 * 86400 else 0
+                ),
             }
         if kind == "openclaude_request":
             return {

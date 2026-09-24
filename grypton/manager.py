@@ -1,8 +1,9 @@
 """Kryptex manager and independent finding validation.
 
-Kryptex is a persistent selectable session through OpenCode/OpenClaude. It
-receives the worker's complete turn summary and returns a bounded JSON directive. Finding
-severity is deliberately outside that session: P1 and P2 findings are reviewed
+Kryptex receives the worker's complete turn summary in a fresh OpenCode session
+and returns a bounded JSON directive. Its operator chat is persistent so a human
+conversation can continue across turns. Finding severity is deliberately outside
+both paths: P1 and P2 findings are reviewed
 automatically by a fresh, tool-disabled GPT-6 Astra process. Lower severities
 reach Astra only after an explicit operator request.
 """
@@ -10,8 +11,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import math
 from pathlib import Path
 import re
+import time
 from typing import Any, Callable, Optional
 
 from . import config
@@ -30,6 +33,9 @@ _PROHIBITIVE_CLAUSE_BOUNDARY = re.compile(
     r"no\s+(?:retry|retries|brute|bruteforce|brute-force|probing|testing|request|requests))\b)",
     re.IGNORECASE,
 )
+
+_MAX_PROVIDER_RETRY_S = 7 * 24 * 60 * 60
+_DEFAULT_PROVIDER_RETRY_S = 60
 
 
 def _affirmative_directive(text: str) -> str:
@@ -163,6 +169,8 @@ class KryptexManager:
         self.manager_model = manager_model or config.MANAGER_MODEL
         self.manager_effort = manager_effort or config.MANAGER_EFFORT
         self.session_id = ""
+        self._provider_circuit_until = 0.0
+        self._direction_call_active = False
         self.directive_schema = self._load_schema("directive_schema.json")
         self.chat_schema = self._load_schema("chat_schema.json")
         self.severity_schema = self._load_schema("severity_schema.json")
@@ -187,6 +195,8 @@ class KryptexManager:
         self.manager_model = model
         self.manager_effort = effort
         self.session_id = ""
+        self._provider_circuit_until = 0.0
+        self._direction_call_active = False
         self.client = self._new_client()
 
     @staticmethod
@@ -198,21 +208,77 @@ class KryptexManager:
         if self.on_event:
             self.on_event({"type": "manager_event", "event": event})
 
-    async def _call_json(self, prompt: str, schema: dict, purpose: str) -> dict:
-        async def call(current_prompt: str, suffix: str = ""):
-            title = f"Grypton Kryptex · {self.ws.slug} · {purpose}{suffix}"
+    def _arm_provider_circuit(self, exc: ProviderError) -> bool:
+        """Remember a structured exhausted-pool result without parsing prose."""
+        metadata = exc.metadata
+        if not (
+            metadata.get("source") == "openclaude"
+            and metadata.get("type") == "openclaude_terminal"
+            and metadata.get("role") == "manager"
+            and metadata.get("reason") == "credential_pool_exhausted"
+        ):
+            return False
+        try:
+            retry_after_s = int(metadata.get("retry_after_s") or 0)
+        except (TypeError, ValueError):
+            retry_after_s = 0
+        if not 0 < retry_after_s <= _MAX_PROVIDER_RETRY_S:
+            retry_after_s = _DEFAULT_PROVIDER_RETRY_S
+        self._provider_circuit_until = time.monotonic() + retry_after_s
+        return True
+
+    def _clear_provider_circuit(self) -> None:
+        self._provider_circuit_until = 0.0
+
+    def _begin_direction_call(self) -> str:
+        """Reserve the sole autonomous direction probe or describe why it is skipped."""
+        remaining = self._provider_circuit_until - time.monotonic()
+        if remaining > 0:
+            return (
+                "Kryptex provider pool is cooling down after credential exhaustion; "
+                f"the next half-open probe is due in {math.ceil(remaining)} seconds."
+            )
+        self._provider_circuit_until = 0.0
+        if self._direction_call_active:
+            return "A Kryptex autonomous direction probe is already in progress."
+        self._direction_call_active = True
+        return ""
+
+    async def _call_json(
+        self,
+        prompt: str,
+        schema: dict,
+        purpose: str,
+        *,
+        persistent_session: bool,
+    ) -> dict:
+        async def provider_call(current_prompt: str, session_id: str, title: str):
             try:
-                return await self.client.call(
-                    current_prompt, session_id=self.session_id, title=title,
+                result = await self.client.call(
+                    current_prompt, session_id=session_id, title=title,
                 )
             except ProviderError as exc:
-                # A Go-plan key may expire between manager turns. Responses
-                # reasoning is encrypted for the account that created it, so a
-                # spare key cannot replay the old OpenCode session. Kryptex has
-                # no tools and the complete turn state is present in each prompt;
-                # retrying once in a new session is safe and preserves key-pool
-                # failover without carrying incompatible reasoning ciphertext.
-                if "capability_rejected: thinking_signature" not in str(exc):
+                self._arm_provider_circuit(exc)
+                raise
+            self._clear_provider_circuit()
+            return result
+
+        async def call(current_prompt: str, suffix: str = ""):
+            title = f"Grypton Kryptex · {self.ws.slug} · {purpose}{suffix}"
+            session_id = self.session_id if persistent_session else ""
+            try:
+                result = await provider_call(current_prompt, session_id, title)
+            except ProviderError as exc:
+                # A Go-plan key may expire during persistent operator chat.
+                # Responses reasoning is encrypted for the account that created
+                # it, so a spare key cannot replay the old OpenCode session.
+                # Retry the current self-contained chat request once without the
+                # incompatible history. Autonomous directions already start
+                # fresh and therefore never enter this branch.
+                if (
+                    not persistent_session
+                    or "capability_rejected: thinking_signature" not in str(exc)
+                ):
                     raise
                 self.session_id = ""
                 if self.on_event:
@@ -220,12 +286,14 @@ class KryptexManager:
                         "type": "manager_session_reset",
                         "reason": "thinking_signature",
                     })
-                return await self.client.call(
-                    current_prompt, session_id="", title=title + " · fresh session",
+                result = await provider_call(
+                    current_prompt, "", title + " · fresh session",
                 )
+            if persistent_session:
+                self.session_id = result.session_id
+            return result
 
         result = await call(prompt)
-        self.session_id = result.session_id
         try:
             value = _extract_json(result.text)
             errors = _check_schema(value, schema)
@@ -241,7 +309,6 @@ class KryptexManager:
                 f"REQUIRED SCHEMA:\n{json.dumps(schema, ensure_ascii=False)}"
             )
             repaired = await call(repair, " repair")
-            self.session_id = repaired.session_id
             value = _extract_json(repaired.text)
             errors = _check_schema(value, schema)
             if errors:
@@ -249,9 +316,19 @@ class KryptexManager:
             return value
 
     async def direct(self, ctx: ManagerContext) -> Directive:
+        circuit_reason = self._begin_direction_call()
+        if circuit_reason:
+            if self.on_event:
+                self.on_event({
+                    "type": "manager_fallback",
+                    "via": "deterministic",
+                    "reason": circuit_reason,
+                })
+            return self._fallback_directive(ctx, circuit_reason)
         try:
             value = await self._call_json(
-                self._build_direction_prompt(ctx), self.directive_schema, "direction"
+                self._build_direction_prompt(ctx), self.directive_schema, "direction",
+                persistent_session=False,
             )
             return Directive(
                 assessment=value["assessment"],
@@ -271,6 +348,8 @@ class KryptexManager:
             if self.on_event:
                 self.on_event({"type": "manager_fallback", "via": "deterministic", "reason": str(exc)})
             return self._fallback_directive(ctx, str(exc))
+        finally:
+            self._direction_call_active = False
 
     async def validate_severity(
         self,
@@ -315,7 +394,8 @@ class KryptexManager:
     async def chat(self, user_message: str, ctx: ManagerContext) -> dict:
         try:
             value = await self._call_json(
-                self._build_chat_prompt(user_message, ctx), self.chat_schema, "operator chat"
+                self._build_chat_prompt(user_message, ctx), self.chat_schema, "operator chat",
+                persistent_session=True,
             )
             value["degraded"] = False
             return value

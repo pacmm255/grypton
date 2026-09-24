@@ -4,11 +4,10 @@ Each iteration:
   1. Worker (Kraude) runs one turn on the manager's directive.
   2. Engine detects deltas (new findings / surface) from the workspace ledgers,
      runs anti-fabrication checks, and computes an exhaustion signal.
-  3. Manager (Kryptex) is given full vision of the turn + all docs and returns a
-     structured directive (assessment, corrections, new angles, expansion
-     strategy, scope enforcement).
-  4. Engine sends new P1/P2 findings to independent Astra validation, persists
-     state, surfaces status to the user, and feeds the next directive to the worker.
+  3. Engine sends new P1/P2 findings to independent Astra validation and
+     persists the verdict.
+  4. Manager (Kryptex) receives the turn, current docs, and that verdict before
+     choosing the next structured directive for the worker.
 
 The loop ends on an explicit user stop, a binding program/scope boundary,
 measured convergence after one attempted pivot, a configured ceiling, or an
@@ -185,6 +184,7 @@ class Engine:
 
         self.stop_requested = False
         self.stop_reason = ""
+        self._stop_event = asyncio.Event()
         self.running = False
 
         self._user_to_worker: asyncio.Queue = asyncio.Queue()
@@ -486,13 +486,96 @@ class Engine:
             # Kryptex call; both roles are idle at this boundary.
             await self._apply_pending_model_switches()
 
-            # User→manager messages are handled in real time by _user_chat_loop;
-            # their persisted standing instructions are already in the constraints
-            # block, so the turn directive doesn't re-drain them here.
-            ctx = self._build_context(turn, new_findings, flags, exhausted, [],
-                                      worker_was_idle=worker_was_idle,
-                                      worker_idle_streak=self._idle_streak,
-                                      convergence_reason=convergence_reason)
+            # Astra reviews new P1/P2 candidates before Kryptex chooses the next
+            # action.  Start from current ledger records so an explicit or prior
+            # verdict cannot trigger a duplicate automatic validation.
+            new_findings = self._refresh_finding_records(new_findings)
+            validation_ctx = self._build_context(
+                turn, new_findings, flags, exhausted, [],
+                worker_was_idle=worker_was_idle,
+                worker_idle_streak=self._idle_streak,
+                convergence_reason=convergence_reason,
+            )
+            auto_findings = self._automatic_validation_candidates(new_findings)
+            skipped = [finding for finding in new_findings if finding not in auto_findings]
+            for finding in skipped:
+                if (
+                    finding.get("status") != "suppressed-by-scope"
+                    and not isinstance(finding.get("manager_verdict"), dict)
+                ):
+                    self.emit("status", text=(
+                        f"Astra not called for {finding.get('id')} "
+                        f"({finding.get('severity', '?')}): automatic validation is P1/P2 only. "
+                        f"Use `grypton validate {self.slug} {finding.get('id')}` to request it."
+                    ))
+            for finding in auto_findings:
+                if self.stop_requested:
+                    break
+                fid = str(finding.get("id") or "")
+                latest = self.ws.findings.find(fid) if fid else None
+                if latest is None:
+                    self.emit("status", text=(
+                        f"Astra skipped {fid or '(unknown finding)'} because the finding "
+                        "is no longer present in the ledger."
+                    ))
+                    continue
+                if not self._automatic_validation_candidates([latest]):
+                    if isinstance(latest.get("manager_verdict"), dict):
+                        self.emit("status", text=(
+                            f"Astra skipped {fid}: a verdict was recorded before "
+                            "automatic validation started."
+                        ))
+                    continue
+                finding = latest
+                self.emit("validation_start", finding_id=fid,
+                          model=config.VALIDATOR_MODEL,
+                          effort=config.VALIDATOR_EFFORT)
+                verdict = await self._validate_with_stop(finding, validation_ctx)
+                if verdict is None:
+                    break
+                fid = str(finding.get("id") or verdict.get("finding_id") or "")
+                verdict = dict(verdict)
+                verdict["finding_id"] = fid
+                persisted, applied = (
+                    self.ws.set_severity_verdict_if_absent(fid, verdict)
+                    if fid else (None, False)
+                )
+                if persisted is not None and applied:
+                    self.emit("verdict", finding_id=fid, verdict=verdict)
+                elif persisted is not None:
+                    self.emit("status", text=(
+                        f"Astra verdict for {fid} was already recorded while validation "
+                        "was running; skipped the duplicate append."
+                    ))
+                self.emit("validation_complete", finding_id=finding.get("id"),
+                          verdict=verdict)
+                # `--stop-on-p1` applies as soon as Astra's decisive verdict is
+                # durable. Do not spend another provider call on Kryptex first.
+                self._handle_p1s()
+                if self.stop_requested:
+                    break
+
+            # A stop requested during Astra should not start another provider
+            # call. Cancellation still propagates through the validator await.
+            if self.stop_requested:
+                break
+
+            # A model switch may have arrived during a long validator call. Apply
+            # it at the same idle role boundary before asking Kryptex to direct.
+            await self._apply_pending_model_switches()
+            if self.stop_requested:
+                break
+
+            # Rebuild after verdict persistence so NEW FINDINGS, the findings
+            # document, and confirmed-P1 count all carry Astra's result into the
+            # exact ManagerContext used for this direction.
+            new_findings = self._refresh_finding_records(new_findings)
+            ctx = self._build_context(
+                turn, new_findings, flags, exhausted, [],
+                worker_was_idle=worker_was_idle,
+                worker_idle_streak=self._idle_streak,
+                convergence_reason=convergence_reason,
+            )
             try:
                 async with self._mgr_lock:
                     directive = await self.manager.direct(ctx)
@@ -504,31 +587,10 @@ class Engine:
                     directive_text = "Continue hunting with full depth; expand the surface if blocked."
                     continue
 
-            # The manager does not grade its own worker. Astra automatically
-            # reviews only claimed P1/P2 findings. Lower severities remain
-            # recorded without a validator call unless the operator explicitly
-            # requests one through `grypton validate`.
+            # Kryptex does not grade findings. Ignore any model-produced
+            # severity verdicts; automatic P1/P2 verdicts are already durable,
+            # and P3+ reaches Astra only through the explicit validate command.
             directive.severity_validations = []
-            auto_findings = self._automatic_validation_candidates(new_findings)
-            skipped = [finding for finding in new_findings if finding not in auto_findings]
-            for finding in skipped:
-                if finding.get("status") != "suppressed-by-scope":
-                    self.emit("status", text=(
-                        f"Astra not called for {finding.get('id')} "
-                        f"({finding.get('severity', '?')}): automatic validation is P1/P2 only. "
-                        f"Use `grypton validate {self.slug} {finding.get('id')}` to request it."
-                    ))
-            for finding in auto_findings:
-                if self.stop_requested:
-                    break
-                self.emit("validation_start", finding_id=finding.get("id"),
-                          model=config.VALIDATOR_MODEL,
-                          effort=config.VALIDATOR_EFFORT)
-                verdict = await self.manager.validate_severity(finding, ctx)
-                directive.severity_validations.append(verdict)
-                self.emit("validation_complete", finding_id=finding.get("id"),
-                          verdict=verdict)
-
             self._apply_manager(directive, new_findings, ctx)
 
             # A genuine program/scope boundary is binding. Machine-measured
@@ -552,11 +614,10 @@ class Engine:
             # ---- P1 handling ----
             self._handle_p1s()
 
-            directive_text = (
-                self._continuation_directive()
-                if getattr(directive, "degraded", False)
-                else (directive.worker_message() or self._continuation_directive())
-            )
+            # Deterministic degradation already produces a context-aware action
+            # from the current ManagerContext. Preserve that action instead of
+            # flattening every provider failure into the generic continuation.
+            directive_text = directive.worker_message() or self._continuation_directive()
 
             # Structural override: refuse to forward a directive that itself tells
             # Kraude to idle / stand by / output a stock idle sentence. Both Codex
@@ -676,8 +737,57 @@ class Engine:
         return [
             finding for finding in findings
             if finding.get("status") != "suppressed-by-scope"
+            and not isinstance(finding.get("manager_verdict"), dict)
             and config.astra_auto_validation_required(finding.get("severity", ""))
         ]
+
+    def _refresh_finding_records(self, findings: list[dict]) -> list[dict]:
+        """Return current ledger versions of a turn's findings in original order."""
+        current = {
+            str(finding.get("id")): finding
+            for finding in self.ws.findings.all()
+            if finding.get("id")
+        }
+        return [current.get(str(finding.get("id")), finding) for finding in findings]
+
+    async def _validate_with_stop(self, finding: dict, ctx: ManagerContext):
+        """Run Astra while allowing a normal engine stop to cancel it promptly."""
+        validation_task = asyncio.create_task(
+            self.manager.validate_severity(finding, ctx)
+        )
+        stop_task = asyncio.create_task(self._stop_event.wait())
+        try:
+            done, _ = await asyncio.wait(
+                {validation_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if validation_task in done:
+                return validation_task.result()
+
+            validation_task.cancel()
+            await asyncio.gather(validation_task, return_exceptions=True)
+            validator = getattr(self.manager, "validator", None)
+            cancel = getattr(validator, "cancel", None)
+            if callable(cancel):
+                await cancel()
+            self.emit("status", text=(
+                f"Astra validation for {finding.get('id') or '(unknown finding)'} "
+                f"was stopped: {self.stop_reason or 'engine stop requested'}."
+            ))
+            return None
+        except BaseException:
+            if not validation_task.done():
+                validation_task.cancel()
+                await asyncio.gather(validation_task, return_exceptions=True)
+            validator = getattr(self.manager, "validator", None)
+            cancel = getattr(validator, "cancel", None)
+            if callable(cancel):
+                await cancel()
+            raise
+        finally:
+            if not stop_task.done():
+                stop_task.cancel()
+            await asyncio.gather(stop_task, return_exceptions=True)
 
     def _apply_manager(self, directive, new_findings, ctx) -> None:
         if directive is None:
@@ -1014,6 +1124,7 @@ class Engine:
     def request_stop(self, reason: str = "user requested stop") -> None:
         self.stop_requested = True
         self.stop_reason = reason
+        self._stop_event.set()
 
     @staticmethod
     def _drain(q: asyncio.Queue) -> list[str]:
@@ -1151,6 +1262,7 @@ class Engine:
     def _stop(self, reason: str) -> None:
         self.stop_requested = True
         self.stop_reason = reason
+        self._stop_event.set()
         self.emit("status", text=f"STOPPING: {reason}")
 
     async def _teardown(self, *, status: str = "stopped") -> None:
@@ -1211,8 +1323,8 @@ class Engine:
 
         The operator's brief is still delivered verbatim on the opening turn.
         A detached deadline run can outlive that one-shot task, so a manager
-        soft stop, idle response, or provider fallback advances to the generic
-        positive action instead of repeatedly submitting credentials or
+        soft stop or idle response advances to the generic positive action
+        instead of repeatedly submitting credentials or
         replaying another completed setup step.
         """
         return _RECOVERY_ACTION if self.run_until_deadline else self._recovery_directive()

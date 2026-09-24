@@ -247,6 +247,7 @@ class ProviderOutputTests(unittest.TestCase):
                         "reason": "credential_pool_exhausted",
                         "upstream_status": 402,
                         "pool_size": 5,
+                        "retry_after_s": 37,
                     })
                     with self.assertRaisesRegex(
                         ProviderError, r"credential pool exhausted \(upstream HTTP 402\)"
@@ -260,6 +261,7 @@ class ProviderOutputTests(unittest.TestCase):
                         "reason": "credential_pool_exhausted",
                         "upstream_status": 402,
                         "pool_size": 5,
+                        "retry_after_s": 37,
                     })
 
                 transcript = (
@@ -283,6 +285,7 @@ class ProviderOutputTests(unittest.TestCase):
                 self.assertEqual(record["error_reason"], "credential_pool_exhausted")
                 self.assertEqual(record["upstream_status"], 402)
                 self.assertEqual(record["pool_size"], 5)
+                self.assertEqual(record["retry_after_s"], 37)
                 self.assertEqual(record["returncode"], -15)
                 self.assertEqual(record["prompt_sha256"], hashlib.sha256(
                     b"fixture prompt"
