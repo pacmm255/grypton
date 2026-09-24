@@ -61,6 +61,7 @@ class ManagerContext:
     worker_last_text: str = ""
     worker_tool_summary: str = ""
     findings_summary: str = ""
+    finding_families: list[dict] = field(default_factory=list)
     surface_summary: str = ""
     tested_summary: str = ""
     progress_tail: str = ""
@@ -78,6 +79,8 @@ class ManagerContext:
     convergence_reason: str = ""
     user_messages: list[str] = field(default_factory=list)
     new_findings: list[dict] = field(default_factory=list)
+    new_finding_cases: list[dict] = field(default_factory=list)
+    novel_finding_families: int = 0
     p1_count: int = 0
 
 
@@ -437,7 +440,12 @@ class KryptexManager:
         )
 
     def _build_direction_prompt(self, ctx: ManagerContext) -> str:
-        pending = json.dumps(ctx.new_findings, ensure_ascii=False, indent=2) if ctx.new_findings else "[]"
+        family_json = json.dumps(
+            ctx.finding_families, ensure_ascii=False, separators=(",", ":")
+        )
+        new_cases = json.dumps(
+            ctx.new_finding_cases, ensure_ascii=False, separators=(",", ":")
+        )
         activity = (
             f"No worker tool call in the last turn; idle streak {ctx.worker_idle_streak}."
             if ctx.worker_was_idle else "Worker tool activity was recorded."
@@ -462,11 +470,11 @@ WORKER REPORT:
 ENGINE FLAGS:
 {json.dumps(ctx.antifab_flags, ensure_ascii=False)}
 
-NEW FINDINGS:
-{pending}
+NEW FINDING CASES JSON:
+{new_cases}
 
-FINDINGS LEDGER:
-{ctx.findings_summary or '(empty)'}
+FINDING FAMILIES JSON:
+{family_json}
 
 ATTACK SURFACE:
 {ctx.surface_summary or '(empty)'}
@@ -484,7 +492,8 @@ NETWORK NOVELTY THIS TURN: {ctx.novel_network_signatures} new signature(s) acros
 PASSIVE STAGNATION STREAK: {ctx.passive_stagnation_streak}
 REPETITIVE PROBE TURN STREAK: {ctx.repetitive_probe_streak}
 CONVERGENCE GUARD: {ctx.convergence_reason or '(not reached)'}
-CONFIRMED P1 COUNT: {ctx.p1_count}
+NEW FINDING FAMILIES THIS TURN: {ctx.novel_finding_families}
+CONFIRMED P1 CASE COUNT: {ctx.p1_count}
 
 JSON SCHEMA:
 {json.dumps(self.directive_schema, ensure_ascii=False)}
@@ -499,6 +508,9 @@ setup and blockers autonomously.
 
 ENGAGEMENT DATA:
 {ctx.constraints_block or '(none recorded)'}
+
+FINDING FAMILIES JSON:
+{json.dumps(ctx.finding_families, ensure_ascii=False, separators=(",", ":"))}
 
 Return only JSON matching this schema:
 {json.dumps(self.chat_schema, ensure_ascii=False)}

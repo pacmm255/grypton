@@ -414,6 +414,15 @@ def _health(slug: str, engine_pid: int) -> dict[str, Any]:
         except (OSError, ValueError, TypeError):
             meta_status = "unreadable"
     ledger = ws.root / ".ledger"
+    finding_cases = _line_count(ledger / "findings.jsonl")
+    finding_families = 0
+    if finding_cases:
+        try:
+            finding_families = len(ws.finding_family_catalog())
+        except (OSError, TypeError, ValueError):
+            # Health reporting must not take down the supervisor when an interrupted
+            # or externally edited ledger needs repair.
+            finding_families = 0
     return {
         "engine_pid": int(engine_pid or 0),
         "engine_alive": pid_matches(engine_pid, "engine", slug,
@@ -424,7 +433,9 @@ def _health(slug: str, engine_pid: int) -> dict[str, Any]:
         "effectful_tool_starts": _line_count(
             ledger / "effectful-tool-starts.jsonl"
         ),
-        "findings": _line_count(ledger / "findings.jsonl"),
+        "findings": finding_cases,
+        "finding_cases": finding_cases,
+        "finding_families": finding_families,
         "surface": _line_count(ledger / "attack-surface.jsonl"),
         "tested": _line_count(ledger / "tested-techniques.jsonl"),
         "provider_calls": _line_count(ws.transcripts_dir / "provider-calls.jsonl"),

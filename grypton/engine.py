@@ -2,8 +2,8 @@
 
 Each iteration:
   1. Worker (Kraude) runs one turn on the manager's directive.
-  2. Engine detects deltas (new findings / surface) from the workspace ledgers,
-     runs anti-fabrication checks, and computes an exhaustion signal.
+  2. Engine detects new finding cases, finding families, and surface from the
+     workspace ledgers, runs anti-fabrication checks, and computes exhaustion.
   3. Engine sends new P1/P2 findings to independent Astra validation and
      persists the verdict.
   4. Manager (Kryptex) receives the turn, current docs, and that verdict before
@@ -214,6 +214,7 @@ class Engine:
         self._exhaustion_streak = 0
         self._idle_streak = 0          # consecutive 0-tool-call worker turns
         self._counts = (0, 0)          # (findings, surface) snapshot
+        self._active_family_ids: set[str] = set()
         self._start_time = 0.0
         self._fault_count = 0
         self._turn_tool_count = 0
@@ -405,7 +406,9 @@ class Engine:
     async def _run_loop(self) -> None:
         self.running = True
         self._start_time = time.time()
-        self._counts = (len(self.ws.findings.all()), len(self.ws.surface.all()))
+        findings = self.ws.findings.all()
+        self._counts = (len(findings), len(self.ws.surface.all()))
+        self._active_family_ids = self._finding_family_ids(findings)
         self._rehydrate_novelty_state()
 
         directive_text = await self._opening_directive()
@@ -545,13 +548,15 @@ class Engine:
             self._complete_worker_provider_window(provider_window_nonce)
 
             # ---- detect deltas ----
-            new_findings, new_surface = self._deltas()
+            new_findings, new_family_ids, new_surface = self._deltas()
             network = self._network_novelty(turn.tool_uses or [])
             for f in new_findings:
                 self.emit("finding", finding=f)
             self.ws.append_progress(
                 f"Turn {self.turn_index}: {len(turn.tool_uses)} tool calls, "
-                f"+{len(new_findings)} finding(s), +{new_surface} novel surface "
+                f"+{len(new_findings)} finding case(s), "
+                f"+{len(new_family_ids)} new finding family ID(s), "
+                f"+{new_surface} novel surface "
                 f"item(s) ({self._raw_new_surface} rows), "
                 f"{network['novel']} novel network signature(s), "
                 f"{network['repeated']} repeated network call(s).")
@@ -570,12 +575,12 @@ class Engine:
                 self._idle_streak = 0
 
             # ---- exhaustion and convergence signals ----
-            if not new_findings and new_surface == 0:
+            if not new_family_ids and new_surface == 0:
                 self._exhaustion_streak += 1
             else:
                 self._exhaustion_streak = 0
 
-            if not new_findings and new_surface == 0 and network["novel"] == 0:
+            if not new_family_ids and new_surface == 0 and network["novel"] == 0:
                 self._passive_stagnation_streak += 1
             else:
                 self._passive_stagnation_streak = 0
@@ -593,6 +598,7 @@ class Engine:
             # Kryptex gets one chance to pivot to a new request shape or newly
             # discovered surface.  If the following turn is still converged,
             # stop rather than pay for hours of sentinel/checkpoint churn.
+            convergence_stop_reason = ""
             if convergence_reason and self._convergence_alerted:
                 if self.run_until_deadline:
                     self.ws.append_progress(
@@ -602,8 +608,11 @@ class Engine:
                     self.ws.append_progress(
                         f"Convergence guard stopped the run after the directed pivot "
                         f"also stagnated: {convergence_reason}.")
-                    self._stop(f"convergence guard: {convergence_reason}")
-                    break
+                    # Preserve case-scoped validation for any P1/P2 evidence
+                    # recorded on this final turn before ending the run.
+                    convergence_stop_reason = (
+                        f"convergence guard: {convergence_reason}"
+                    )
             if not convergence_reason:
                 self._convergence_alerted = False
 
@@ -625,8 +634,12 @@ class Engine:
                 worker_was_idle=worker_was_idle,
                 worker_idle_streak=self._idle_streak,
                 convergence_reason=convergence_reason,
+                novel_finding_families=len(new_family_ids),
             )
             auto_findings = self._automatic_validation_candidates(new_findings)
+            auto_candidate_ids = {
+                str(finding.get("id") or "") for finding in auto_findings
+            }
             skipped = [finding for finding in new_findings if finding not in auto_findings]
             for finding in skipped:
                 if (
@@ -690,21 +703,47 @@ class Engine:
             if self.stop_requested:
                 break
 
+            new_findings = self._refresh_finding_records(new_findings)
+            needs_verification = any(
+                str(finding.get("id") or "") in auto_candidate_ids
+                and (
+                    str(finding.get("status") or "").lower()
+                    in {"needs-more-evidence", "validation-pending"}
+                    or str((finding.get("manager_verdict") or {}).get(
+                        "verdict") or "").lower()
+                    in {"needs-more-evidence", "pending"}
+                )
+                for finding in new_findings
+            )
+            verification_followup = bool(
+                convergence_reason and needs_verification
+            )
+            if verification_followup and convergence_stop_reason:
+                self.ws.append_progress(
+                    "Convergence stop deferred for one manager-directed "
+                    "verification turn after Astra requested more evidence."
+                )
+                convergence_stop_reason = ""
+
+            if convergence_stop_reason:
+                self._stop(convergence_stop_reason)
+                break
+
             # A model switch may have arrived during a long validator call. Apply
             # it at the same idle role boundary before asking Kryptex to direct.
             await self._apply_pending_model_switches()
             if self.stop_requested:
                 break
 
-            # Rebuild after verdict persistence so NEW FINDINGS, the findings
-            # document, and confirmed-P1 count all carry Astra's result into the
-            # exact ManagerContext used for this direction.
-            new_findings = self._refresh_finding_records(new_findings)
+            # Rebuild after verdict persistence so the raw new cases, compact
+            # family catalog, and confirmed-P1 case count all carry Astra's
+            # result into the exact ManagerContext used for this direction.
             ctx = self._build_context(
                 turn, new_findings, flags, exhausted, [],
                 worker_was_idle=worker_was_idle,
                 worker_idle_streak=self._idle_streak,
                 convergence_reason=convergence_reason,
+                novel_finding_families=len(new_family_ids),
             )
             try:
                 async with self._mgr_lock:
@@ -728,7 +767,9 @@ class Engine:
             # unsupported "we are done" response are reframed into a new action.
             if not directive.cont:
                 if self._manager_stop_is_binding(
-                    directive, convergence_reason=convergence_reason
+                    directive,
+                    convergence_reason=("" if verification_followup
+                                        else convergence_reason),
                 ):
                     self._stop(directive.stop_reason or "scope or authorization boundary")
                     break
@@ -736,7 +777,8 @@ class Engine:
                     f"Kryptex attempted a soft stop "
                     f"({(directive.stop_reason or 'unspecified')[:140]}) — continuing per "
                     f"the engagement instructions with a new in-scope angle."))
-                directive.directive = self._continuation_directive()
+                if not verification_followup or not directive.worker_message():
+                    directive.directive = self._continuation_directive()
 
             if convergence_reason:
                 self._convergence_alerted = True
@@ -1057,7 +1099,7 @@ class Engine:
 
     def _build_context(self, turn, new_findings, flags, exhausted, user_msgs,
                        worker_was_idle=False, worker_idle_streak=0,
-                       convergence_reason="") -> ManagerContext:
+                       convergence_reason="", novel_finding_families=0) -> ManagerContext:
         c = self.ws.load_constraints()
         return ManagerContext(
             target=self.target, target_type=self.target_type, turn_index=self.turn_index,
@@ -1065,6 +1107,7 @@ class Engine:
             worker_last_text=(turn.assistant_text if turn else ""),
             worker_tool_summary=self._tool_summary(turn.tool_uses if turn else []),
             findings_summary=self._doc_tail(self.ws.root / "findings.md", 3000),
+            finding_families=self.ws.finding_family_catalog(),
             surface_summary=self._doc_window(self.ws.root / "attack-surface.md", 3000),
             tested_summary=self._doc_window(self.ws.root / "tested-techniques.md", 2500),
             progress_tail=self._doc_tail(self.ws.root / "progress.md", 1500, tail=True),
@@ -1079,6 +1122,8 @@ class Engine:
             repetitive_probe_streak=self._repetitive_probe_streak,
             convergence_reason=convergence_reason,
             user_messages=user_msgs, new_findings=new_findings,
+            new_finding_cases=self._manager_case_projection(new_findings),
+            novel_finding_families=novel_finding_families,
             p1_count=len(self.ws.confirmed_p1s()),
         )
 
@@ -1099,6 +1144,34 @@ class Engine:
             if finding.get("id")
         }
         return [current.get(str(finding.get("id")), finding) for finding in findings]
+
+    @staticmethod
+    def _manager_case_projection(findings: list[dict]) -> list[dict]:
+        """Keep new-case direction data useful without forwarding case evidence."""
+        projected = []
+        for finding in findings:
+            verdict = finding.get("manager_verdict")
+            astra = {}
+            if isinstance(verdict, dict):
+                checks = verdict.get("independent_checks")
+                if not isinstance(checks, list):
+                    checks = []
+                astra = {
+                    "verdict": str(verdict.get("verdict") or "")[:32],
+                    "severity": str(verdict.get("severity") or "")[:16],
+                    "independent_checks": [
+                        str(check)[:300] for check in checks[:8]
+                    ],
+                }
+            projected.append({
+                "id": str(finding.get("id") or "")[:32],
+                "title": str(finding.get("title") or "")[:300],
+                "severity": str(finding.get("severity") or "")[:16],
+                "status": str(finding.get("status") or "")[:64],
+                "surface": str(finding.get("surface") or "")[:300],
+                "astra": astra,
+            })
+        return projected
 
     async def _validate_with_stop(self, finding: dict, ctx: ManagerContext):
         """Run Astra while allowing a normal engine stop to cancel it promptly."""
@@ -1149,7 +1222,7 @@ class Engine:
         # Apply severity verdicts from the directive, but DEDUP: skip ones that
         # would just re-affirm an already-decisive verdict at the same severity.
         # Without this, the manager re-validates the same finding every turn it
-        # sees in the FINDINGS block (observed: F001 got 6 identical
+        # sees in the family catalog (observed: F001 got 6 identical
         # "Confirmed P2" appendices over the bugcrowd engagement).
         existing_by_id = {f["id"]: f for f in self.ws.findings.all()}
         validated = set()
@@ -1196,7 +1269,7 @@ class Engine:
         except OSError:
             pass
         if config.CONFIG.stop_on_p1:
-            self._stop(f"{len(p1s)} confirmed P1(s) and stop_on_p1 is set")
+            self._stop(f"{len(p1s)} confirmed P1 case(s) and stop_on_p1 is set")
 
     # -------------------------------------------------------- introspection
 
@@ -1205,6 +1278,8 @@ class Engine:
         all_s = self.ws.surface.all()
         old_f, old_s = self._counts
         new_findings = all_f[old_f:]
+        current_family_ids = self._finding_family_ids(all_f)
+        new_family_ids = current_family_ids - self._active_family_ids
         new_rows = all_s[old_s:]
         self._raw_new_surface = len(new_rows)
         new_surface = 0
@@ -1215,7 +1290,19 @@ class Engine:
                 if not self._surface_is_bookkeeping(row):
                     new_surface += 1
         self._counts = (len(all_f), len(all_s))
-        return new_findings, new_surface
+        self._active_family_ids = current_family_ids
+        return new_findings, new_family_ids, new_surface
+
+    @staticmethod
+    def _finding_family_ids(findings: list[dict]) -> set[str]:
+        """Return active anchor IDs; every family is backed by at least one case."""
+        return {
+            family_id
+            for finding in findings
+            if (family_id := str(
+                finding.get("family_id") or finding.get("id") or ""
+            ).strip())
+        }
 
     @staticmethod
     def _surface_key(row: dict) -> str:
@@ -1336,7 +1423,7 @@ class Engine:
         if self._passive_stagnation_streak >= passive_limit:
             return (
                 f"{self._passive_stagnation_streak} consecutive turns produced no "
-                "finding, novel surface, or new network request signature"
+                "new finding family, novel surface, or new network request signature"
             )
         return ""
 
