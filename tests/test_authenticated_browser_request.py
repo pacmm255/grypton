@@ -65,6 +65,8 @@ class _BrowserRequestHandler(BaseHTTPRequestHandler):
     rotated_token = "http-rotated-token-secret-123456"
     expired_echo = "expired-echo-cookie-secret-123456"
     authorization_echo = "authorization-echo-secret-123456"
+    cookie_echo_one = "cookie-echo-one-secret-123456"
+    cookie_echo_two = "cookie-echo-two-secret-123456"
     exfil_url = ""
     hostile_gets = 0
     bootstrap_network_gets = 0
@@ -133,6 +135,13 @@ class _BrowserRequestHandler(BaseHTTPRequestHandler):
                 headers=(("Clear-Site-Data", '"cookies", "storage"'),),
             )
             return
+        if path == "/http-header-looking-body":
+            self._send(
+                200,
+                b'Set-Cookie: body-only=fake\nClear-Site-Data: "cookies"\n',
+                content_type="text/plain",
+            )
+            return
         if path == "/http-token-rotate":
             self._send(
                 200,
@@ -152,7 +161,8 @@ class _BrowserRequestHandler(BaseHTTPRequestHandler):
         if path == "/neutral-secret-echo":
             body = (
                 f"values {type(self).expired_echo} "
-                f"{type(self).authorization_echo}"
+                f"{type(self).authorization_echo} "
+                f"{type(self).cookie_echo_one} {type(self).cookie_echo_two}"
             ).encode()
             self._send(
                 200, body, content_type="text/plain",
@@ -164,6 +174,11 @@ class _BrowserRequestHandler(BaseHTTPRequestHandler):
                     (
                         "Authorization",
                         f"Bearer {type(self).authorization_echo}",
+                    ),
+                    (
+                        "Cookie",
+                        f"first={type(self).cookie_echo_one}; "
+                        f"second={type(self).cookie_echo_two}",
                     ),
                 ),
             )
@@ -308,6 +323,50 @@ def local_server(handler):
         server.shutdown()
         server.server_close()
         thread.join(timeout=2)
+
+
+class HttpTransportCaptureTests(unittest.TestCase):
+    def test_head_response_is_captured_once(self):
+        with isolated_runtime(), local_server(_BrowserRequestHandler) as port:
+            origin = f"http://127.0.0.1:{port}"
+            ws = Workspace("head-response-capture")
+            ws.create(origin, "web")
+            ws.save_constraints(Constraints(in_scope=[origin]))
+
+            result = tools.http_request(ws, origin + "/hostile", method="HEAD")
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(sum(
+                line.startswith("HTTP/")
+                for line in result["data"]["response"].splitlines()
+            ), 1)
+            flow = Path(result["data"]["flow"]).read_text(errors="replace")
+            self.assertEqual(sum(
+                line.startswith("HTTP/")
+                for line in flow.split("### RESPONSE\n", 1)[1].splitlines()
+            ), 1)
+
+    def test_response_header_capture_is_removed_after_setup_failure(self):
+        with isolated_runtime(), local_server(_BrowserRequestHandler) as port:
+            origin = f"http://127.0.0.1:{port}"
+            ws = Workspace("header-capture-cleanup")
+            ws.create(origin, "web")
+            ws.save_constraints(Constraints(in_scope=[origin]))
+            real_open = os.open
+
+            def fail_request_header(path, *args, **kwargs):
+                if str(path).endswith(".headers"):
+                    raise OSError("synthetic request-header setup failure")
+                return real_open(path, *args, **kwargs)
+
+            with patch("grypton.tools.os.open", side_effect=fail_request_header):
+                result = tools.http_request(
+                    ws, origin + "/hostile", headers={"X-Test": "value"}
+                )
+
+            self.assertFalse(result["ok"], result)
+            temporary = config.RUNTIME_DIR / "http-tmp" / ws.slug
+            self.assertEqual(list(temporary.iterdir()), [])
 
 
 @unittest.skipUnless(tools._browser_executable(), "Chromium is unavailable")
@@ -725,6 +784,25 @@ class AuthenticatedBrowserRequestTests(unittest.TestCase):
                         "attribute-only Set-Cookie should exercise presence invalidation",
                     )
 
+    def test_http_body_header_lookalikes_do_not_invalidate_rich_state(self):
+        with isolated_runtime(), local_server(_BrowserRequestHandler) as port:
+            ws = self._workspace(port)
+            self._seed_rich_session(ws, port)
+            storage_path = credentials.browser_storage_path(ws.slug, "primary")
+            before = storage_path.read_bytes()
+
+            result = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/http-header-looking-body",
+                "credential": "primary",
+            })
+
+            self.assertTrue(result["ok"], result)
+            self.assertTrue(storage_path.exists())
+            self.assertEqual(storage_path.read_bytes(), before)
+            self.assertTrue(
+                credentials.load_browser_storage(ws.slug, "primary")["available"]
+            )
+
     def test_special_storage_keys_round_trip_and_headers_fail_closed(self):
         with isolated_runtime(), local_server(_BrowserRequestHandler) as port:
             ws = self._workspace(port)
@@ -834,6 +912,19 @@ class AuthenticatedBrowserRequestTests(unittest.TestCase):
             )
             self.assertNotIn(_BrowserRequestHandler.expired_echo, observable)
             self.assertNotIn(_BrowserRequestHandler.authorization_echo, observable)
+            self.assertNotIn(_BrowserRequestHandler.cookie_echo_one, observable)
+            self.assertNotIn(_BrowserRequestHandler.cookie_echo_two, observable)
+
+    def test_shared_redactor_scrubs_empty_username_url_credentials(self):
+        password = "empty-user-password-never-log"
+        cleaned = tools.redact_sensitive_text(
+            f"Location: https://:{password}@example.test/callback"
+        )
+        self.assertNotIn(password, cleaned)
+        self.assertEqual(
+            cleaned,
+            "Location: https://[REDACTED]@example.test/callback",
+        )
 
     def test_profile_revision_change_blocks_browser_request(self):
         with isolated_runtime(), local_server(_BrowserRequestHandler) as port:

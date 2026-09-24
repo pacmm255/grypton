@@ -50,7 +50,7 @@ _SENSITIVE_HEADER_RE = re.compile(
     r"x-api-key|x-auth-token|x-csrf-token|x-xsrf-token)\s*:\s*).*$"
 )
 _URL_USERINFO_RE = re.compile(
-    r"(?i)\b((?:https?|wss?|ftp)://)[^/\s:@]+(?::[^/\s@]*)?@"
+    r"(?i)\b((?:https?|wss?|ftp)://)[^/\s@?#]*@"
 )
 _SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"""(?ix)
@@ -788,6 +788,12 @@ def _browser_private_response_values(body: str, headers: dict) -> tuple[str, ...
                     _name, separator, cookie_value = pair.partition("=")
                     if separator:
                         remember(cookie_value.strip())
+            elif normalized_header == "cookie":
+                for line in value.replace("\r", "\n").split("\n"):
+                    for pair in line.split(";"):
+                        _name, separator, cookie_value = pair.partition("=")
+                        if separator:
+                            remember(cookie_value.strip())
             if normalized_header in {"authorization", "proxyauthorization"}:
                 scheme = re.match(
                     r"(?i)^\s*(?:bearer|basic)\s+([A-Za-z0-9._~+/=-]{1,})",
@@ -1012,6 +1018,14 @@ def _save_flow(workspace: Workspace, method: str, url: str, headers: Optional[di
     return path
 
 
+def _final_http_response_header_block(value: str) -> str:
+    """Return only the final actual HTTP header block dumped by curl."""
+    starts = list(re.finditer(r"(?im)^HTTP/[^\r\n]+", value))
+    if not starts:
+        return ""
+    return re.split(r"\r?\n\r?\n", value[starts[-1].start():], maxsplit=1)[0]
+
+
 def http_request(workspace: Workspace, url: str, *, method: str = "GET",
                  headers: Optional[dict] = None, body: Optional[str] = None,
                  timeout: int = 30, follow_redirects: bool = False,
@@ -1069,7 +1083,7 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
     if _bearer_token and not any(key.lower() == "authorization" for key in clean_headers):
         clean_headers["Authorization"] = f"Bearer {_bearer_token}"
 
-    argv = [curl, "--disable", "--silent", "--show-error", "--include", "--compressed",
+    argv = [curl, "--disable", "--silent", "--show-error", "--compressed",
             "--max-time", str(timeout), "--connect-timeout", str(min(timeout, 15))]
     if method == "HEAD":
         argv.append("--head")
@@ -1083,42 +1097,73 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
     private_tmp = config.RUNTIME_DIR / "http-tmp" / workspace.slug
     private_tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(private_tmp, 0o700)
+    response_header_path: Optional[Path] = None
     header_path: Optional[Path] = None
-    if clean_headers:
-        header_path = private_tmp / f".curl-{time.time_ns()}.headers"
-        header_fd = os.open(
-            header_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600
-        )
-        with os.fdopen(header_fd, "w", encoding="utf-8") as stream:
-            for key, value in clean_headers.items():
-                stream.write(f"{key}: {value}\n")
-        argv += ["--header", f"@{header_path}"]
-    if _cookie_jar is not None:
-        argv += ["--cookie", str(_cookie_jar), "--cookie-jar", str(_cookie_jar)]
-    request_input = None
-    if body is not None:
-        argv += ["--data-binary", "@-"]
-        request_input = body.encode("utf-8")
-    argv += ["--", url]
-
+    capture_path: Optional[Path] = None
     started = time.time()
-    capture_path = private_tmp / f".curl-{time.time_ns()}.capture"
-    fd = os.open(capture_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
     try:
+        response_header_path = (
+            private_tmp / f".curl-{time.time_ns()}.response-headers"
+        )
+        response_header_fd = os.open(
+            response_header_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+            0o600,
+        )
+        os.close(response_header_fd)
+        argv += ["--dump-header", str(response_header_path)]
+        if clean_headers:
+            header_path = private_tmp / f".curl-{time.time_ns()}.headers"
+            header_fd = os.open(
+                header_path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+                0o600,
+            )
+            with os.fdopen(header_fd, "w", encoding="utf-8") as stream:
+                for key, value in clean_headers.items():
+                    stream.write(f"{key}: {value}\n")
+            argv += ["--header", f"@{header_path}"]
+        if _cookie_jar is not None:
+            argv += ["--cookie", str(_cookie_jar), "--cookie-jar", str(_cookie_jar)]
+        request_input = None
+        if body is not None:
+            argv += ["--data-binary", "@-"]
+            request_input = body.encode("utf-8")
+        argv += ["--", url]
+
+        capture_path = private_tmp / f".curl-{time.time_ns()}.capture"
+        fd = os.open(
+            capture_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW,
+            0o600,
+        )
         with os.fdopen(fd, "wb") as capture:
             result = subprocess.run(
                 argv, input=request_input, stdout=capture, stderr=subprocess.PIPE,
                 timeout=timeout + 5, env=_minimal_local_environment(), umask=0o077,
             )
-        response_bytes = capture_path.stat().st_size
-        with capture_path.open("rb") as capture:
-            raw_output = capture.read(MAX_RESPONSE_BYTES)
+        response_header_bytes = response_header_path.stat().st_size
+        # `curl --head` writes its headers to stdout as well as --dump-header.
+        # Ignore that duplicate stream so one network response yields one block.
+        response_body_bytes = 0 if method == "HEAD" else capture_path.stat().st_size
+        response_bytes = response_header_bytes + response_body_bytes
+        with response_header_path.open("rb") as response_headers:
+            raw_response_headers = response_headers.read(MAX_RESPONSE_BYTES)
+        remaining = max(0, MAX_RESPONSE_BYTES - len(raw_response_headers))
+        raw_response_body = b""
+        if method != "HEAD":
+            with capture_path.open("rb") as capture:
+                raw_response_body = capture.read(remaining)
+        raw_output = raw_response_headers + raw_response_body
     except subprocess.TimeoutExpired:
         return _err(f"HTTP request timed out after {timeout}s; it was not retried.")
     except OSError as exc:
         return _err(f"HTTP transport failed before a response was captured: {exc}")
     finally:
-        capture_path.unlink(missing_ok=True)
+        if capture_path is not None:
+            capture_path.unlink(missing_ok=True)
+        if response_header_path is not None:
+            response_header_path.unlink(missing_ok=True)
         if header_path is not None:
             header_path.unlink(missing_ok=True)
     if _cookie_jar is not None and _cookie_jar.exists():
@@ -1126,11 +1171,16 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
 
     output = raw_output.decode("utf-8", "replace")
     if isinstance(_response_observation, dict):
+        response_header_text = raw_response_headers.decode("utf-8", "replace")
+        incomplete_headers = response_header_bytes > len(raw_response_headers)
+        final_header_block = _final_http_response_header_block(response_header_text)
         _response_observation["set_cookie"] = bool(
-            re.search(r"(?im)^\s*set-cookie\s*:", output)
+            incomplete_headers
+            or re.search(r"(?im)^\s*set-cookie\s*:", final_header_block)
         )
         _response_observation["clear_site_data"] = bool(
-            re.search(r"(?im)^\s*clear-site-data\s*:", output)
+            incomplete_headers
+            or re.search(r"(?im)^\s*clear-site-data\s*:", final_header_block)
         )
     extracted = _extract_auth_tokens(output) if _session_identity else {}
     if _session_identity and extracted:

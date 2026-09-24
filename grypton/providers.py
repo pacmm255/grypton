@@ -69,7 +69,7 @@ _AUTH_SCHEME = re.compile(
     r"[A-Za-z0-9._~+/=-]+"
 )
 _URL_USERINFO = re.compile(
-    r"(?i)\b((?:https?|wss?|ftp)://)[^/\s:@]+(?::[^/\s@]*)?@"
+    r"(?i)\b((?:https?|wss?|ftp)://)[^/\s@?#]*@"
 )
 
 _STATUS_GLYPH = r"(?:\u2705|\u2611\ufe0f?|\u2714\ufe0f?|\U0001f3c1|\U0001f680|\U0001faf0|\U0001f3ac|\U0001f389|\U0001f44d|\u2728)"

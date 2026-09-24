@@ -231,6 +231,9 @@ class ProviderOutputTests(unittest.TestCase):
             "https://synthetic-user:SYNTHETIC_PASSWORD_VALUE@example.test/path": (
                 "synthetic-user", "SYNTHETIC_PASSWORD_VALUE",
             ),
+            "https://:EMPTY_USER_PASSWORD_VALUE@example.test/path": (
+                "EMPTY_USER_PASSWORD_VALUE",
+            ),
         }
         for value, secrets in cases.items():
             with self.subTest(value=value.split(":", 1)[0]):
