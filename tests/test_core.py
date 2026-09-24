@@ -1674,6 +1674,22 @@ class WorkerEventTests(unittest.TestCase):
         self.assertEqual(worker.strip(), "SCOPE DATA")
         self.assertEqual(workspace.strip(), "SCOPE DATA")
 
+    def test_degraded_manager_actions_do_not_restate_conduct_rules(self):
+        manager = object.__new__(KryptexManager)
+        contexts = (
+            ManagerContext(target="example.test", target_type="web", turn_index=1),
+            ManagerContext(target="example.test", target_type="web", turn_index=1,
+                           worker_was_idle=True),
+            ManagerContext(target="example.test", target_type="web", turn_index=1,
+                           exhaustion=True),
+        )
+        for context in contexts:
+            message = manager._fallback_directive(context, "provider unavailable").worker_message()
+            lowered = message.lower()
+            for generated_rule in ("do not", "don't", "never", "must not",
+                                   "refrain from", "only within", "scope"):
+                self.assertNotIn(generated_rule, lowered)
+
     def test_explicit_mission_reaches_kraude_runtime_prompt_verbatim(self):
         with isolated_runtime():
             worker = OpenCodeWorker(WorkerSpec(

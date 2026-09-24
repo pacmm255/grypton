@@ -418,9 +418,8 @@ class KryptexManager:
             )
         elif ctx.exhaustion:
             action = (
-                "Expand only within the recorded scope: inspect saved JavaScript, schemas, headers, "
-                "and existing captures for one untested route or parameter, then test that single lead "
-                "and update the ledgers."
+                "Inspect saved JavaScript, schemas, headers, and existing captures for one "
+                "untested route or parameter, then test that lead and update the ledgers."
             )
         else:
             action = (
