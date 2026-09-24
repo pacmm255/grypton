@@ -9,6 +9,7 @@ reach Astra only after an explicit operator request.
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 import json
 import math
@@ -233,6 +234,18 @@ class KryptexManager:
     def _clear_provider_circuit(self) -> None:
         self._provider_circuit_until = 0.0
 
+    def _provider_retry_delay(self, exc: ProviderError) -> int | None:
+        """Arm the pool circuit and return its bounded, sanitized wait."""
+        if not self._arm_provider_circuit(exc):
+            return None
+        return max(
+            1,
+            min(
+                _MAX_PROVIDER_RETRY_S,
+                math.ceil(self._provider_circuit_until - time.monotonic()),
+            ),
+        )
+
     def _begin_direction_call(self) -> str:
         """Reserve the sole autonomous direction probe or describe why it is skipped."""
         remaining = self._provider_circuit_until - time.monotonic()
@@ -256,15 +269,38 @@ class KryptexManager:
         persistent_session: bool,
     ) -> dict:
         async def provider_call(current_prompt: str, session_id: str, title: str):
-            try:
-                result = await self.client.call(
-                    current_prompt, session_id=session_id, title=title,
-                )
-            except ProviderError as exc:
-                self._arm_provider_circuit(exc)
-                raise
-            self._clear_provider_circuit()
-            return result
+            while True:
+                try:
+                    result = await self.client.call(
+                        current_prompt, session_id=session_id, title=title,
+                    )
+                except ProviderError as exc:
+                    retry_after_s = self._provider_retry_delay(exc)
+                    if retry_after_s is None:
+                        raise
+                    metadata = exc.metadata
+                    if self.on_event:
+                        self.on_event({
+                            "type": "manager_provider_wait",
+                            "reason": "credential_pool_exhausted",
+                            "retry_after_s": retry_after_s,
+                            "pool_size": metadata.get("pool_size", 0),
+                            "upstream_status": metadata.get("upstream_status", 0),
+                        })
+                    # Manager calls cannot run tools, so replaying this complete,
+                    # self-contained request after the provider cooldown has no
+                    # external side effects.  The sleep remains cancellable by
+                    # an operator stop or engine shutdown.
+                    await asyncio.sleep(retry_after_s)
+                    self._clear_provider_circuit()
+                    if self.on_event:
+                        self.on_event({
+                            "type": "manager_provider_retry",
+                            "reason": "credential_pool_exhausted",
+                        })
+                    continue
+                self._clear_provider_circuit()
+                return result
 
         async def call(current_prompt: str, suffix: str = ""):
             title = f"Grypton Kryptex · {self.ws.slug} · {purpose}{suffix}"

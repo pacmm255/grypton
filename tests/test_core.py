@@ -1606,7 +1606,7 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
                 ["", ""],
             )
 
-    async def test_manager_direction_circuit_skips_until_one_half_open_probe(self):
+    async def test_manager_direction_waits_for_exhausted_pool_and_retries(self):
         with isolated_runtime():
             ws = Workspace("manager-circuit")
             ws.create("127.0.0.1", "web")
@@ -1633,6 +1633,7 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             }
             manager.client.call = AsyncMock(side_effect=[
                 exhausted,
+                exhausted,
                 OpenCodeResult(
                     text=json.dumps(response), session_id="ses-half-open", events=[],
                     tools=[], usage=[], duration_s=0.1,
@@ -1642,24 +1643,93 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
                 target="127.0.0.1", target_type="web", turn_index=2,
             )
 
-            with patch("grypton.manager.time.monotonic", return_value=100.0):
-                first = await manager.direct(context)
-            with patch("grypton.manager.time.monotonic", return_value=110.0):
-                skipped = await manager.direct(context)
-            with patch("grypton.manager.time.monotonic", return_value=131.0):
+            with patch("grypton.manager.asyncio.sleep", new=AsyncMock()) as pause:
                 recovered = await manager.direct(context)
 
-            self.assertTrue(first.degraded)
-            self.assertTrue(skipped.degraded)
-            self.assertIn("20 seconds", skipped.assessment)
             self.assertFalse(recovered.degraded)
             self.assertEqual(recovered.directive, "check login")
-            self.assertEqual(manager.client.call.await_count, 2)
+            self.assertEqual(manager.client.call.await_count, 3)
+            prompts = [
+                call.args[0] for call in manager.client.call.await_args_list
+            ]
+            self.assertEqual(
+                prompts, [prompts[0], prompts[0], prompts[0]],
+            )
+            self.assertEqual(
+                [call.kwargs["session_id"] for call in manager.client.call.await_args_list],
+                ["", "", ""],
+            )
+            self.assertEqual(
+                [call.args[0] for call in pause.await_args_list], [30, 30],
+            )
             self.assertEqual(manager._provider_circuit_until, 0.0)
             self.assertEqual(
                 [event["type"] for event in events],
-                ["manager_fallback", "manager_fallback"],
+                [
+                    "manager_provider_wait", "manager_provider_retry",
+                    "manager_provider_wait", "manager_provider_retry",
+                ],
             )
+            self.assertEqual(events[0]["retry_after_s"], 30)
+            self.assertEqual(events[0]["pool_size"], 5)
+            self.assertEqual(events[0]["upstream_status"], 429)
+
+    async def test_manager_pool_wait_is_cancellable_without_fallback(self):
+        with isolated_runtime():
+            ws = Workspace("manager-circuit-cancel")
+            ws.create("127.0.0.1", "web")
+            events = []
+            manager = KryptexManager(ws, "system", on_event=events.append)
+            manager.client.call = AsyncMock(side_effect=ProviderError(
+                "manager OpenClaude credential pool exhausted (upstream HTTP 429).",
+                metadata={
+                    "source": "openclaude",
+                    "type": "openclaude_terminal",
+                    "role": "manager",
+                    "reason": "credential_pool_exhausted",
+                    "upstream_status": 429,
+                    "pool_size": 5,
+                    "retry_after_s": 60,
+                },
+            ))
+
+            with patch(
+                "grypton.manager.asyncio.sleep",
+                new=AsyncMock(side_effect=asyncio.CancelledError),
+            ) as pause:
+                with self.assertRaises(asyncio.CancelledError):
+                    await manager.direct(ManagerContext(
+                        target="127.0.0.1", target_type="web", turn_index=2,
+                    ))
+
+            pause.assert_awaited_once_with(60)
+            self.assertEqual(manager.client.call.await_count, 1)
+            self.assertFalse(manager._direction_call_active)
+            self.assertEqual(
+                [event["type"] for event in events], ["manager_provider_wait"],
+            )
+
+    async def test_manager_direction_still_falls_back_for_non_pool_error(self):
+        with isolated_runtime():
+            ws = Workspace("manager-non-pool-error")
+            ws.create("127.0.0.1", "web")
+            events = []
+            manager = KryptexManager(ws, "system", on_event=events.append)
+            manager.client.call = AsyncMock(side_effect=ProviderError(
+                "manager OpenCode returned no final text.",
+                metadata={"replay_safe": False},
+            ))
+
+            with patch("grypton.manager.asyncio.sleep", new=AsyncMock()) as pause:
+                directive = await manager.direct(ManagerContext(
+                    target="127.0.0.1", target_type="web", turn_index=2,
+                ))
+
+            self.assertTrue(directive.degraded)
+            self.assertEqual(directive.fallback_provider, "deterministic")
+            self.assertEqual(manager.client.call.await_count, 1)
+            pause.assert_not_awaited()
+            self.assertEqual([event["type"] for event in events], ["manager_fallback"])
 
     async def test_operator_chat_bypasses_and_clears_direction_circuit(self):
         with isolated_runtime():

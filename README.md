@@ -400,16 +400,17 @@ shows a key-specific condition:
 
 The failed key enters a cooldown, so later requests do not immediately reuse
 it. Grypton tries each currently usable key at most once for a 429. If every
-key is limited, the role call ends immediately instead of waiting inside
-OpenClaude's retry window or letting OpenCode repeat the request. Temporary
+key is limited, the current OpenCode process ends promptly with a sanitized
+retry delay. A tool-disabled Kryptex request waits for that delay and retries
+automatically; Kraude follows the detached-run recovery policy below. Temporary
 connection failures and HTTP 408, 425, or 5xx responses are
 retried with bounded delay when the configured retry window permits it.
 
-When every Kryptex key is cooling down, autonomous direction uses its existing
-deterministic fallback until the earliest key is eligible for one half-open
-probe. This avoids a known-doomed provider request on every worker turn.
-Operator chat remains available and a successful chat or model change clears
-the circuit immediately.
+When every Kryptex key is cooling down, autonomous direction and operator chat
+wait interruptibly until the earliest key is eligible, then retry the same
+self-contained, tool-disabled request. Repeated exhaustion waits again instead
+of degrading that manager turn. Other provider failures still use the existing
+deterministic direction fallback.
 
 Grypton does not rotate keys for a malformed request, an unknown model, an
 unsupported effort, a tool error, or a scope denial because a different key

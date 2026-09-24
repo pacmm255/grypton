@@ -75,7 +75,7 @@ OpenClaude classifies an upstream failure before deciding what can help:
 | --- | --- |
 | 401 or 402 | Bench the key and use the next usable key. |
 | 403 identified as data policy, blocked account, credits, quota, or billing | Bench the key and use the next usable key. |
-| Any provider HTTP 429 | Bench the key and use the next usable key once; end the role call promptly when the pool is exhausted. |
+| Any provider HTTP 429 | Bench the key and use the next usable key once; end the OpenCode process promptly when the pool is exhausted and retry a tool-disabled manager request after the advertised cooldown. |
 | Connection failure, 408, 425, or 5xx | Retry with bounded backoff when the configured retry window permits it. |
 | Invalid request, unknown model, unsupported effort, ordinary permission denial, tool error, or scope denial | Return the error without spending another key. |
 
@@ -84,9 +84,9 @@ never replays a request after response streaming has begun. This prevents one
 model answer or tool request from being emitted twice. A model switch closes
 the old role gateway, so the new selection gets a clean transport lifecycle.
 Pool exhaustion carries only sanitized status, pool-size, and retry-delay
-metadata. Kryptex uses that delay to skip autonomous provider calls until one
-half-open probe is due; its deterministic direction keeps the engine moving.
-Operator chat bypasses this direction-only circuit and can clear it on success.
+metadata. Kryptex waits interruptibly for that delay and retries its complete,
+tool-disabled request until the pool recovers. Its deterministic direction is
+reserved for failures outside this structured transient condition.
 
 Gateway events are sanitized before they reach Grypton. The engine records
 route, protocol, message and tool counts, effective effort, and safe notices
