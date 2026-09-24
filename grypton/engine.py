@@ -4,8 +4,8 @@ Each iteration:
   1. Worker (Kraude) runs one turn on the manager's directive.
   2. Engine detects new finding cases, finding families, and surface from the
      workspace ledgers, runs anti-fabrication checks, and computes exhaustion.
-  3. Engine sends new P1/P2 findings to independent Astra validation and
-     persists the verdict.
+  3. Engine sends new or materially reopened P1/P2 findings to independent
+     Astra validation and persists the verdict.
   4. Manager (Kryptex) receives the turn, current docs, and that verdict before
      choosing the next structured directive for the worker.
 
@@ -29,7 +29,7 @@ import re
 from . import antifab, config, prompts
 from .manager import ManagerContext
 from .worker import WorkerError
-from .workspace import Workspace
+from .workspace import ASTRA_REVALIDATION_REVISION_FIELD, Workspace
 
 
 # Structural patterns the engine refuses to send to the worker as a directive —
@@ -625,10 +625,10 @@ class Engine:
             # Kryptex call; both roles are idle at this boundary.
             await self._apply_pending_model_switches()
 
-            # Astra reviews new P1/P2 candidates before Kryptex chooses the next
-            # action.  Start from current ledger records so an explicit or prior
-            # verdict cannot trigger a duplicate automatic validation.
-            new_findings = self._refresh_finding_records(new_findings)
+            # Astra reviews new and materially reopened P1/P2 candidates before
+            # Kryptex chooses the next action. Start from current ledger records
+            # so an explicit or prior verdict cannot trigger a duplicate call.
+            new_findings = self._validation_turn_findings(new_findings)
             validation_ctx = self._build_context(
                 turn, new_findings, flags, exhausted, [],
                 worker_was_idle=worker_was_idle,
@@ -679,16 +679,22 @@ class Engine:
                 fid = str(finding.get("id") or verdict.get("finding_id") or "")
                 verdict = dict(verdict)
                 verdict["finding_id"] = fid
+                expected_revision = str(
+                    finding.get(ASTRA_REVALIDATION_REVISION_FIELD) or ""
+                ).strip()
                 persisted, applied = (
-                    self.ws.set_severity_verdict_if_absent(fid, verdict)
+                    self.ws.set_severity_verdict_if_absent(
+                        fid, verdict,
+                        expected_revalidation_revision=expected_revision,
+                    )
                     if fid else (None, False)
                 )
                 if persisted is not None and applied:
                     self.emit("verdict", finding_id=fid, verdict=verdict)
                 elif persisted is not None:
                     self.emit("status", text=(
-                        f"Astra verdict for {fid} was already recorded while validation "
-                        "was running; skipped the duplicate append."
+                        f"Astra verdict for {fid} was superseded by a concurrent verdict "
+                        "or evidence revision; skipped the stale append."
                     ))
                 self.emit("validation_complete", finding_id=finding.get("id"),
                           verdict=verdict)
@@ -1144,6 +1150,33 @@ class Engine:
             if finding.get("id")
         }
         return [current.get(str(finding.get("id")), finding) for finding in findings]
+
+    def _validation_turn_findings(self, new_findings: list[dict]) -> list[dict]:
+        """Include reopened evidence revisions in this turn's validation set."""
+        current = self.ws.findings.all()
+        by_id = {
+            str(finding.get("id")): finding
+            for finding in current
+            if finding.get("id")
+        }
+        ordered = []
+        seen: set[str] = set()
+        for finding in new_findings:
+            fid = str(finding.get("id") or "")
+            if fid and fid not in seen:
+                ordered.append(by_id.get(fid, finding))
+                seen.add(fid)
+        for finding in current:
+            fid = str(finding.get("id") or "")
+            if (
+                fid
+                and fid not in seen
+                and str(finding.get(ASTRA_REVALIDATION_REVISION_FIELD) or "").strip()
+                and self._automatic_validation_candidates([finding])
+            ):
+                ordered.append(finding)
+                seen.add(fid)
+        return ordered
 
     @staticmethod
     def _manager_case_projection(findings: list[dict]) -> list[dict]:

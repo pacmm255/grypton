@@ -219,6 +219,98 @@ class ValidationOrderTests(unittest.IsolatedAsyncioTestCase):
                 "Explicit validation completed concurrently.",
             )
 
+    async def test_material_evidence_revision_reenters_automatic_validation(self):
+        with isolated_runtime(), patch.multiple(
+            config.CONFIG,
+            max_turns=1,
+            max_run_seconds=0,
+            stop_on_p1=False,
+            passive_stagnation_limit=99,
+            repetitive_probe_turn_limit=99,
+            exhaustion_threshold=99,
+        ):
+            ws = Workspace("validation-revision")
+            ws.create("https://example.test", "web")
+            evidence_case = ws.record_finding(
+                title="Evidence case", severity="P2",
+                description="Initial candidate.", evidence="flows/initial.http",
+            )
+            description_case = ws.record_finding(
+                title="Description case", severity="P2",
+                description="Initial wording.", evidence="flows/other.http",
+            )
+            for finding in (evidence_case, description_case):
+                ws.set_severity_verdict(finding["id"], {
+                    "finding_id": finding["id"],
+                    "verdict": "needs-more-evidence",
+                    "severity": "P2",
+                    "reasoning": "Add a positive/control pair.",
+                })
+
+            engine = Engine("validation-revision", backend="mock")
+            await engine.setup(
+                brief="test the application",
+                target="https://example.test",
+                target_type="web",
+            )
+
+            def worker_script(_worker, _directive):
+                engine.ws.revise_finding(
+                    evidence_case["id"],
+                    reason="Attach the requested positive/control pair.",
+                    evidence="flows/positive-control.http",
+                )
+                engine.ws.revise_finding(
+                    description_case["id"],
+                    reason="Clarify wording without adding evidence.",
+                    description="Clarified wording only.",
+                )
+                return "Revised two existing cases."
+
+            validated: list[tuple[str, str]] = []
+
+            async def validate(finding, _ctx, *, explicit=False):
+                self.assertFalse(explicit)
+                validated.append((finding["id"], finding["evidence"]))
+                return {
+                    "finding_id": finding["id"],
+                    "verdict": "confirm", "severity": "P2",
+                    "confidence": 0.94,
+                    "reasoning": "The revised evidence is sufficient.",
+                }
+
+            contexts = []
+
+            async def direct(ctx):
+                contexts.append(ctx)
+                return Directive(directive="Continue with the next lead.")
+
+            engine.worker.script = worker_script
+            engine.manager.validate_severity = validate
+            engine.manager.direct = direct
+
+            await engine.run()
+
+            self.assertEqual(
+                validated,
+                [(evidence_case["id"], "flows/positive-control.http")],
+            )
+            current_evidence = engine.ws.findings.find(evidence_case["id"])
+            current_description = engine.ws.findings.find(description_case["id"])
+            self.assertEqual(current_evidence["status"], "confirmed")
+            self.assertEqual(
+                current_evidence["manager_verdict"]["verdict"], "confirm",
+            )
+            self.assertEqual(current_description["status"], "needs-more-evidence")
+            self.assertEqual(
+                current_description["manager_verdict"]["verdict"],
+                "needs-more-evidence",
+            )
+            self.assertEqual(
+                [finding["id"] for finding in contexts[0].new_findings],
+                [evidence_case["id"]],
+            )
+
     async def test_conditional_verdict_write_has_one_winner(self):
         with isolated_runtime():
             ws = Workspace("validation-atomic")

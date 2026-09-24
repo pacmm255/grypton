@@ -26,12 +26,17 @@ from . import config, prompts
 SEVERITY_RANK = {"P1": 1, "P2": 2, "P3": 3, "P4": 4, "P5": 5,
                  "CRITICAL": 1, "HIGH": 2, "MEDIUM": 3, "LOW": 4, "INFO": 5}
 
-# Finding revisions deliberately exclude severity and all workflow fields.  A
-# worker can correct what the evidence supports without changing whether Astra
-# must review the candidate or rewriting an existing validation decision.
+# Finding revisions deliberately exclude severity and direct workflow fields.
+# A worker can correct the narrative but only a material evidence amendment can
+# reopen an existing needs-more-evidence P1/P2 decision for Astra.
 FINDING_NARRATIVE_FIELDS = (
     "title", "vuln_class", "surface", "description", "poc", "evidence",
 )
+# A material evidence amendment can reopen a P1/P2 case after Astra requested
+# more evidence.  The revision ID is kept on the record until the matching
+# validation result is durably applied; it also prevents a result based on an
+# older evidence revision from winning a concurrent update race.
+ASTRA_REVALIDATION_REVISION_FIELD = "astra_revalidation_revision"
 FINDING_FAMILY_FIELDS = (
     "family_id", "family_root_cause", "family_case_kind",
     "family_separate_reason", "family_history",
@@ -957,9 +962,11 @@ class Workspace:
                        source: str = "worker", **changes: str) -> dict:
         """Correct a finding's narrative while preserving an atomic audit trail.
 
-        Severity, status, validation, identity, and source fields are immutable.
-        The narrative changes and their before/after values are written to the
-        authoritative finding record in the same locked ledger replacement.
+        Severity, identity, and source fields are immutable.  The narrative
+        changes and their before/after values are written to the authoritative
+        finding record in the same locked ledger replacement.  A non-empty,
+        materially changed evidence field reopens automatic P1/P2 validation
+        only when Astra's current verdict requests more evidence.
         """
         finding_id = str(finding_id or "").strip()
         reason = str(reason or "").strip()
@@ -999,10 +1006,40 @@ class Workspace:
                 "source": str(source or "worker"),
                 "changes": changed,
             })
+            evidence_change = changed.get("evidence")
+            previous_verdict = record.get("manager_verdict")
+            verdict_value = (
+                str(previous_verdict.get("verdict") or "").strip().lower()
+                if isinstance(previous_verdict, dict) else ""
+            )
+            pending_revision = str(
+                record.get(ASTRA_REVALIDATION_REVISION_FIELD) or ""
+            ).strip()
+            material_new_evidence = bool(
+                evidence_change
+                and evidence_change["after"].strip()
+                and evidence_change["after"].strip()
+                != evidence_change["before"].strip()
+            )
+            reopen_validation = bool(
+                material_new_evidence
+                and record.get("status") != "suppressed-by-scope"
+                and config.astra_auto_validation_required(record.get("severity", ""))
+                and (
+                    verdict_value in {"needs-more-evidence", "pending"}
+                    or pending_revision
+                )
+            )
+            if reopen_validation:
+                revision["automatic_revalidation_requested"] = True
             for field_name, delta in changed.items():
                 record[field_name] = delta["after"]
             record["revisions"] = [*history, dict(revision)]
             record["last_revised_at"] = revision["ts"]
+            if reopen_validation:
+                record["manager_verdict"] = None
+                record["status"] = "validation-pending"
+                record[ASTRA_REVALIDATION_REVISION_FIELD] = revision["id"]
 
         hit = self.findings.update(finding_id, apply, strict=True)
         if hit is None:
@@ -1022,18 +1059,27 @@ class Workspace:
         self,
         finding_id: str,
         verdict: dict,
+        *,
+        expected_revalidation_revision: str = "",
     ) -> tuple[Optional[dict], bool]:
         """Atomically persist a verdict only when the finding has none.
 
         Automatic Astra validation can overlap an explicit ``grypton validate``
         process. The condition must be checked while holding the finding ledger's
         file lock so an already-recorded verdict cannot be overwritten by the
-        automatic result.
+        automatic result.  A revalidation result must also match the evidence
+        revision it reviewed so newer evidence cannot receive a stale verdict.
         """
         applied = False
+        expected_revision = str(expected_revalidation_revision or "").strip()
 
         def apply(record: dict) -> None:
             nonlocal applied
+            current_revision = str(
+                record.get(ASTRA_REVALIDATION_REVISION_FIELD) or ""
+            ).strip()
+            if current_revision != expected_revision:
+                return
             if isinstance(record.get("manager_verdict"), dict):
                 return
             self._apply_severity_verdict(record, verdict)
@@ -1047,6 +1093,7 @@ class Workspace:
     @staticmethod
     def _apply_severity_verdict(record: dict, verdict: dict) -> None:
         record["manager_verdict"] = verdict
+        record.pop(ASTRA_REVALIDATION_REVISION_FIELD, None)
         if record.get("status") == "suppressed-by-scope":
             return
         value = str(verdict.get("verdict") or "").lower()

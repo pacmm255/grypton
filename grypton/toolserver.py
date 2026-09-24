@@ -12,7 +12,8 @@ from typing import Callable
 
 from . import config, credentials, tools
 from .providers import append_jsonl
-from .workspace import (FINDING_FAMILY_LIMITS, FINDING_NARRATIVE_FIELDS,
+from .workspace import (ASTRA_REVALIDATION_REVISION_FIELD,
+                        FINDING_FAMILY_LIMITS, FINDING_NARRATIVE_FIELDS,
                         FindingFamilyCollision, Workspace)
 
 PROTOCOL_VERSION = "2024-11-05"
@@ -145,11 +146,16 @@ def _revise_finding(ws, args):
         return {"ok": False, "summary": str(exc).strip("'")}
     revision = (record.get("revisions") or [])[-1]
     fields = ", ".join((revision.get("changes") or {}).keys())
+    revalidation = (
+        str(record.get(ASTRA_REVALIDATION_REVISION_FIELD) or "")
+        == str(revision.get("id") or "")
+    )
     return {
         "ok": True,
         "summary": (
             f"Recorded amendment {revision.get('id')} for {record['id']} "
             f"({fields}); severity remains {record['severity']}."
+            + (" Automatic Astra revalidation queued." if revalidation else "")
         ),
         "data": record,
     }

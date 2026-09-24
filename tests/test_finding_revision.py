@@ -10,7 +10,8 @@ from unittest.mock import patch
 
 from grypton import config
 from grypton.toolserver import REGISTRY, cli_main, dispatch
-from grypton.workspace import FINDING_NARRATIVE_FIELDS, Workspace
+from grypton.workspace import (ASTRA_REVALIDATION_REVISION_FIELD,
+                               FINDING_NARRATIVE_FIELDS, Workspace)
 
 
 @contextmanager
@@ -173,6 +174,124 @@ class FindingRevisionTests(unittest.TestCase):
             self.assertEqual(
                 current["description"], "The request reached the registered handler."
             )
+
+    def test_new_evidence_reopens_only_needs_more_p1_p2_validation(self):
+        with isolated_runtime():
+            ws = Workspace("revision-revalidation")
+            ws.create("https://example.test", "web")
+            finding = ws.record_finding(
+                title="High candidate", severity="P2",
+                description="Initial observed behavior.",
+                evidence="flows/initial.http",
+            )
+            prior = {
+                "finding_id": finding["id"],
+                "verdict": "needs-more-evidence",
+                "severity": "P2",
+                "reasoning": "A positive/control pair is still required.",
+            }
+            ws.set_severity_verdict(finding["id"], prior)
+
+            description_only = ws.revise_finding(
+                finding["id"], reason="Clarify the observation.",
+                description="Initial observed behavior, without an impact claim.",
+            )
+            self.assertEqual(description_only["manager_verdict"], prior)
+            self.assertEqual(description_only["status"], "needs-more-evidence")
+            self.assertNotIn(
+                ASTRA_REVALIDATION_REVISION_FIELD, description_only,
+            )
+            self.assertFalse(
+                description_only["revisions"][-1].get(
+                    "automatic_revalidation_requested"
+                )
+            )
+
+            with self.assertRaisesRegex(ValueError, "does not change"):
+                ws.revise_finding(
+                    finding["id"], reason="Duplicate the same capture.",
+                    evidence="flows/initial.http",
+                )
+
+            revised = ws.revise_finding(
+                finding["id"], reason="Add the requested positive/control pair.",
+                evidence="flows/positive-control.http",
+            )
+            self.assertIsNone(revised["manager_verdict"])
+            self.assertEqual(revised["status"], "validation-pending")
+            self.assertEqual(
+                revised[ASTRA_REVALIDATION_REVISION_FIELD], "R002",
+            )
+            self.assertTrue(
+                revised["revisions"][-1]["automatic_revalidation_requested"]
+            )
+
+            low = ws.record_finding(
+                title="Medium candidate", severity="P3",
+                evidence="flows/medium-initial.http",
+            )
+            low_verdict = {
+                "finding_id": low["id"], "verdict": "needs-more-evidence",
+                "severity": "P3",
+            }
+            ws.set_severity_verdict(low["id"], low_verdict)
+            low_revised = ws.revise_finding(
+                low["id"], reason="Add medium-severity evidence.",
+                evidence="flows/medium-new.http",
+            )
+            self.assertEqual(low_revised["manager_verdict"], low_verdict)
+            self.assertEqual(low_revised["status"], "needs-more-evidence")
+            self.assertNotIn(ASTRA_REVALIDATION_REVISION_FIELD, low_revised)
+
+    def test_revalidation_write_rejects_a_stale_evidence_revision(self):
+        with isolated_runtime():
+            ws = Workspace("revision-stale-validation")
+            ws.create("https://example.test", "web")
+            finding = ws.record_finding(
+                title="Critical candidate", severity="P1",
+                evidence="flows/initial.http",
+            )
+            ws.set_severity_verdict(finding["id"], {
+                "finding_id": finding["id"],
+                "verdict": "needs-more-evidence", "severity": "P1",
+            })
+            first = ws.revise_finding(
+                finding["id"], reason="Add the first control.",
+                evidence="flows/control-one.http",
+            )
+            second = ws.revise_finding(
+                finding["id"], reason="Replace it with a complete control.",
+                evidence="flows/control-two.http",
+            )
+            self.assertEqual(
+                first[ASTRA_REVALIDATION_REVISION_FIELD], "R001",
+            )
+            self.assertEqual(
+                second[ASTRA_REVALIDATION_REVISION_FIELD], "R002",
+            )
+
+            verdict = {
+                "finding_id": finding["id"], "verdict": "confirm",
+                "severity": "P1", "reasoning": "Validated current evidence.",
+            }
+            _record, stale_applied = ws.set_severity_verdict_if_absent(
+                finding["id"], verdict,
+                expected_revalidation_revision="R001",
+            )
+            self.assertFalse(stale_applied)
+            still_pending = ws.findings.find(finding["id"])
+            self.assertIsNone(still_pending["manager_verdict"])
+            self.assertEqual(
+                still_pending[ASTRA_REVALIDATION_REVISION_FIELD], "R002",
+            )
+
+            current, current_applied = ws.set_severity_verdict_if_absent(
+                finding["id"], verdict,
+                expected_revalidation_revision="R002",
+            )
+            self.assertTrue(current_applied)
+            self.assertEqual(current["status"], "confirmed")
+            self.assertNotIn(ASTRA_REVALIDATION_REVISION_FIELD, current)
 
 
 if __name__ == "__main__":
