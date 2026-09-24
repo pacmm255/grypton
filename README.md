@@ -1122,8 +1122,8 @@ restore quota. Use `/view full` to see sanitized gateway notices, or review:
 .state/engagements/ENGAGEMENT/transcripts/openclaude.events.jsonl
 ```
 
-The file contains route names, status notices, and short key fingerprints. It
-does not contain the keys.
+The file contains route names, sanitized status notices, and bounded retry and
+pool metadata. It contains neither key values nor key fingerprints.
 
 ## A live model change starts a new session
 

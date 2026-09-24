@@ -14,6 +14,7 @@ from playwright.sync_api import sync_playwright
 
 from grypton import config
 from grypton.providers import append_jsonl
+from grypton.tools import _browser_executable as _application_browser_executable
 from grypton.web import make_server
 from grypton.workspace import Constraints, Workspace
 
@@ -26,17 +27,11 @@ CHROME_ARGS = [
 
 
 def _browser_executable() -> str:
-    """Prefer an installed Playwright shell over host wrappers with stale paths."""
-    shells = sorted(
-        Path.home().glob(
-            ".cache/ms-playwright/chromium_headless_shell-*/chrome-linux/headless_shell"
-        ),
-        reverse=True,
-    )
-    for candidate in shells:
-        if candidate.is_file():
-            return str(candidate)
-    return "/opt/google/chrome/chrome"
+    """Use the same working browser binary selected by the application."""
+    executable = _application_browser_executable()
+    if not executable:
+        raise RuntimeError("no supported Chromium or Chrome executable is available")
+    return executable
 
 
 def main() -> None:
