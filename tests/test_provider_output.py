@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
+import hashlib
 import json
 from pathlib import Path
 import tempfile
@@ -167,6 +168,9 @@ class ProviderOutputTests(unittest.TestCase):
                 record = json.loads((
                     workspace / "transcripts/provider-calls.jsonl"
                 ).read_text().splitlines()[-1])
+                self.assertEqual(len((
+                    workspace / "transcripts/provider-calls.jsonl"
+                ).read_text().splitlines()), 1)
                 self.assertEqual(record["raw_final_text_chars"], len(final))
                 self.assertEqual(record["normalized_text_chars"], len(result.text))
                 self.assertTrue(record["text_filtered"])
@@ -229,7 +233,9 @@ class ProviderOutputTests(unittest.TestCase):
                               new=AsyncMock(return_value=process)), \
                         patch("grypton.providers._terminate",
                               new=AsyncMock(side_effect=terminate)) as stop:
-                    call = asyncio.create_task(client.call("fixture prompt", timeout=30))
+                    call = asyncio.create_task(client.call(
+                        "fixture prompt", session_id="ses-prior", timeout=30,
+                    ))
                     for _ in range(20):
                         if client._terminal_signal is not None:
                             break
@@ -261,6 +267,246 @@ class ProviderOutputTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
                 self.assertIn('"reason": "credential_pool_exhausted"', transcript)
                 self.assertNotIn("fixture-secret", transcript)
+                records = [json.loads(line) for line in (
+                    workspace / "transcripts/provider-calls.jsonl"
+                ).read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(len(records), 1)
+                record = records[0]
+                self.assertFalse(record["ok"])
+                self.assertEqual(record["role"], "manager")
+                self.assertEqual(record["route"], "go/muse-spark-1.3-contributor")
+                self.assertEqual(record["effort"], "xhigh")
+                self.assertEqual(record["session_id"], "ses-prior")
+                self.assertTrue(record["resumed"])
+                self.assertEqual(record["error_class"], "openclaude_terminal")
+                self.assertEqual(record["error_type"], "ProviderError")
+                self.assertEqual(record["error_reason"], "credential_pool_exhausted")
+                self.assertEqual(record["upstream_status"], 402)
+                self.assertEqual(record["pool_size"], 5)
+                self.assertEqual(record["returncode"], -15)
+                self.assertEqual(record["prompt_sha256"], hashlib.sha256(
+                    b"fixture prompt"
+                ).hexdigest())
+                self.assertNotIn("fixture-secret", json.dumps(record))
+
+        asyncio.run(exercise())
+
+    def test_timeout_records_one_sanitized_provider_call(self):
+        class _Input:
+            def write(self, value):
+                self.value = value
+
+            async def drain(self):
+                return None
+
+            def close(self):
+                return None
+
+        class _Stream:
+            async def read(self, _size):
+                return b""
+
+        class _Process:
+            pid = 43212
+
+            def __init__(self):
+                self.stdin = _Input()
+                self.stdout = _Stream()
+                self.stderr = _Stream()
+                self.returncode = None
+                self.done = asyncio.Event()
+
+            async def wait(self):
+                await self.done.wait()
+                return self.returncode
+
+        async def exercise():
+            with isolated_runtime():
+                workspace = config.ENGAGEMENTS_DIR / "timeout-call"
+                workspace.mkdir(parents=True)
+                client = OpenCodeClient(
+                    role="worker", route=config.WORKER_MODEL, effort="max",
+                    workspace=workspace, target_slug="timeout-call",
+                    allow_tools=True, agent_prompt="test",
+                )
+                process = _Process()
+                gateway = SimpleNamespace(
+                    model_route=f"openclaude/{config.WORKER_MODEL}",
+                    drain_events=lambda: [],
+                )
+
+                async def terminate(proc):
+                    proc.returncode = -15
+                    proc.done.set()
+
+                with patch.object(client, "_ensure_gateway", AsyncMock(return_value=gateway)), \
+                        patch.object(client, "_environment", return_value=({}, "fixture-secret")), \
+                        patch.object(config, "require_binary", return_value="/usr/bin/true"), \
+                        patch("grypton.providers.asyncio.create_subprocess_exec",
+                              new=AsyncMock(return_value=process)), \
+                        patch("grypton.providers._terminate",
+                              new=AsyncMock(side_effect=terminate)):
+                    with self.assertRaisesRegex(ProviderError, "timed out"):
+                        await client.call("timeout prompt", timeout=0)
+
+                records = [json.loads(line) for line in (
+                    workspace / "transcripts/provider-calls.jsonl"
+                ).read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(len(records), 1)
+                record = records[0]
+                self.assertEqual(record["error_class"], "timeout")
+                self.assertEqual(record["error_type"], "ProviderError")
+                self.assertFalse(record["ok"])
+                self.assertEqual(record["returncode"], -15)
+                self.assertNotIn("fixture-secret", json.dumps(record))
+
+        asyncio.run(exercise())
+
+    def test_stream_provider_error_records_redacted_failure(self):
+        class _Input:
+            def write(self, value):
+                self.value = value
+
+            async def drain(self):
+                return None
+
+            def close(self):
+                return None
+
+        class _ErrorStream:
+            async def read(self, _size):
+                raise ProviderError("stream failed with bearer fixture-secret")
+
+        class _EmptyStream:
+            async def read(self, _size):
+                return b""
+
+        class _Process:
+            pid = 43213
+
+            def __init__(self):
+                self.stdin = _Input()
+                self.stdout = _ErrorStream()
+                self.stderr = _EmptyStream()
+                self.returncode = None
+                self.done = asyncio.Event()
+
+            async def wait(self):
+                await self.done.wait()
+                return self.returncode
+
+        async def exercise():
+            with isolated_runtime():
+                workspace = config.ENGAGEMENTS_DIR / "stream-call"
+                workspace.mkdir(parents=True)
+                client = OpenCodeClient(
+                    role="worker", route=config.WORKER_MODEL, effort="max",
+                    workspace=workspace, target_slug="stream-call",
+                    allow_tools=True, agent_prompt="test",
+                )
+                process = _Process()
+                gateway = SimpleNamespace(
+                    model_route=f"openclaude/{config.WORKER_MODEL}",
+                    drain_events=lambda: [],
+                )
+
+                async def terminate(proc):
+                    proc.returncode = -15
+                    proc.done.set()
+
+                with patch.object(client, "_ensure_gateway", AsyncMock(return_value=gateway)), \
+                        patch.object(client, "_environment", return_value=({}, "fixture-secret")), \
+                        patch.object(config, "require_binary", return_value="/usr/bin/true"), \
+                        patch("grypton.providers.asyncio.create_subprocess_exec",
+                              new=AsyncMock(return_value=process)), \
+                        patch("grypton.providers._terminate",
+                              new=AsyncMock(side_effect=terminate)):
+                    with self.assertRaisesRegex(ProviderError, "stream failed"):
+                        await client.call("stream prompt", timeout=30)
+
+                record = json.loads((
+                    workspace / "transcripts/provider-calls.jsonl"
+                ).read_text(encoding="utf-8").splitlines()[0])
+                self.assertEqual(record["error_class"], "stream_error")
+                self.assertEqual(record["error_type"], "ProviderError")
+                self.assertEqual(record["error_message"],
+                                 "stream failed with bearer [REDACTED]")
+                self.assertNotIn("fixture-secret", json.dumps(record))
+
+        asyncio.run(exercise())
+
+    def test_cancelled_call_records_failure_and_preserves_cancellation(self):
+        class _Input:
+            def write(self, value):
+                self.value = value
+
+            async def drain(self):
+                return None
+
+            def close(self):
+                return None
+
+        class _Stream:
+            async def read(self, _size):
+                return b""
+
+        class _Process:
+            pid = 43214
+
+            def __init__(self):
+                self.stdin = _Input()
+                self.stdout = _Stream()
+                self.stderr = _Stream()
+                self.returncode = None
+                self.done = asyncio.Event()
+
+            async def wait(self):
+                await self.done.wait()
+                return self.returncode
+
+        async def exercise():
+            with isolated_runtime():
+                workspace = config.ENGAGEMENTS_DIR / "cancelled-call"
+                workspace.mkdir(parents=True)
+                client = OpenCodeClient(
+                    role="manager", route="go/muse-spark-1.3-contributor",
+                    effort="xhigh", workspace=workspace,
+                    target_slug="cancelled-call", allow_tools=False,
+                    agent_prompt="test",
+                )
+                process = _Process()
+                gateway = SimpleNamespace(
+                    model_route="openclaude/go/muse-spark-1.3-contributor",
+                    drain_events=lambda: [],
+                )
+
+                async def terminate(proc):
+                    proc.returncode = -15
+                    proc.done.set()
+
+                with patch.object(client, "_ensure_gateway", AsyncMock(return_value=gateway)), \
+                        patch.object(client, "_environment", return_value=({}, "fixture-secret")), \
+                        patch.object(config, "require_binary", return_value="/usr/bin/true"), \
+                        patch("grypton.providers.asyncio.create_subprocess_exec",
+                              new=AsyncMock(return_value=process)), \
+                        patch("grypton.providers._terminate",
+                              new=AsyncMock(side_effect=terminate)):
+                    call = asyncio.create_task(client.call("cancel prompt", timeout=30))
+                    for _ in range(20):
+                        if client._terminal_signal is not None:
+                            break
+                        await asyncio.sleep(0)
+                    call.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await call
+
+                records = [json.loads(line) for line in (
+                    workspace / "transcripts/provider-calls.jsonl"
+                ).read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(len(records), 1)
+                self.assertEqual(records[0]["error_class"], "cancelled")
+                self.assertEqual(records[0]["error_type"], "CancelledError")
+                self.assertFalse(records[0]["ok"])
 
         asyncio.run(exercise())
 

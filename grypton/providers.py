@@ -718,18 +718,110 @@ class OpenCodeClient:
         stderr_task = asyncio.create_task(read_limited(self.proc.stderr))
         io_task = asyncio.gather(stdout_task, stderr_task, self.proc.wait())
         terminal_task = asyncio.create_task(self._terminal_signal.wait())
+        failure_class = ""
+
+        def append_failure_record(exc: BaseException, classification: str) -> None:
+            """Record one sanitized row for a call that cannot reach final parsing."""
+            partial_stdout = "\n".join(cleaned_lines)
+            stderr_bytes = b""
+            if stderr_task.done() and not stderr_task.cancelled():
+                try:
+                    value = stderr_task.result()
+                except BaseException:
+                    value = b""
+                if isinstance(value, bytes):
+                    stderr_bytes = value
+            cleaned_stderr = clean(
+                stderr_bytes.decode("utf-8", errors="replace"), (secret,)
+            )
+            if cleaned_stderr:
+                append_jsonl(stream_path, {
+                    "type": "stderr", "text": cleaned_stderr[-8000:],
+                })
+            if malformed:
+                append_jsonl(stream_path, {
+                    "type": "malformed", "lines": malformed,
+                })
+
+            result_session = session_id
+            for event in events:
+                candidate = event.get("sessionID") or event.get("session_id")
+                if isinstance(candidate, str) and candidate:
+                    result_session = candidate
+
+            metadata = exc.metadata if isinstance(exc, ProviderError) else {}
+            source = metadata.get("source")
+            reason = metadata.get("reason")
+            try:
+                upstream_status = int(metadata.get("upstream_status") or 0)
+            except (TypeError, ValueError):
+                upstream_status = 0
+            try:
+                pool_size = int(metadata.get("pool_size") or 0)
+            except (TypeError, ValueError):
+                pool_size = 0
+
+            record = {
+                "at": time.time(),
+                "role": self.role,
+                "route": self.route,
+                "effort": self.effort,
+                "transport_route": transport_route,
+                "runner": "opencode",
+                "gateway": "openclaude",
+                "session_id": result_session,
+                "resumed": bool(session_id),
+                "duration_s": round(time.time() - started, 3),
+                "returncode": self.proc.returncode,
+                "event_count": len(events),
+                "tool_count": sum(
+                    event.get("type") == "tool_use" for event in events
+                ),
+                "usage": [],
+                "cost": 0.0,
+                "prompt_sha256": prompt_hash,
+                "stdout_sha256": hashlib.sha256(
+                    partial_stdout.encode("utf-8")
+                ).hexdigest(),
+                "stderr_present": bool(cleaned_stderr),
+                "ok": False,
+                "error_class": classification,
+                "error_type": type(exc).__name__,
+                "error_message": clean(str(exc), (secret,))[:1000],
+            }
+            if isinstance(source, str) and source:
+                record["error_source"] = clean(source, (secret,))[:100]
+            if isinstance(reason, str) and reason:
+                record["error_reason"] = clean(reason, (secret,))[:100]
+            if 100 <= upstream_status <= 599:
+                record["upstream_status"] = upstream_status
+            if 0 < pool_size <= 1000:
+                record["pool_size"] = pool_size
+            try:
+                gateway_events = gateway.drain_events()
+            except Exception:
+                gateway_events = []
+            record["failover_count"] = sum(
+                1 for event in gateway_events
+                if event.get("type") == "openclaude_notice"
+                and "continuing on key" in str(event.get("message") or "")
+            )
+            append_jsonl(self.transcripts / "provider-calls.jsonl", record)
+
         try:
             done, _ = await asyncio.wait(
                 (io_task, terminal_task), timeout=timeout,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if not done:
+                failure_class = "timeout"
                 await _terminate(self.proc)
                 await asyncio.gather(io_task, return_exceptions=True)
                 raise ProviderError(
                     f"{self.role} OpenCode call timed out after {timeout:g}s."
                 )
             if terminal_task in done and terminal_task.result():
+                failure_class = "openclaude_terminal"
                 await _terminate(self.proc)
                 await asyncio.gather(io_task, return_exceptions=True)
                 raise ProviderError(
@@ -738,14 +830,26 @@ class OpenCodeClient:
                     metadata=self._terminal_metadata,
                 )
             cleaned_stdout, stderr, returncode = await io_task
-        except ProviderError:
+        except ProviderError as exc:
+            if not failure_class:
+                failure_class = "stream_error"
             if self.proc.returncode is None:
                 await _terminate(self.proc)
             await asyncio.gather(io_task, return_exceptions=True)
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            append_failure_record(exc, failure_class)
             raise
-        except BaseException:
+        except BaseException as exc:
+            if not failure_class:
+                failure_class = (
+                    "cancelled"
+                    if isinstance(exc, asyncio.CancelledError)
+                    else "unexpected_error"
+                )
             await _terminate(self.proc)
             await asyncio.gather(io_task, return_exceptions=True)
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            append_failure_record(exc, failure_class)
             raise
         finally:
             if not terminal_task.done():
@@ -831,9 +935,29 @@ class OpenCodeClient:
             if event.get("type") == "openclaude_notice"
             and "continuing on key" in str(event.get("message") or "")
         )
+        if returncode:
+            detail = cleaned_stderr[-1000:] or (
+                errors[-1] if errors else "no error detail"
+            )
+            call_record.update({
+                "error_class": "process_exit",
+                "error_type": "ProviderError",
+                "error_message": clean(detail, (secret,))[:1000],
+            })
+        elif errors:
+            call_record.update({
+                "error_class": "provider_event_error",
+                "error_type": "ProviderError",
+                "error_message": clean(errors[-1], (secret,))[:1000],
+            })
+        elif not texts:
+            call_record.update({
+                "error_class": "empty_response",
+                "error_type": "ProviderError",
+                "error_message": f"{self.role} OpenCode returned no final text.",
+            })
         append_jsonl(self.transcripts / "provider-calls.jsonl", call_record)
         if returncode:
-            detail = cleaned_stderr[-1000:] or (errors[-1] if errors else "no error detail")
             raise ProviderError(f"{self.role} OpenCode exited with {returncode}: {detail}")
         if errors:
             raise ProviderError(f"{self.role} OpenCode error: {errors[-1]}")
