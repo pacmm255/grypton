@@ -12,7 +12,7 @@ from typing import Callable
 
 from . import config, credentials, tools
 from .providers import append_jsonl
-from .workspace import Workspace
+from .workspace import FINDING_NARRATIVE_FIELDS, Workspace
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_INFO = {"name": "grypton", "version": "3.4.0"}
@@ -54,6 +54,41 @@ def _record_finding(ws, args):
         summary = f"Recorded {record['id']}; automatic Astra validation is not requested for {record['severity']}."
     return {"ok": True, "summary": summary,
             "data": record}
+
+
+def _revise_finding(ws, args):
+    allowed = {"finding_id", "reason", *FINDING_NARRATIVE_FIELDS}
+    invalid = sorted(set(args) - allowed)
+    if invalid:
+        return {
+            "ok": False,
+            "summary": "Finding revision rejected immutable or unsupported fields: "
+                       + ", ".join(invalid) + ".",
+        }
+    changes = {
+        field_name: args[field_name]
+        for field_name in FINDING_NARRATIVE_FIELDS
+        if field_name in args
+    }
+    try:
+        record = ws.revise_finding(
+            args.get("finding_id", ""),
+            reason=args.get("reason", ""),
+            source="worker",
+            **changes,
+        )
+    except (KeyError, ValueError) as exc:
+        return {"ok": False, "summary": str(exc).strip("'")}
+    revision = (record.get("revisions") or [])[-1]
+    fields = ", ".join((revision.get("changes") or {}).keys())
+    return {
+        "ok": True,
+        "summary": (
+            f"Recorded amendment {revision.get('id')} for {record['id']} "
+            f"({fields}); severity remains {record['severity']}."
+        ),
+        "data": record,
+    }
 
 
 def _surface(ws, args):
@@ -370,6 +405,20 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
                  "evidence": _string("Capture path or concrete evidence")},
                 ("title", "severity", "vuln_class", "surface", "description", "poc", "evidence")),
         _record_finding),
+    "revise_finding": ("Correct or narrow a finding narrative with durable before/after history.",
+        {**_object({
+            "finding_id": _string("Existing finding ID"),
+            "reason": _string("Why the evidence requires this amendment"),
+            "title": _string("Revised short title"),
+            "vuln_class": _string("Revised vulnerability class"),
+            "surface": _string("Revised affected surface"),
+            "description": _string("Revised impact and behavior"),
+            "poc": _string("Revised reproduction steps"),
+            "evidence": _string("Revised capture path or concrete evidence"),
+        }, ("finding_id", "reason")),
+         "anyOf": [{"required": [field_name]}
+                   for field_name in FINDING_NARRATIVE_FIELDS]},
+        _revise_finding),
     "attack_surface_add": ("Record a discovered in-scope host, route, parameter, behavior, or clue.",
         _object({"item": _string("Observed surface"), "kind": _string("Surface kind"),
                  "detail": _string("Concrete detail"), "interesting": _string("Why it matters")},
@@ -811,6 +860,11 @@ def cli_main(argv=None) -> int:
     finding = sub.add_parser("finding"); finding.add_argument("title"); finding.add_argument("severity")
     finding.add_argument("--class", dest="vuln_class", default=""); finding.add_argument("--surface", default="")
     finding.add_argument("--description", default=""); finding.add_argument("--poc", default=""); finding.add_argument("--evidence", default="")
+    revision = sub.add_parser("finding-revise"); revision.add_argument("finding_id")
+    revision.add_argument("--reason", required=True)
+    revision.add_argument("--title"); revision.add_argument("--class", dest="vuln_class")
+    revision.add_argument("--surface"); revision.add_argument("--description")
+    revision.add_argument("--poc"); revision.add_argument("--evidence")
     read = sub.add_parser("read"); read.add_argument("name", choices=["findings", "surface", "tested", "progress", "scope", "program"])
     analyze = sub.add_parser("local-analyze"); analyze.add_argument("path")
     analyze.add_argument("--analyzer", choices=["file", "strings", "sha256", "literal", "regex"], default="file")
@@ -846,6 +900,13 @@ def cli_main(argv=None) -> int:
     elif ns.command == "surface": mapping = {ns.command: ("attack_surface_add", {"item": ns.item, "kind": ns.kind, "detail": ns.detail, "interesting": ns.interesting})}
     elif ns.command == "tested": mapping = {ns.command: ("tested_technique_log", {"surface": ns.surface, "technique": ns.technique, "result": ns.result, "evidence": ns.evidence})}
     elif ns.command == "finding": mapping = {ns.command: ("record_finding", {"title": ns.title, "severity": ns.severity, "vuln_class": ns.vuln_class, "surface": ns.surface, "description": ns.description, "poc": ns.poc, "evidence": ns.evidence})}
+    elif ns.command == "finding-revise":
+        revision_args = {"finding_id": ns.finding_id, "reason": ns.reason}
+        for field_name in FINDING_NARRATIVE_FIELDS:
+            value = getattr(ns, field_name)
+            if value is not None:
+                revision_args[field_name] = value
+        mapping = {ns.command: ("revise_finding", revision_args)}
     elif ns.command == "read": mapping = {ns.command: ("read_doc", {"name": ns.name})}
     elif ns.command == "local-analyze": mapping = {ns.command: ("local_analyze", {
         "path": ns.path, "analyzer": ns.analyzer, "min_length": ns.min_length,

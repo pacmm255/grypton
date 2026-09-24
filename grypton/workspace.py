@@ -23,6 +23,13 @@ from . import config
 SEVERITY_RANK = {"P1": 1, "P2": 2, "P3": 3, "P4": 4, "P5": 5,
                  "CRITICAL": 1, "HIGH": 2, "MEDIUM": 3, "LOW": 4, "INFO": 5}
 
+# Finding revisions deliberately exclude severity and all workflow fields.  A
+# worker can correct what the evidence supports without changing whether Astra
+# must review the candidate or rewriting an existing validation decision.
+FINDING_NARRATIVE_FIELDS = (
+    "title", "vuln_class", "surface", "description", "poc", "evidence",
+)
+
 
 # --------------------------------------------------------------------------
 # Locking + ledger primitives
@@ -361,6 +368,63 @@ class Workspace:
         self._append_finding_to_md(rec)
         return rec
 
+    def revise_finding(self, finding_id: str, *, reason: str,
+                       source: str = "worker", **changes: str) -> dict:
+        """Correct a finding's narrative while preserving an atomic audit trail.
+
+        Severity, status, validation, identity, and source fields are immutable.
+        The narrative changes and their before/after values are written to the
+        authoritative finding record in the same locked ledger replacement.
+        """
+        finding_id = str(finding_id or "").strip()
+        reason = str(reason or "").strip()
+        if not finding_id:
+            raise ValueError("finding ID is required")
+        if not reason:
+            raise ValueError("revision reason is required")
+        if not changes:
+            raise ValueError("at least one narrative field must be supplied")
+
+        invalid = sorted(set(changes) - set(FINDING_NARRATIVE_FIELDS))
+        if invalid:
+            raise ValueError(
+                "finding fields are immutable or unsupported: " + ", ".join(invalid)
+            )
+        for field_name, value in changes.items():
+            if not isinstance(value, str):
+                raise ValueError(f"finding field {field_name} must be a string")
+
+        revision: dict[str, Any] = {}
+
+        def apply(record: dict) -> None:
+            changed = {
+                field_name: {"before": str(record.get(field_name) or ""), "after": value}
+                for field_name, value in changes.items()
+                if str(record.get(field_name) or "") != value
+            }
+            if not changed:
+                raise ValueError("revision does not change the finding")
+            history = record.get("revisions")
+            if not isinstance(history, list):
+                history = []
+            revision.update({
+                "id": f"R{len(history) + 1:03d}",
+                "ts": time.time(),
+                "reason": reason,
+                "source": str(source or "worker"),
+                "changes": changed,
+            })
+            for field_name, delta in changed.items():
+                record[field_name] = delta["after"]
+            record["revisions"] = [*history, dict(revision)]
+            record["last_revised_at"] = revision["ts"]
+
+        hit = self.findings.update(finding_id, apply)
+        if hit is None:
+            raise KeyError(f"finding {finding_id!r} was not found")
+        self._append_finding_amendment_to_md(finding_id, hit["severity"], revision)
+        return hit
+
     def set_severity_verdict(self, finding_id: str, verdict: dict) -> Optional[dict]:
         def apply(record: dict) -> None:
             self._apply_severity_verdict(record, verdict)
@@ -515,6 +579,13 @@ class Workspace:
                " session work and manual notes are preserved on resume._\n"]
         for r in self.findings.all():
             out.append(self._fmt_finding(r))
+            for revision in r.get("revisions") or []:
+                if isinstance(revision, dict):
+                    out.append(self._fmt_finding_amendment(
+                        str(r.get("id") or "?"),
+                        str(r.get("severity") or "?"),
+                        revision,
+                    ))
             v = r.get("manager_verdict") or {}
             if v:
                 out.append(self._fmt_verdict(r["id"], v))
@@ -592,6 +663,29 @@ class Workspace:
         return "\n".join(lines)
 
     @staticmethod
+    def _fmt_finding_amendment(finding_id: str, severity: str,
+                               revision: dict) -> str:
+        timestamp = float(revision.get("ts") or time.time())
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp))
+        revision_id = str(revision.get("id") or "R???")
+        lines = ["", f"### {finding_id} — Finding amendment {revision_id}  _({stamp})_"]
+        lines.append(f"- **Reason:** {revision.get('reason') or '(not recorded)'}  ")
+        lines.append(f"- **Claimed severity unchanged:** {severity}  ")
+        changes = revision.get("changes")
+        if isinstance(changes, dict):
+            for field_name in FINDING_NARRATIVE_FIELDS:
+                delta = changes.get(field_name)
+                if not isinstance(delta, dict):
+                    continue
+                lines.append("")
+                lines.append(f"**Amended {field_name}:**")
+                lines.append("")
+                lines.append(f"- Previous: {delta.get('before', '')}")
+                lines.append(f"- Revised: {delta.get('after', '')}")
+        lines.append("")
+        return "\n".join(lines)
+
+    @staticmethod
     def _fmt_surface(r: dict) -> str:
         line = f"- `{r.get('id','?')}` [{r.get('kind','?')}] `{r.get('item','')}`"
         if r.get("detail"):
@@ -625,6 +719,14 @@ class Workspace:
         self._ensure_findings_md()
         self._append_md(self.root / "findings.md",
                         self._fmt_verdict(finding_id, verdict))
+
+    def _append_finding_amendment_to_md(self, finding_id: str, severity: str,
+                                        revision: dict) -> None:
+        self._ensure_findings_md()
+        self._append_md(
+            self.root / "findings.md",
+            self._fmt_finding_amendment(finding_id, severity, revision),
+        )
 
     def _append_surface_to_md(self, rec: dict) -> None:
         self._ensure_surface_md()
