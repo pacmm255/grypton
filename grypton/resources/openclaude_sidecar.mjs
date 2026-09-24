@@ -270,7 +270,12 @@ async function start(route, effort, port) {
     const entry = requestCredential(init);
     if (!entry?.fingerprint) return;
     if (response.ok) return;
-    if (![401, 402, 429].includes(response.status)) return;
+    // OpenClaude rotates every 401, 402 and 403, while Grypton's fetch wrapper
+    // classifies every Go 429 as key-specific before OpenClaude sees it. Track
+    // the same response classes here so a refusal that exhausts the pool is
+    // observable even though current OpenClaude correctly returns it without
+    // emitting the older "waiting" notice.
+    if (![401, 402, 403, 429].includes(response.status)) return;
     const retryAfter = Number(response.headers.get('retry-after'));
     const configured = Number(activeConfig?.retry?.keyCooldownMs);
     const fallback = response.status === 429
@@ -278,10 +283,8 @@ async function start(route, effort, port) {
       : Number.isSafeInteger(configured) && configured > 0 ? configured : 900_000;
     const cooldown = Number.isFinite(retryAfter) && retryAfter > 0
       ? Math.round(retryAfter * 1000) : fallback;
-    credentialFailures.set(
-      entry.fingerprint,
-      Date.now() + Math.min(cooldown, 7 * 86_400_000),
-    );
+    const boundedCooldown = Math.max(1_000, Math.min(cooldown, 7 * 86_400_000));
+    credentialFailures.set(entry.fingerprint, Date.now() + boundedCooldown);
     if (!terminalSent && credentialPool.length > 0
         && credentialPool.every(item => credentialFailures.has(item.fingerprint))) {
       terminalSent = true;
@@ -316,8 +319,8 @@ async function start(route, effort, port) {
       emit('notice', value);
       // This fixed OpenClaude notice is emitted only after a credential-class
       // failure when every key is already benched and the gateway is about to
-      // sleep. It also covers classified 403 failures without interpreting or
-      // retaining their provider body here.
+      // sleep. Response observation above handles refusals such as 403 without
+      // interpreting or retaining their provider body here.
       const exhausted = message.match(
         /^every key for this provider is spent or limited; waiting (\d+)s\b/i,
       );

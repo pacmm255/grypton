@@ -940,7 +940,7 @@ class OpenClaudeRotationTests(unittest.IsolatedAsyncioTestCase):
                     if request_task is not None:
                         await asyncio.gather(request_task, return_exceptions=True)
 
-    async def test_partially_benched_credential_403_uses_wait_notice_as_terminal(self):
+    async def test_partially_benched_credential_403_emits_prompt_terminal(self):
         asyncio.get_running_loop().slow_callback_duration = 1.0
         with generic_rate_limited_provider(spare_succeeds=True) as (port, calls, control), \
                 tempfile.TemporaryDirectory() as directory:
@@ -976,10 +976,13 @@ class OpenClaudeRotationTests(unittest.IsolatedAsyncioTestCase):
                         "type": "openclaude_terminal",
                         "route": "fixture-chat",
                         "reason": "credential_pool_exhausted",
-                        "upstream_status": 0,
+                        "upstream_status": 403,
                         "pool_size": 2,
                         "retry_after_s": 30,
                     }])
+                    status, _ = await asyncio.wait_for(request_task, timeout=2)
+                    request_task = None
+                    self.assertEqual(status, 429)
                     self.assertEqual(calls, [
                         f"Bearer {PRIMARY_KEY}",
                         f"Bearer {SPARE_KEY}",
@@ -1157,7 +1160,10 @@ class OpenClaudeRotationTests(unittest.IsolatedAsyncioTestCase):
                             return exc.code, exc.read().decode()
 
                     status, _ = await asyncio.to_thread(post)
-                    self.assertEqual(status, 402)
+                    # OpenClaude aggregates a fully exhausted multi-key pool
+                    # into one retryable response while the sidecar retains the
+                    # last private upstream status in its sanitized event.
+                    self.assertEqual(status, 429)
                     self.assertEqual(calls, [
                         f"Bearer {PRIMARY_KEY}",
                         f"Bearer {SPARE_KEY}",
