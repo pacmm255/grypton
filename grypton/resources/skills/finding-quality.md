@@ -6,8 +6,8 @@ impact, and an honest claimed severity. Record one root cause per finding. If a
 key fact is inferred, keep it as a hypothesis and gather the missing evidence
 before calling `record_finding`.
 
-Read `program-brief.md` when present. Anything the program excludes is not a
-finding for that engagement. A P5 informational signal, generic missing header,
+Use the projected scope document's finding exclusions for the engagement. A P5
+informational signal, generic missing header,
 version string, build placeholder, or scanner-only observation belongs in the
 surface/tested ledger unless the operator explicitly requests informational
 tracking. A positive response without a meaningful control and demonstrated

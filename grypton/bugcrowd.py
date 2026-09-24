@@ -1,8 +1,10 @@
 """Parse a saved public Bugcrowd brief before an autonomous engagement.
 
 Bugcrowd briefs are the authority for targets, access requirements, exclusions,
-and program-specific automation rules.  This module deliberately accepts a
-saved JSON snapshot rather than guessing authorization from a hostname.
+and compatibility checks.  This module deliberately accepts a saved JSON
+snapshot rather than guessing authorization from a hostname.  Free-form brief
+prose is retained for operator inspection, but only structured scope and finding
+policy fields are eligible for worker import.
 """
 from __future__ import annotations
 
@@ -169,6 +171,12 @@ def _target_host(target: str) -> str:
     return (urlsplit(value).hostname or "").lower().rstrip(".")
 
 
+def _importable_scope_rule(rule: str) -> bool:
+    """Reject display labels that the brief parser found beside a real URI."""
+    host = _rule_host(str(rule))
+    return bool(host and ("." in host or ":" in host or host == "localhost"))
+
+
 def _snippet(text: str, match: re.Match, radius: int = 150) -> str:
     return text[max(0, match.start() - radius):min(len(text), match.end() + radius)].strip()
 
@@ -187,6 +195,142 @@ _ACCOUNT_SUPPORTED = re.compile(
     r"(?i)(?:when registering for an account|create an account|select [\"']sign up[\"']|"
     r"you may want to set up test accounts?)"
 )
+
+_SEVERITY_LABELS = {
+    "p1": "Critical", "critical": "Critical",
+    "p2": "High", "high": "High",
+    "p3": "Medium", "medium": "Medium",
+    "p4": "Low", "low": "Low",
+    "p5": "Informational", "info": "Informational",
+    "informational": "Informational",
+}
+
+
+def _severity_label(value) -> str:
+    """Return one explicit Bugcrowd severity label without inferring conduct."""
+    if isinstance(value, dict):
+        for key in ("severity", "maxSeverity", "maximumSeverity", "label", "name"):
+            label = _severity_label(value.get(key))
+            if label:
+                return label
+        return ""
+    text = _plain(str(value or ""))
+    if not text:
+        return ""
+    direct = _SEVERITY_LABELS.get(text.lower())
+    if direct:
+        return direct
+    match = re.search(
+        r"(?i)(?<![A-Za-z0-9])(?:P[1-5]|Critical|High|Medium|Low|Info(?:rmational)?)(?![A-Za-z0-9])",
+        text,
+    )
+    return _SEVERITY_LABELS.get(match.group(0).lower(), "") if match else ""
+
+
+def _target_severity(target: dict, group: dict) -> str:
+    for container in (target, group):
+        for key in ("maxSeverity", "maximumSeverity", "max_severity",
+                    "maximum_severity", "severity"):
+            label = _severity_label(container.get(key))
+            if label:
+                return label
+    for tag in target.get("tags") or []:
+        if isinstance(tag, dict):
+            label = _severity_label(tag.get("name"))
+        else:
+            label = _severity_label(tag)
+        if label:
+            return label
+    # Group titles are free-form display text (for example, "High value web
+    # assets") and therefore cannot serve as explicit severity metadata.
+    return ""
+
+
+def _policy_values(value) -> list[str]:
+    """Extract names from structured VRT/finding fields, never general prose."""
+    if isinstance(value, str):
+        text = _plain(value)
+        return [text] if text else []
+    if isinstance(value, list):
+        return [item for value_item in value for item in _policy_values(value_item)]
+    if not isinstance(value, dict):
+        return []
+    for key in ("categories", "category", "vrtCategories", "vrt_categories",
+                "vrtItems", "vrt_items", "items", "vulnerabilities"):
+        if key in value:
+            names = _policy_values(value[key])
+            if names:
+                return names
+    for key in ("name", "label", "title", "path"):
+        if key in value:
+            names = _policy_values(value[key])
+            if names:
+                return names
+    return []
+
+
+def _policy_condition(value: dict) -> str:
+    for key in ("condition", "when", "note", "notes"):
+        if isinstance(value.get(key), str):
+            condition = _plain(value[key])
+            if condition:
+                return condition
+    targets: list[str] = []
+    for key in ("targets", "targetGroups", "target_groups"):
+        if key in value:
+            targets.extend(_policy_values(value[key]))
+    if targets:
+        return "applies to " + ", ".join(dict.fromkeys(targets))
+    return ""
+
+
+def _structured_finding_policy(data: dict) -> tuple[list[str], list[str]]:
+    excluded: list[str] = []
+    conditional: list[str] = []
+
+    def add(value, *, force_conditional: bool = False) -> None:
+        records = value if isinstance(value, list) else [value]
+        for record in records:
+            names = _policy_values(record)
+            if not names:
+                continue
+            condition = _policy_condition(record) if isinstance(record, dict) else ""
+            if force_conditional or condition:
+                for name in names:
+                    conditional.append(f"{name}: {condition}" if condition else name)
+            else:
+                excluded.extend(names)
+
+    for key in ("outOfScopeFindingCategories", "out_of_scope_finding_categories",
+                "outOfScopeFindings", "out_of_scope_findings"):
+        if key in data:
+            add(data[key])
+    for key in ("conditionalOutOfScopeFindings", "conditional_out_of_scope_findings",
+                "conditionalExclusions", "conditional_exclusions"):
+        if key in data:
+            add(data[key], force_conditional=True)
+
+    for key in ("vrtScopeRules", "vrt_scope_rules"):
+        rules = data.get(key)
+        if not isinstance(rules, list):
+            continue
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            disposition = " ".join(
+                str(rule.get(name) or "")
+                for name in ("disposition", "status", "type", "scope")
+            ).lower()
+            is_excluded = bool(rule.get("outOfScope") or rule.get("isOutOfScope"))
+            is_excluded = is_excluded or "out of scope" in disposition \
+                or "out_of_scope" in disposition or "exclude" in disposition
+            if is_excluded:
+                add(rule)
+
+    return (
+        list(dict.fromkeys(excluded)),
+        list(dict.fromkeys(conditional)),
+    )
 
 
 def _target_score(target: dict) -> int:
@@ -210,6 +354,7 @@ def analyze_snapshot(path: str | Path) -> dict:
     automation = _AUTOMATION_DENY.search(text)
     credential = _CREDENTIAL_REQUIRED.search(text)
     account = _ACCOUNT_SUPPORTED.search(text)
+    excluded_findings, conditional_exclusions = _structured_finding_policy(data)
     targets: list[dict] = []
     for group in data.get("scope") or []:
         if not isinstance(group, dict):
@@ -225,6 +370,7 @@ def analyze_snapshot(path: str | Path) -> dict:
                 "uri": target.get("uri") or "",
                 "category": target.get("category") or "other",
                 "scope_rules": _candidate_rules(target),
+                "severity": _target_severity(target, group),
                 "reward_range": rewards,
             }
             row["score"] = _target_score(row) if row["in_scope"] else -1
@@ -249,6 +395,8 @@ def analyze_snapshot(path: str | Path) -> dict:
         "logged_in_snapshot": bool(document.get("isLoggedIn")),
         "targets": targets,
         "recommended_targets": ranked[:12],
+        "out_of_scope_finding_categories": excluded_findings,
+        "conditional_out_of_scope_findings": conditional_exclusions,
         "brief_text": text,
     }
 
@@ -271,7 +419,41 @@ def out_of_scope_rules(profile: dict) -> list[str]:
         rule
         for row in profile.get("targets") or [] if not row.get("in_scope")
         for rule in row.get("scope_rules") or []
+        if _importable_scope_rule(rule)
     ))
+
+
+def structured_scope(profile: dict) -> dict:
+    """Project a brief to the only four fields permitted in worker scope data."""
+    in_scope: list[str] = []
+    severities: dict[str, str] = {}
+    for row in profile.get("targets") or []:
+        if not row.get("in_scope"):
+            continue
+        severity = _severity_label(row.get("severity"))
+        for rule in row.get("scope_rules") or []:
+            # Display names such as "GraphQL" or "Mobile app" can appear next
+            # to a real URI in Bugcrowd exports. They are metadata, not targets.
+            if not _importable_scope_rule(rule):
+                continue
+            if rule not in in_scope:
+                in_scope.append(rule)
+            if severity:
+                severities[rule] = severity
+    return {
+        "in_scope": in_scope,
+        "url_severities": severities,
+        "out_of_scope_finding_categories": list(dict.fromkeys(
+            str(value).strip()
+            for value in profile.get("out_of_scope_finding_categories") or []
+            if str(value).strip()
+        )),
+        "conditional_out_of_scope_findings": list(dict.fromkeys(
+            str(value).strip()
+            for value in profile.get("conditional_out_of_scope_findings") or []
+            if str(value).strip()
+        )),
+    }
 
 
 def public_profile(profile: dict) -> dict:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 import time
 from typing import Callable, Optional
@@ -11,6 +12,67 @@ from .providers import OpenCodeClient, ProviderError, tool_state_text
 
 
 EventCb = Optional[Callable[[dict], None]]
+
+
+def _token_count(value) -> Optional[int]:
+    """Return one trustworthy non-negative token count."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if isinstance(value, float) and (not math.isfinite(value) or not value.is_integer()):
+        return None
+    count = int(value)
+    return count if count >= 0 else None
+
+
+def _opencode_step_context_tokens(value) -> Optional[int]:
+    """Return the live footprint from one canonical OpenCode token record.
+
+    A valid provider total is its best prospective next-call estimate. Without
+    one, OpenCode's fields are non-overlapping: uncached input, cache reads and
+    writes, visible output, and reasoning. Their sum estimates the conversation
+    that will be carried into the next model step.
+    """
+    if not isinstance(value, dict):
+        return None
+    explicit_total = _token_count(value.get("total"))
+    if explicit_total is not None:
+        return explicit_total
+
+    input_tokens = _token_count(value.get("input"))
+    output_tokens = _token_count(value.get("output"))
+    reasoning_tokens = _token_count(value.get("reasoning"))
+    cache = value.get("cache")
+    if (
+        input_tokens is None
+        or output_tokens is None
+        or reasoning_tokens is None
+        or not isinstance(cache, dict)
+    ):
+        return None
+    cache_read = _token_count(cache.get("read"))
+    cache_write = _token_count(cache.get("write"))
+    if cache_read is None or cache_write is None:
+        return None
+    return (
+        input_tokens + output_tokens + reasoning_tokens
+        + cache_read + cache_write
+    )
+
+
+def usage_context_tokens(usage) -> Optional[int]:
+    """Return the latest valid OpenCode step's live context footprint.
+
+    Every later agentic step, and every resumed provider call, sends the prior
+    conversation again. Summing those records counts the same context many
+    times. Walk backward to the final valid step and ignore older observations.
+    """
+    if not isinstance(usage, list) or not usage:
+        return None
+    for step in reversed(usage):
+        footprint = _opencode_step_context_tokens(step)
+        if footprint is not None:
+            return footprint
+    return None
 
 
 class WorkerError(RuntimeError):
@@ -99,7 +161,10 @@ class OpenCodeWorker:
             "subtype": "init",
             "cwd": str(self.spec.cwd),
             "session_id": self.session_id,
-            "tools": ["read", "grep", "glob", "grypton MCP"],
+            "tools": [
+                "read", "grep", "glob", "bash", "edit", "task",
+                "grypton MCP (scoped network + evidence tools)",
+            ],
             "mcp_servers": [{"name": "grypton", "status": "configured"}],
             "model": self.spec.model,
             "permissionMode": "auto",
@@ -114,6 +179,12 @@ class OpenCodeWorker:
         self.session_id = ""
         self.spec.session_uuid = ""
         return 0
+
+    def rollover_session(self) -> None:
+        """Forget only Kraude's conversation after durable engine persistence."""
+        self.session_id = ""
+        self.spec.session_uuid = ""
+        self._pool_exhaustion_reset_used = False
 
     async def aclose(self) -> None:
         await self.client.cancel()
@@ -147,8 +218,9 @@ class OpenCodeWorker:
             ):
                 # OpenCode sessions can retain provider-specific conversation
                 # state across calls. Consume one fresh-session recovery for a
-                # consecutive 429 exhaustion burst; the engine already retries
-                # the unchanged directive from durable workspace state.
+                # consecutive 429 exhaustion burst. The engine retries from
+                # durable workspace state and suppresses exact replay whenever
+                # the native-capable provider process may have executed work.
                 self.session_id = ""
                 self.spec.session_uuid = ""
                 self._pool_exhaustion_reset_used = True
@@ -156,6 +228,7 @@ class OpenCodeWorker:
         self._pool_exhaustion_reset_used = False
         self.session_id = result.session_id
         self.spec.session_uuid = result.session_id
+        context_tokens = usage_context_tokens(result.usage)
         tools = [{
             "name": self._tool_name(item.get("name")),
             "input": item.get("input") if isinstance(item.get("input"), dict) else {},
@@ -171,6 +244,9 @@ class OpenCodeWorker:
                 "usage": result.usage,
                 "event_count": len(result.events),
                 "returncode": result.returncode,
+                **({
+                    "context_tokens": context_tokens,
+                } if context_tokens is not None else {}),
             },
             num_turns=1,
             duration_s=time.time() - started,

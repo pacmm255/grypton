@@ -69,9 +69,11 @@ def _target_value(ns) -> str:
 
 def _constraints(ns, target: str) -> Constraints:
     program_profile = None
+    imported_scope = None
     program_path = getattr(ns, "bugcrowd_brief", None)
     if program_path:
-        from .bugcrowd import analyze_snapshot, matching_scope_rules, out_of_scope_rules
+        from .bugcrowd import (analyze_snapshot, matching_scope_rules,
+                               out_of_scope_rules, structured_scope)
         program_profile = analyze_snapshot(program_path)
         if program_profile["automation_prohibited"]:
             raise ValueError(
@@ -81,31 +83,53 @@ def _constraints(ns, target: str) -> Constraints:
         matches = matching_scope_rules(program_profile, target)
         if not matches:
             raise ValueError("target does not match an in-scope target in the Bugcrowd brief")
+        imported_scope = structured_scope(program_profile)
         ns._bugcrowd_profile = program_profile
     else:
         matches = []
 
+    imported_scope = imported_scope or {
+        "in_scope": [], "url_severities": {},
+        "out_of_scope_finding_categories": [],
+        "conditional_out_of_scope_findings": [],
+    }
+    explicit_in_scope = _csv(getattr(ns, "in_scope", ""))
+    in_scope = explicit_in_scope or imported_scope["in_scope"] or matches or [target]
+    imported_severities = imported_scope["url_severities"]
+    if program_profile:
+        missing_severity = [
+            rule for rule in in_scope
+            if not str(imported_severities.get(rule) or "").strip()
+        ]
+        if missing_severity:
+            examples = ", ".join(missing_severity[:3])
+            suffix = "" if len(missing_severity) <= 3 else ", …"
+            raise ValueError(
+                "Bugcrowd in-scope URL(s) are missing an explicit severity: "
+                + examples + suffix
+            )
+
     value = Constraints(
         included_severities=_csv(getattr(ns, "only", "")),
-        excluded_classes=_csv(getattr(ns, "exclude", "")),
+        excluded_classes=list(dict.fromkeys(
+            _csv(getattr(ns, "exclude", ""))
+            + imported_scope["out_of_scope_finding_categories"]
+        )),
         included_classes=_csv(getattr(ns, "include", "")),
-        in_scope=_csv(getattr(ns, "in_scope", "")) or matches or [target],
+        in_scope=in_scope,
         out_of_scope=_csv(getattr(ns, "out_scope", "")),
+        url_severities={
+            rule: imported_severities[rule]
+            for rule in in_scope if rule in imported_severities
+        },
+        conditional_exclusions=imported_scope["conditional_out_of_scope_findings"],
     )
     if program_profile:
+        # Retain negative URL/host boundaries for tool enforcement. The worker
+        # projection intentionally omits Constraints.out_of_scope.
         value.out_of_scope = list(dict.fromkeys(
             value.out_of_scope + out_of_scope_rules(program_profile)
         ))
-        value.add_rule(
-            "Read program-brief.md before testing a new target or vulnerability class; "
-            "program exclusions and access rules are binding."
-        )
-        if program_profile["credential_requirement"]:
-            value.add_rule(
-                "The program has a Bugcrowd credential/account requirement. Do not "
-                "substitute an unrelated inbox or identity; use assigned researcher "
-                "credentials or choose an anonymous target that does not require them."
-            )
     for rule in getattr(ns, "rule", []) or []:
         value.add_rule(rule)
     authorization = getattr(ns, "authorization_file", None)
@@ -115,11 +139,6 @@ def _constraints(ns, target: str) -> Constraints:
         data = path.read_bytes()
         notes.append(f"Authorization record: {path.name}; sha256="
                      f"{hashlib.sha256(data).hexdigest()}; recorded={int(time.time())}")
-    if program_profile:
-        notes.append(
-            f"Bugcrowd brief: {Path(program_profile['source']).name}; "
-            f"sha256={program_profile['sha256']}."
-        )
     value.notes = " ".join(notes)
     return value
 
@@ -365,6 +384,9 @@ def cmd_init(ns) -> int:
     ws.save_constraints(constraints)
     profile = getattr(ns, "_bugcrowd_profile", None)
     if profile:
+        # Workspace stores these under manager-only operator state. Preserve the
+        # original import for audit/re-import while Kraude receives only the
+        # structured Constraints projection in its workspace and system prompt.
         ws.save_program_brief(profile["brief_text"], profile)
     return _run_engagement(ws, ns, brief=ns.brief or f"Assess {target} within recorded scope.", fresh=True)
 
@@ -467,6 +489,67 @@ def cmd_show(ns) -> int:
     return 0
 
 
+def cmd_program(ns) -> int:
+    """Show an imported program snapshot to the operator only."""
+    if os.environ.get("GRYPTON_ENGAGEMENT_DIR"):
+        print("ERROR: program snapshots are available only from an operator shell.",
+              file=sys.stderr)
+        return 2
+    try:
+        ws = _existing_workspace(ns.target)
+    except ValueError as exc:
+        print(f"ERROR: {exc}.", file=sys.stderr)
+        return 2
+
+    brief_present = ws.program_brief_path.is_file()
+    profile_present = ws.program_profile_path.is_file()
+    payload = {
+        "target": ws.slug,
+        "present": brief_present or profile_present,
+        "brief_present": brief_present,
+        "profile_present": profile_present,
+        "brief": None,
+        "profile": None,
+    }
+    if not payload["present"]:
+        if ns.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print(f"No stored Bugcrowd program snapshot for {ws.slug}.")
+        return 0
+
+    try:
+        if brief_present:
+            payload["brief"] = _redact_program_text(
+                _read_program_file(ws.program_brief_path, errors="replace")
+            )
+        if profile_present:
+            profile = json.loads(_read_program_file(ws.program_profile_path))
+            if not isinstance(profile, dict):
+                raise ValueError("profile root is not an object")
+            payload["profile"] = _redact_program_value(profile)
+    except (OSError, UnicodeError, ValueError):
+        print(f"ERROR: stored program snapshot for {ws.slug} is unreadable.", file=sys.stderr)
+        return 2
+
+    if ns.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"Program snapshot: {ws.slug}")
+    if brief_present:
+        print("\nBrief\n" + str(payload["brief"] or "").rstrip())
+    else:
+        print("\nBrief\n(not stored)")
+    if profile_present:
+        print("\nNormalized profile\n" + json.dumps(
+            payload["profile"], ensure_ascii=False, indent=2
+        ))
+    else:
+        print("\nNormalized profile\n(not stored)")
+    return 0
+
+
 def _jsonl_tail(path: Path, limit: int) -> list[dict]:
     """Read a small JSONL tail for a human-facing live view."""
     rows: list[dict] = []
@@ -491,11 +574,103 @@ _INLINE_SECRET_RX = re.compile(
     r"([:=]\s*|%3[dD])[^\s,;&]+"
 )
 
+_PROGRAM_SECRET_KEYS = frozenset({
+    "authorization", "cookie", "credential", "credentials", "password",
+    "passwd", "proxy_authorization", "secret", "set_cookie", "token",
+    "access_token", "auth_token", "id_token", "refresh_token",
+    "session_token", "api_key", "client_secret", "private_key",
+    "username", "user_name", "email", "email_address",
+    "x_api_key", "x_auth_token",
+})
+_PROGRAM_SECRET_LINE_RX = re.compile(
+    r"(?im)^(\s*(?:authorization|proxy-authorization|cookie|set-cookie|"
+    r"credentials?|password|passwd|secret|(?:access|auth|id|refresh|session)[_-]?token|"
+    r"api[_-]?key|client[_-]?secret|private[_-]?key|user[_-]?name|"
+    r"email(?:[_-]?address)?)\s*[:=]\s*).*$"
+)
+_PROGRAM_SECRET_ASSIGNMENT_RX = re.compile(
+    r'''(?ix)
+    ((?:["']?(?:authorization|proxy[_-]?authorization|cookie|set[_-]?cookie|
+       credentials?|password|passwd|secret|(?:access|auth|id|refresh|session)[_-]?token|
+       api[_-]?key|client[_-]?secret|private[_-]?key|user[_-]?name|
+       email(?:[_-]?address)?)["']?)\s*[:=]\s*)
+    (?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^&\s,;}\]]+)
+    '''
+)
+_PROGRAM_AUTH_HEADER_SCHEME_RX = re.compile(
+    r'''(?ix)
+    ((?:["']?(?:authorization|proxy[_-]?authorization)["']?)\s*[:=]\s*
+     ["']?(?:bearer|basic)\s+)
+    [A-Za-z0-9._~+/=-]+
+    '''
+)
+_PROGRAM_AUTH_SCHEME_RX = re.compile(
+    r"(?i)(\b(?:bearer|basic)\s+)"
+    r"(?=[A-Za-z0-9._~+/=-]{8,})(?=[A-Za-z0-9._~+/=-]*[0-9._~+/=-])"
+    r"[A-Za-z0-9._~+/=-]+"
+)
+_PROGRAM_URL_CREDENTIAL_RX = re.compile(
+    r"(?i)\b((?:https?|wss?|ftp)://)[^/\s:@]+(?::[^/\s@]*)?@"
+)
+
 
 def _redact_summary(value: object) -> str:
     """Keep live operational views useful without reproducing sensitive values."""
     text = " ".join(str(value or "").split())
     return _INLINE_SECRET_RX.sub(lambda match: f"{match.group(1)}=[REDACTED]", text)
+
+
+def _program_secret_key(value: object) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(value).lower()).strip("_")
+    return normalized in _PROGRAM_SECRET_KEYS
+
+
+def _read_program_file(path: Path, *, errors: str = "strict") -> str:
+    """Read a regular private snapshot file without following symbolic links."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    elif path.is_symlink():
+        raise OSError("symbolic links are not accepted")
+    fd = os.open(path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("snapshot is not a regular file")
+        with os.fdopen(fd, encoding="utf-8", errors=errors) as stream:
+            fd = -1
+            return stream.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _redact_program_text(value: object) -> str:
+    """Redact credential-shaped values while preserving program document layout."""
+    text = str(value or "")
+    text = _PROGRAM_URL_CREDENTIAL_RX.sub(r"\1[REDACTED]@", text)
+    text = _PROGRAM_AUTH_HEADER_SCHEME_RX.sub(r"\1[REDACTED]", text)
+    text = _PROGRAM_AUTH_SCHEME_RX.sub(r"\1[REDACTED]", text)
+    text = _PROGRAM_SECRET_LINE_RX.sub(r"\1[REDACTED]", text)
+    return _PROGRAM_SECRET_ASSIGNMENT_RX.sub(r"\1[REDACTED]", text)
+
+
+def _redact_program_value(value):
+    """Recursively sanitize a stored public-policy profile for terminal output."""
+    if isinstance(value, dict):
+        return {
+            key: (
+                "[REDACTED]" if _program_secret_key(key)
+                else _redact_program_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_program_value(item) for item in value]
+    if isinstance(value, str):
+        return _redact_program_text(value)
+    return value
 
 
 def _finding_overview(row: dict | None) -> dict | None:
@@ -654,6 +829,8 @@ def cmd_plan(ns) -> int:
         "accepted_severities": constraints.included_severities,
         "included_finding_categories": constraints.included_classes,
         "out_of_scope_finding_categories": constraints.excluded_classes,
+        "url_severities": constraints.url_severities,
+        "conditional_out_of_scope_findings": constraints.conditional_exclusions,
         "hard_rules": constraints.hard_rules,
         "models": models,
         "scenario_ids": scenarios,
@@ -1479,7 +1656,7 @@ def _run_options(parser) -> None:
     parser.add_argument("-m", "--brief", default="", help="Engagement mission")
     _model_options(parser)
     parser.add_argument("--permission-mode", choices=["scoped"], default="scoped",
-                        help="Use Grypton's recorded-scope, captured-tool permission mode")
+                        help="Enable native worker tools plus Grypton's scope-enforcing MCP tools")
     parser.add_argument("-p", "--print", dest="print_mode", action="store_true",
                         help="Run without interactive console input; retain the event stream")
     parser.add_argument("--console", choices=["quiet", "normal", "full"], default="normal",
@@ -1571,6 +1748,11 @@ def build_parser() -> argparse.ArgumentParser:
     show = sub.add_parser("show", help="Show one engagement and its review paths")
     show.add_argument("target"); show.add_argument("--json", action="store_true")
     show.set_defaults(func=cmd_show)
+    program = sub.add_parser(
+        "program", help="Show the stored operator-only Bugcrowd program snapshot"
+    )
+    program.add_argument("target"); program.add_argument("--json", action="store_true")
+    program.set_defaults(func=cmd_program)
     overview = sub.add_parser("overview", aliases=["inspect"],
                               help="Show a compact engagement picture and current next step")
     overview.add_argument("target"); overview.add_argument("--limit", type=int, default=5)
@@ -1728,7 +1910,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 _COMMAND_NAMES = {
-    "init", "plan", "resume", "status", "ls", "show", "overview", "inspect", "activity", "tail",
+    "init", "plan", "resume", "status", "ls", "show", "program", "overview", "inspect", "activity", "tail",
     "findings", "validate", "auth", "surface", "history", "scope", "audit", "report", "stop", "models",
     "run", "doctor", "tools", "scenarios", "bugcrowd-brief", "lab", "benchmark", "serve", "demo",
 }

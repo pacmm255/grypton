@@ -27,6 +27,7 @@ from .workspace import Workspace
 
 
 _RUN_ID_RX = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{8}$")
+_SUPERVISED_RUN_ENV = "GRYPTON_SUPERVISOR_RUN_ID"
 
 
 @dataclass(frozen=True)
@@ -76,6 +77,9 @@ def _paths(slug: str, run_id: str) -> dict[str, Path]:
         "events": root / "events.jsonl",
         "supervisor_pid": root / "supervisor.pid",
         "engine_pid": root / "engine.pid",
+        # An existing entry is a fail-closed signal: Kraude may have executed
+        # a native OpenCode tool whose side effect is invisible to MCP ledgers.
+        "provider_call_window": root / "worker-provider-call.active",
     }
 
 
@@ -111,6 +115,172 @@ def _write_text_private(path: Path, value: str) -> None:
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
     _write_text_private(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+
+
+def _sync_file_and_parent(path: Path) -> None:
+    """Make a small runtime marker durable across an abrupt child exit."""
+    file_flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        file_flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        file_flags |= os.O_NOFOLLOW
+    fd = os.open(path, file_flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    directory_flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        directory_flags |= os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    parent_fd = os.open(path.parent, directory_flags)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _create_provider_call_marker(path: Path, value: dict[str, Any]) -> None:
+    """Create and sync a marker without replacing an earlier active window."""
+    _mkdir_private(path.parent)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        # A partial entry remains active by design; completion cannot remove it
+        # without reading the expected nonce from a complete regular file.
+        raise
+    directory_flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        directory_flags |= os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    parent_fd = os.open(path.parent, directory_flags)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _read_provider_call_marker(path: Path) -> dict[str, Any]:
+    """Read one regular marker without following a worker-created symlink."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return {}
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            value = json.load(stream)
+    except (OSError, ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _provider_call_window_begin(slug: str, *, turn: int, attempt: int) -> str:
+    """Publish a supervised Kraude provider window and return its nonce.
+
+    Foreground engines have no supervisor to restart them and therefore return
+    an empty nonce. The marker contains counters only; prompts, tool arguments,
+    URLs, and provider output never enter supervisor state.
+    """
+    run_id = str(os.environ.get(_SUPERVISED_RUN_ENV) or "")
+    if not run_id:
+        return ""
+    slug = config.slugify(slug)
+    if not _valid_run_id(run_id):
+        raise RuntimeError("invalid supervised run identity")
+    paths = _paths(slug, run_id)
+    spec = _read_json(paths["spec"])
+    if spec.get("slug") != slug or spec.get("run_id") != run_id:
+        raise RuntimeError("supervised run identity does not match private state")
+    nonce = secrets.token_hex(16)
+    try:
+        _create_provider_call_marker(paths["provider_call_window"], {
+            "version": 1,
+            "state": "active",
+            "nonce": nonce,
+            "engine_pid": os.getpid(),
+            "turn": max(0, int(turn)),
+            "attempt": max(0, int(attempt)),
+            "started_at": time.time(),
+        })
+    except FileExistsError as exc:
+        raise RuntimeError(
+            "a prior Kraude provider call window is still active"
+        ) from exc
+    return nonce
+
+
+def _provider_call_window_complete(slug: str, nonce: str) -> None:
+    """Clear only the provider window opened by ``nonce``.
+
+    A missing, corrupt, or replaced marker stays fail-closed. Raising here
+    leaves the entry in place, so an abnormal engine exit cannot be restarted
+    into a possibly repeated native action.
+    """
+    if not nonce:
+        return
+    run_id = str(os.environ.get(_SUPERVISED_RUN_ENV) or "")
+    if not _valid_run_id(run_id):
+        raise RuntimeError("missing supervised run identity for provider completion")
+    path = _paths(config.slugify(slug), run_id)["provider_call_window"]
+    marker = _read_provider_call_marker(path)
+    recorded = marker.get("nonce")
+    if not isinstance(recorded, str) or not secrets.compare_digest(recorded, nonce):
+        if not _provider_call_window_active(slug, run_id):
+            # A native tool or external actor removed the marker while the
+            # provider was active. Recreate it before raising so the supervisor
+            # cannot mistake this failure for a safe pre-call crash.
+            try:
+                _create_provider_call_marker(path, {
+                    "version": 1,
+                    "state": "active",
+                    "nonce": nonce,
+                    "engine_pid": os.getpid(),
+                    "recovered_missing_marker": True,
+                    "started_at": time.time(),
+                })
+            except FileExistsError:
+                pass
+        raise RuntimeError("provider call window changed before durable completion")
+    path.unlink()
+    directory_flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        directory_flags |= os.O_CLOEXEC
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    parent_fd = os.open(path.parent, directory_flags)
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _provider_call_window_active(slug: str, run_id: str) -> bool:
+    """Treat every filesystem entry at the marker path as active."""
+    path = _paths(config.slugify(slug), run_id)["provider_call_window"]
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # An unreadable marker is still evidence that replay may be unsafe.
+        return True
+    return True
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -959,6 +1129,17 @@ def supervise(slug: str, run_id: str) -> int:
                               reason="effectful_tool_started",
                               effectful_tool_starts=effectful_delta)
                 break
+            if _provider_call_window_active(slug, run_id):
+                exit_status = "failed"
+                stop_reason = (
+                    "abnormal exit during a Kraude provider call; replay disabled"
+                )
+                _append_event(
+                    paths["events"],
+                    "restart_suppressed",
+                    reason="worker_provider_call_active",
+                )
+                break
             if restarts >= restart_limit:
                 exit_status, stop_reason = "failed", "restart limit reached"
                 break
@@ -1031,7 +1212,15 @@ def run_engine(slug: str, run_id: str) -> int:
     if fresh_worker_session:
         arguments.append("--fresh-worker-session")
     from .cli import main
-    return int(main(arguments))
+    prior_run_id = os.environ.get(_SUPERVISED_RUN_ENV)
+    os.environ[_SUPERVISED_RUN_ENV] = run_id
+    try:
+        return int(main(arguments))
+    finally:
+        if prior_run_id is None:
+            os.environ.pop(_SUPERVISED_RUN_ENV, None)
+        else:
+            os.environ[_SUPERVISED_RUN_ENV] = prior_run_id
 
 
 _ERROR_SECRET_RX = re.compile(

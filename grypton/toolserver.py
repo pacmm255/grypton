@@ -385,9 +385,11 @@ def _save_research(ws, args):
 
 def _read_doc(ws, args):
     mapping = {"findings": "findings.md", "surface": "attack-surface.md",
-        "tested": "tested-techniques.md", "progress": "progress.md", "scope": "scope-rules.md",
-        "program": "program-brief.md"}
-    path = ws.root / mapping.get(args.get("name", "findings"), "findings.md")
+        "tested": "tested-techniques.md", "progress": "progress.md", "scope": "scope-rules.md"}
+    name = args.get("name", "findings")
+    if name not in mapping:
+        return {"ok": False, "summary": "That engagement document is not worker-readable."}
+    path = ws.root / mapping[name]
     if not path.is_file():
         return {"ok": True, "summary": f"{path.name} is not attached to this engagement.",
                 "data": {"text": "", "present": False}}
@@ -600,8 +602,8 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
     "save_research": ("Save a research note in the engagement workspace.",
         _object({"topic": _string("Topic"), "content": _string("Markdown")}, ("topic", "content")),
         _save_research),
-    "read_doc": ("Read findings, surface, tested, progress, scope, or an attached program brief.",
-        _object({"name": {"type": "string", "enum": ["findings", "surface", "tested", "progress", "scope", "program"]}}),
+    "read_doc": ("Read findings, surface, tested, progress, or the projected scope document.",
+        _object({"name": {"type": "string", "enum": ["findings", "surface", "tested", "progress", "scope"]}}),
         _read_doc),
     "tool_inventory": ("List available native binaries and Goja state.", _object({}),
         lambda ws, args: tools.inventory()),
@@ -865,7 +867,7 @@ def cli_main(argv=None) -> int:
     revision.add_argument("--title"); revision.add_argument("--class", dest="vuln_class")
     revision.add_argument("--surface"); revision.add_argument("--description")
     revision.add_argument("--poc"); revision.add_argument("--evidence")
-    read = sub.add_parser("read"); read.add_argument("name", choices=["findings", "surface", "tested", "progress", "scope", "program"])
+    read = sub.add_parser("read"); read.add_argument("name", choices=["findings", "surface", "tested", "progress", "scope"])
     analyze = sub.add_parser("local-analyze"); analyze.add_argument("path")
     analyze.add_argument("--analyzer", choices=["file", "strings", "sha256", "literal", "regex"], default="file")
     analyze.add_argument("--min-length", type=int, default=6)

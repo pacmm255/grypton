@@ -19,13 +19,18 @@ from grypton import config
 from grypton.cli import (_duration_seconds, _run_engagement,
                          _run_engagement_unlocked, build_parser, cmd_run_stop)
 from grypton.engine import Engine
+from grypton.worker import TurnResult
 from grypton.runtime import (
     _ProcessIdentity,
     _ProcessSnapshot,
+    _SUPERVISED_RUN_ENV,
     _advance_health_deadline,
     _descendant_pgids,
     _engine_argv,
     _paths,
+    _provider_call_window_active,
+    _provider_call_window_begin,
+    _provider_call_window_complete,
     _process_snapshot,
     _safe_error,
     _signal_process_groups,
@@ -553,6 +558,211 @@ class RuntimeTests(unittest.TestCase):
             state = public_status(ws.slug)
             self.assertEqual(state["status"], "failed")
             self.assertIn("replay disabled", state["stop_reason"])
+
+    def test_abnormal_exit_with_active_native_provider_window_is_not_restarted(self):
+        with runtime_home():
+            ws = Workspace("native-no-replay")
+            ws.create("example.test", "web")
+            run_id = "20260923T000000Z-00000013"
+            paths = _paths(ws.slug, run_id)
+            _write_json(paths["spec"], {
+                "slug": ws.slug,
+                "run_id": run_id,
+                "deadline_at": time.time() + 60,
+                "health_interval_seconds": 600,
+                "restart_limit": 5,
+            })
+            _write_json(paths["state"], {
+                "slug": ws.slug, "run_id": run_id,
+                "status": "starting", "restarts": 0,
+            })
+            _write_json(
+                config.RUNTIME_DIR / "supervisors/native-no-replay/current.json",
+                {"run_id": run_id},
+            )
+            with patch.dict(os.environ, {_SUPERVISED_RUN_ENV: run_id}):
+                nonce = _provider_call_window_begin(ws.slug, turn=3, attempt=1)
+            self.assertTrue(nonce)
+            self.assertTrue(_provider_call_window_active(ws.slug, run_id))
+
+            process = _Process(pid=44665, returncode=7)
+            after = {
+                "workspace_status": "running",
+                "tool_calls": 0,
+                "effectful_tool_starts": 0,
+            }
+            with patch("grypton.runtime.subprocess.Popen", return_value=process) as popen, \
+                    patch("grypton.runtime._health", return_value=after):
+                self.assertEqual(supervise(ws.slug, run_id), 1)
+
+            self.assertEqual(popen.call_count, 1)
+            state = public_status(ws.slug)
+            self.assertEqual(state["status"], "failed")
+            self.assertIn("Kraude provider call", state["stop_reason"])
+            events = [
+                json.loads(line)
+                for line in paths["events"].read_text(encoding="utf-8").splitlines()
+            ]
+            suppressed = [row for row in events if row["event"] == "restart_suppressed"]
+            self.assertEqual(suppressed[-1]["reason"], "worker_provider_call_active")
+            self.assertNotIn("nonce", suppressed[-1])
+
+    def test_real_worker_crash_leaves_window_active_until_turn_persistence(self):
+        class NativeProviderCrash(BaseException):
+            pass
+
+        with runtime_home():
+            ws = Workspace("native-window-crash")
+            ws.create("example.test", "web")
+            run_id = "20260923T000000Z-00000014"
+            paths = _paths(ws.slug, run_id)
+            _write_json(paths["spec"], {
+                "slug": ws.slug,
+                "run_id": run_id,
+                "deadline_at": time.time() + 60,
+            })
+            engine = Engine(ws.slug, backend="real")
+            engine.worker = SimpleNamespace(session_id="", aclose=AsyncMock())
+            engine.manager = SimpleNamespace(session_id="", aclose=AsyncMock())
+            engine._opening_directive = AsyncMock(return_value="exercise native tool")
+            engine._apply_pending_model_switches = AsyncMock()
+            engine._user_chat_loop = AsyncMock(return_value=None)
+            observed = []
+
+            async def crash_during_provider(_directive):
+                observed.append(_provider_call_window_active(ws.slug, run_id))
+                raise NativeProviderCrash("synthetic crash after native tool")
+
+            engine._run_turn_with_heartbeat = crash_during_provider
+            with patch.dict(os.environ, {_SUPERVISED_RUN_ENV: run_id}):
+                with self.assertRaises(NativeProviderCrash):
+                    asyncio.run(engine.run())
+
+            self.assertEqual(observed, [True])
+            self.assertTrue(_provider_call_window_active(ws.slug, run_id))
+            self.assertEqual(ws.load_meta().turn_index, 0)
+
+    def test_matching_completed_provider_window_is_removed(self):
+        with runtime_home():
+            ws = Workspace("native-window-complete")
+            ws.create("example.test", "web")
+            run_id = "20260923T000000Z-00000015"
+            paths = _paths(ws.slug, run_id)
+            _write_json(paths["spec"], {
+                "slug": ws.slug,
+                "run_id": run_id,
+                "deadline_at": time.time() + 60,
+            })
+            with patch.dict(os.environ, {_SUPERVISED_RUN_ENV: run_id}):
+                nonce = _provider_call_window_begin(ws.slug, turn=1, attempt=1)
+                self.assertTrue(_provider_call_window_active(ws.slug, run_id))
+                _provider_call_window_complete(ws.slug, nonce)
+            self.assertFalse(_provider_call_window_active(ws.slug, run_id))
+
+    def test_missing_provider_window_is_recreated_before_completion_fails(self):
+        with runtime_home():
+            ws = Workspace("native-window-missing")
+            ws.create("example.test", "web")
+            run_id = "20260923T000000Z-00000017"
+            paths = _paths(ws.slug, run_id)
+            _write_json(paths["spec"], {
+                "slug": ws.slug,
+                "run_id": run_id,
+                "deadline_at": time.time() + 60,
+            })
+            with patch.dict(os.environ, {_SUPERVISED_RUN_ENV: run_id}):
+                nonce = _provider_call_window_begin(ws.slug, turn=1, attempt=1)
+                paths["provider_call_window"].unlink()
+                with self.assertRaisesRegex(RuntimeError, "changed"):
+                    _provider_call_window_complete(ws.slug, nonce)
+
+            self.assertTrue(_provider_call_window_active(ws.slug, run_id))
+            recovered = json.loads(
+                paths["provider_call_window"].read_text(encoding="utf-8")
+            )
+            self.assertTrue(recovered["recovered_missing_marker"])
+
+    def test_engine_reuses_window_across_retries_and_begin_never_overwrites(self):
+        with runtime_home():
+            ws = Workspace("native-window-retry")
+            ws.create("example.test", "web")
+            run_id = "20260923T000000Z-00000018"
+            paths = _paths(ws.slug, run_id)
+            _write_json(paths["spec"], {
+                "slug": ws.slug,
+                "run_id": run_id,
+                "deadline_at": time.time() + 60,
+            })
+            engine = Engine(ws.slug, backend="real")
+            with patch.dict(os.environ, {_SUPERVISED_RUN_ENV: run_id}):
+                first = engine._begin_worker_provider_window(turn=1, attempt=1)
+                second = engine._begin_worker_provider_window(turn=1, attempt=2)
+                self.assertEqual(first, second)
+                with self.assertRaisesRegex(RuntimeError, "still active"):
+                    _provider_call_window_begin(ws.slug, turn=1, attempt=3)
+
+            marker = json.loads(
+                paths["provider_call_window"].read_text(encoding="utf-8")
+            )
+            self.assertEqual(marker["nonce"], first)
+            self.assertEqual(marker["attempt"], 1)
+
+    def test_successful_real_turn_clears_window_after_turn_and_resume_state(self):
+        with runtime_home():
+            ws = Workspace("native-window-persisted")
+            ws.create("example.test", "web")
+            run_id = "20260923T000000Z-00000016"
+            paths = _paths(ws.slug, run_id)
+            _write_json(paths["spec"], {
+                "slug": ws.slug,
+                "run_id": run_id,
+                "deadline_at": time.time() + 60,
+            })
+            engine = Engine(ws.slug, backend="real")
+            engine.worker = SimpleNamespace(
+                session_id="worker-completed-session",
+                aclose=AsyncMock(),
+            )
+            engine.manager = SimpleNamespace(session_id="", aclose=AsyncMock())
+            engine._opening_directive = AsyncMock(return_value="exercise native tool")
+            engine._apply_pending_model_switches = AsyncMock()
+            engine._user_chat_loop = AsyncMock(return_value=None)
+            checkpoints = []
+
+            async def completed_provider(_directive):
+                checkpoints.append((
+                    "provider",
+                    _provider_call_window_active(ws.slug, run_id),
+                ))
+                return TurnResult(
+                    assistant_text="completed",
+                    tool_uses=[{"name": "bash"}],
+                    result={},
+                )
+
+            engine._run_turn_with_heartbeat = completed_provider
+            persist_turn = engine._persist_turn
+
+            def persist_then_stop(turn):
+                checkpoints.append((
+                    "persist",
+                    _provider_call_window_active(ws.slug, run_id),
+                ))
+                persist_turn(turn)
+                engine.stop_requested = True
+
+            engine._persist_turn = persist_then_stop
+            with patch.dict(os.environ, {_SUPERVISED_RUN_ENV: run_id}):
+                asyncio.run(engine.run())
+
+            self.assertEqual(checkpoints, [
+                ("provider", True),
+                ("persist", True),
+            ])
+            self.assertFalse(_provider_call_window_active(ws.slug, run_id))
+            self.assertEqual(ws.load_meta().turn_index, 1)
+            turns = (ws.transcripts_dir / "turns.jsonl").read_text(encoding="utf-8")
+            self.assertIn('"turn": 1', turns)
 
     def test_abnormal_pre_tool_failure_is_restarted(self):
         with runtime_home():

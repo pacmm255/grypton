@@ -11,6 +11,12 @@ from pathlib import Path
 from . import config
 
 
+# Increment whenever Kraude's static prompt or worker-visible instruction
+# projection changes in a way that an existing OpenCode conversation cannot
+# safely inherit. Engine setup uses this stamp to retire that conversation once.
+WORKER_PROMPT_CONTRACT_VERSION = 1
+
+
 def _load(name: str) -> str:
     return (config.PROMPTS_DIR / name).read_text(encoding="utf-8")
 

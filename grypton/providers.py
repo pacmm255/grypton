@@ -15,17 +15,61 @@ import sys
 import time
 from typing import Callable, Optional
 
-from . import config
+from . import config, credentials
+from .native_shell import NativeShellError, NativeShellSpec, prepare_native_shell
+from .network_broker import NetworkBrokerError, ScopedNetworkBroker
 from .openclaude import OpenClaudeError, OpenClaudeGateway
 
 
 MAX_STREAM_BYTES = 16_000_000
 MCP_TIMEOUT_MS = 120_000
 MAX_ASSISTANT_TEXT_CHARS = 12_000
+MAX_FAILURE_TOOL_COUNT = 10_000
 _OPENCODE_VERSION: Optional[str] = None
 _CONTROL = re.compile(
     r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|"
     r"[\x00-\x08\x0b-\x1f\x7f-\x9f]"
+)
+_SENSITIVE_PROVIDER_KEYS = frozenset({
+    "authorization", "proxy_authorization", "cookie", "set_cookie",
+    "credential", "credentials", "password", "passwd", "secret", "token",
+    "access_token", "auth_token", "id_token", "refresh_token", "session_token",
+    "api_key", "client_secret", "private_key", "x_api_key", "x_auth_token",
+    "x_csrf_token", "x_xsrf_token",
+})
+_PROVIDER_STRUCTURAL_KEYS = frozenset({
+    "call_id", "finish_reason", "id", "model", "provider", "role",
+    "session_id", "status", "tool", "type",
+})
+_SENSITIVE_HEADER_LINE = re.compile(
+    r"(?im)^(\s*(?:authorization|proxy-authorization|cookie|set-cookie|"
+    r"x-api-key|x-auth-token|x-csrf-token|x-xsrf-token)\s*:\s*).*$"
+)
+_SENSITIVE_QUOTED_HEADER = re.compile(
+    r'''(?ix)
+    (?P<quote>["'])
+    (?P<prefix>(?:authorization|proxy-authorization|cookie|set-cookie|
+       x-api-key|x-auth-token|x-csrf-token|x-xsrf-token)\s*:\s*)
+    (?!["'])[^"'\r\n]*(?P=quote)
+    '''
+)
+_SENSITIVE_ASSIGNMENT = re.compile(
+    r'''(?ix)
+    (?<![A-Za-z0-9_])
+    ((?:["']?(?:authorization|proxy[_-]?authorization|cookie|set[_-]?cookie|credentials?|
+       password|passwd|secret|token|(?:access|auth|id|refresh|session)[_-]?token|
+       api[_-]?key|client[_-]?secret|private[_-]?key|x[_-]?api[_-]?key|
+       x[_-]?auth[_-]?token|x[_-]?(?:csrf|xsrf)[_-]?token)["']?)\s*[:=]\s*)
+    (\[REDACTED\]|"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^&\s,;}\]]+)
+    '''
+)
+_AUTH_SCHEME = re.compile(
+    r"(?i)(\b(?:bearer|basic)\s+)"
+    r"(?=[A-Za-z0-9._~+/=-]{8,})(?=[A-Za-z0-9._~+/=-]*[0-9._~+/=-])"
+    r"[A-Za-z0-9._~+/=-]+"
+)
+_URL_USERINFO = re.compile(
+    r"(?i)\b((?:https?|wss?|ftp)://)[^/\s:@]+(?::[^/\s@]*)?@"
 )
 
 _STATUS_GLYPH = r"(?:\u2705|\u2611\ufe0f?|\u2714\ufe0f?|\U0001f3c1|\U0001f680|\U0001faf0|\U0001f3ac|\U0001f389|\U0001f44d|\u2728)"
@@ -59,6 +103,15 @@ class ProviderError(RuntimeError):
     def __init__(self, message: str, *, metadata: Optional[dict] = None):
         super().__init__(message)
         self.metadata = dict(metadata or {})
+
+
+def _bounded_tool_event_count(events: list[dict]) -> int:
+    """Return a non-sensitive upper-bounded count of observed tool events."""
+    count = sum(
+        1 for event in events
+        if isinstance(event, dict) and event.get("type") == "tool_use"
+    )
+    return min(count, MAX_FAILURE_TOOL_COUNT)
 
 
 def tool_state_text(state: dict) -> str:
@@ -102,12 +155,69 @@ def append_jsonl(path: Path, value) -> None:
 
 
 def clean(text: str, secrets=()) -> str:
-    for secret in secrets:
+    for secret in sorted({str(value) for value in secrets if value}, key=len, reverse=True):
         if secret:
             text = text.replace(secret, "[REDACTED]")
-    text = re.sub(r"(?i)(bearer\s+)[\w.\-]+", r"\1[REDACTED]", text)
+    text = _URL_USERINFO.sub(r"\1[REDACTED]@", text)
+    text = _SENSITIVE_QUOTED_HEADER.sub(
+        lambda match: (
+            match.group("quote") + match.group("prefix")
+            + "[REDACTED]" + match.group("quote")
+        ),
+        text,
+    )
+    text = _AUTH_SCHEME.sub(r"\1[REDACTED]", text)
+
+    def redact_assignment(match: re.Match) -> str:
+        value = match.group(2)
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            replacement = value[0] + "[REDACTED]" + value[-1]
+        else:
+            replacement = "[REDACTED]"
+        return match.group(1) + replacement
+
+    text = _SENSITIVE_ASSIGNMENT.sub(redact_assignment, text)
+    text = _SENSITIVE_HEADER_LINE.sub(r"\1[REDACTED]", text)
     text = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}", "[REDACTED]", text)
     return _CONTROL.sub("", text)
+
+
+def _provider_structural_field(path: tuple[str, ...], key: str) -> bool:
+    """Identify control fields only at their documented event-envelope paths."""
+    if not path:
+        return key in _PROVIDER_STRUCTURAL_KEYS
+    if path == ("part",):
+        return key in {
+            "call_id", "finish_reason", "id", "model", "provider", "role",
+            "status", "tool", "type",
+        }
+    if path == ("part", "state"):
+        return key == "status"
+    return False
+
+
+def _clean_provider_value(value, secrets=(), _path: tuple[str, ...] = ()):
+    """Recursively sanitize one parsed provider event before any consumer sees it."""
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            snake_key = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key))
+            normalized = re.sub(r"[^a-z0-9]+", "_", snake_key.lower()).strip("_")
+            if normalized in _SENSITIVE_PROVIDER_KEYS:
+                cleaned[key] = "[REDACTED]"
+            elif (_provider_structural_field(_path, normalized)
+                  and isinstance(item, str)):
+                cleaned[key] = clean(item)
+            else:
+                cleaned[key] = _clean_provider_value(
+                    item, secrets, _path + (normalized,)
+                )
+        return cleaned
+    if isinstance(value, list):
+        return [_clean_provider_value(item, secrets, _path) for item in value]
+    if isinstance(value, str):
+        return clean(value, secrets)
+    return value
 
 
 def _bounded_assistant_text(text: str) -> tuple[str, bool]:
@@ -334,6 +444,53 @@ def _seed_opencode_dependencies(destination: Path) -> None:
         shutil.copy2(source / name, destination / name)
 
 
+def _remove_ambient_path(path: Path) -> None:
+    """Remove one untrusted OpenCode context path without following symlinks."""
+    try:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.exists():
+            shutil.rmtree(path)
+    except OSError as exc:
+        raise ProviderError(
+            "OpenCode ambient instruction state could not be isolated"
+        ) from exc
+
+
+def _prepare_opencode_context(runtime: Path, transport: Path) -> tuple[Path, Path, Path]:
+    """Create a prompt-isolated OpenCode home and discard ambient directives.
+
+    OpenCode's project-config switch excludes repository instructions, but its
+    config directory, managed config, home-directory skills, and execution
+    directory are separate inputs.  These paths persist so sessions can resume;
+    remove only instruction/config/skill names and retain provider/session data
+    plus the pinned plugin SDK.
+    """
+    config_dir = private_dir(runtime / "config/opencode")
+    for name in (
+        "AGENTS.md", "CLAUDE.md", "CONTEXT.md",
+        "config.json", "opencode.json", "opencode.jsonc", "config",
+        "agent", "agents", "command", "commands", "skill", "skills",
+        "plugin", "plugins", "tool", "tools",
+    ):
+        _remove_ambient_path(config_dir / name)
+
+    for name in (
+        "AGENTS.md", "CLAUDE.md", "CONTEXT.md",
+        "opencode.json", "opencode.jsonc", ".opencode", ".claude", ".agents",
+    ):
+        _remove_ambient_path(transport / name)
+
+    # Neither directory contains resumable sessions; rebuild them so an older
+    # release or host policy cannot contribute prompts to this provider call.
+    home = runtime / "opencode-home"
+    managed = runtime / "managed-config"
+    for directory in (home, managed):
+        _remove_ambient_path(directory)
+        private_dir(directory)
+    return config_dir, home, managed
+
+
 
 
 async def _terminate(proc: asyncio.subprocess.Process) -> None:
@@ -380,39 +537,88 @@ class OpenCodeClient:
                 "external_directory": "deny",
             }
 
-        # A command-name blacklist cannot contain a native shell: Python,
-        # Node, /dev/tcp, copied binaries, and package hooks can all perform
-        # unscoped I/O or read private credentials. Local documents remain
-        # available through OpenCode's bounded file tools; every network and
-        # protocol action must cross the observable grypton_* MCP boundary.
-        bash = "deny"
-
-        # OpenCode runs inside a small transport directory rather than the
-        # Grypton checkout.  The engagement itself is deliberately outside
-        # that directory, so a blanket external-directory denial makes even
-        # its own scope file unreadable.  Give the worker access only to the
-        # one engagement and its transport directory; every other external
-        # path remains denied.  Manager sessions have no filesystem tools.
-        external_directory: str | dict = "deny"
-        allowed_external = [path.resolve() for path in (workspace, transport_workspace)
-                            if path is not None]
-        if allowed_external:
-            # OpenCode permission patterns are evaluated in insertion order
-            # with the last matching rule winning. Put the catch-all first so
-            # the two narrow workspace grants can override it.
-            external_directory = {
-                "*": "deny",
-                **{str(path / "*"): "allow" for path in allowed_external},
-            }
+        workspace = workspace.resolve() if workspace is not None else None
+        transport_workspace = (
+            transport_workspace.resolve()
+            if transport_workspace is not None else None
+        )
+        public_dirs = ("research", "scripts", "loot", "workspace", "flows")
+        public_docs = (
+            "findings.md", "attack-surface.md", "tested-techniques.md",
+            "scope-rules.md", "progress.md", "AGENTS.md",
+        )
+        file_rules: dict[str, str] = {"*": "deny"}
+        external_directory: dict[str, str] = {"*": "deny"}
+        if workspace is not None and transport_workspace is not None:
+            engagement_alias = transport_workspace / "engagement"
+            # OpenCode versions differ on whether file-tool permission inputs
+            # are absolute, worktree-relative, or the unresolved symlink form.
+            # Authorize every safe spelling and deny private children last.
+            file_rules.update({
+                "engagement": "allow",
+                str(workspace): "allow",
+                str(engagement_alias): "allow",
+            })
+            for name in public_dirs:
+                spellings = (
+                    workspace / name,
+                    engagement_alias / name,
+                )
+                file_rules[f"engagement/{name}"] = "allow"
+                file_rules[f"engagement/{name}/*"] = "allow"
+                external_directory[f"engagement/{name}"] = "allow"
+                external_directory[f"engagement/{name}/*"] = "allow"
+                for path in spellings:
+                    file_rules[str(path)] = "allow"
+                    file_rules[str(path / "*")] = "allow"
+                    external_directory[str(path)] = "allow"
+                    external_directory[str(path / "*")] = "allow"
+            for name in public_docs:
+                spellings = (
+                    workspace / name,
+                    engagement_alias / name,
+                )
+                file_rules[f"engagement/{name}"] = "allow"
+                external_directory[f"engagement/{name}"] = "allow"
+                for path in spellings:
+                    file_rules[str(path)] = "allow"
+                    external_directory[str(path)] = "allow"
+            for private_name in (".ledger", "transcripts"):
+                file_rules[f"engagement/{private_name}"] = "deny"
+                file_rules[f"engagement/{private_name}/*"] = "deny"
+                external_directory[f"engagement/{private_name}"] = "deny"
+                external_directory[f"engagement/{private_name}/*"] = "deny"
+                file_rules[str(workspace / private_name)] = "deny"
+                file_rules[str(workspace / private_name / "*")] = "deny"
+                external_directory[str(workspace / private_name)] = "deny"
+                external_directory[str(workspace / private_name / "*")] = "deny"
+                file_rules[str(engagement_alias / private_name)] = "deny"
+                file_rules[str(engagement_alias / private_name / "*")] = "deny"
+                external_directory[str(engagement_alias / private_name)] = "deny"
+                external_directory[str(engagement_alias / private_name / "*")] = "deny"
+            for private_file in ("target.json",):
+                for relative in (f"engagement/{private_file}",):
+                    file_rules[relative] = "deny"
+                    external_directory[relative] = "deny"
+                for path in (
+                    workspace / private_file,
+                    engagement_alias / private_file,
+                ):
+                    file_rules[str(path)] = "deny"
+                    external_directory[str(path)] = "deny"
 
         return {
             "*": "allow",
-            "bash": bash,
-            "edit": "deny",
+            "bash": "allow",
+            "read": dict(file_rules),
+            "edit": dict(file_rules),
+            "glob": dict(file_rules),
+            "grep": dict(file_rules),
+            "list": dict(file_rules),
             "webfetch": "deny",
             "websearch": "deny",
             "question": "deny",
-            "task": "deny",
+            "task": "allow",
             "external_directory": external_directory,
         }
 
@@ -453,6 +659,8 @@ class OpenCodeClient:
         self.transcripts = private_dir(self.workspace / "transcripts")
         self.proc: Optional[asyncio.subprocess.Process] = None
         self.gateway: OpenClaudeGateway | None = None
+        self.native_shell: NativeShellSpec | None = None
+        self.network_broker: ScopedNetworkBroker | None = None
         self._terminal_signal: asyncio.Event | None = None
         self._terminal_error = ""
         self._terminal_metadata: dict = {}
@@ -536,13 +744,55 @@ class OpenCodeClient:
         self.provider = self.gateway.model.provider
         return self.gateway
 
+    async def _ensure_network_broker(self) -> None:
+        if not self.allow_tools:
+            return
+        if self.native_shell is None:
+            raise ProviderError("worker native shell is not initialized")
+        if self.network_broker is None:
+            self.network_broker = ScopedNetworkBroker(
+                self.workspace,
+                self.target_slug,
+                self.native_shell.broker_socket,
+                self.native_shell.uid,
+            )
+        try:
+            await self.network_broker.start()
+        except NetworkBrokerError as exc:
+            raise ProviderError(
+                f"{self.role} scoped network broker is unavailable: {exc}"
+            ) from exc
+
     def _environment(self) -> tuple[dict, str]:
         if self.gateway is None:
             raise ProviderError("OpenClaude gateway must be started before building OpenCode state.")
         gateway = self.gateway
         for kind in ("config", "data", "cache", "state"):
             private_dir(self.runtime / kind)
-        _seed_opencode_dependencies(self.runtime / "config/opencode")
+        opencode_config, opencode_home, managed_config = _prepare_opencode_context(
+            self.runtime, self.transport_workspace
+        )
+        _seed_opencode_dependencies(opencode_config)
+
+        if self.allow_tools and (
+            self.native_shell is None
+            or not self.native_shell.launcher.is_file()
+            or not self.native_shell.home.is_dir()
+            or not self.native_shell.temporary.is_dir()
+            or not (self.native_shell.native_bin / "curl").is_file()
+        ):
+            try:
+                self.native_shell = prepare_native_shell(
+                    target_slug=self.target_slug,
+                    transport=self.transport_workspace,
+                    workspace=self.workspace,
+                    runtime=self.runtime,
+                    source_root=config.SOURCE_ROOT,
+                )
+            except NativeShellError as exc:
+                raise ProviderError(
+                    f"{self.role} native shell isolation is unavailable: {exc}"
+                ) from exc
 
         permissions = self._permissions(
             self.allow_tools,
@@ -559,6 +809,8 @@ class OpenCodeClient:
             "model": transport_route,
             "small_model": transport_route,
             "default_agent": f"grypton-{self.role}",
+            "instructions": [],
+            "skills": {"paths": [], "urls": []},
             "permission": permissions,
             "share": "disabled",
             "autoupdate": False,
@@ -576,6 +828,8 @@ class OpenCodeClient:
             "mcp": {},
         }
         if self.allow_tools:
+            assert self.native_shell is not None
+            inline["shell"] = str(self.native_shell.launcher)
             inline["mcp"] = {
                 "grypton": {
                     "type": "local",
@@ -595,16 +849,22 @@ class OpenCodeClient:
 
         env = _minimal_child_environment()
         env.update({
+            "HOME": str(opencode_home),
             "XDG_CONFIG_HOME": str(self.runtime / "config"),
             "XDG_DATA_HOME": str(self.runtime / "data"),
             "XDG_CACHE_HOME": str(self.runtime / "cache"),
             "XDG_STATE_HOME": str(self.runtime / "state"),
             "OPENCODE_CONFIG_CONTENT": json.dumps(inline),
-            "OPENCODE_CONFIG_DIR": str(self.runtime / "config/opencode"),
+            "OPENCODE_CONFIG_DIR": str(opencode_config),
             "OPENCODE_DISABLE_CLAUDE_CODE": "true",
+            "OPENCODE_DISABLE_CLAUDE_CODE_PROMPT": "true",
             "OPENCODE_DISABLE_PROJECT_CONFIG": "true",
+            "OPENCODE_DISABLE_EXTERNAL_SKILLS": "true",
             "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS": "true",
             "OPENCODE_DISABLE_DEFAULT_PLUGINS": "true",
+            # OpenCode otherwise reads `/etc/opencode` after local config. Point
+            # its supported managed-config override at a fresh private directory.
+            "OPENCODE_TEST_MANAGED_CONFIG_DIR": str(managed_config),
             "OPENCODE_EXPERIMENTAL_DISABLE_COPY_ON_SELECT": "true",
             "OPENCODE_PERMISSION": json.dumps(permissions),
             "GIT_CEILING_DIRECTORIES": str(config.GRYPTON_HOME),
@@ -617,6 +877,8 @@ class OpenCodeClient:
             "NO_COLOR": "1",
             **gateway.environment(),
         })
+        if self.native_shell is not None:
+            env.update(self.native_shell.internal_environment())
         source_path = str(config.SOURCE_ROOT)
         inherited_pythonpath = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = source_path + (
@@ -632,9 +894,27 @@ class OpenCodeClient:
         timeout: float = 1800,
         title: str = "",
     ) -> OpenCodeResult:
-        binary = config.require_binary("opencode")
-        gateway = await self._ensure_gateway()
-        env, secret = self._environment()
+        try:
+            binary = config.require_binary("opencode")
+            # OpenClaude's bounded credential discovery also examines the selected
+            # working directory. Remove stale project artifacts before starting the
+            # gateway, then `_environment` repeats the check immediately before
+            # OpenCode starts.
+            _prepare_opencode_context(self.runtime, self.transport_workspace)
+            gateway = await self._ensure_gateway()
+            env, secret = self._environment()
+            await self._ensure_network_broker()
+        except ProviderError as exc:
+            # No OpenCode process exists yet, so this is positive evidence that
+            # no model-selected native tool could have started.
+            exc.metadata = {
+                **(exc.metadata if isinstance(exc.metadata, dict) else {}),
+                "replay_safe": True,
+            }
+            raise
+        event_secrets = (secret, *credentials.provider_redaction_values(
+            self.target_slug
+        ))
         transport_route = gateway.model_route
         argv = [
             binary, "run", "--pure", "--format", "json",
@@ -650,22 +930,51 @@ class OpenCodeClient:
 
         started = time.time()
         prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        self.proc = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=str(self.transport_workspace),
-            env=env,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
-        self._terminal_signal = asyncio.Event()
-        self._terminal_error = ""
-        self._terminal_metadata = {}
-        assert self.proc.stdin and self.proc.stdout and self.proc.stderr
-        self.proc.stdin.write(prompt.encode("utf-8"))
-        await self.proc.stdin.drain()
-        self.proc.stdin.close()
+        try:
+            self.proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=str(self.transport_workspace),
+                env=env,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # Process creation failed, which is the last point at which exact
+            # replay is positively known to be free of native tool effects.
+            raise ProviderError(
+                f"{self.role} OpenCode process could not start "
+                f"({type(exc).__name__}).",
+                metadata={"replay_safe": True},
+            ) from exc
+        try:
+            self._terminal_signal = asyncio.Event()
+            self._terminal_error = ""
+            self._terminal_metadata = {}
+            if not (self.proc.stdin and self.proc.stdout and self.proc.stderr):
+                raise ProviderError("OpenCode process streams are unavailable.")
+            self.proc.stdin.write(prompt.encode("utf-8"))
+            await self.proc.stdin.drain()
+            self.proc.stdin.close()
+        except asyncio.CancelledError:
+            await _terminate(self.proc)
+            raise
+        except Exception as exc:
+            await _terminate(self.proc)
+            if isinstance(exc, ProviderError):
+                exc.metadata = {
+                    **(exc.metadata if isinstance(exc.metadata, dict) else {}),
+                    "replay_safe": False,
+                }
+                raise
+            raise ProviderError(
+                f"{self.role} OpenCode prompt delivery failed "
+                f"({type(exc).__name__}).",
+                metadata={"replay_safe": False},
+            ) from exc
 
         events: list[dict] = []
         malformed: list[str] = []
@@ -673,18 +982,23 @@ class OpenCodeClient:
         stream_path = self.transcripts / f"{self.role}.opencode.events.jsonl"
 
         def consume_stdout_line(raw: bytes) -> None:
-            line = clean(raw.decode("utf-8", errors="replace"), (secret,))
-            if not line.strip():
+            decoded = raw.decode("utf-8", errors="replace")
+            if not decoded.strip():
                 return
-            cleaned_lines.append(line)
             try:
-                event = json.loads(line)
+                event = json.loads(decoded)
             except ValueError:
+                line = clean(decoded, event_secrets)
+                cleaned_lines.append(line)
                 malformed.append(line[:500])
                 return
             if not isinstance(event, dict):
+                line = clean(decoded, event_secrets)
+                cleaned_lines.append(line)
                 malformed.append(line[:500])
                 return
+            event = _clean_provider_value(event, event_secrets)
+            cleaned_lines.append(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
             events.append(event)
             append_jsonl(stream_path, event)
             if self.event_callback:
@@ -737,7 +1051,7 @@ class OpenCodeClient:
                 if isinstance(value, bytes):
                     stderr_bytes = value
             cleaned_stderr = clean(
-                stderr_bytes.decode("utf-8", errors="replace"), (secret,)
+                stderr_bytes.decode("utf-8", errors="replace"), event_secrets
             )
             if cleaned_stderr:
                 append_jsonl(stream_path, {
@@ -783,9 +1097,7 @@ class OpenCodeClient:
                 "duration_s": round(time.time() - started, 3),
                 "returncode": self.proc.returncode,
                 "event_count": len(events),
-                "tool_count": sum(
-                    event.get("type") == "tool_use" for event in events
-                ),
+                "tool_count": _bounded_tool_event_count(events),
                 "usage": [],
                 "cost": 0.0,
                 "prompt_sha256": prompt_hash,
@@ -796,12 +1108,12 @@ class OpenCodeClient:
                 "ok": False,
                 "error_class": classification,
                 "error_type": type(exc).__name__,
-                "error_message": clean(str(exc), (secret,))[:1000],
+                "error_message": clean(str(exc), event_secrets)[:1000],
             }
             if isinstance(source, str) and source:
-                record["error_source"] = clean(source, (secret,))[:100]
+                record["error_source"] = clean(source, event_secrets)[:100]
             if isinstance(reason, str) and reason:
-                record["error_reason"] = clean(reason, (secret,))[:100]
+                record["error_reason"] = clean(reason, event_secrets)[:100]
             if 100 <= upstream_status <= 599:
                 record["upstream_status"] = upstream_status
             if 0 < pool_size <= 1000:
@@ -835,10 +1147,15 @@ class OpenCodeClient:
                 failure_class = "openclaude_terminal"
                 await _terminate(self.proc)
                 await asyncio.gather(io_task, return_exceptions=True)
+                terminal_metadata = dict(self._terminal_metadata)
+                # A terminal sidecar signal can race with OpenCode stdout after
+                # one or more tools have already run. Preserve only the bounded
+                # count needed by the engine's replay-suppression decision.
+                terminal_metadata["tool_count"] = _bounded_tool_event_count(events)
                 raise ProviderError(
                     self._terminal_error
                     or f"{self.role} OpenClaude provider became terminal.",
-                    metadata=self._terminal_metadata,
+                    metadata=terminal_metadata,
                 )
             cleaned_stdout, stderr, returncode = await io_task
         except ProviderError as exc:
@@ -848,6 +1165,16 @@ class OpenCodeClient:
                 await _terminate(self.proc)
             await asyncio.gather(io_task, return_exceptions=True)
             await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            # Keep replay-safety metadata on every provider failure that can
+            # occur after stdout began. Never expose tool names, inputs, output,
+            # or session data through the exception boundary.
+            exc.metadata = {
+                **(exc.metadata if isinstance(exc.metadata, dict) else {}),
+                "tool_count": _bounded_tool_event_count(events),
+                # Once the native-capable OpenCode process exists, a missing
+                # stdout event cannot prove that its command never ran.
+                "replay_safe": False,
+            }
             append_failure_record(exc, failure_class)
             raise
         except BaseException as exc:
@@ -861,6 +1188,16 @@ class OpenCodeClient:
             await asyncio.gather(io_task, return_exceptions=True)
             await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
             append_failure_record(exc, failure_class)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            if isinstance(exc, Exception):
+                raise ProviderError(
+                    f"{self.role} OpenCode call failed ({type(exc).__name__}).",
+                    metadata={
+                        "tool_count": _bounded_tool_event_count(events),
+                        "replay_safe": False,
+                    },
+                ) from exc
             raise
         finally:
             if not terminal_task.done():
@@ -874,7 +1211,9 @@ class OpenCodeClient:
             self._terminal_error = ""
             self._terminal_metadata = {}
 
-        cleaned_stderr = clean(stderr.decode("utf-8", errors="replace"), (secret,))
+        cleaned_stderr = clean(
+            stderr.decode("utf-8", errors="replace"), event_secrets
+        )
         if cleaned_stderr:
             append_jsonl(stream_path, {"type": "stderr", "text": cleaned_stderr[-8000:]})
         if malformed:
@@ -953,13 +1292,13 @@ class OpenCodeClient:
             call_record.update({
                 "error_class": "process_exit",
                 "error_type": "ProviderError",
-                "error_message": clean(detail, (secret,))[:1000],
+                "error_message": clean(detail, event_secrets)[:1000],
             })
         elif errors:
             call_record.update({
                 "error_class": "provider_event_error",
                 "error_type": "ProviderError",
-                "error_message": clean(errors[-1], (secret,))[:1000],
+                "error_message": clean(errors[-1], event_secrets)[:1000],
             })
         elif not texts:
             call_record.update({
@@ -968,12 +1307,25 @@ class OpenCodeClient:
                 "error_message": f"{self.role} OpenCode returned no final text.",
             })
         append_jsonl(self.transcripts / "provider-calls.jsonl", call_record)
+        failure_metadata = {
+            "tool_count": _bounded_tool_event_count(events),
+            "replay_safe": False,
+        }
         if returncode:
-            raise ProviderError(f"{self.role} OpenCode exited with {returncode}: {detail}")
+            raise ProviderError(
+                f"{self.role} OpenCode exited with {returncode}: {detail}",
+                metadata=failure_metadata,
+            )
         if errors:
-            raise ProviderError(f"{self.role} OpenCode error: {errors[-1]}")
+            raise ProviderError(
+                f"{self.role} OpenCode error: {errors[-1]}",
+                metadata=failure_metadata,
+            )
         if not texts:
-            raise ProviderError(f"{self.role} OpenCode returned no final text.")
+            raise ProviderError(
+                f"{self.role} OpenCode returned no final text.",
+                metadata=failure_metadata,
+            )
         return OpenCodeResult(
             text=assistant_text,
             session_id=result_session,
@@ -992,6 +1344,9 @@ class OpenCodeClient:
         if self.gateway is not None:
             await self.gateway.close()
             self.gateway = None
+        if self.network_broker is not None:
+            await self.network_broker.close()
+            self.network_broker = None
 
 
 class CodexValidator:

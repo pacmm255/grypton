@@ -216,6 +216,9 @@ class GryptonConfig:
     passive_stagnation_limit: int = 6
     # Cap on transcript chars fed to the manager per turn (keeps codex fast).
     digest_char_budget: int = 24000
+    # Start a new Kraude conversation after this many reported OpenCode tokens
+    # have accumulated in one worker session. 0 disables automatic rollover.
+    worker_context_rollover_tokens: int = 250_000
 
     # Tooling toggles
     enable_goja: bool = True

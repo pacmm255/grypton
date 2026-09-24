@@ -10,7 +10,7 @@ import unittest
 
 from grypton import config, prompts
 from grypton.cli import build_parser
-from grypton.engine import Engine
+from grypton.engine import Engine, _RECOVERY_ACTION
 from grypton.runtime import _engine_argv, _paths, _write_json, public_status, run_engine, start_background
 from grypton.workspace import Constraints, Workspace
 
@@ -154,6 +154,7 @@ class FreshWorkerSessionTests(unittest.TestCase):
 
                 meta = ws.load_meta()
                 self.assertEqual(meta.worker_uuid, "")
+                self.assertEqual(meta.last_directive, "")
                 self.assertEqual(meta.manager_session_id, "manager-keep")
                 self.assertEqual(meta.turn_index, 17)
                 surface = ws.surface.all()
@@ -168,6 +169,40 @@ class FreshWorkerSessionTests(unittest.TestCase):
                     "private operator text", "private manager rule", "private free-form note",
                 ):
                     self.assertNotIn(private_value, scope_doc)
+
+        asyncio.run(exercise())
+
+    def test_fresh_worker_without_brief_does_not_replay_saved_directive(self):
+        async def exercise():
+            with isolated_runtime():
+                ws = Workspace("fresh-worker-no-brief")
+                ws.create("https://example.test", "web")
+                ws.update_meta(
+                    worker_uuid="worker-old",
+                    manager_session_id="manager-keep",
+                    last_directive="stale manager playbook",
+                )
+                engine = Engine(
+                    ws.slug,
+                    backend="real",
+                    worker_model="fixture/worker",
+                    manager_model="fixture/manager",
+                )
+                with patch("grypton.worker.KraudeWorker", _FakeWorker), patch(
+                    "grypton.manager.KryptexManager", _FakeManager
+                ):
+                    await engine.setup(
+                        brief="",
+                        target="https://example.test",
+                        target_type="web",
+                        fresh_clone=False,
+                        fresh_worker_session=True,
+                    )
+
+                self.assertEqual(_FakeWorker.instances[-1].spec.session_uuid, "")
+                self.assertEqual(_FakeManager.instances[-1].session_id, "manager-keep")
+                self.assertEqual(ws.load_meta().last_directive, "")
+                self.assertEqual(await engine._opening_directive(), _RECOVERY_ACTION)
 
         asyncio.run(exercise())
 
@@ -200,6 +235,90 @@ class FreshWorkerSessionTests(unittest.TestCase):
                 self.assertEqual(_FakeWorker.instances[-1].spec.session_uuid, "worker-keep")
                 self.assertEqual(_FakeManager.instances[-1].session_id, "manager-keep")
                 self.assertEqual(ws.load_meta().worker_uuid, "worker-keep")
+
+        asyncio.run(exercise())
+
+    def test_legacy_prompt_contract_discards_worker_session_once(self):
+        async def exercise():
+            with isolated_runtime():
+                ws = Workspace("legacy-worker-prompt")
+                ws.create("https://example.test", "web")
+                ws.update_meta(
+                    worker_uuid="worker-from-old-prompt",
+                    worker_model="fixture/saved-worker",
+                    worker_effort="high",
+                    manager_session_id="manager-keep",
+                    manager_model="fixture/saved-manager",
+                    manager_effort="xhigh",
+                    last_directive=(
+                        "Legacy full program prose: never test production; "
+                        "replay all private operator rules."
+                    ),
+                    turn_index=23,
+                )
+                # Emulate metadata written before the worker prompt contract
+                # acquired a durable version stamp.
+                raw = json.loads(ws.meta_path.read_text(encoding="utf-8"))
+                raw.pop("worker_prompt_contract_version")
+                ws.meta_path.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+                self.assertEqual(ws.load_meta().worker_prompt_contract_version, 0)
+
+                engine = Engine(ws.slug, backend="real")
+                with patch("grypton.worker.KraudeWorker", _FakeWorker), patch(
+                    "grypton.manager.KryptexManager", _FakeManager
+                ):
+                    await engine.setup(
+                        brief="",
+                        target="https://example.test",
+                        target_type="web",
+                        fresh_clone=False,
+                        fresh_worker_session=False,
+                    )
+
+                migrated = ws.load_meta()
+                self.assertEqual(_FakeWorker.instances[-1].spec.session_uuid, "")
+                self.assertEqual(_FakeManager.instances[-1].session_id, "manager-keep")
+                self.assertEqual(migrated.worker_uuid, "")
+                self.assertEqual(
+                    migrated.worker_prompt_contract_version,
+                    prompts.WORKER_PROMPT_CONTRACT_VERSION,
+                )
+                self.assertEqual(migrated.worker_model, "fixture/saved-worker")
+                self.assertEqual(migrated.worker_effort, "high")
+                self.assertEqual(migrated.manager_session_id, "manager-keep")
+                self.assertEqual(migrated.manager_model, "fixture/saved-manager")
+                self.assertEqual(migrated.manager_effort, "xhigh")
+                self.assertEqual(migrated.last_directive, "")
+                self.assertEqual(migrated.turn_index, 23)
+                self.assertEqual(await engine._opening_directive(), _RECOVERY_ACTION)
+
+                # Once the current stamp is durable, a replacement worker
+                # conversation and its narrow directive are safe to resume.
+                ws.update_meta(
+                    worker_uuid="worker-from-current-prompt",
+                    last_directive="Continue the current narrow test.",
+                )
+                resumed = Engine(ws.slug, backend="real")
+                with patch("grypton.worker.KraudeWorker", _FakeWorker), patch(
+                    "grypton.manager.KryptexManager", _FakeManager
+                ):
+                    await resumed.setup(
+                        brief="",
+                        target="https://example.test",
+                        target_type="web",
+                        fresh_clone=False,
+                        fresh_worker_session=False,
+                    )
+
+                self.assertEqual(
+                    _FakeWorker.instances[-1].spec.session_uuid,
+                    "worker-from-current-prompt",
+                )
+                self.assertEqual(ws.load_meta().worker_uuid, "worker-from-current-prompt")
+                self.assertEqual(
+                    await resumed._opening_directive(),
+                    "Continue the current narrow test.",
+                )
 
         asyncio.run(exercise())
 

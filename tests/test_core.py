@@ -55,6 +55,7 @@ def isolated_runtime():
             "RUNTIME_DIR": root / ".state/runtime",
             "LOG_DIR": root / ".state/runtime/logs",
             "PROVIDER_DIR": root / ".state/providers",
+            "CREDENTIALS_DIR": root / ".state/credentials",
             "OPENCODE_WORKSPACES_DIR": root / ".opencode-workspaces",
             "TARGET_DATA_DIR": root / "target",
         }
@@ -326,7 +327,7 @@ class CliTests(unittest.TestCase):
                     "Test using only accounts created with @bugcrowdninja.com email addresses."
                 )},
                 "scope": [
-                    {"name": "web", "inScope": True, "targets": [
+                    {"name": "web", "inScope": True, "maxSeverity": "P1", "targets": [
                         {"name": "*.example.test", "uri": "*.example.test", "category": "website"},
                         {"name": "GraphQL", "uri": "https://api.example.test/graphql", "category": "api"},
                     ]},
@@ -1513,12 +1514,16 @@ class WorkerEventTests(unittest.TestCase):
         self.assertNotIn("GITHUB_TOKEN", env)
         self.assertNotIn("HTTPS_PROXY", env)
 
-    def test_worker_permissions_force_network_through_captured_tools(self):
+    def test_worker_permissions_enable_native_tools_and_keep_manager_toolless(self):
         permissions = OpenCodeClient._permissions(True)
+        for name in ("bash", "task"):
+            self.assertEqual(permissions[name], "allow")
+        for name in ("read", "edit", "glob", "grep", "list"):
+            self.assertIsInstance(permissions[name], dict)
+            self.assertEqual(permissions[name]["*"], "deny")
         self.assertEqual(permissions["webfetch"], "deny")
         self.assertEqual(permissions["websearch"], "deny")
-        self.assertEqual(permissions["bash"], "deny")
-        self.assertEqual(permissions["edit"], "deny")
+        self.assertEqual(permissions["question"], "deny")
 
         manager_permissions = OpenCodeClient._permissions(False)
         self.assertEqual(manager_permissions["*"], "deny")
@@ -1527,15 +1532,42 @@ class WorkerEventTests(unittest.TestCase):
         workspace = Path("/tmp/grypton-engagement")
         transport = Path("/tmp/grypton-transport")
         permissions = OpenCodeClient._permissions(True, workspace, transport)
-        self.assertEqual(permissions["external_directory"]["/tmp/grypton-engagement/*"], "allow")
-        self.assertEqual(permissions["external_directory"]["/tmp/grypton-transport/*"], "allow")
+        for rule_name in (
+            "read", "edit", "glob", "grep", "list", "external_directory",
+        ):
+            rules = permissions[rule_name]
+            for public in (
+                "/tmp/grypton-engagement/research",
+                "/tmp/grypton-transport/engagement/research",
+                "engagement/research",
+            ):
+                self.assertEqual(rules[public], "allow")
+                self.assertEqual(rules[public + "/*"], "allow")
+            for private in (
+                "/tmp/grypton-engagement/transcripts",
+                "/tmp/grypton-transport/engagement/.ledger",
+                "engagement/transcripts",
+            ):
+                self.assertEqual(rules[private], "deny")
+                self.assertEqual(rules[private + "/*"], "deny")
+            for private_file in (
+                "/tmp/grypton-engagement/target.json",
+                "/tmp/grypton-transport/engagement/target.json",
+                "engagement/target.json",
+            ):
+                self.assertEqual(rules[private_file], "deny")
+            self.assertEqual(rules["engagement/AGENTS.md"], "allow")
+            self.assertNotIn(
+                "/tmp/grypton-transport/arbitrary-private-file", rules
+            )
         self.assertEqual(permissions["external_directory"]["*"], "deny")
         self.assertEqual(next(iter(permissions["external_directory"])), "*")
 
     def test_mcp_subprocess_imports_from_source_when_state_home_is_elsewhere(self):
         with isolated_runtime():
-            workspace = config.ENGAGEMENTS_DIR / "mcp-import"
-            workspace.mkdir(parents=True)
+            workspace_state = Workspace("mcp-import")
+            workspace_state.create("example.test", "web")
+            workspace = workspace_state.root
             client = OpenCodeClient(
                 role="worker", route=config.WORKER_MODEL, effort="max",
                 workspace=workspace, target_slug="mcp-import", allow_tools=True,
@@ -1569,6 +1601,7 @@ class WorkerEventTests(unittest.TestCase):
             self.assertEqual(inline["enabled_providers"], ["openclaude"])
             self.assertEqual(inline["model"], transport_route)
             self.assertIn("openclaude", inline["provider"])
+            self.assertEqual(inline["shell"], str(client.native_shell.launcher))
             self.assertEqual(env[TOKEN_ENV], gateway_token)
             self.assertEqual(secret, gateway_token)
             self.assertNotIn(gateway_token, env["OPENCODE_CONFIG_CONTENT"])
@@ -1662,7 +1695,7 @@ class WorkerEventTests(unittest.TestCase):
 
 class EngineTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
-    def _worker_pool_exhausted(status: int = 429) -> ProviderError:
+    def _worker_pool_exhausted(status: int = 429, tool_count: int = 0) -> ProviderError:
         return ProviderError(
             f"worker OpenClaude credential pool exhausted (upstream HTTP {status}).",
             metadata={
@@ -1672,6 +1705,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                 "reason": "credential_pool_exhausted",
                 "upstream_status": status,
                 "pool_size": 1,
+                "tool_count": tool_count,
             },
         )
 
@@ -1682,13 +1716,15 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                 system_prompt="scope projection", extra_env={"GRYPTON_TARGET": "worker-429"},
             ))
             worker.client.call = AsyncMock(side_effect=[
-                self._worker_pool_exhausted(), self._worker_pool_exhausted(),
+                self._worker_pool_exhausted(tool_count=2),
+                self._worker_pool_exhausted(tool_count=1),
             ])
             directive = "Credential alias: primary. Check whether it can authenticate."
 
             with self.assertRaises(WorkerError) as first:
                 await worker.run_turn(directive)
             self.assertEqual(first.exception.metadata["upstream_status"], 429)
+            self.assertEqual(first.exception.metadata["tool_count"], 2)
             self.assertEqual(worker.session_id, "")
             self.assertEqual(worker.spec.session_uuid, "")
 
@@ -1734,7 +1770,7 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(worker.session_id, f"ses-{index}")
                 self.assertEqual(worker.spec.session_uuid, f"ses-{index}")
 
-    async def test_engine_retries_429_pool_exhaustion_once_with_same_directive_fresh(self):
+    async def test_engine_retries_429_pool_exhaustion_with_fresh_nonreplay_directive(self):
         with isolated_runtime():
             engine = Engine("engine-worker-429", backend="mock")
             directive = "Credential alias: primary. Check whether it can authenticate."
@@ -1745,11 +1781,15 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                 extra_env={"GRYPTON_TARGET": engine.slug},
             ))
             worker.client.call = AsyncMock(side_effect=[
-                self._worker_pool_exhausted(), self._worker_pool_exhausted(),
+                self._worker_pool_exhausted(),
+                OpenCodeResult(
+                    text="Provider recovered.", session_id="ses-recovered",
+                    events=[], tools=[], usage=[], duration_s=0.01,
+                ),
             ])
             engine.worker = worker
             previous_turns = config.CONFIG.max_turns
-            config.CONFIG.max_turns = 2
+            config.CONFIG.max_turns = 1
             try:
                 with patch("grypton.engine.asyncio.sleep", new=AsyncMock()):
                     await engine.run()
@@ -1758,9 +1798,12 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(worker.client.call.await_count, 2)
             calls = worker.client.call.await_args_list
-            self.assertEqual([call.args[0] for call in calls], [directive, directive])
+            self.assertEqual(calls[0].args[0], directive)
+            self.assertNotEqual(calls[1].args[0], directive)
+            self.assertIn("durable results already recorded", calls[1].args[0])
             self.assertEqual([call.kwargs["session_id"] for call in calls],
                              ["ses-heavy", ""])
+            self.assertEqual(engine.turn_index, 1)
             self.assertIn("max_turns safety ceiling", engine.stop_reason)
 
     async def test_explicit_operator_brief_is_opening_directive_verbatim(self):

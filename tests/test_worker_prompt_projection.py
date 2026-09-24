@@ -1,6 +1,7 @@
 import unittest
 
 from grypton import prompts
+from grypton.cli import _constraints, build_parser
 from grypton.toolserver import REGISTRY
 from grypton.workspace import Constraints
 
@@ -35,6 +36,36 @@ class WorkerPromptProjectionTests(unittest.TestCase):
         manager_block = constraints.to_prompt_block()
         self.assertIn("Severity for https://example.test/app: Medium", manager_block)
         self.assertIn("Conditional out-of-scope finding: CORS", manager_block)
+
+    def test_manual_cli_scope_has_truthful_fallback_severity_policy(self):
+        parser = build_parser()
+        restricted = parser.parse_args([
+            "init", "--target", "https://example.test/app",
+            "--in-scope", "https://example.test/app,https://example.test/help",
+            "--only", "P1,P2",
+        ])
+        restricted_block = _constraints(
+            restricted, "https://example.test/app"
+        ).to_worker_prompt_block()
+        self.assertIn(
+            "- In scope: https://example.test/app — severity: P1, P2",
+            restricted_block,
+        )
+        self.assertIn(
+            "- In scope: https://example.test/help — severity: P1, P2",
+            restricted_block,
+        )
+
+        unrestricted = parser.parse_args([
+            "init", "--target", "https://example.test/default",
+        ])
+        unrestricted_block = _constraints(
+            unrestricted, "https://example.test/default"
+        ).to_worker_prompt_block()
+        self.assertIn(
+            "- In scope: https://example.test/default — severity: all severities",
+            unrestricted_block,
+        )
 
     def test_worker_system_and_workspace_are_exact_projection(self):
         block = "=== ENGAGEMENT DATA ===\n- In scope: https://example.test — severity: High"

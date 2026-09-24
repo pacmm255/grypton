@@ -633,7 +633,7 @@ def _print_config(engine, renderer: Renderer) -> None:
     print(f"  worker       {models['kraude']['route']} · {models['kraude']['effort']} · OpenClaude")
     print(f"  manager      {models['kryptex']['route']} · {models['kryptex']['effort']} · OpenClaude")
     print(f"  validator    {models['validator']['route']} · {models['validator']['effort']} (automatic P1/P2)")
-    print(f"  console      {renderer.view} · scoped captured-tool mode")
+    print(f"  console      {renderer.view} · native + Grypton MCP tools")
     print(f"  in scope     {', '.join(constraints.in_scope) or '—'}")
 
 
@@ -661,10 +661,13 @@ async def _print_model_catalog(search: str = "") -> None:
 
 def _print_permissions(engine) -> None:
     constraints = engine.ws.load_constraints()
-    print(bold("Permission mode: scoped captured tools"))
+    print(bold("Permission mode: native + scoped Grypton MCP tools"))
     print(f"  network scope   {', '.join(constraints.in_scope) or '—'}")
     print(f"  exclusions      {', '.join(constraints.out_of_scope) or 'none recorded'}")
-    print("  worker network actions are scope-checked and written to the engagement ledger.")
+    print("  native read/search/edit/task calls can access the public engagement workspace and are retained in provider events.")
+    print("  native Bash cannot open network sockets; its curl command uses the scoped Grypton capture broker.")
+    print("  native web fetch/search are disabled; Grypton MCP network calls enforce scope and write captures and audit rows.")
+    print("  OpenCode questions are disabled; Kryptex resolves ordinary blockers.")
     print("  `!` accepts only read-only local inspection commands; it cannot make network calls.")
 
 
@@ -674,7 +677,6 @@ _WORKSPACE_REFERENCES = {
     "tested": "tested-techniques.md", "tested-techniques.md": "tested-techniques.md",
     "progress": "progress.md", "progress.md": "progress.md",
     "scope": "scope-rules.md", "scope-rules.md": "scope-rules.md",
-    "program": "program-brief.md", "program-brief.md": "program-brief.md",
 }
 _WORKSPACE_REFERENCE_RX = re.compile(r"(?<![\w.])@([A-Za-z][A-Za-z0-9._-]*)")
 

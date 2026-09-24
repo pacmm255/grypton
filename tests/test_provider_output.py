@@ -10,10 +10,10 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from grypton import config
+from grypton import config, credentials
 from grypton.manager import KryptexManager, ManagerContext
 from grypton.providers import (MAX_ASSISTANT_TEXT_CHARS, OpenCodeClient, ProviderError,
-                               _select_assistant_text)
+                               _select_assistant_text, clean)
 from grypton.workspace import Workspace
 
 
@@ -29,6 +29,7 @@ def isolated_runtime():
             "RUNTIME_DIR": state / "runtime",
             "LOG_DIR": state / "runtime/logs",
             "PROVIDER_DIR": state / "providers",
+            "CREDENTIALS_DIR": state / "credentials",
             "OPENCODE_WORKSPACES_DIR": root / ".opencode-workspaces",
             "TARGET_DATA_DIR": root / "target",
         }
@@ -38,6 +39,34 @@ def isolated_runtime():
 
 
 class ProviderOutputTests(unittest.TestCase):
+    def test_pre_spawn_provider_failure_is_replay_safe(self):
+        async def exercise():
+            with isolated_runtime():
+                workspace = config.ENGAGEMENTS_DIR / "pre-spawn-call"
+                workspace.mkdir(parents=True)
+                client = OpenCodeClient(
+                    role="worker", route=config.WORKER_MODEL, effort="max",
+                    workspace=workspace, target_slug="pre-spawn-call",
+                    allow_tools=True, agent_prompt="test",
+                )
+                failure = ProviderError("gateway unavailable")
+                with patch.object(
+                    client, "_ensure_gateway", AsyncMock(side_effect=failure)
+                ), patch.object(
+                    config, "require_binary", return_value="/usr/bin/true"
+                ), patch(
+                    "grypton.providers.asyncio.create_subprocess_exec",
+                    new=AsyncMock(),
+                ) as spawn:
+                    with self.assertRaisesRegex(
+                        ProviderError, "gateway unavailable"
+                    ) as raised:
+                        await client.call("fixture prompt")
+                self.assertIs(raised.exception.metadata["replay_safe"], True)
+                spawn.assert_not_awaited()
+
+        asyncio.run(exercise())
+
     def test_selects_and_normalizes_substantive_final_text(self):
         final = "\n".join([
             "Observed POST /app/session returned HTTP 401 without a cookie.",
@@ -154,6 +183,7 @@ class ProviderOutputTests(unittest.TestCase):
                 )
                 with patch.object(client, "_ensure_gateway", AsyncMock(return_value=gateway)), \
                         patch.object(client, "_environment", return_value=({}, "fixture-secret")), \
+                        patch.object(client, "_ensure_network_broker", AsyncMock()), \
                         patch.object(config, "require_binary", return_value="/usr/bin/true"), \
                         patch("grypton.providers.asyncio.create_subprocess_exec",
                               new=AsyncMock(return_value=process)):
@@ -177,6 +207,304 @@ class ProviderOutputTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_clean_redacts_common_native_tool_credentials(self):
+        cases = {
+            "Set-Cookie: app_session=SYNTHETIC_COOKIE_VALUE; HttpOnly": (
+                "SYNTHETIC_COOKIE_VALUE",
+            ),
+            "Cookie: app_session=SYNTHETIC_COOKIE_VALUE": (
+                "SYNTHETIC_COOKIE_VALUE",
+            ),
+            "Authorization: Basic U1lOVEhFVElDOlZBTFVF": (
+                "U1lOVEhFVElDOlZBTFVF",
+            ),
+            "Authorization: Bearer SYNTHETIC_BEARER+/=": (
+                "SYNTHETIC_BEARER+/=",
+            ),
+            '{"access_token":"SYNTHETIC_ACCESS_VALUE",'
+            '"refreshToken":"SYNTHETIC_REFRESH_VALUE",'
+            '"session_token":"SYNTHETIC_SESSION_VALUE",'
+            '"password":"SYNTHETIC_PASSWORD_VALUE"}': (
+                "SYNTHETIC_ACCESS_VALUE", "SYNTHETIC_REFRESH_VALUE",
+                "SYNTHETIC_SESSION_VALUE", "SYNTHETIC_PASSWORD_VALUE",
+            ),
+            "https://synthetic-user:SYNTHETIC_PASSWORD_VALUE@example.test/path": (
+                "synthetic-user", "SYNTHETIC_PASSWORD_VALUE",
+            ),
+        }
+        for value, secrets in cases.items():
+            with self.subTest(value=value.split(":", 1)[0]):
+                cleaned = clean(value)
+                for secret in secrets:
+                    self.assertNotIn(secret, cleaned)
+                self.assertIn("[REDACTED]", cleaned)
+
+    def test_clean_preserves_ordinary_authentication_prose(self):
+        prose = "Basic authentication is supported; Bearer authentication is optional."
+        self.assertEqual(clean(prose), prose)
+        self.assertNotIn(
+            "SYNTHETIC_BEARER+/=",
+            clean("Bearer SYNTHETIC_BEARER+/="),
+        )
+        self.assertNotIn(
+            "U1lOVEhFVElDOlZBTFVF",
+            clean("Basic U1lOVEhFVElDOlZBTFVF"),
+        )
+        self.assertEqual(
+            clean("Authorization: Bearer readableword"),
+            "Authorization: [REDACTED]",
+        )
+
+    def test_call_sanitizes_tool_input_and_output_before_persistence(self):
+        class _Input:
+            def write(self, value):
+                self.value = value
+
+            async def drain(self):
+                return None
+
+            def close(self):
+                return None
+
+        class _Stream:
+            def __init__(self, payload=b""):
+                self.payload = payload
+
+            async def read(self, _size):
+                payload, self.payload = self.payload, b""
+                return payload
+
+        class _Process:
+            pid = 43215
+
+            def __init__(self, stdout):
+                self.stdin = _Input()
+                self.stdout = _Stream(stdout)
+                self.stderr = _Stream()
+                self.returncode = None
+
+            async def wait(self):
+                self.returncode = 0
+                return 0
+
+        async def exercise():
+            with isolated_runtime():
+                workspace = config.ENGAGEMENTS_DIR / "sanitized-native-call"
+                workspace.mkdir(parents=True)
+                client = OpenCodeClient(
+                    role="worker", route=config.WORKER_MODEL, effort="max",
+                    workspace=workspace, target_slug="sanitized-native-call",
+                    allow_tools=True, agent_prompt="test",
+                )
+                secrets = {
+                    "cookie": "SYNTHETIC_COOKIE_VALUE",
+                    "basic": "U1lOVEhFVElDOlZBTFVF",
+                    "bearer": "SYNTHETIC_BEARER+/=",
+                    "access": "SYNTHETIC_ACCESS_VALUE",
+                    "refresh": "SYNTHETIC_REFRESH_VALUE",
+                    "session": "SYNTHETIC_SESSION_VALUE",
+                    "password": "SYNTHETIC_PASSWORD_VALUE",
+                    "userinfo": "synthetic-user",
+                    "opaque": "SYNTHETIC_OPAQUE_VALUE",
+                }
+                output = "\n".join([
+                    f"Set-Cookie: app_session={secrets['cookie']}; HttpOnly",
+                    f"Cookie: app_session={secrets['cookie']}",
+                    f"Authorization: Basic {secrets['basic']}",
+                    f"Authorization: Bearer {secrets['bearer']}",
+                    json.dumps({
+                        "access_token": secrets["access"],
+                        "refreshToken": secrets["refresh"],
+                        "session_token": secrets["session"],
+                        "password": secrets["password"],
+                    }),
+                    "Unlabelled echoed value: " + secrets["opaque"],
+                ])
+                events = [
+                    {
+                        "type": "tool_use", "sessionID": "ses-sanitized",
+                        "part": {
+                            "callID": "tool-sanitized", "tool": "bash",
+                            "state": {
+                                "status": "completed",
+                                "input": {
+                                    "command": (
+                                        "curl https://"
+                                        f"{secrets['userinfo']}:{secrets['password']}"
+                                        "@example.test/path"
+                                    ),
+                                    "headers": {
+                                        "Cookie": secrets["cookie"],
+                                        "Authorization": f"Basic {secrets['basic']}",
+                                    },
+                                    "password": secrets["password"],
+                                },
+                                "output": output,
+                            },
+                        },
+                    },
+                    {
+                        "type": "text", "sessionID": "ses-sanitized",
+                        "part": {
+                            "text": f"Completed with password={secrets['password']}."
+                        },
+                    },
+                ]
+                payload = b"".join(
+                    (json.dumps(event) + "\n").encode() for event in events
+                )
+                process = _Process(payload)
+                gateway = SimpleNamespace(
+                    model_route=f"openclaude/{config.WORKER_MODEL}",
+                    drain_events=lambda: [],
+                )
+                with patch.object(client, "_ensure_gateway", AsyncMock(return_value=gateway)), \
+                        patch.object(client, "_environment", return_value=({}, "gateway-secret")), \
+                        patch.object(client, "_ensure_network_broker", AsyncMock()), \
+                        patch.object(config, "require_binary", return_value="/usr/bin/true"), \
+                        patch("grypton.providers.credentials.provider_redaction_values",
+                              return_value=(secrets["opaque"],)), \
+                        patch("grypton.providers.asyncio.create_subprocess_exec",
+                              new=AsyncMock(return_value=process)):
+                    result = await client.call("sanitized prompt")
+
+                persisted = (
+                    workspace / "transcripts/worker.opencode.events.jsonl"
+                ).read_text(encoding="utf-8")
+                observable = persisted + json.dumps({
+                    "text": result.text,
+                    "events": result.events,
+                    "tools": result.tools,
+                })
+                for secret in secrets.values():
+                    self.assertNotIn(secret, observable)
+                self.assertIn("[REDACTED]", observable)
+                self.assertEqual(
+                    result.tools[0]["input"]["headers"]["Cookie"], "[REDACTED]"
+                )
+                self.assertEqual(result.tools[0]["input"]["password"], "[REDACTED]")
+                self.assertNotIn("SYNTHETIC_", result.tools[0]["output"])
+
+        asyncio.run(exercise())
+
+    def test_short_credential_preserves_provider_control_fields(self):
+        class _Input:
+            def write(self, value):
+                self.value = value
+
+            async def drain(self):
+                return None
+
+            def close(self):
+                return None
+
+        class _Stream:
+            def __init__(self, payload=b""):
+                self.payload = payload
+
+            async def read(self, _size):
+                payload, self.payload = self.payload, b""
+                return payload
+
+        class _Process:
+            pid = 43216
+
+            def __init__(self, stdout):
+                self.stdin = _Input()
+                self.stdout = _Stream(stdout)
+                self.stderr = _Stream()
+                self.returncode = None
+
+            async def wait(self):
+                self.returncode = 0
+                return 0
+
+        async def exercise():
+            with isolated_runtime():
+                credentials.save_credential(
+                    "short-secret-call", "short", "a", "fixture-password"
+                )
+                workspace = config.ENGAGEMENTS_DIR / "short-secret-call"
+                workspace.mkdir(parents=True)
+                client = OpenCodeClient(
+                    role="worker", route=config.WORKER_MODEL, effort="max",
+                    workspace=workspace, target_slug="short-secret-call",
+                    allow_tools=True, agent_prompt="test",
+                )
+                event = {
+                    "type": "tool_use",
+                    "sessionID": "session-alpha",
+                    "role": "assistant",
+                    "part": {
+                        "callID": "call-alpha",
+                        "tool": "bash",
+                        "state": {
+                            "status": "completed",
+                            "input": {
+                                "command": "printf a",
+                                "status": "a", "type": "a", "id": "a",
+                                "nested": {"tool": "a"},
+                            },
+                            "output": {
+                                "status": "a", "type": "a", "id": "a",
+                                "tool": "a", "payload": "payload a",
+                            },
+                        },
+                    },
+                }
+                text_event = {
+                    "type": "text", "sessionID": "session-alpha",
+                    "role": "assistant", "part": {"text": "done"},
+                }
+                process = _Process((
+                    json.dumps(event) + "\n" + json.dumps(text_event) + "\n"
+                ).encode())
+                gateway = SimpleNamespace(
+                    model_route=f"openclaude/{config.WORKER_MODEL}",
+                    drain_events=lambda: [],
+                )
+                with patch.object(client, "_ensure_gateway", AsyncMock(return_value=gateway)), \
+                        patch.object(client, "_environment", return_value=({}, "gateway-secret")), \
+                        patch.object(client, "_ensure_network_broker", AsyncMock()), \
+                        patch.object(config, "require_binary", return_value="/usr/bin/true"), \
+                        patch("grypton.providers.asyncio.create_subprocess_exec",
+                              new=AsyncMock(return_value=process)):
+                    result = await client.call("short-secret prompt")
+
+                self.assertEqual(result.session_id, "session-alpha")
+                self.assertEqual(result.events[0]["type"], "tool_use")
+                self.assertEqual(result.events[0]["role"], "assistant")
+                part = result.events[0]["part"]
+                self.assertEqual(part["callID"], "call-alpha")
+                self.assertEqual(part["tool"], "bash")
+                self.assertEqual(part["state"]["status"], "completed")
+                self.assertEqual(
+                    part["state"]["input"]["command"], "printf [REDACTED]"
+                )
+                for key in ("status", "type", "id"):
+                    self.assertEqual(
+                        part["state"]["input"][key], "[REDACTED]"
+                    )
+                self.assertEqual(
+                    part["state"]["input"]["nested"]["tool"], "[REDACTED]"
+                )
+                output = part["state"]["output"]
+                for key in ("status", "type", "id", "tool"):
+                    self.assertEqual(output[key], "[REDACTED]")
+                self.assertEqual(
+                    output["payload"],
+                    "p[REDACTED]ylo[REDACTED]d [REDACTED]",
+                )
+                tool_output = json.loads(result.tools[0]["output"])
+                self.assertEqual(tool_output, output)
+                persisted = (
+                    workspace / "transcripts/worker.opencode.events.jsonl"
+                ).read_text(encoding="utf-8")
+                self.assertIn('"sessionID": "session-alpha"', persisted)
+                self.assertNotIn('"output": "payload a"', persisted)
+
+        asyncio.run(exercise())
+
     def test_terminal_gateway_signal_ends_opencode_call_promptly(self):
         class _Input:
             def write(self, value):
@@ -189,15 +517,19 @@ class ProviderOutputTests(unittest.TestCase):
                 return None
 
         class _Stream:
+            def __init__(self, payload=b""):
+                self.payload = payload
+
             async def read(self, _size):
-                return b""
+                payload, self.payload = self.payload, b""
+                return payload
 
         class _Process:
             pid = 43211
 
-            def __init__(self):
+            def __init__(self, stdout=b""):
                 self.stdin = _Input()
-                self.stdout = _Stream()
+                self.stdout = _Stream(stdout)
                 self.stderr = _Stream()
                 self.returncode = None
                 self.done = asyncio.Event()
@@ -216,7 +548,15 @@ class ProviderOutputTests(unittest.TestCase):
                     target_slug="terminal-call", allow_tools=False,
                     agent_prompt="test",
                 )
-                process = _Process()
+                tool_event = {
+                    "type": "tool_use",
+                    "part": {
+                        "callID": "fixture-tool",
+                        "tool": "http_request",
+                        "state": {"status": "completed", "input": {}},
+                    },
+                }
+                process = _Process((json.dumps(tool_event) + "\n").encode())
                 gateway = SimpleNamespace(
                     model_route="openclaude/go/muse-spark-1.3-contributor",
                     drain_events=lambda: [],
@@ -228,6 +568,7 @@ class ProviderOutputTests(unittest.TestCase):
 
                 with patch.object(client, "_ensure_gateway", AsyncMock(return_value=gateway)), \
                         patch.object(client, "_environment", return_value=({}, "fixture-secret")), \
+                        patch.object(client, "_ensure_network_broker", AsyncMock()), \
                         patch.object(config, "require_binary", return_value="/usr/bin/true"), \
                         patch("grypton.providers.asyncio.create_subprocess_exec",
                               new=AsyncMock(return_value=process)), \
@@ -262,6 +603,8 @@ class ProviderOutputTests(unittest.TestCase):
                         "upstream_status": 402,
                         "pool_size": 5,
                         "retry_after_s": 37,
+                        "tool_count": 1,
+                        "replay_safe": False,
                     })
 
                 transcript = (
@@ -286,6 +629,7 @@ class ProviderOutputTests(unittest.TestCase):
                 self.assertEqual(record["upstream_status"], 402)
                 self.assertEqual(record["pool_size"], 5)
                 self.assertEqual(record["retry_after_s"], 37)
+                self.assertEqual(record["tool_count"], 1)
                 self.assertEqual(record["returncode"], -15)
                 self.assertEqual(record["prompt_sha256"], hashlib.sha256(
                     b"fixture prompt"
@@ -344,13 +688,17 @@ class ProviderOutputTests(unittest.TestCase):
 
                 with patch.object(client, "_ensure_gateway", AsyncMock(return_value=gateway)), \
                         patch.object(client, "_environment", return_value=({}, "fixture-secret")), \
+                        patch.object(client, "_ensure_network_broker", AsyncMock()), \
                         patch.object(config, "require_binary", return_value="/usr/bin/true"), \
                         patch("grypton.providers.asyncio.create_subprocess_exec",
                               new=AsyncMock(return_value=process)), \
                         patch("grypton.providers._terminate",
                               new=AsyncMock(side_effect=terminate)):
-                    with self.assertRaisesRegex(ProviderError, "timed out"):
+                    with self.assertRaisesRegex(
+                        ProviderError, "timed out"
+                    ) as raised:
                         await client.call("timeout prompt", timeout=0)
+                    self.assertIs(raised.exception.metadata["replay_safe"], False)
 
                 records = [json.loads(line) for line in (
                     workspace / "transcripts/provider-calls.jsonl"
@@ -419,13 +767,17 @@ class ProviderOutputTests(unittest.TestCase):
 
                 with patch.object(client, "_ensure_gateway", AsyncMock(return_value=gateway)), \
                         patch.object(client, "_environment", return_value=({}, "fixture-secret")), \
+                        patch.object(client, "_ensure_network_broker", AsyncMock()), \
                         patch.object(config, "require_binary", return_value="/usr/bin/true"), \
                         patch("grypton.providers.asyncio.create_subprocess_exec",
                               new=AsyncMock(return_value=process)), \
                         patch("grypton.providers._terminate",
                               new=AsyncMock(side_effect=terminate)):
-                    with self.assertRaisesRegex(ProviderError, "stream failed"):
+                    with self.assertRaisesRegex(
+                        ProviderError, "stream failed"
+                    ) as raised:
                         await client.call("stream prompt", timeout=30)
+                    self.assertIs(raised.exception.metadata["replay_safe"], False)
 
                 record = json.loads((
                     workspace / "transcripts/provider-calls.jsonl"

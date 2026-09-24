@@ -1,11 +1,11 @@
 """Per-target workspace: directories, canonical docs, ledgers, and constraints.
 
-Each target gets ``.state/engagements/<slug>/`` containing the documents the brief
-mandates (R21–R24) plus the user-constraint memory (R27). Every document that
-is appended/updated is backed by a JSONL *ledger* (the source of truth) and a
-rendered Markdown *view* (regenerated atomically). This avoids fragile in-place
-Markdown edits and is safe for concurrent writers (engine + MCP server) via an
-``fcntl`` file lock.
+Each target gets ``.state/engagements/<slug>/`` containing worker-visible
+documents and evidence. Full user constraints and imported program material
+live in manager-only ``.state/operator/engagements/<slug>/`` state. Documents
+that are appended or updated are backed by JSONL ledgers and rendered Markdown
+views. This avoids fragile in-place edits and is safe for concurrent writers
+(engine + MCP server) via an ``fcntl`` file lock.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
-from . import config
+from . import config, prompts
 
 SEVERITY_RANK = {"P1": 1, "P2": 2, "P3": 3, "P4": 4, "P5": 5,
                  "CRITICAL": 1, "HIGH": 2, "MEDIUM": 3, "LOW": 4, "INFO": 5}
@@ -195,12 +195,16 @@ class Constraints:
         stay out of Kraude's static prompt. Runtime enforcement remains in code.
         """
         lines = ["=== ENGAGEMENT DATA ==="]
+        default_severity = (
+            ", ".join(self.included_severities)
+            if self.included_severities else "all severities"
+        )
         for item in self.in_scope:
-            severity = str(self.url_severities.get(item) or "").strip()
-            if severity:
-                lines.append(f"- In scope: {item} — severity: {severity}")
-            else:
-                lines.append(f"- In scope: {item}")
+            severity = (
+                str(self.url_severities.get(item) or "").strip()
+                or default_severity
+            )
+            lines.append(f"- In scope: {item} — severity: {severity}")
         if self.excluded_classes:
             lines.append(
                 "- Out-of-scope finding categories: "
@@ -231,6 +235,7 @@ class TargetMeta:
     created_at: float = field(default_factory=time.time)
     status: str = "initialized"      # initialized|running|paused|stopped|failed
     worker_uuid: str = ""
+    worker_prompt_contract_version: int = prompts.WORKER_PROMPT_CONTRACT_VERSION
     worker_project_dir: str = ""
     worker_kind: str = ""            # opencode+openclaude
     manager_session_id: str = ""     # persistent Kryptex operator-chat session id
@@ -272,7 +277,110 @@ class Workspace:
 
     @property
     def constraints_path(self) -> Path:
+        """Manager-only constraints, kept outside the worker workspace."""
+        return self._operator_state_dir / "scope-rules.json"
+
+    @property
+    def _operator_state_dir(self) -> Path:
+        return config.STATE_DIR / "operator" / "engagements" / self.slug
+
+    @property
+    def program_brief_path(self) -> Path:
+        return self._operator_state_dir / "program-brief.md"
+
+    @property
+    def program_profile_path(self) -> Path:
+        return self._operator_state_dir / "program-profile.json"
+
+    @property
+    def _legacy_constraints_path(self) -> Path:
         return self.root / ".ledger" / "scope-rules.json"
+
+    @property
+    def _legacy_program_brief_path(self) -> Path:
+        return self.root / "program-brief.md"
+
+    @property
+    def _legacy_program_profile_path(self) -> Path:
+        return self.root / ".ledger" / "program-profile.json"
+
+    @property
+    def _legacy_retired_path(self) -> Path:
+        return self._operator_state_dir / ".legacy-retired"
+
+    @property
+    def _legacy_operator_paths(self) -> tuple[Path, Path, Path]:
+        return (
+            self._legacy_constraints_path,
+            self._legacy_program_brief_path,
+            self._legacy_program_profile_path,
+        )
+
+    def _migrate_operator_state(self) -> None:
+        """Mirror legacy controls without disrupting an older live process.
+
+        Scope prose remains available through ``scope-rules.md``. The complete
+        constraints and imported program material are manager inputs and live
+        in a sibling private state tree that OpenCode is not granted through
+        its external-directory permissions. Legacy files remain authoritative
+        until an exclusively owned Engine setup performs the explicit handoff.
+        """
+        # ``Path.mkdir(parents=True, mode=...)`` applies ``mode`` only to the
+        # leaf. Keep both shared operator parents private as well; the native
+        # worker identity has traversal ACLs on ``.state`` for its engagement,
+        # so world-readable intermediate directories would otherwise disclose
+        # operator engagement names.
+        operator_root = config.STATE_DIR / "operator"
+        operator_engagements = operator_root / "engagements"
+        for directory in (
+            operator_root, operator_engagements, self._operator_state_dir,
+        ):
+            directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.chmod(directory, 0o700)
+        pairs = (
+            (self._legacy_constraints_path, self.constraints_path),
+            (self._legacy_program_brief_path, self.program_brief_path),
+            (self._legacy_program_profile_path, self.program_profile_path),
+        )
+        with _file_lock(self._operator_state_dir / ".migration.lock"):
+            if self._legacy_retired_path.is_file():
+                # Once the exclusive handoff is durable, a worker-created file
+                # at an old path must never become manager state or scope input.
+                for legacy in self._legacy_operator_paths:
+                    if legacy.is_symlink() or legacy.is_file():
+                        legacy.unlink()
+                return
+            for legacy, private in pairs:
+                if legacy.is_symlink() or not legacy.is_file():
+                    continue
+                _atomic_write(
+                    private,
+                    legacy.read_text(encoding="utf-8"),
+                )
+
+    def retire_legacy_operator_state(self) -> None:
+        """Complete the compatibility handoff under exclusive engine ownership."""
+        self._migrate_operator_state()
+        with _file_lock(self._operator_state_dir / ".migration.lock"):
+            # Publish retirement before unlinking. A crash between these steps
+            # makes the next load finish cleanup instead of trusting an old path.
+            _atomic_write(self._legacy_retired_path, "1\n")
+            for legacy in self._legacy_operator_paths:
+                if legacy.is_symlink() or legacy.is_file():
+                    legacy.unlink()
+
+    def _save_operator_text(self, private: Path, legacy: Path, text: str) -> None:
+        """Write private state and any active legacy compatibility copy."""
+        with _file_lock(self._operator_state_dir / ".migration.lock"):
+            # Write the old-code source of truth first. If the process stops
+            # between writes, the next ordinary load mirrors it back to private
+            # state. Never follow a model-visible legacy symlink.
+            if self._legacy_retired_path.is_file():
+                if legacy.is_symlink() or legacy.is_file():
+                    legacy.unlink()
+            elif not legacy.is_symlink() and legacy.is_file():
+                _atomic_write(legacy, text)
+            _atomic_write(private, text)
 
     def exists(self) -> bool:
         return self.meta_path.exists()
@@ -285,6 +393,10 @@ class Workspace:
             os.chmod(d, 0o700)
         meta = TargetMeta(slug=self.slug, target=target, target_type=target_type)
         self.save_meta(meta)
+        # An older engine may still use its original files. Mirror them before
+        # deciding whether this workspace has constraints, but leave retirement
+        # to a new Engine after it owns the engagement lock.
+        self._migrate_operator_state()
         if not self.constraints_path.exists():
             self.save_constraints(Constraints())
         self.render_all()
@@ -293,7 +405,11 @@ class Workspace:
     def load_meta(self) -> TargetMeta:
         data = json.loads(self.meta_path.read_text())
         known = {f.name for f in TargetMeta.__dataclass_fields__.values()}  # type: ignore[attr-defined]
-        return TargetMeta(**{k: v for k, v in data.items() if k in known})
+        values = {k: v for k, v in data.items() if k in known}
+        # A missing stamp is an older prompt contract, even though newly
+        # constructed TargetMeta objects default to the current contract.
+        values.setdefault("worker_prompt_contract_version", 0)
+        return TargetMeta(**values)
 
     def save_meta(self, meta: TargetMeta) -> None:
         _atomic_write(self.meta_path, json.dumps(asdict(meta), indent=2))
@@ -308,6 +424,7 @@ class Workspace:
     # ---- constraints -----------------------------------------------------
 
     def load_constraints(self) -> Constraints:
+        self._migrate_operator_state()
         if not self.constraints_path.exists():
             return Constraints()
         data = json.loads(self.constraints_path.read_text())
@@ -315,7 +432,12 @@ class Workspace:
         return Constraints(**{k: v for k, v in data.items() if k in known})
 
     def save_constraints(self, c: Constraints) -> None:
-        _atomic_write(self.constraints_path, json.dumps(asdict(c), indent=2))
+        self._migrate_operator_state()
+        self._save_operator_text(
+            self.constraints_path,
+            self._legacy_constraints_path,
+            json.dumps(asdict(c), indent=2),
+        )
         self.render_scope_document()
 
     def render_scope_document(self) -> None:
@@ -323,14 +445,17 @@ class Workspace:
         self._render_scope()
 
     def save_program_brief(self, text: str, profile: dict) -> None:
-        """Persist the reviewed public brief inside the model-visible workspace."""
-        _atomic_write(
-            self.root / "program-brief.md",
+        """Persist imported program material as manager-only engagement state."""
+        self._migrate_operator_state()
+        self._save_operator_text(
+            self.program_brief_path,
+            self._legacy_program_brief_path,
             "# Program brief snapshot\n\n" + text.strip() + "\n",
         )
         public = {key: value for key, value in profile.items() if key != "brief_text"}
-        _atomic_write(
-            self.root / ".ledger" / "program-profile.json",
+        self._save_operator_text(
+            self.program_profile_path,
+            self._legacy_program_profile_path,
             json.dumps(public, indent=2, ensure_ascii=False) + "\n",
         )
 

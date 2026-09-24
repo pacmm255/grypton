@@ -18,7 +18,7 @@ import secrets
 import stat
 import threading
 import time
-from urllib.parse import urlsplit
+from urllib.parse import quote, quote_plus, urlsplit
 
 from . import config
 
@@ -300,6 +300,67 @@ def list_credentials(target: str) -> list[str]:
         path.stem for path in directory.glob("*.json")
         if _NAME.fullmatch(path.stem) and path.is_file() and not path.is_symlink()
     )
+
+
+def provider_redaction_values(target: str) -> tuple[str, ...]:
+    """Return bounded credential/session variants for provider-log scrubbing.
+
+    The provider transport calls this in its trusted parent process immediately
+    before it starts OpenCode.  Values are never sent to the model or placed in
+    its environment; they are used only as exact replacement needles while the
+    JSON event stream is still in memory.  A malformed private record is skipped
+    instead of weakening provider availability or exposing its contents in an
+    error message.
+    """
+    values: set[str] = set()
+    try:
+        aliases = list_credentials(target)[:256]
+    except (CredentialError, OSError):
+        return ()
+
+    def add(value: object) -> None:
+        text = str(value or "")
+        if not text or len(text) > 131_072 or len(values) >= 4096:
+            return
+        values.add(text)
+        for encoded in (quote(text, safe=""), quote_plus(text, safe="")):
+            values.add(encoded)
+            values.add(re.sub(
+                r"%[0-9A-F]{2}", lambda match: match.group(0).lower(), encoded
+            ))
+        for ensure_ascii in (False, True):
+            rendered = json.dumps(text, ensure_ascii=ensure_ascii)
+            values.add(rendered[1:-1])
+
+    for alias in aliases:
+        try:
+            secret = load_credential(target, alias)
+        except (CredentialError, OSError):
+            continue
+        add(secret.get("username"))
+        add(secret.get("password"))
+        username = str(secret.get("username") or "")
+        compact = _PHONE_SEPARATORS.sub("", username.strip())
+        if compact and compact != username:
+            add(compact)
+        for transform in ("stored", "iran-e164"):
+            try:
+                add(normalize_login_username(username, transform))
+            except CredentialError:
+                pass
+        try:
+            for token in load_tokens(target, alias).values():
+                add(token)
+        except (CredentialError, OSError):
+            pass
+        try:
+            cookie_path = cookie_jar_storage_path(target, alias)
+            for row in _cookie_rows(cookie_path):
+                if len(row) >= 7:
+                    add(row[6])
+        except (CredentialError, OSError):
+            pass
+    return tuple(sorted(values, key=len, reverse=True))
 
 
 def _profile_url(value: object, *, label: str) -> str:

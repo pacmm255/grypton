@@ -1,6 +1,6 @@
 # Grypton Code
 
-Grypton Code is a persistent, tool-using security-testing workspace. You give it a target and a clear scope. It keeps the work, captures, decisions, findings, and validation results in one engagement directory.
+Grypton Code is a persistent, tool-using security-testing workspace. You give it a target and a clear scope. It keeps the work, captures, decisions, findings, and validation results as private engagement state.
 
 Use Grypton only for systems you are allowed to assess.
 
@@ -27,7 +27,7 @@ flowchart LR
     K --> W[Kraude\nworker]
     OC[OpenClaude\nmodel gateway] --> K
     OC --> W
-    W --> T[Scoped tools]
+    W --> T[Native and Grypton MCP tools]
     T --> E[Private evidence workspace]
     E --> K
     E --> A[Astra\nindependent validator]
@@ -38,18 +38,18 @@ flowchart LR
 
 | Role | What it does | Model route |
 | --- | --- | --- |
-| **Kraude** | Maps the target, uses the scoped tools, records evidence, and writes finding candidates. | `zai-coding-plan/glm-5.3` at `max` |
+| **Kraude** | Maps the target, uses the available native and Grypton MCP tools, records evidence, and writes finding candidates. | `zai-coding-plan/glm-5.3` at `max` |
 | **Kryptex** | Manages Kraude, chooses the next useful step, corrects weak work, and handles ordinary blockers. | `go/muse-spark-1.3-contributor` at `xhigh` |
 | **Astra** | Independently reviews serious finding evidence. | `gpt-6-astra` at `max` |
 
 Kryptex does not validate its own worker. New P1 and P2 findings go to Astra automatically. P3, P4, and P5 findings stay recorded until you explicitly request validation.
 
-Kraude receives a deliberately small role prompt: the target, the recorded
-scope URLs, severity acceptance data, out-of-scope finding categories, and the
-operator or Kryptex instruction for that turn. Grypton passes an explicit
+Kraude receives a deliberately small role prompt: the exact recorded in-scope
+URLs with their per-URL severity, out-of-scope finding categories and
+conditional exclusions, and the operator or Kryptex instruction for that turn. Grypton passes an explicit
 operator mission verbatim and does not prepend generated conduct rules. The
-OpenCode session supplies the available tool schemas automatically, while the
-tools enforce and capture the recorded scope in code.
+OpenCode session supplies its native tools and every Grypton MCP tool
+automatically. Tool calls remain in the provider event log.
 
 ## Set up OpenClaude and the key pool
 
@@ -92,7 +92,9 @@ OpenClaude configuration file.
 | **Flow** | A saved request and response capture. |
 | **Finding** | A candidate issue with a saved proof. It is only confirmed after the required Astra review. |
 
-All engagement data lives under `.state/engagements/`. The top-level `target/` directory stays empty.
+Worker-visible evidence lives under `.state/engagements/`. Raw constraints and
+imported program material live separately under manager-only `.state/operator/`.
+The top-level `target/` directory stays empty.
 
 ---
 
@@ -202,7 +204,7 @@ subset; it always runs detached with quiet, non-interactive output.
 | `--kraude-effort LEVEL` | Set Kraude's supported reasoning effort. |
 | `--kryptex-model ROUTE` | Use this OpenClaude route for Kryptex. |
 | `--kryptex-effort LEVEL` | Set Kryptex's supported reasoning effort. |
-| `--permission-mode scoped` | Use Grypton's scope-checked, captured-tool mode. |
+| `--permission-mode scoped` | Enable native worker tools plus Grypton's scope-enforcing MCP tools. |
 | `-p` or `--print` | Do not wait for console input. Keep the event stream in stdout. |
 | `--console quiet` | Start with compact terminal output. Also accepts `normal` and `full`. |
 | `--max-turns N` | Stop after at most `N` worker turns. |
@@ -445,7 +447,7 @@ Your messages are saved as standing instructions for the engagement. Kryptex rec
 | `/context` | Show engagement records and document sizes. |
 | `/cost` | Show recorded worker-turn cost and provider-call counts. |
 | `/config` | Show model routes, scope mode, and console mode. |
-| `/permissions` | Show the enforced network and tool boundaries. |
+| `/permissions` | Show native tool availability and Grypton MCP boundaries. |
 | `/resume` | Print the command to resume this engagement later. |
 | `/model` | Show the active Kraude, Kryptex, and Astra routes. |
 | `/models [filter]` | Browse available OpenClaude routes. |
@@ -479,7 +481,6 @@ Use `@` to tell Kryptex which durable record matters for your message. Grypton d
 | `@tested` | `tested-techniques.md` |
 | `@progress` | `progress.md` |
 | `@scope` | `scope-rules.md` |
-| `@program` | `program-brief.md`, when a Bugcrowd brief was used |
 
 Example:
 
@@ -560,6 +561,17 @@ Start with the same brief:
 ```
 
 The preflight checks that the target is listed, imports matching scope and exclusions, identifies credential requirements, and stops when the brief prohibits automation.
+
+Review the saved normalized brief and profile later with:
+
+```bash
+./bin/grypton program https-api-example-test
+./bin/grypton program https-api-example-test --json
+```
+
+`program` reads the operator-only copy and is unavailable inside model provider
+runtimes. It does not add the full brief or profile to Kraude or Kryptex
+prompts, and credential-shaped values are redacted from terminal output.
 
 ---
 
@@ -806,12 +818,13 @@ Use these commands from another terminal while an engagement is running, or afte
 ./bin/grypton surface https-app-example-test
 ./bin/grypton history https-app-example-test
 ./bin/grypton scope https-app-example-test
+./bin/grypton program https-app-example-test
 
 # Integrity check
 ./bin/grypton audit https-app-example-test
 ```
 
-Add `--json` to `status`, `show`, `overview`, `activity`, `findings`, `surface`, `history`, `scope`, `audit`, and selected other review commands when you need machine-readable output.
+Add `--json` to `status`, `show`, `program`, `overview`, `activity`, `findings`, `surface`, `history`, `scope`, `audit`, and selected other review commands when you need machine-readable output.
 
 ## Create a report
 
@@ -832,12 +845,19 @@ Add `--json` to `status`, `show`, `overview`, `activity`, `findings`, `surface`,
 
 # Working with tools manually
 
-Kraude has OpenCode read/search tools and Grypton's structured MCP tools.
-Native Bash, native file mutation, and native web access are disabled. Network
-activity goes through Grypton's scope-checked, captured, and audited tools. A
-safe manual subset is available through `grypton tools`; use its help for the
-exact public subcommands. The tool-group table below describes the full MCP
-surface available to Kraude, including tools that are intentionally MCP-only.
+Kraude has OpenCode's native read, search, Bash, edit, and task tools, plus
+every structured Grypton MCP tool. Native file tools can use the public
+engagement documents and the `research/`, `scripts/`, `loot/`, `workspace/`,
+and `flows/` directories; private operator state, credentials, provider state,
+transcripts, and ledger files stay outside that boundary. Native Bash cannot
+open Internet sockets. Its PATH-first `curl` command crosses a local broker
+that applies the recorded scope and saves the same request/response capture,
+effect marker, and tool-call ledger row as `http_request`. OpenCode's native
+web fetch and web search are disabled so they cannot bypass that path. Native
+tool calls remain in the OpenCode provider event log. A manual MCP subset is
+available through `grypton tools`; use its help for the exact public
+subcommands. The tool-group table below describes the full MCP surface
+available to Kraude.
 
 Start by seeing what is available:
 
@@ -1039,6 +1059,10 @@ Named target logins are separate from provider credentials. They stay under
 `.state/credentials/<engagement>/` and are addressed only by alias from an
 engagement. Detached supervisor state stays under `.state/runtime/` with
 private directory and file permissions.
+
+Full constraints and imported program snapshots stay under
+`.state/operator/engagements/<engagement>/`. Kraude receives only the rendered
+`scope-rules.md` projection shown above.
 
 ---
 

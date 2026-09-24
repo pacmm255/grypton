@@ -50,6 +50,7 @@ def isolated_runtime():
             "RUNTIME_DIR": root / ".state/runtime",
             "LOG_DIR": root / ".state/runtime/logs",
             "PROVIDER_DIR": root / ".state/providers",
+            "CREDENTIALS_DIR": root / ".state/credentials",
             "OPENCODE_WORKSPACES_DIR": root / ".opencode-workspaces",
             "TARGET_DATA_DIR": root / "target",
         }

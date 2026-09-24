@@ -28,6 +28,7 @@ import re
 
 from . import antifab, config, prompts
 from .manager import ManagerContext
+from .worker import WorkerError
 from .workspace import Workspace
 
 
@@ -100,6 +101,22 @@ def _looks_like_soft_retreat_directive(text: str) -> bool:
 _RECOVERY_ACTION = (
     "Use the most relevant available tool to test the highest-impact unresolved "
     "lead in the recorded attack surface and record the observed result."
+)
+
+
+# OpenClaude has already tried every currently usable key before emitting a
+# credential-pool terminal event. Wait for its sanitized cooldown instead of
+# immediately hammering the exhausted pool. The cap prevents one malformed or
+# overly conservative provider value from making the engine unresponsive for
+# hours; a still-exhausted pool can advertise the next bounded wait.
+_DEFAULT_WORKER_PROVIDER_RETRY_S = 60
+_MAX_WORKER_PROVIDER_RETRY_S = 300
+_WORKER_RETRY_POLL_S = 1.0
+_MAX_WORKER_FAILURE_TOOL_COUNT = 10_000
+_PARTIAL_TOOL_RECOVERY_ACTION = (
+    "Continue from the durable results already recorded. Select a different "
+    "highest-impact unresolved lead in the recorded attack surface, test it "
+    "with an available tool, and record the observed result."
 )
 
 
@@ -210,6 +227,9 @@ class Engine:
             "signatures": [],
         }
         self._raw_new_surface = 0
+        # One supervised marker spans provider retries until a completed Kraude
+        # turn and the resume cursor are both durable.
+        self._worker_provider_window_nonce = ""
 
     # ---------------------------------------------------------------- setup
 
@@ -226,6 +246,9 @@ class Engine:
         else:
             self.ws.update_meta(target=target, target_type=target_type)
 
+        # setup runs only after the engagement lock is held. Complete the
+        # compatibility handoff before OpenCode can see the workspace.
+        self.ws.retire_legacy_operator_state()
         constraints = self.ws.load_constraints()
         worker_cblock = constraints.to_worker_prompt_block()
         # This document is visible to Kraude. Refresh it on every start so an
@@ -249,6 +272,29 @@ class Engine:
             encoding="utf-8")
 
         meta = self.ws.load_meta()
+        prompt_contract_changed = (
+            meta.worker_prompt_contract_version
+            != prompts.WORKER_PROMPT_CONTRACT_VERSION
+        )
+        # A resumed OpenCode conversation retains the static prompt from when
+        # it was created, and its saved directive may contain manager prose from
+        # that older contract. Publish the new stamp together with empty worker
+        # resume state so a crash cannot expose the stamp while leaving either
+        # incompatible input resumable. All manager and route state survives.
+        # A deliberately fresh Kraude conversation must not be seeded from the
+        # last Kryptex directive.  That directive belongs to the discarded
+        # provider conversation and can contain an older orchestration frame.
+        # A caller-supplied brief is held on ``self.brief`` and remains the
+        # opening message, so clearing this resume cursor loses no current
+        # operator request.
+        reset_worker_context = prompt_contract_changed or fresh_worker_session
+        meta = self.ws.update_meta(
+            worker_prompt_contract_version=prompts.WORKER_PROMPT_CONTRACT_VERSION,
+            **({
+                "worker_uuid": "",
+                "last_directive": "",
+            } if reset_worker_context else {}),
+        )
         self.turn_index = meta.turn_index
         if not fresh_clone:
             if not self._worker_model_explicit and meta.worker_model:
@@ -382,8 +428,12 @@ class Engine:
             directive_text = self._prepend_user_to_worker(directive_text)
 
             # ---- worker turn ----
-            self.turn_index += 1
-            self.emit("turn", index=self.turn_index)
+            attempt_turn_index = self.turn_index + 1
+            self.emit("turn", index=attempt_turn_index)
+            provider_window_nonce = self._begin_worker_provider_window(
+                turn=attempt_turn_index,
+                attempt=self._fault_count + 1,
+            )
             try:
                 turn = await self._run_turn_with_heartbeat(directive_text)
                 self._fault_count = 0
@@ -394,25 +444,105 @@ class Engine:
             except Exception as e:  # worker crashed mid-turn
                 self._fault_count += 1
                 self.emit("error", text=f"Worker fault ({self._fault_count}): {e}")
+                tool_count = self._worker_failure_tool_count(e)
+                replay_unsafe = self._worker_failure_replay_unsafe(e)
+                if tool_count or replay_unsafe:
+                    # The failed conversation may end between a tool call and
+                    # its model-visible result.  Absence of an observed event is
+                    # not proof that a native command did not run: OpenCode can
+                    # exit before flushing that event. Persist a fresh Kraude
+                    # session before any wait or provider retry; durable evidence
+                    # and Kryptex state stay untouched.
+                    self._reset_worker_after_partial_failure()
+                retry = (
+                    self._deadline_worker_retry(e)
+                    if self.run_until_deadline else None
+                )
+                if retry is not None:
+                    event = {
+                        "attempt": self._fault_count,
+                        "wait_s": retry["wait_s"],
+                        "reason": retry["reason"],
+                        "upstream_status": retry["upstream_status"],
+                        "tool_count": tool_count,
+                    }
+                    self.emit("worker_provider_retry", **event)
+                    self.ws.append_progress(
+                        f"Attempt for turn {attempt_turn_index}: transient Kraude "
+                        "provider failure; "
+                        f"retrying after {retry['wait_s']}s "
+                        f"(reason={retry['reason']}, "
+                        f"upstream_status={retry['upstream_status'] or 'unknown'}, "
+                        f"tool_count={tool_count})."
+                    )
+                    if not await self._wait_for_worker_retry(retry["wait_s"]):
+                        break
+                    if tool_count or replay_unsafe:
+                        directive_text = self._suppress_partial_worker_replay(
+                            directive_text,
+                            turn=attempt_turn_index,
+                            attempt=self._fault_count,
+                            tool_count=tool_count,
+                            reason=retry["reason"],
+                        )
+                    try:
+                        await self.worker.ensure_started()
+                    except Exception as restart_error:
+                        raise RuntimeError(
+                            "Kraude could not restart after a transient provider failure."
+                        ) from restart_error
+                    continue
+
+                # Programming and configuration faults have no structured
+                # provider retry classification. Surface them immediately in a
+                # detached run so the supervisor records a failed child rather
+                # than spending the remaining deadline in a retry loop.
+                if self.run_until_deadline and not isinstance(e, WorkerError):
+                    raise
                 if self._fault_count >= 5:
+                    if self.run_until_deadline:
+                        raise
                     self._stop(f"unrecoverable worker fault: {e}")
                     break
-                await asyncio.sleep(min(2 ** self._fault_count, 30))
+                backoff_s = min(2 ** self._fault_count, 30)
+                if self.run_until_deadline:
+                    if not await self._wait_for_worker_retry(backoff_s):
+                        break
+                else:
+                    await asyncio.sleep(backoff_s)
+                if tool_count or replay_unsafe:
+                    directive_text = self._suppress_partial_worker_replay(
+                        directive_text,
+                        turn=attempt_turn_index,
+                        attempt=self._fault_count,
+                        tool_count=tool_count,
+                        reason="provider_failure",
+                    )
                 try:
                     await self.worker.ensure_started()
                 except Exception as e2:
                     self.emit("error", text=f"Worker restart failed: {e2}")
                 continue
 
+            # A turn becomes durable only after the worker provider completed.
+            # Failed attempts therefore neither consume --max-turns nor advance
+            # the engagement's persisted completed-turn counter.
+            self.turn_index = attempt_turn_index
             self.emit("worker_turn", text=turn.assistant_text,
                       tools=turn.tool_uses, cost=turn.cost_usd, dur=turn.duration_s)
             self._persist_turn(turn)
+            self._rollover_worker_session_if_needed(turn)
             # Status readers should see the completed worker turn while Spark or
             # Astra are still processing, rather than lagging a whole cycle.
             self.ws.update_meta(
                 turn_index=self.turn_index,
                 worker_uuid=getattr(self.worker, "session_id", "") or "",
             )
+            # The provider may have executed native tools that do not appear in
+            # Grypton's MCP effect ledger. Clear the fail-closed supervisor
+            # window only after both the completed turn and its resume metadata
+            # are durable.
+            self._complete_worker_provider_window(provider_window_nonce)
 
             # ---- detect deltas ----
             new_findings, new_surface = self._deltas()
@@ -704,6 +834,226 @@ class Engine:
                               tools=self._turn_tool_count)
                     last_heartbeat = time.time()
         return task.result()
+
+    @staticmethod
+    def _worker_failure_tool_count(exc: Exception) -> int:
+        """Read only the bounded replay-safety signal from provider metadata."""
+        metadata = getattr(exc, "metadata", None)
+        if not isinstance(metadata, dict):
+            return 0
+        tool_count = metadata.get("tool_count")
+        if (
+            isinstance(tool_count, bool)
+            or not isinstance(tool_count, int)
+            or tool_count <= 0
+        ):
+            return 0
+        return min(tool_count, _MAX_WORKER_FAILURE_TOOL_COUNT)
+
+    @staticmethod
+    def _worker_failure_replay_unsafe(exc: Exception) -> bool:
+        """Fail closed unless a worker provider proves no tool could have run."""
+        if not isinstance(exc, WorkerError):
+            return False
+        metadata = exc.metadata if isinstance(exc.metadata, dict) else {}
+        return metadata.get("replay_safe") is not True
+
+    def _begin_worker_provider_window(self, *, turn: int, attempt: int) -> str:
+        """Mark one supervised real-provider call before OpenCode can run."""
+        if self.backend != "real":
+            return ""
+        if self._worker_provider_window_nonce:
+            return self._worker_provider_window_nonce
+        from .runtime import _provider_call_window_begin
+        nonce = _provider_call_window_begin(
+            self.slug,
+            turn=turn,
+            attempt=attempt,
+        )
+        self._worker_provider_window_nonce = nonce
+        return nonce
+
+    def _complete_worker_provider_window(self, nonce: str) -> None:
+        """Release a matching window after the completed turn is durable."""
+        if not nonce:
+            return
+        from .runtime import (_provider_call_window_complete,
+                              _sync_file_and_parent)
+        # `_persist_turn` and Workspace.update_meta have both returned by this
+        # point. Sync their files and directory entries before removing the
+        # replay guard; any sync failure leaves the marker active.
+        _sync_file_and_parent(self.ws.transcripts_dir / "turns.jsonl")
+        _sync_file_and_parent(self.ws.meta_path)
+        _provider_call_window_complete(self.slug, nonce)
+        self._worker_provider_window_nonce = ""
+
+    def _reset_worker_after_partial_failure(self) -> None:
+        """Forget only Kraude's incomplete provider conversation."""
+        self.ws.update_meta(turn_index=self.turn_index, worker_uuid="")
+        worker = self.worker
+        rollover = getattr(worker, "rollover_session", None)
+        if callable(rollover):
+            try:
+                rollover()
+            finally:
+                # Keep the persisted empty ID authoritative even if a custom
+                # worker hook fails partway through its local cleanup.
+                worker.session_id = ""
+                spec = getattr(worker, "spec", None)
+                if spec is not None:
+                    spec.session_uuid = ""
+        else:
+            worker.session_id = ""
+            spec = getattr(worker, "spec", None)
+            if spec is not None:
+                spec.session_uuid = ""
+
+    def _suppress_partial_worker_replay(
+        self,
+        current_directive: str,
+        *,
+        turn: int,
+        attempt: int,
+        tool_count: int,
+        reason: str,
+    ) -> str:
+        """Replace a possibly effectful failed directive with a fresh action."""
+        replacement = _PARTIAL_TOOL_RECOVERY_ACTION
+        if replacement.strip() == str(current_directive or "").strip():
+            replacement += " Choose another concrete surface item for this attempt."
+        event = {
+            "turn": turn,
+            "attempt": attempt,
+            "tool_count": tool_count,
+            "reason": reason,
+            "session_reset": True,
+        }
+        self.emit("worker_replay_suppressed", **event)
+        if tool_count:
+            basis = f"after {tool_count} observed tool event(s)"
+        else:
+            basis = "because native tool execution could not be ruled out"
+        self.ws.append_progress(
+            f"Attempt for turn {turn}: suppressed replay {basis}; "
+            "Kraude will continue in a fresh session."
+        )
+        return replacement
+
+    @staticmethod
+    def _deadline_worker_retry(exc: Exception) -> Optional[dict]:
+        """Classify one sanitized OpenClaude exhausted-pool worker failure.
+
+        Generic exceptions and unstructured ``WorkerError`` instances stay on
+        the finite fault path. This keeps coding/configuration mistakes from
+        becoming an endless deadline-mode loop.
+        """
+        if not isinstance(exc, WorkerError):
+            return None
+        metadata = exc.metadata if isinstance(exc.metadata, dict) else {}
+        if not (
+            metadata.get("source") == "openclaude"
+            and metadata.get("type") == "openclaude_terminal"
+            and metadata.get("role") == "worker"
+            and metadata.get("reason") == "credential_pool_exhausted"
+        ):
+            return None
+
+        retry_after = metadata.get("retry_after_s")
+        if (
+            isinstance(retry_after, bool)
+            or not isinstance(retry_after, int)
+            or retry_after <= 0
+        ):
+            retry_after = _DEFAULT_WORKER_PROVIDER_RETRY_S
+        wait_s = min(retry_after, _MAX_WORKER_PROVIDER_RETRY_S)
+
+        status = metadata.get("upstream_status")
+        if (
+            isinstance(status, bool)
+            or not isinstance(status, int)
+            or not 100 <= status <= 599
+        ):
+            status = 0
+        return {
+            "wait_s": wait_s,
+            "reason": "credential_pool_exhausted",
+            "upstream_status": status,
+        }
+
+    async def _wait_for_worker_retry(self, delay_s: int) -> bool:
+        """Wait for a retry while honoring engine stop and runtime deadline."""
+        retry_deadline = time.monotonic() + max(0, delay_s)
+        while not self.stop_requested:
+            if (self.ws.root / ".ledger" / "STOP").exists():
+                self._stop("external stop flag (`grypton stop`)")
+                return False
+
+            timeout = retry_deadline - time.monotonic()
+            if timeout <= 0:
+                return True
+
+            max_run_seconds = config.CONFIG.max_run_seconds
+            if max_run_seconds and self._start_time:
+                run_remaining = max_run_seconds - (time.time() - self._start_time)
+                if run_remaining <= 0:
+                    self._stop("max_run_seconds safety ceiling reached")
+                    return False
+                timeout = min(timeout, run_remaining)
+
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(),
+                    timeout=min(timeout, _WORKER_RETRY_POLL_S),
+                )
+            except asyncio.TimeoutError:
+                continue
+            return False
+        return False
+
+    def _rollover_worker_session_if_needed(self, turn) -> bool:
+        """Persist and clear an over-limit Kraude conversation between calls."""
+        limit = getattr(config.CONFIG, "worker_context_rollover_tokens", 0)
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            return False
+        result = getattr(turn, "result", None)
+        if not isinstance(result, dict) or "context_tokens" not in result:
+            return False
+        context_tokens = result.get("context_tokens")
+        if (
+            isinstance(context_tokens, bool)
+            or not isinstance(context_tokens, int)
+            or context_tokens < limit
+        ):
+            return False
+        worker = self.worker
+        rollover = getattr(worker, "rollover_session", None)
+        if not callable(rollover) or not getattr(worker, "session_id", ""):
+            return False
+
+        # Workspace metadata is an atomic replace. Persist the empty resumable ID
+        # before changing in-memory state, with no await or provider call between
+        # the two operations. A crash can therefore only resume fresh or retain
+        # the still-valid old session; it cannot publish a half-written ID.
+        self.ws.update_meta(turn_index=self.turn_index, worker_uuid="")
+        rollover()
+        # Keep the disk record authoritative even if a custom worker's rollover
+        # hook is incomplete. The production hook also resets its token counter.
+        worker.session_id = ""
+        spec = getattr(worker, "spec", None)
+        if spec is not None:
+            spec.session_uuid = ""
+        event = {
+            "turn": self.turn_index,
+            "context_tokens": context_tokens,
+            "threshold": limit,
+        }
+        self.emit("worker_session_rollover", **event)
+        self.ws.append_progress(
+            f"Turn {self.turn_index}: Kraude context rolled over after "
+            f"a reported {context_tokens}-token context footprint "
+            f"(threshold {limit})."
+        )
+        return True
 
     def _build_context(self, turn, new_findings, flags, exhausted, user_msgs,
                        worker_was_idle=False, worker_idle_streak=0,
