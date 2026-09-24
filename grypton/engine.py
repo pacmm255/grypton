@@ -27,6 +27,7 @@ from urllib.parse import parse_qsl, urlsplit
 import re
 
 from . import antifab, config, prompts
+from .finding_views import astra_confirmed_cases_at_or_above
 from .manager import ManagerContext
 from .worker import WorkerError
 from .workspace import ASTRA_REVALIDATION_REVISION_FIELD, Workspace
@@ -174,7 +175,8 @@ class Engine:
                  emit: Optional[Callable[..., None]] = None,
                  worker_model: str = "", worker_effort: str = "",
                  manager_model: str = "", manager_effort: str = "",
-                 run_until_deadline: bool = False):
+                 run_until_deadline: bool = False,
+                 run_until_stopped: bool = False):
         self._worker_model_explicit = bool(worker_model)
         self._manager_model_explicit = bool(manager_model)
         self._worker_effort_explicit = bool(worker_effort)
@@ -187,10 +189,12 @@ class Engine:
         self.worker_effort = worker_effort or config.CONFIG.worker_effort
         self.manager_model = manager_model or config.CONFIG.manager_model
         self.manager_effort = manager_effort or config.CONFIG.manager_effort
-        # A detached finite run uses its supervisor deadline as its completion
+        # A detached persistent run uses its supervisor policy as its completion
         # boundary. Convergence still forces a new Kryptex-directed pivot, but
-        # it must not quietly turn a requested long run into a short one.
-        self.run_until_deadline = bool(run_until_deadline)
+        # it must not quietly turn a requested run into a short one. Keep the
+        # historical attribute name for finite-run compatibility.
+        self.run_until_deadline = bool(run_until_deadline or run_until_stopped)
+        self.run_until_stopped = bool(run_until_stopped)
 
         self.worker = None
         self.manager = None
@@ -410,6 +414,14 @@ class Engine:
         self._counts = (len(findings), len(self.ws.surface.all()))
         self._active_family_ids = self._finding_family_ids(findings)
         self._rehydrate_novelty_state()
+
+        # An indefinite resume may already contain the requested durable Astra
+        # verdict. Avoid another provider call when the completion condition was
+        # met before this engine child started.
+        if config.CONFIG.until_severity:
+            self._handle_p1s()
+            if self.stop_requested:
+                return
 
         directive_text = await self._opening_directive()
         # Real-time user↔Kryptex chat runs concurrently with worker turns (R10).
@@ -1293,15 +1305,27 @@ class Engine:
 
     def _handle_p1s(self) -> None:
         p1s = self.ws.confirmed_p1s()
-        if not p1s:
+        if p1s:
+            # compatibility marker some setups watch for
+            try:
+                (self.ws.root / ".ledger").mkdir(exist_ok=True)
+                (self.ws.root / ".ledger" / "p1-found").write_text(str(time.time()))
+            except OSError:
+                pass
+
+        threshold = str(config.CONFIG.until_severity or "").strip().upper()
+        if threshold:
+            matches = astra_confirmed_cases_at_or_above(
+                self.ws.findings.all(), threshold
+            )
+            if matches:
+                self._stop(
+                    f"{len(matches)} Astra-confirmed case(s) at {threshold} or higher"
+                )
             return
-        # compatibility marker some setups watch for
-        try:
-            (self.ws.root / ".ledger").mkdir(exist_ok=True)
-            (self.ws.root / ".ledger" / "p1-found").write_text(str(time.time()))
-        except OSError:
-            pass
-        if config.CONFIG.stop_on_p1:
+
+        # Preserve the original --stop-on-p1 behavior for existing finite runs.
+        if p1s and config.CONFIG.stop_on_p1:
             self._stop(f"{len(p1s)} confirmed P1 case(s) and stop_on_p1 is set")
 
     # -------------------------------------------------------- introspection
@@ -1730,6 +1754,8 @@ class Engine:
 
     def _manager_stop_is_binding(self, directive, *, convergence_reason: str = "") -> bool:
         """Classify a manager-requested stop for this engine run mode."""
+        if self.run_until_stopped:
+            return False
         if self.run_until_deadline:
             return self._matches_recorded_deadline_boundary(directive)
         return self._is_hard_stop(

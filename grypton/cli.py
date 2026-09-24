@@ -54,6 +54,10 @@ def _json_object_argument(value: str) -> dict:
 _DURATION_RX = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smhd]?)\s*$", re.I)
 
 
+class _RunPolicyError(ValueError):
+    """A contradictory public run policy, distinct from model selection."""
+
+
 def _duration_seconds(value: str) -> int:
     """Parse a compact duration such as 30s, 10m, 1.5h, or 1d."""
     match = _DURATION_RX.fullmatch(str(value or ""))
@@ -222,15 +226,45 @@ def _requested_role_models(ns, meta=None, *, validate: bool = False) -> dict[str
 
 
 def _configure_run(ns, ws: Workspace | None = None, *, fresh: bool = False) -> dict[str, dict[str, str]]:
-    if getattr(ns, "duration_seconds", None) is not None:
+    forever = bool(getattr(ns, "forever", False))
+    supervised_without_deadline = bool(getattr(ns, "run_until_stopped", False))
+    if forever:
+        conflicting = [
+            name for name, value in (
+                ("--duration", getattr(ns, "duration_seconds", None)),
+                ("--max-seconds", getattr(ns, "max_seconds", None)),
+                ("--auto-stop-time", getattr(ns, "auto_stop_time", None)),
+                ("--max-turns", getattr(ns, "max_turns", None)),
+                ("--restart-limit", getattr(ns, "restart_limit", None)),
+            )
+            if value is not None
+        ]
+        if conflicting:
+            raise _RunPolicyError(
+                "--forever cannot be combined with " + ", ".join(conflicting)
+            )
+
+    until_severity = str(getattr(ns, "until_severity", None) or "").upper()
+    stop_on_p1 = bool(getattr(ns, "stop_on_p1", False))
+    if stop_on_p1 and until_severity and until_severity != "P1":
+        raise _RunPolicyError("--stop-on-p1 conflicts with --until-severity P2")
+    if forever and not until_severity:
+        until_severity = "P1" if stop_on_p1 else "P2"
+
+    if forever or supervised_without_deadline:
+        config.CONFIG.max_run_seconds = 0
+        config.CONFIG.max_turns = 0
+    elif getattr(ns, "duration_seconds", None) is not None:
         config.CONFIG.max_run_seconds = int(ns.duration_seconds)
     elif getattr(ns, "auto_stop_time", None) is not None:
         config.CONFIG.max_run_seconds = int(ns.auto_stop_time) * 60
     elif getattr(ns, "max_seconds", None) is not None:
         config.CONFIG.max_run_seconds = int(ns.max_seconds)
-    if getattr(ns, "max_turns", None) is not None:
+    if (not forever and not supervised_without_deadline
+            and getattr(ns, "max_turns", None) is not None):
         config.CONFIG.max_turns = int(ns.max_turns)
-    config.CONFIG.stop_on_p1 = bool(getattr(ns, "stop_on_p1", False))
+    config.CONFIG.stop_on_p1 = stop_on_p1
+    config.CONFIG.until_severity = until_severity
     config.CONFIG.backend = getattr(ns, "backend", "real")
     meta = None if fresh or ws is None else ws.load_meta()
     models = _requested_role_models(ns, meta, validate=config.CONFIG.backend == "real")
@@ -269,6 +303,10 @@ def _acquire_engine_lock(ws: Workspace) -> int:
 
 
 def _run_engagement(ws: Workspace, ns, *, brief: str, fresh: bool) -> int:
+    if getattr(ns, "forever", False):
+        # An unbounded run must be detached so it has a durable supervisor and
+        # remains controllable through `grypton run status|logs|stop`.
+        ns.background = True
     if getattr(ns, "background", False):
         return _run_engagement_unlocked(ws, ns, brief=brief, fresh=fresh)
 
@@ -306,6 +344,9 @@ def _run_engagement_unlocked(ws: Workspace, ns, *, brief: str, fresh: bool) -> i
 
     try:
         models = _configure_run(ns, ws, fresh=fresh)
+    except _RunPolicyError as exc:
+        print(f"ERROR: invalid run configuration: {exc}", file=sys.stderr)
+        return 2
     except (ValueError, RuntimeError, OSError) as exc:
         print(f"ERROR: invalid model selection: {exc}", file=sys.stderr)
         return 2
@@ -319,6 +360,8 @@ def _run_engagement_unlocked(ws: Workspace, ns, *, brief: str, fresh: bool) -> i
                 max_run_seconds=config.CONFIG.max_run_seconds,
                 max_turns=config.CONFIG.max_turns,
                 stop_on_p1=config.CONFIG.stop_on_p1,
+                forever=bool(getattr(ns, "forever", False)),
+                until_severity=config.CONFIG.until_severity,
                 worker_model=models["worker"]["route"],
                 worker_effort=models["worker"]["effort"],
                 manager_model=models["manager"]["route"],
@@ -327,12 +370,17 @@ def _run_engagement_unlocked(ws: Workspace, ns, *, brief: str, fresh: bool) -> i
                     getattr(ns, "fresh_worker_session", False)
                 ),
                 health_interval_seconds=getattr(ns, "health_interval", 600),
-                restart_limit=getattr(ns, "restart_limit", 3),
+                restart_limit=getattr(ns, "restart_limit", None),
             )
         except (ValueError, RuntimeError, OSError) as exc:
             print(f"ERROR: could not start background run: {exc}", file=sys.stderr)
             return 2
         print(f"Background run started for {ws.slug} (supervisor {state.get('supervisor_pid')}).")
+        if state.get("run_mode") == "until-finding":
+            print(
+                "  policy  no deadline; unlimited safe restarts; stop when Astra "
+                f"confirms {state.get('until_severity', 'P2')} or higher"
+            )
         print(f"  status  grypton run status {ws.slug}")
         print(f"  logs    grypton run logs {ws.slug}")
         print(f"  stop    grypton run stop {ws.slug}")
@@ -347,6 +395,7 @@ def _run_engagement_unlocked(ws: Workspace, ns, *, brief: str, fresh: bool) -> i
         manager_model=models["manager"]["route"],
         manager_effort=models["manager"]["effort"],
         run_until_deadline=bool(getattr(ns, "run_until_deadline", False)),
+        run_until_stopped=bool(getattr(ns, "run_until_stopped", False)),
     )
 
     async def execute():
@@ -1132,7 +1181,8 @@ def cmd_stop(ns) -> int:
 
 def cmd_run_start(ns) -> int:
     ns.background = True
-    if (getattr(ns, "duration_seconds", None) is None and
+    if (not getattr(ns, "forever", False) and
+            getattr(ns, "duration_seconds", None) is None and
             getattr(ns, "max_seconds", None) is None and
             getattr(ns, "auto_stop_time", None) is None):
         ns.duration_seconds = 12 * 60 * 60
@@ -1151,8 +1201,15 @@ def cmd_run_status(ns) -> int:
     if ns.json:
         print(json.dumps(state, ensure_ascii=False, indent=2))
         return 0
+    restart_limit = state.get("restart_limit", 0)
+    restart_label = "unlimited" if restart_limit is None else str(restart_limit)
     print(f"{state.get('slug')}: {state.get('status')} · alive={state.get('alive', False)} · "
-          f"restarts={state.get('restarts', 0)}/{state.get('restart_limit', 0)}")
+          f"restarts={state.get('restarts', 0)}/{restart_label}")
+    if state.get("run_mode") == "until-finding":
+        print(
+            "  policy  no deadline · stop when Astra confirms "
+            f"{state.get('until_severity', 'P2')} or higher"
+        )
     health = state.get("last_health") or {}
     if health:
         print(f"  health  turns={health.get('turns', 0)} tools={health.get('tool_calls', 0)} "
@@ -1724,14 +1781,29 @@ def _run_options(parser) -> None:
     parser.add_argument("--duration", dest="duration_seconds", type=_duration_seconds,
                         default=None, metavar="DURATION",
                         help="Finite run duration such as 90m or 12h")
+    parser.add_argument(
+        "--forever",
+        action="store_true",
+        help=("Run under the detached supervisor without a deadline; stop when "
+              "Astra confirms P1 or P2"),
+    )
+    parser.add_argument(
+        "--until-severity",
+        type=lambda value: str(value).upper(),
+        choices=["P1", "P2"],
+        metavar="{P1,P2}",
+        help="Stop when Astra confirms this severity or higher",
+    )
     parser.add_argument("--stop-on-p1", action="store_true")
     parser.add_argument("--background", action="store_true",
                         help="Run under the detached private supervisor")
     parser.add_argument("--health-interval", type=_duration_seconds, default=600,
                         metavar="DURATION", help="Supervisor health interval (default: 10m)")
-    parser.add_argument("--restart-limit", type=int, default=3, metavar="N",
-                        help="Maximum abnormal-exit restarts (default: 3)")
+    parser.add_argument("--restart-limit", type=int, default=None, metavar="N",
+                        help="Maximum abnormal-exit restarts (finite runs default: 3)")
     parser.add_argument("--run-until-deadline", action="store_true",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--run-until-stopped", action="store_true",
                         help=argparse.SUPPRESS)
 
 
@@ -1756,11 +1828,24 @@ def _supervised_run_options(parser) -> None:
     parser.add_argument("--duration", dest="duration_seconds", type=_duration_seconds,
                         default=None, metavar="DURATION",
                         help="Finite run duration such as 90m or 12h")
+    parser.add_argument(
+        "--forever",
+        action="store_true",
+        help=("Run without a deadline; stop when Astra confirms P1 or P2 "
+              "(unlimited safe restarts)"),
+    )
+    parser.add_argument(
+        "--until-severity",
+        type=lambda value: str(value).upper(),
+        choices=["P1", "P2"],
+        metavar="{P1,P2}",
+        help="Stop when Astra confirms this severity or higher",
+    )
     parser.add_argument("--stop-on-p1", action="store_true")
     parser.add_argument("--health-interval", type=_duration_seconds, default=600,
                         metavar="DURATION", help="Supervisor health interval (default: 10m)")
-    parser.add_argument("--restart-limit", type=int, default=3, metavar="N",
-                        help="Maximum abnormal-exit restarts (default: 3)")
+    parser.add_argument("--restart-limit", type=int, default=None, metavar="N",
+                        help="Maximum abnormal-exit restarts (finite runs default: 3)")
     _fresh_worker_session_option(parser)
 
 
@@ -1975,7 +2060,7 @@ _COMMAND_NAMES = {
 _COMPAT_VALUE_OPTIONS = {
     "--target", "--type", "--only", "--exclude", "--include", "--in-scope", "--out-scope", "--rule",
     "--authorization-file", "--bugcrowd-brief", "-m", "--brief", "--max-seconds", "--max-turns",
-    "--auto-stop-time", "--duration", "--health-interval", "--restart-limit",
+    "--auto-stop-time", "--duration", "--until-severity", "--health-interval", "--restart-limit",
     "--console", "--model", "--kraude-model", "--kraude-effort",
     "--kryptex-model", "--kryptex-effort", "--permission-mode", "--backend",
 }

@@ -164,6 +164,37 @@ def confirmed_p1_cases(findings: Iterable[dict]) -> list[dict]:
     ]
 
 
+def astra_confirmed_cases_at_or_above(
+    findings: Iterable[dict],
+    until_severity: str,
+) -> list[dict]:
+    """Return decisive Astra verdicts at or above a P1/P2 threshold.
+
+    The threshold is based solely on Astra's persisted verdict severity.  A
+    worker's claimed severity cannot satisfy it, and a degraded validator
+    result is never decisive.
+    """
+    threshold = str(until_severity or "").strip().upper()
+    threshold_rank = {"P1": 1, "P2": 2}.get(threshold)
+    if threshold_rank is None:
+        return []
+    severity_rank = {"P1": 1, "P2": 2}
+    matches = []
+    records = [finding for finding in findings if isinstance(finding, dict)]
+    for finding in confirmed_finding_cases(records):
+        verdict = finding_case_verdict(finding)
+        if verdict.get("degraded"):
+            continue
+        if str(verdict.get("validator_model") or "") != config.VALIDATOR_MODEL:
+            continue
+        if str(verdict.get("validator_effort") or "") != config.VALIDATOR_EFFORT:
+            continue
+        rank = severity_rank.get(str(verdict.get("severity") or "").strip().upper())
+        if rank is not None and rank <= threshold_rank:
+            matches.append(finding)
+    return matches
+
+
 def finding_family_view(workspace) -> tuple[list[dict], list[str]]:
     """Return an integrity-checked catalog, falling back to safe singletons."""
     try:

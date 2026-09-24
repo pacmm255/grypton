@@ -201,6 +201,9 @@ class GryptonConfig:
 
     # Non-stop doctrine (R1/R12). stop_on_p1=False => keep hunting even after a P1.
     stop_on_p1: bool = False
+    # Optional Astra-confirmed stopping threshold. ``P2`` means P1 or P2;
+    # an empty value preserves the legacy stop_on_p1 behavior.
+    until_severity: str = ""
     # Hard ceilings purely as runaway safety nets. 0 = unbounded.
     max_run_seconds: int = 0
     max_turns: int = 0

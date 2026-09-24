@@ -23,6 +23,7 @@ import time
 from typing import Any
 
 from . import config
+from .finding_views import astra_confirmed_cases_at_or_above
 from .workspace import Workspace
 
 
@@ -442,6 +443,15 @@ def _health(slug: str, engine_pid: int) -> dict[str, Any]:
     }
 
 
+def _astra_completion_count(slug: str, until_severity: str) -> int:
+    """Count durable Astra verdicts that satisfy an indefinite run policy."""
+    findings = [
+        finding for finding in Workspace(slug).findings.all()
+        if isinstance(finding, dict)
+    ]
+    return len(astra_confirmed_cases_at_or_above(findings, until_severity))
+
+
 def _state_update(path: Path, state: dict[str, Any], **changes: Any) -> None:
     """Merge state changes under a process lock; parent and child start concurrently."""
     _mkdir_private(path.parent)
@@ -478,19 +488,37 @@ def _start_background_locked(
     worker_effort: str,
     manager_model: str,
     manager_effort: str,
+    forever: bool = False,
+    until_severity: str = "",
     fresh_worker_session: bool = False,
     health_interval_seconds: int = 600,
-    restart_limit: int = 3,
+    restart_limit: int | None = None,
 ) -> dict[str, Any]:
     """Start one detached supervisor and return its public, secret-free state."""
     duration = int(max_run_seconds or 0)
     interval = int(health_interval_seconds or 0)
-    retries = int(restart_limit)
-    if duration <= 0:
-        raise ValueError("background runs require a finite --duration, --max-seconds, or --auto-stop-time")
+    indefinite = bool(forever)
+    threshold = str(until_severity or "").strip().upper()
+    if indefinite:
+        if duration > 0 or int(max_turns or 0) > 0:
+            raise ValueError("--forever cannot have a duration or turn ceiling")
+        if threshold not in {"P1", "P2"}:
+            threshold = "P1" if stop_on_p1 else "P2"
+        if restart_limit is not None:
+            raise ValueError("--forever uses unlimited safe restarts")
+        retries: int | None = None
+    else:
+        if duration <= 0:
+            raise ValueError(
+                "background runs require a finite --duration, --max-seconds, "
+                "or --auto-stop-time (or use --forever)"
+            )
+        if threshold and threshold not in {"P1", "P2"}:
+            raise ValueError("--until-severity must be P1 or P2")
+        retries = 3 if restart_limit is None else int(restart_limit)
     if not 5 <= interval <= 3600:
         raise ValueError("--health-interval must be between 5 seconds and 1 hour")
-    if not 0 <= retries <= 20:
+    if retries is not None and not 0 <= retries <= 20:
         raise ValueError("--restart-limit must be between 0 and 20")
     _require_pidfd_support()
 
@@ -507,16 +535,18 @@ def _start_background_locked(
     run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now)) + "-" + secrets.token_hex(4)
     paths = _paths(ws.slug, run_id)
     _mkdir_private(paths["root"])
-    deadline = now + duration
+    deadline = None if indefinite else now + duration
     # This is the only supervisor file containing the brief. It is never
     # returned by status, appended to events, or placed in any process argv.
     spec = {
-        "version": 1,
+        "version": 2,
         "slug": ws.slug,
         "run_id": run_id,
         "brief": str(brief or ""),
         "backend": str(backend),
         "deadline_at": deadline,
+        "run_mode": "until-finding" if indefinite else "finite",
+        "until_severity": threshold,
         "max_turns": int(max_turns or 0),
         "stop_on_p1": bool(stop_on_p1),
         "worker_model": str(worker_model),
@@ -530,18 +560,22 @@ def _start_background_locked(
         "fresh_worker_session_consumed": False,
         "health_interval_seconds": interval,
         "restart_limit": retries,
-        # This private engine mode makes the finite detached deadline the
-        # completion boundary instead of treating convergence as completion.
-        "run_until_deadline": True,
+        # Persistent engine modes continue through convergence. A finite run
+        # ends at its deadline; an indefinite run ends at its Astra threshold.
+        "run_until_deadline": not indefinite,
+        "run_until_stopped": indefinite,
     }
     _write_json(paths["spec"], spec)
     state = {
-        "version": 1,
+        "version": 2,
         "run_id": run_id,
         "slug": ws.slug,
         "status": "starting",
         "started_at": now,
         "deadline_at": deadline,
+        "run_mode": "until-finding" if indefinite else "finite",
+        "until_severity": threshold,
+        "restart_policy": "unlimited-safe" if indefinite else "limited",
         "health_interval_seconds": interval,
         "restart_limit": retries,
         "restarts": 0,
@@ -571,7 +605,13 @@ def _start_background_locked(
     )
     _write_text_private(paths["supervisor_pid"], f"{process.pid}\n")
     _state_update(paths["state"], state, supervisor_pid=process.pid)
-    _append_event(paths["events"], "supervisor_spawned", supervisor_pid=process.pid)
+    _append_event(
+        paths["events"],
+        "supervisor_spawned",
+        supervisor_pid=process.pid,
+        run_mode=state["run_mode"],
+        until_severity=threshold,
+    )
     ready_by = time.monotonic() + 5
     while time.monotonic() < ready_by:
         current = _read_json(paths["state"])
@@ -631,6 +671,7 @@ def public_status(slug: str) -> dict[str, Any]:
         "version", "run_id", "slug", "started_at", "deadline_at", "ended_at",
         "health_interval_seconds", "restart_limit", "restarts", "supervisor_pid",
         "engine_pid", "last_health", "last_exit_code", "stop_reason", "updated_at",
+        "run_mode", "until_severity", "restart_policy",
     )
     result = {key: state.get(key) for key in allowed if key in state}
     result.update({"status": status, "alive": alive, "events": str(paths["events"])})
@@ -981,6 +1022,11 @@ def _advance_health_deadline(
     return scheduled_at + (slots * interval)
 
 
+def _restart_delay(restarts: int) -> int:
+    """Bound retry backoff without constructing an unbounded exponent."""
+    return 30 if restarts >= 5 else 2 ** max(0, restarts)
+
+
 def supervise(slug: str, run_id: str) -> int:
     slug = config.slugify(slug)
     paths = _paths(slug, run_id)
@@ -989,8 +1035,38 @@ def supervise(slug: str, run_id: str) -> int:
         return 2
     state = _read_json(paths["state"])
     _write_text_private(paths["supervisor_pid"], f"{os.getpid()}\n")
+    run_mode = str(spec.get("run_mode") or "finite")
+    indefinite = run_mode == "until-finding"
+    threshold = str(spec.get("until_severity") or "").strip().upper()
+    if indefinite and threshold not in {"P1", "P2"}:
+        return 2
+    deadline_value = spec.get("deadline_at")
+    if indefinite:
+        deadline: float | None = None
+    else:
+        try:
+            deadline = float(deadline_value)
+        except (TypeError, ValueError):
+            return 2
+    raw_restart_limit = spec.get("restart_limit", 3)
+    if indefinite and raw_restart_limit is None:
+        restart_limit: int | None = None
+    else:
+        try:
+            restart_limit = int(raw_restart_limit)
+        except (TypeError, ValueError):
+            return 2
+        if not 0 <= restart_limit <= 20:
+            return 2
+
     _state_update(paths["state"], state, supervisor_pid=os.getpid(), status="running")
-    _append_event(paths["events"], "supervisor_started", supervisor_pid=os.getpid())
+    _append_event(
+        paths["events"],
+        "supervisor_started",
+        supervisor_pid=os.getpid(),
+        run_mode=run_mode,
+        until_severity=threshold,
+    )
 
     stop_requested = False
 
@@ -1002,9 +1078,7 @@ def supervise(slug: str, run_id: str) -> int:
     previous_int = signal.getsignal(signal.SIGINT)
     signal.signal(signal.SIGTERM, on_stop)
     signal.signal(signal.SIGINT, on_stop)
-    deadline = float(spec["deadline_at"])
     interval = int(spec["health_interval_seconds"])
-    restart_limit = int(spec["restart_limit"])
     restarts = 0
     exit_status = "failed"
     stop_reason = "supervisor failure"
@@ -1017,7 +1091,11 @@ def supervise(slug: str, run_id: str) -> int:
             if stop_requested:
                 exit_status, stop_reason = "stopped", "operator stop"
                 break
-            if time.time() >= deadline:
+            if indefinite and _astra_completion_count(slug, threshold):
+                exit_status = "completed"
+                stop_reason = f"Astra confirmed {threshold} or higher"
+                break
+            if deadline is not None and time.time() >= deadline:
                 exit_status, stop_reason = "expired", "duration reached"
                 break
 
@@ -1041,13 +1119,17 @@ def supervise(slug: str, run_id: str) -> int:
             except OSError as exc:
                 _append_event(paths["events"], "engine_spawn_failed",
                               error_type=type(exc).__name__, restart=restarts)
-                if restarts >= restart_limit:
+                if restart_limit is not None and restarts >= restart_limit:
                     exit_status, stop_reason = "failed", "restart limit reached"
                     break
                 restarts += 1
                 _state_update(paths["state"], state, status="restarting", restarts=restarts,
                               engine_pid=0)
-                time.sleep(min(2 ** restarts, 30))
+                retry_until = time.time() + _restart_delay(restarts)
+                if deadline is not None:
+                    retry_until = min(retry_until, deadline)
+                while time.time() < retry_until and not stop_requested:
+                    time.sleep(0.25)
                 continue
 
             _write_text_private(paths["engine_pid"], f"{child.pid}\n")
@@ -1058,6 +1140,7 @@ def supervise(slug: str, run_id: str) -> int:
             next_health = 0.0
             timed_out = False
             stopped = False
+            threshold_met = False
             observed_groups = _descendant_pgids(child.pid)
             while child.poll() is None:
                 _merge_process_groups(
@@ -1069,7 +1152,12 @@ def supervise(slug: str, run_id: str) -> int:
                     _state_update(paths["state"], state, status="stopping")
                     _signal_engine(child, signal.SIGTERM)
                     break
-                if now >= deadline:
+                if indefinite and _astra_completion_count(slug, threshold):
+                    threshold_met = True
+                    _state_update(paths["state"], state, status="stopping")
+                    _signal_engine(child, signal.SIGTERM)
+                    break
+                if deadline is not None and now >= deadline:
                     timed_out = True
                     _state_update(paths["state"], state, status="stopping")
                     _signal_engine(child, signal.SIGTERM)
@@ -1085,11 +1173,16 @@ def supervise(slug: str, run_id: str) -> int:
                     )
                 time.sleep(0.5)
 
-            if stopped or timed_out:
+            if stopped or timed_out or threshold_met:
                 cleanup_complete = _stop_engine(child, observed_groups)
                 if cleanup_complete:
-                    exit_status = "stopped" if stopped else "expired"
-                    stop_reason = "operator stop" if stopped else "duration reached"
+                    if threshold_met:
+                        exit_status = "completed"
+                        stop_reason = f"Astra confirmed {threshold} or higher"
+                    elif stopped:
+                        exit_status, stop_reason = "stopped", "operator stop"
+                    else:
+                        exit_status, stop_reason = "expired", "duration reached"
                 else:
                     exit_status = "failed"
                     stop_reason = "verified process cleanup incomplete"
@@ -1111,27 +1204,35 @@ def supervise(slug: str, run_id: str) -> int:
                 exit_status = "failed"
                 stop_reason = "verified process cleanup incomplete"
                 break
-            # A zero exit includes natural completion, policy/scope stop, the
-            # engine's own duration, and a STOP-ledger stop. None are restarted.
+            # In finite mode a zero exit is terminal for compatibility. In an
+            # indefinite run it is successful only when the durable Astra
+            # threshold is present; a premature clean exit is safely resumed.
             if returncode == 0:
-                exit_status, stop_reason = "completed", "clean engine exit"
-                break
+                if not indefinite:
+                    exit_status, stop_reason = "completed", "clean engine exit"
+                    break
+                if _astra_completion_count(slug, threshold):
+                    exit_status = "completed"
+                    stop_reason = f"Astra confirmed {threshold} or higher"
+                    break
             if stop_requested:
                 exit_status, stop_reason = "stopped", "operator stop"
                 break
-            if time.time() >= deadline:
+            if deadline is not None and time.time() >= deadline:
                 exit_status, stop_reason = "expired", "duration reached"
                 break
             after = _health(slug, 0)
             stop_flag = Workspace(slug).root / ".ledger" / "STOP"
-            if stop_flag.exists() or after.get("workspace_status") == "stopped":
+            if (not indefinite
+                    and (stop_flag.exists()
+                         or after.get("workspace_status") == "stopped")):
                 exit_status, stop_reason = "completed", "persisted engine stop"
                 break
             effectful_delta = (
                 int(after.get("effectful_tool_starts") or 0)
                 - effectful_starts_before
             )
-            if effectful_delta > 0:
+            if returncode != 0 and effectful_delta > 0:
                 exit_status = "failed"
                 stop_reason = (
                     "abnormal exit after an effectful tool began; replay disabled"
@@ -1151,7 +1252,7 @@ def supervise(slug: str, run_id: str) -> int:
                     reason="worker_provider_call_active",
                 )
                 break
-            if restarts >= restart_limit:
+            if restart_limit is not None and restarts >= restart_limit:
                 exit_status, stop_reason = "failed", "restart limit reached"
                 break
 
@@ -1159,7 +1260,9 @@ def supervise(slug: str, run_id: str) -> int:
             _state_update(paths["state"], state, status="restarting", restarts=restarts)
             _append_event(paths["events"], "restart_scheduled", restart=restarts,
                           previous_returncode=returncode)
-            until = min(time.time() + min(2 ** restarts, 30), deadline)
+            until = time.time() + _restart_delay(restarts)
+            if deadline is not None:
+                until = min(until, deadline)
             while time.time() < until and not stop_requested:
                 time.sleep(0.25)
     finally:
@@ -1191,7 +1294,15 @@ def run_engine(slug: str, run_id: str) -> int:
     spec = _read_json(_paths(slug, run_id)["spec"])
     if spec.get("slug") != slug or spec.get("run_id") != run_id:
         return 2
-    remaining = max(1, int(math.ceil(float(spec["deadline_at"]) - time.time())))
+    run_mode = str(spec.get("run_mode") or "finite")
+    indefinite = run_mode == "until-finding"
+    if indefinite:
+        remaining = None
+    else:
+        remaining = max(
+            1,
+            int(math.ceil(float(spec["deadline_at"]) - time.time())),
+        )
     fresh_worker_session = (
         spec.get("fresh_worker_session") is True
         and spec.get("fresh_worker_session_consumed") is not True
@@ -1205,21 +1316,26 @@ def run_engine(slug: str, run_id: str) -> int:
         _write_json(_paths(slug, run_id)["spec"], spec)
     arguments = [
         "resume", slug, "-p", "--console", "quiet",
-        "--max-seconds", str(remaining),
         "--backend", str(spec.get("backend") or "real"),
         "--kraude-model", str(spec.get("worker_model") or config.CONFIG.worker_model),
         "--kraude-effort", str(spec.get("worker_effort") or config.CONFIG.worker_effort),
         "--kryptex-model", str(spec.get("manager_model") or config.CONFIG.manager_model),
         "--kryptex-effort", str(spec.get("manager_effort") or config.CONFIG.manager_effort),
     ]
+    if remaining is not None:
+        arguments.extend(("--max-seconds", str(remaining)))
     if spec.get("brief"):
         arguments.extend(("--brief", str(spec["brief"])))
     if int(spec.get("max_turns") or 0):
         arguments.extend(("--max-turns", str(int(spec["max_turns"]))))
     if spec.get("stop_on_p1"):
         arguments.append("--stop-on-p1")
+    if spec.get("until_severity"):
+        arguments.extend(("--until-severity", str(spec["until_severity"])))
     if spec.get("run_until_deadline"):
         arguments.append("--run-until-deadline")
+    if spec.get("run_until_stopped"):
+        arguments.append("--run-until-stopped")
     if fresh_worker_session:
         arguments.append("--fresh-worker-session")
     from .cli import main

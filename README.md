@@ -167,6 +167,7 @@ Grypton supports the familiar Code-style shortcuts and the explicit command form
 | Start without terminal input | `./bin/grypton -p --target HOST "mission"` |
 | Start with the explicit command | `./bin/grypton init --target HOST -m "mission"` |
 | Start a finite background run | `./bin/grypton init --target HOST --background --duration 12h -m "mission"` |
+| Continue until Astra confirms P1 or P2 | `./bin/grypton init --target HOST --forever -m "mission"` |
 | Continue the newest engagement | `./bin/grypton -c` |
 | Resume one engagement | `./bin/grypton -r ENGAGEMENT` or `./bin/grypton resume ENGAGEMENT` |
 | Resume with a new Kraude conversation | `./bin/grypton resume ENGAGEMENT --fresh-worker-session` |
@@ -211,9 +212,11 @@ subset; it always runs detached with quiet, non-interactive output.
 | `--max-seconds N` | Stop after at most `N` seconds. |
 | `--auto-stop-time N` | Stop after at most `N` minutes. |
 | `--duration DURATION` | Set a finite duration such as `90m` or `12h`. |
-| `--background` | Run under the detached private supervisor. A finite time limit is required. |
+| `--background` | Run under the detached private supervisor. Use a finite time limit or `--forever`. |
+| `--forever` | Run without a deadline until Astra confirms P1 or P2. This implies `--background`. |
+| `--until-severity P1\|P2` | Select the Astra-confirmed stopping threshold. `P2` means P1 or P2. With `--forever`, the default is `P2`. |
 | `--health-interval DURATION` | Record background health counters at this interval. Default: `10m`. |
-| `--restart-limit N` | Allow at most `N` safe supervisor restarts after an abnormal exit. Default: `3`. |
+| `--restart-limit N` | Allow at most `N` safe supervisor restarts for a finite run. Default: `3`. `--forever` uses unlimited safe restarts. |
 | `--fresh-worker-session` | On `resume` or `run start`, start a new Kraude conversation while keeping the workspace, ledgers, and Kryptex operator-chat session. |
 | `--stop-on-p1` | Stop after a confirmed P1. |
 | `--force` | Reuse the existing engagement name and reset its run state. |
@@ -285,7 +288,20 @@ To supervise an existing engagement that is not currently running, run:
 
 `run start` uses a 12-hour limit when you omit every time-limit option. A
 background `init` or `resume` must include `--duration`, `--max-seconds`, or
-`--auto-stop-time`.
+`--auto-stop-time`, unless it uses `--forever`.
+
+To keep working until independent validation confirms a high-severity result:
+
+```bash
+./bin/grypton run start https-app-example-test --forever
+```
+
+This mode has no time or turn deadline. Its default completion condition is an
+Astra verdict of P1 or P2. Use `--until-severity P1` when only a confirmed P1
+should complete the run. Recoverable engine and provider exits use an unlimited
+restart budget. Grypton still fails closed if an interrupted effectful action
+cannot be replayed safely or if verified process cleanup fails. `run stop`
+remains available at any time.
 
 A detached finite run keeps requesting new Kryptex-directed pivots when its
 current leads converge, using the deadline as its normal completion boundary.
@@ -298,12 +314,12 @@ The lifecycle log contains timestamps, process state, exit codes, and workspace
 counters. It does not contain the mission, prompts, tool arguments, evidence,
 or credentials. Before a network, process, installer, or workspace-mutating MCP
 handler begins, Grypton durably records an argument-free restart-safety marker.
-A supervisor restarts the engine only after an abnormal exit that happened
-before any such handler began. Completed private read-only calls do not disable
-a safe restart. It does not restart a clean exit, a policy or scope stop, an
-operator stop, or a run that has started an effectful tool. Background startup
-also rejects an engagement whose shared engine lock is held by a foreground
-run.
+A supervisor restarts the engine only when replay is safe. Completed private
+read-only calls do not disable a safe restart. A finite run keeps its configured
+restart limit. A `--forever` run also resumes after a premature clean exit and
+has no numeric restart limit. Neither mode replays an execution-uncertain
+effectful turn. Background startup also rejects an engagement whose shared
+engine lock is held by a foreground run.
 
 ---
 
@@ -1205,13 +1221,14 @@ Or intentionally reset that engagement's run state:
 
 ## A background run will not start
 
-A direct background `init` or `resume` needs a finite stop condition. Add one
-of these options:
+A direct background `init` or `resume` needs a finite stop condition or the
+indefinite Astra threshold. Add one of these options:
 
 ```bash
 --duration 12h
 --max-seconds 43200
 --auto-stop-time 720
+--forever
 ```
 
 For a saved engagement, `run start ENGAGEMENT` defaults to 12 hours. Use
