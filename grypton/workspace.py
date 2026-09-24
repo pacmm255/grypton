@@ -38,9 +38,18 @@ FINDING_FAMILY_FIELDS = (
 )
 FINDING_FAMILY_LIMITS = {
     "family_id": 32, "root_cause": 500, "case_kind": 200,
-    "separate_reason": 1000, "reason": 1000,
+    "separate_reason": 1000, "reason": 1000, "source": 200,
 }
 FINDING_FAMILY_HISTORY_LIMIT = 64
+FINDING_FAMILY_EVENT_KEYS = frozenset({
+    "id", "ts", "action", "from_family_id", "to_family_id", "reason", "source",
+})
+FINDING_FAMILY_EVENT_REQUIRED_KEYS = (
+    FINDING_FAMILY_EVENT_KEYS - {"ts", "source"}
+)
+# Epoch seconds through 2286 are ample for durable audit history while keeping
+# corrupted JSON numbers small, finite, and portable across consumers.
+FINDING_FAMILY_TIMESTAMP_MAX = 10_000_000_000
 
 
 def normalize_finding_root_cause(value: str) -> str:
@@ -649,9 +658,18 @@ class Workspace:
                     if not isinstance(event, dict):
                         errors.append(f"finding {finding_id} has an invalid family event")
                         break
+                    if set(event) - FINDING_FAMILY_EVENT_KEYS:
+                        errors.append(
+                            f"finding {finding_id} family event has unexpected keys"
+                        )
+                    if FINDING_FAMILY_EVENT_REQUIRED_KEYS - set(event):
+                        errors.append(
+                            f"finding {finding_id} family event has missing keys"
+                        )
                     event_id = event.get("id")
                     action = event.get("action")
                     event_ts = event.get("ts")
+                    event_source = event.get("source")
                     if (not isinstance(event_id, str)
                             or event_id != f"H{number:03d}"):
                         errors.append(f"finding {finding_id} family event IDs are invalid")
@@ -659,14 +677,22 @@ class Workspace:
                             "create", "link", "relink", "materialize",
                     }):
                         errors.append(f"finding {finding_id} family event action is invalid")
-                    if (event_ts is not None and (
+                    if ("ts" in event and (
                             isinstance(event_ts, bool)
                             or not isinstance(event_ts, (int, float))
                             or (isinstance(event_ts, float)
                                 and not math.isfinite(event_ts))
-                            or event_ts < 0)):
+                            or event_ts < 0
+                            or event_ts > FINDING_FAMILY_TIMESTAMP_MAX)):
                         errors.append(
                             f"finding {finding_id} family event timestamp is invalid"
+                        )
+                    if ("source" in event and (
+                            not isinstance(event_source, str)
+                            or not event_source.strip()
+                            or len(event_source) > FINDING_FAMILY_LIMITS["source"])):
+                        errors.append(
+                            f"finding {finding_id} family event source is invalid"
                         )
                     target = event.get("to_family_id")
                     origin = event.get("from_family_id")
@@ -681,6 +707,24 @@ class Workspace:
                     if (not isinstance(event_reason, str) or not event_reason.strip()
                             or len(event_reason) > FINDING_FAMILY_LIMITS["reason"]):
                         errors.append(f"finding {finding_id} family event reason is invalid")
+                    if number == 1:
+                        valid_initial = (
+                            (action == "create" and origin is None
+                             and target == finding_id)
+                            or (action == "materialize" and origin == finding_id
+                                and target == finding_id)
+                            or (action == "link" and origin in (None, finding_id)
+                                and target != finding_id)
+                        )
+                        if not valid_initial:
+                            errors.append(
+                                f"finding {finding_id} initial family transition is invalid"
+                            )
+                    elif (action != "relink" or origin != previous
+                          or target == origin):
+                        errors.append(
+                            f"finding {finding_id} family relink transition is invalid"
+                        )
                     if number > 1 and origin != previous:
                         errors.append(f"finding {finding_id} family history is discontinuous")
                     previous = target
@@ -747,6 +791,7 @@ class Workspace:
                        evidence: str = "", source: str = "worker",
                        root_cause: str = "", family_id: str = "",
                        case_kind: str = "", separate_reason: str = "") -> dict:
+        source = _family_text("source", source, required=True)
         structured = any(value != "" for value in (
             root_cause, family_id, case_kind, separate_reason,
         ))
@@ -757,6 +802,11 @@ class Workspace:
                 raise ValueError(f"finding family state is invalid: {errors[0]}")
             by_id, _, catalog = self._finding_family_index(rows)
             fid = f"F{max((int(row['id'][1:]) for row in rows), default=0) + 1:03d}"
+            if len(fid) > FINDING_FAMILY_LIMITS["family_id"]:
+                raise ValueError(
+                    "generated finding ID exceeds "
+                    f"{FINDING_FAMILY_LIMITS['family_id']} characters"
+                )
             normalized_severity = severity.upper()
             rec = {
                 "id": fid, "title": title, "severity": normalized_severity,
@@ -828,6 +878,7 @@ class Workspace:
         root_cause = _family_text("root_cause", root_cause)
         case_kind = _family_text("case_kind", case_kind, required=True)
         separate_reason = _family_text("separate_reason", separate_reason)
+        source = _family_text("source", source, required=True)
         with _file_lock(self.finding_family_lock):
             rows = self.findings.all_strict()
             errors = self._finding_family_errors(rows)

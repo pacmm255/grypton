@@ -442,6 +442,7 @@ class FindingFamilyRuntimeTests(unittest.IsolatedAsyncioTestCase):
             finding = record_family(ws, "Broken child", "Shared cache parser")
             rows = ws.findings.all()
             rows[0]["family_id"] = "F999"
+            rows[0]["family_history"][-1]["action"] = "link"
             rows[0]["family_history"][-1]["to_family_id"] = "F999"
             ws.findings.path.write_text(
                 "".join(json.dumps(row) + "\n" for row in rows),

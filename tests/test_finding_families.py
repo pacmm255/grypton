@@ -14,8 +14,10 @@ from grypton import config
 from grypton.engine import Engine
 from grypton.toolserver import REGISTRY, cli_main, dispatch
 from grypton.workspace import (FINDING_FAMILY_HISTORY_LIMIT,
-                               FINDING_FAMILY_LIMITS, FindingFamilyCollision,
-                               LedgerFormatError, Workspace)
+                               FINDING_FAMILY_LIMITS,
+                               FINDING_FAMILY_TIMESTAMP_MAX,
+                               FindingFamilyCollision, LedgerFormatError,
+                               Workspace)
 
 
 @contextmanager
@@ -68,7 +70,9 @@ def structured(finding_id, family_id, root="shared cause"):
     row.update({
         "family_id": family_id, "family_root_cause": root,
         "family_case_kind": "route", "family_history": [{
-            "id": "H001", "action": "create", "from_family_id": None,
+            "id": "H001",
+            "action": "create" if family_id == finding_id else "link",
+            "from_family_id": None,
             "to_family_id": family_id, "reason": "fixture",
         }],
     })
@@ -201,6 +205,7 @@ class FindingFamilyTests(unittest.TestCase):
             )
             self.assertEqual(retried["family_history"], linked["family_history"])
             self.assertEqual(ws.findings.path.read_bytes(), before_retry)
+            self.assertEqual(ws.finding_family_integrity_errors(), [])
 
     def test_legacy_cases_can_be_grouped_and_anchor_materialized(self):
         with isolated_runtime():
@@ -356,7 +361,8 @@ class FindingFamilyTests(unittest.TestCase):
             "to_family_id": invalid_values,
             "reason": (*invalid_values, None, "", "   ",
                        "x" * (FINDING_FAMILY_LIMITS["reason"] + 1)),
-            "ts": ([], {}, True, "invalid", -1, float("nan"), float("inf")),
+            "ts": ([], {}, True, "invalid", -1, float("nan"), float("inf"),
+                   FINDING_FAMILY_TIMESTAMP_MAX + 1, 10 ** 1000),
         }
         for field, values in event_values.items():
             for value in values:
@@ -381,7 +387,15 @@ class FindingFamilyTests(unittest.TestCase):
 
         huge_timestamp = structured("F001", "F001")
         huge_timestamp["family_history"][0]["ts"] = 10 ** 1000
-        self.assertEqual(Workspace._finding_family_errors([huge_timestamp]), [])
+        self.assertIn(
+            "family event timestamp is invalid",
+            "\n".join(Workspace._finding_family_errors([huge_timestamp])),
+        )
+        bounded_timestamp = structured("F001", "F001")
+        bounded_timestamp["family_history"][0]["ts"] = (
+            FINDING_FAMILY_TIMESTAMP_MAX
+        )
+        self.assertEqual(Workspace._finding_family_errors([bounded_timestamp]), [])
         bounded_reason = structured("F001", "F001")
         bounded_reason["family_history"][0]["reason"] = (
             "x" * FINDING_FAMILY_LIMITS["reason"]
@@ -425,6 +439,151 @@ class FindingFamilyTests(unittest.TestCase):
             self.assertIn("finding F001 family event reason is invalid", errors)
             with self.assertRaisesRegex(ValueError, "event reason is invalid"):
                 ws.finding_family_catalog()
+
+    def test_history_transition_state_machine_rejects_impossible_events(self):
+        def event(number, action, origin, target):
+            return {
+                "id": f"H{number:03d}", "action": action,
+                "from_family_id": origin, "to_family_id": target,
+                "reason": "fixture",
+            }
+
+        invalid = [
+            ([event(1, "create", "F001", "F001")], "F001", "initial family"),
+            ([event(1, "create", None, "F002")], "F002", "initial family"),
+            ([event(1, "materialize", None, "F001")], "F001", "initial family"),
+            ([event(1, "materialize", "F001", "F002")], "F002", "initial family"),
+            ([event(1, "link", "F999", "F002")], "F002", "initial family"),
+            ([event(1, "link", None, "F001")], "F001", "initial family"),
+            ([event(1, "relink", None, "F001")], "F001", "initial family"),
+            ([event(1, "create", None, "F001"),
+              event(2, "link", "F001", "F002")], "F002", "family relink"),
+            ([event(1, "create", None, "F001"),
+              event(2, "relink", "F001", "F001")], "F001", "family relink"),
+            ([event(1, "create", None, "F001"),
+              event(2, "relink", "F999", "F002")], "F002", "family relink"),
+        ]
+        for history, family_id, expected in invalid:
+            with self.subTest(history=history, expected=expected):
+                row = structured("F001", family_id)
+                row["family_history"] = history
+                self.assertIn(
+                    f"{expected} transition is invalid",
+                    "\n".join(Workspace._finding_family_errors([row])),
+                )
+
+        with isolated_runtime():
+            ws = workspace("invalid-noop-relink")
+            row = structured("F001", "F001")
+            row["family_history"].append(
+                event(2, "relink", "F001", "F001")
+            )
+            ws.findings.append(row)
+            self.assertIn(
+                "family relink transition is invalid",
+                "\n".join(ws.finding_family_integrity_errors()),
+            )
+            with self.assertRaisesRegex(ValueError, "relink transition is invalid"):
+                ws.finding_family_catalog()
+
+    def test_generated_history_forms_satisfy_transition_integrity(self):
+        with isolated_runtime():
+            ws = workspace("generated-family-history")
+            anchor = record(ws, "Anchor", "Anchor root")
+            child = record(ws, "Child", "", family_id=anchor["id"])
+            ws.findings.append(legacy("F003", "Legacy anchor"))
+            ws.findings.append(legacy("F004", "Legacy child"))
+            materialized = ws.link_finding_family(
+                "F003", "F003", reason="materialize fixture",
+                root_cause="Legacy root", case_kind="legacy anchor",
+            )
+            linked = ws.link_finding_family(
+                "F004", anchor["id"], reason="link fixture",
+                case_kind="legacy child",
+            )
+            other = record(ws, "Other", "Other root")
+            relinked = ws.link_finding_family(
+                child["id"], other["id"], reason="relink fixture",
+                case_kind="moved child",
+            )
+
+            self.assertEqual(anchor["family_history"][0]["action"], "create")
+            self.assertEqual(child["family_history"][0]["action"], "link")
+            self.assertEqual(materialized["family_history"][0]["action"], "materialize")
+            self.assertEqual(linked["family_history"][0]["action"], "link")
+            self.assertEqual(
+                [event["action"] for event in relinked["family_history"]],
+                ["link", "relink"],
+            )
+            self.assertEqual(ws.finding_family_integrity_errors(), [])
+            self.assertEqual(len(ws.finding_family_catalog()), 3)
+
+    def test_event_metadata_and_api_sources_are_bounded(self):
+        extra = structured("F001", "F001")
+        extra["family_history"][0]["unexpected"] = "value"
+        self.assertIn(
+            "family event has unexpected keys",
+            "\n".join(Workspace._finding_family_errors([extra])),
+        )
+        missing = structured("F001", "F001")
+        del missing["family_history"][0]["from_family_id"]
+        self.assertIn(
+            "family event has missing keys",
+            "\n".join(Workspace._finding_family_errors([missing])),
+        )
+        for source in (None, "", "   ", [], {},
+                       "x" * (FINDING_FAMILY_LIMITS["source"] + 1)):
+            with self.subTest(source=source):
+                row = structured("F001", "F001")
+                row["family_history"][0]["source"] = source
+                self.assertIn(
+                    "family event source is invalid",
+                    "\n".join(Workspace._finding_family_errors([row])),
+                )
+        valid = structured("F001", "F001")
+        valid["family_history"][0].update({
+            "source": "x" * FINDING_FAMILY_LIMITS["source"],
+            "ts": FINDING_FAMILY_TIMESTAMP_MAX,
+        })
+        self.assertEqual(Workspace._finding_family_errors([valid]), [])
+
+        with isolated_runtime():
+            ws = workspace("invalid-record-source")
+            self.assertFalse(ws.findings.path.exists())
+            with self.assertRaisesRegex(ValueError, "source is required"):
+                ws.record_finding(title="Invalid source", severity="P3", source="   ")
+            with self.assertRaisesRegex(ValueError, "source must be a string"):
+                ws.record_finding(title="Invalid source", severity="P3", source=[])
+            with self.assertRaisesRegex(ValueError, "source exceeds"):
+                ws.record_finding(
+                    title="Invalid source", severity="P3",
+                    source="x" * (FINDING_FAMILY_LIMITS["source"] + 1),
+                )
+            self.assertFalse(ws.findings.path.exists())
+
+            ws.findings.append(legacy("F001"))
+            before_link = ws.findings.path.read_bytes()
+            with self.assertRaisesRegex(ValueError, "source is required"):
+                ws.link_finding_family(
+                    "F001", "F001", reason="materialize",
+                    root_cause="Legacy root", case_kind="legacy", source=" ",
+                )
+            self.assertEqual(ws.findings.path.read_bytes(), before_link)
+
+    def test_generated_finding_id_overflow_is_non_destructive(self):
+        with isolated_runtime():
+            ws = workspace("finding-id-overflow")
+            maximum_id = "F" + "9" * (FINDING_FAMILY_LIMITS["family_id"] - 1)
+            ws.findings.append(legacy(maximum_id))
+            self.assertEqual(ws.finding_family_integrity_errors(), [])
+            before_ledger = ws.findings.path.read_bytes()
+            before_document = (ws.root / "findings.md").read_bytes()
+
+            with self.assertRaisesRegex(ValueError, "generated finding ID exceeds"):
+                ws.record_finding(title="Overflow", severity="P3")
+
+            self.assertEqual(ws.findings.path.read_bytes(), before_ledger)
+            self.assertEqual((ws.root / "findings.md").read_bytes(), before_document)
 
     def test_catalog_sorts_family_and_case_ids_numerically_past_999(self):
         with isolated_runtime():
@@ -491,6 +650,7 @@ class FindingFamilyTests(unittest.TestCase):
 
             anchor = record(ws, "Anchor", "Anchor root")
             moving = record(ws, "Moving", "Moving root")
+            alternate = record(ws, "Alternate", "Alternate root")
             with self.assertRaisesRegex(ValueError, "reason exceeds"):
                 ws.link_finding_family(
                     moving["id"], anchor["id"],
@@ -499,23 +659,29 @@ class FindingFamilyTests(unittest.TestCase):
                 )
             def fill_history(row):
                 history = row["family_history"]
-                history.extend({
-                    "id": f"H{number:03d}", "action": "relink",
-                    "from_family_id": moving["id"], "to_family_id": moving["id"],
-                    "reason": "bounded",
-                } for number in range(2, FINDING_FAMILY_HISTORY_LIMIT + 1))
+                previous = moving["id"]
+                for number in range(2, FINDING_FAMILY_HISTORY_LIMIT + 1):
+                    target = anchor["id"] if number % 2 == 0 else alternate["id"]
+                    history.append({
+                        "id": f"H{number:03d}", "action": "relink",
+                        "from_family_id": previous, "to_family_id": target,
+                        "reason": "bounded",
+                    })
+                    previous = target
+                row["family_id"] = previous
+                row["family_root_cause"] = "Anchor root"
             ws.findings.update(moving["id"], fill_history, strict=True)
             self.assertEqual(ws.finding_family_integrity_errors(), [])
             self.assertEqual(
                 ws.link_finding_family(
-                    moving["id"], moving["id"], reason="retry",
-                    root_cause="Moving root", case_kind="route",
-                )["family_id"], moving["id"],
+                    moving["id"], anchor["id"], reason="retry",
+                    root_cause="Anchor root", case_kind="route",
+                )["family_id"], anchor["id"],
             )
             before = ws.findings.path.read_bytes()
             with self.assertRaisesRegex(ValueError, "history limit"):
                 ws.link_finding_family(
-                    moving["id"], anchor["id"], reason="one more",
+                    moving["id"], alternate["id"], reason="one more",
                     case_kind="route",
                 )
             self.assertEqual(ws.findings.path.read_bytes(), before)
