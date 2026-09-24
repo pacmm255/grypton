@@ -62,6 +62,9 @@ class _BrowserRequestHandler(BaseHTTPRequestHandler):
     basic_token = "YmFzaWMtc2VjcmV0LTEyMzQ1Ng=="
     html_credential = "html-credential-secret-123456"
     html_meta_token = "html-meta-secret-123456"
+    rotated_token = "http-rotated-token-secret-123456"
+    expired_echo = "expired-echo-cookie-secret-123456"
+    authorization_echo = "authorization-echo-secret-123456"
     exfil_url = ""
     hostile_gets = 0
     bootstrap_network_gets = 0
@@ -95,9 +98,13 @@ class _BrowserRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/redirect":
             type(self).redirect_gets += 1
+            destination = urlsplit(type(self).exfil_url)
             self.send_response(302)
             self.send_header(
-                "Location", type(self).exfil_url + "?code=redirect-secret-never-log"
+                "Location",
+                f"{destination.scheme}://location-user:location-password@"
+                f"{destination.netloc}{destination.path}"
+                "?code=redirect-secret-never-log",
             )
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -111,6 +118,28 @@ class _BrowserRequestHandler(BaseHTTPRequestHandler):
                 ),),
             )
             return
+        if path == "/http-cookie-attribute":
+            self._send(
+                200, b'{"ok":true}', content_type="application/json",
+                headers=((
+                    "Set-Cookie",
+                    f"app_session={type(self).session}; HttpOnly; SameSite=Lax; Path=/",
+                ),),
+            )
+            return
+        if path == "/http-clear-site-data":
+            self._send(
+                200, b'{"ok":true}', content_type="application/json",
+                headers=(("Clear-Site-Data", '"cookies", "storage"'),),
+            )
+            return
+        if path == "/http-token-rotate":
+            self._send(
+                200,
+                json.dumps({"access_token": type(self).rotated_token}).encode(),
+                content_type="application/json",
+            )
+            return
         if path == "/plain-secrets":
             body = (
                 f"token={type(self).form_token}&note=Authorization%3A+Bearer+"
@@ -119,6 +148,25 @@ class _BrowserRequestHandler(BaseHTTPRequestHandler):
                 f"<meta name='csrf-token' content='{type(self).html_meta_token}'>"
             ).encode()
             self._send(200, body, content_type="text/html; charset=utf-8")
+            return
+        if path == "/neutral-secret-echo":
+            body = (
+                f"values {type(self).expired_echo} "
+                f"{type(self).authorization_echo}"
+            ).encode()
+            self._send(
+                200, body, content_type="text/plain",
+                headers=(
+                    (
+                        "Set-Cookie",
+                        f"expired={type(self).expired_echo}; Max-Age=0; Path=/",
+                    ),
+                    (
+                        "Authorization",
+                        f"Bearer {type(self).authorization_echo}",
+                    ),
+                ),
+            )
             return
         self._send(404, b"not found", content_type="text/plain")
 
@@ -426,7 +474,10 @@ class AuthenticatedBrowserRequestTests(unittest.TestCase):
             observable = json.dumps(result, ensure_ascii=False) + "".join(
                 path.read_text(errors="replace") for path in ws.flows_dir.glob("*.http")
             )
-            self.assertNotIn("redirect-secret-never-log", observable)
+            for secret in (
+                "redirect-secret-never-log", "location-user", "location-password",
+            ):
+                self.assertNotIn(secret, observable)
 
     def _upgrade_profile(self, port: int) -> dict:
         origin = f"http://127.0.0.1:{port}"
@@ -625,6 +676,121 @@ class AuthenticatedBrowserRequestTests(unittest.TestCase):
                 ).read_text(encoding="utf-8"),
             )
 
+    def test_http_token_rotation_invalidates_rich_browser_state(self):
+        with isolated_runtime(), local_server(_BrowserRequestHandler) as port:
+            ws = self._workspace(port)
+            self._seed_rich_session(ws, port)
+            storage_path = credentials.browser_storage_path(ws.slug, "primary")
+
+            result = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/http-token-rotate",
+                "credential": "primary",
+            })
+
+            self.assertTrue(result["ok"], result)
+            self.assertFalse(storage_path.exists())
+            self.assertEqual(
+                credentials.load_tokens(ws.slug, "primary").get("access_token"),
+                _BrowserRequestHandler.rotated_token,
+            )
+            observable = json.dumps(result, ensure_ascii=False) + "".join(
+                path.read_text(errors="replace")
+                for path in ws.flows_dir.glob("*.http")
+            )
+            self.assertNotIn(_BrowserRequestHandler.rotated_token, observable)
+
+    def test_http_browser_semantic_headers_invalidate_rich_state(self):
+        for route in ("/http-cookie-attribute", "/http-clear-site-data"):
+            with self.subTest(route=route), isolated_runtime(), \
+                    local_server(_BrowserRequestHandler) as port:
+                ws = self._workspace(port)
+                self._seed_rich_session(ws, port)
+                jar = credentials.cookie_jar_storage_path(ws.slug, "primary")
+                digest_before = credentials.cookie_jar_digest(jar)
+
+                result = dispatch(ws, "authenticated_http_request", {
+                    "url": f"http://127.0.0.1:{port}{route}",
+                    "credential": "primary",
+                })
+
+                self.assertTrue(result["ok"], result)
+                self.assertFalse(
+                    credentials.browser_storage_path(
+                        ws.slug, "primary"
+                    ).exists()
+                )
+                if route == "/http-cookie-attribute":
+                    self.assertEqual(
+                        credentials.cookie_jar_digest(jar), digest_before,
+                        "attribute-only Set-Cookie should exercise presence invalidation",
+                    )
+
+    def test_special_storage_keys_round_trip_and_headers_fail_closed(self):
+        with isolated_runtime(), local_server(_BrowserRequestHandler) as port:
+            ws = self._workspace(port)
+            self._seed_rich_session(ws, port)
+            origin = f"http://127.0.0.1:{port}"
+            rich = credentials.load_browser_storage(ws.slug, "primary")
+            credentials.save_browser_storage(
+                ws.slug, "primary", origin=origin, cookies=rich["cookies"],
+                local_storage={
+                    "__proto__": _BrowserRequestHandler.csrf,
+                    "constructor": "constructor-private-value",
+                },
+                session_storage={
+                    "__proto__": _BrowserRequestHandler.nonce,
+                    "prototype": "prototype-private-value",
+                },
+            )
+
+            result = dispatch(ws, "authenticated_browser_request", {
+                "url": origin + "/api/action", "page_url": origin + "/hostile",
+                "credential": "primary", "method": "POST", "body": "{}",
+                "headers": {"X-Meta": _BrowserRequestHandler.meta},
+                "header_sources": {
+                    "X-CSRF": {"source": "localStorage", "name": "__proto__"},
+                    "X-Nonce": {"source": "sessionStorage", "name": "__proto__"},
+                },
+            })
+            self.assertTrue(result["ok"], result)
+            stored = credentials.load_browser_storage(ws.slug, "primary")
+            self.assertEqual(
+                stored["local_storage"]["__proto__"],
+                _BrowserRequestHandler.csrf,
+            )
+            self.assertEqual(
+                stored["session_storage"]["__proto__"],
+                _BrowserRequestHandler.nonce,
+            )
+            self.assertEqual(
+                stored["local_storage"]["constructor"],
+                "constructor-private-value",
+            )
+            self.assertEqual(
+                stored["session_storage"]["prototype"],
+                "prototype-private-value",
+            )
+
+            posts = _BrowserRequestHandler.api_posts
+            bad_calls = (
+                {"headers": {"__proto__": "value"}},
+                {"header_sources": {
+                    "__proto__": {
+                        "source": "localStorage", "name": "__proto__",
+                    },
+                }},
+            )
+            for bad in bad_calls:
+                args = {
+                    "url": origin + "/api/action", "page_url": origin + "/hostile",
+                    "credential": "primary", "method": "POST", "body": "{}",
+                    **bad,
+                }
+                rejected = dispatch(ws, "authenticated_browser_request", args)
+                self.assertFalse(rejected["ok"], rejected)
+                self.assertIn("reserved object property", rejected["summary"])
+            self.assertEqual(_BrowserRequestHandler.api_posts, posts)
+
     def test_non_json_response_secrets_are_redacted(self):
         with isolated_runtime(), local_server(_BrowserRequestHandler) as port:
             ws = self._workspace(port)
@@ -649,6 +815,25 @@ class AuthenticatedBrowserRequestTests(unittest.TestCase):
                 _BrowserRequestHandler.html_meta_token,
             ):
                 self.assertNotIn(secret, observable)
+
+    def test_sensitive_header_components_redact_neutral_echoes(self):
+        with isolated_runtime(), local_server(_BrowserRequestHandler) as port:
+            ws = self._workspace(port)
+            self._seed_rich_session(ws, port)
+
+            result = dispatch(ws, "authenticated_browser_request", {
+                "url": f"http://127.0.0.1:{port}/neutral-secret-echo",
+                "page_url": f"http://127.0.0.1:{port}/hostile",
+                "credential": "primary",
+            })
+
+            self.assertTrue(result["ok"], result)
+            observable = json.dumps(result, ensure_ascii=False) + "".join(
+                path.read_text(errors="replace")
+                for path in ws.flows_dir.glob("*.http")
+            )
+            self.assertNotIn(_BrowserRequestHandler.expired_echo, observable)
+            self.assertNotIn(_BrowserRequestHandler.authorization_echo, observable)
 
     def test_profile_revision_change_blocks_browser_request(self):
         with isolated_runtime(), local_server(_BrowserRequestHandler) as port:

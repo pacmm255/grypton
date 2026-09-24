@@ -49,6 +49,9 @@ _SENSITIVE_HEADER_RE = re.compile(
     r"(?im)^(\s*(?:authorization|proxy-authorization|cookie|set-cookie|"
     r"x-api-key|x-auth-token|x-csrf-token|x-xsrf-token)\s*:\s*).*$"
 )
+_URL_USERINFO_RE = re.compile(
+    r"(?i)\b((?:https?|wss?|ftp)://)[^/\s:@]+(?::[^/\s@]*)?@"
+)
 _SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"""(?ix)
     ((?:["']?(?:authorization|proxy[_-]?authorization|cookie|set[_-]?cookie|
@@ -95,6 +98,7 @@ def redact_sensitive_text(value: object, secret_values: Iterable[str] = ()) -> s
     for secret in sorted({str(item) for item in secret_values if str(item)},
                          key=len, reverse=True):
         text = text.replace(secret, "[REDACTED]")
+    text = _URL_USERINFO_RE.sub(r"\1[REDACTED]@", text)
     text = _SENSITIVE_HEADER_RE.sub(r"\1[REDACTED]", text)
     text = _AUTH_SCHEME_RE.sub(r"\1[REDACTED]", text)
     return _SENSITIVE_ASSIGNMENT_RE.sub(r"\1[REDACTED]", text)
@@ -647,6 +651,10 @@ def _browser_request_headers(headers: Optional[dict]) -> dict[str, str]:
         normalized = key.lower()
         if normalized in normalized_names:
             raise ValueError("Browser request headers contain a case-insensitive duplicate.")
+        if normalized in {"__proto__", "prototype", "constructor"}:
+            raise ValueError(
+                f"Browser request header {key!r} uses a reserved object property name."
+            )
         if normalized in forbidden or normalized.startswith(
             ("proxy-", "sec-", "x-grypton-")
         ):
@@ -687,6 +695,10 @@ def _browser_request_header_sources(value: Optional[dict],
         normalized = raw_header.lower()
         if normalized in seen:
             raise ValueError("Browser request headers contain a case-insensitive duplicate.")
+        if normalized in {"__proto__", "prototype", "constructor"}:
+            raise ValueError(
+                f"Derived browser header {raw_header!r} uses a reserved object property name."
+            )
         if normalized in forbidden or normalized.startswith(
             ("proxy-", "sec-", "x-grypton-")
         ):
@@ -769,6 +781,20 @@ def _browser_private_response_values(body: str, headers: dict) -> tuple[str, ...
         if key_is_sensitive(key):
             remember(value)
         if isinstance(value, str):
+            normalized_header = re.sub(r"[^a-z0-9]", "", str(key).lower())
+            if normalized_header == "setcookie":
+                for line in value.replace("\r", "\n").split("\n"):
+                    pair = line.split(";", 1)[0]
+                    _name, separator, cookie_value = pair.partition("=")
+                    if separator:
+                        remember(cookie_value.strip())
+            if normalized_header in {"authorization", "proxyauthorization"}:
+                scheme = re.match(
+                    r"(?i)^\s*(?:bearer|basic)\s+([A-Za-z0-9._~+/=-]{1,})",
+                    value,
+                )
+                if scheme:
+                    remember(scheme.group(1))
             try:
                 parsed_header_url = urlsplit(value)
             except ValueError:
@@ -995,7 +1021,8 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
                  _bearer_token: str = "", _bearer_origin: str = "",
                  _session_identity: Optional[tuple[str, str, str]] = None,
                  _capture_headers: Optional[dict] = None,
-                 _capture_body: Optional[str] = None) -> dict:
+                 _capture_body: Optional[str] = None,
+                 _response_observation: Optional[dict] = None) -> dict:
     blocked = _scope_error(workspace, url)
     if blocked:
         return blocked
@@ -1098,6 +1125,13 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
         os.chmod(_cookie_jar, 0o600)
 
     output = raw_output.decode("utf-8", "replace")
+    if isinstance(_response_observation, dict):
+        _response_observation["set_cookie"] = bool(
+            re.search(r"(?im)^\s*set-cookie\s*:", output)
+        )
+        _response_observation["clear_site_data"] = bool(
+            re.search(r"(?im)^\s*clear-site-data\s*:", output)
+        )
     extracted = _extract_auth_tokens(output) if _session_identity else {}
     if _session_identity and extracted:
         saved = credentials.load_tokens(target_slug, credential_name)
@@ -1695,6 +1729,7 @@ def authenticated_http_request(workspace: Workspace, url: str, *, credential: st
                 token_snapshot = _snapshot_private_material(token_file)
                 storage_snapshot = _snapshot_private_material(storage_file)
                 cookie_digest_before = credentials.cookie_jar_digest(jar_storage)
+                response_observation: dict[str, bool] = {}
                 commit_material = False
                 material_restored = False
                 try:
@@ -1709,6 +1744,7 @@ def authenticated_http_request(workspace: Workspace, url: str, *, credential: st
                         _cookie_jar=jar, _bearer_token=bearer,
                         _bearer_origin=bound_origin,
                         _session_identity=(workspace.slug, credential, bound_origin),
+                        _response_observation=response_observation,
                     )
                     data = (
                         result.get("data")
@@ -1723,15 +1759,21 @@ def authenticated_http_request(workspace: Workspace, url: str, *, credential: st
                     )
                     if candidate_commit:
                         try:
+                            tokens_changed = (
+                                credentials.load_tokens(workspace.slug, credential)
+                                != tokens
+                            )
                             if (
                                 credentials.cookie_jar_digest(jar_storage)
                                 != cookie_digest_before
+                                or tokens_changed
+                                or response_observation.get("set_cookie") is True
+                                or response_observation.get("clear_site_data") is True
                             ):
-                                # curl cannot preserve the richer HttpOnly,
-                                # SameSite and partition metadata.  A committed
-                                # cookie mutation therefore invalidates the
-                                # browser artifact instead of leaving stale
-                                # same-generation cookies available.
+                                # The transports share one proof generation.
+                                # curl cannot update exact web storage or retain
+                                # rich cookie attributes, so a committed token
+                                # or cookie mutation invalidates browser state.
                                 storage_file.unlink(missing_ok=True)
                             commit_material = True
                         except Exception:
@@ -3176,7 +3218,7 @@ def _browser_auth_storage(page, area: str) -> dict:
             """area => {
               const storage = area === 'localStorage' ? localStorage : sessionStorage;
               if (storage.length > 100) return {valid: false};
-              const output = {}; let total = 0;
+              const entries = []; let total = 0; let captured = 0;
               for (let i = 0; i < storage.length; i++) {
                 const key = storage.key(i);
                 if (key === null) continue;
@@ -3184,9 +3226,9 @@ def _browser_auth_storage(page, area: str) -> dict:
                 if (key.length > 512 || item.length > 65536) return {valid: false};
                 total += key.length + item.length;
                 if (total > 1000000) return {valid: false};
-                output[key] = item;
+                entries.push([key, item]); captured += 1;
               }
-              return {valid: true, values: output};
+              return {valid: captured === storage.length, entries};
             }""",
             area,
         )
@@ -3197,12 +3239,25 @@ def _browser_auth_storage(page, area: str) -> dict:
     if (
         not isinstance(value, dict)
         or value.get("valid") is not True
-        or not isinstance(value.get("values"), dict)
+        or not isinstance(value.get("entries"), list)
     ):
         raise _BrowserStorageCaptureError(
             "browser storage exceeds the exact private capture limits"
         )
-    return value["values"]
+    output: dict[str, str] = {}
+    for entry in value["entries"]:
+        if (
+            not isinstance(entry, list) or len(entry) != 2
+            or not isinstance(entry[0], str) or not isinstance(entry[1], str)
+            or entry[0] in output
+        ):
+            raise _BrowserStorageCaptureError(
+                "browser storage capture was not exact"
+            )
+        output[entry[0]] = entry[1]
+    if len(output) != len(value["entries"]):
+        raise _BrowserStorageCaptureError("browser storage capture was not exact")
+    return output
 
 
 def _browser_auth_local_storage(page) -> dict:
@@ -3223,8 +3278,9 @@ def _browser_auth_restore_storage(context, url: str, storage: dict) -> None:
         "session": session if isinstance(session, dict) else {},
     }
     encoded = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+    encoded_literal = json.dumps(encoded, ensure_ascii=True)
     context.add_init_script(script=f"""(() => {{
-      const state = {encoded};
+      const state = JSON.parse({encoded_literal});
       try {{
         if (location.origin !== new URL(state.url).origin) return;
         for (const [key, value] of Object.entries(state.local)) {{
