@@ -456,6 +456,27 @@ class FindingFamilyRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(health["finding_cases"], 1)
             self.assertEqual(health["finding_families"], 0)
 
+    def test_runtime_health_fails_closed_on_unhashable_family_event(self):
+        with isolated_runtime():
+            ws = Workspace("invalid-family-event-health")
+            ws.create("example.test", "web")
+            record_family(ws, "Broken history", "Shared cache parser")
+            rows = ws.findings.all()
+            rows[0]["family_history"][0]["action"] = []
+            ws.findings.path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+
+            errors = ws.finding_family_integrity_errors()
+            self.assertIn("family event action is invalid", errors[0])
+            with self.assertRaisesRegex(ValueError, "event action is invalid"):
+                ws.finding_family_catalog()
+            health = _health(ws.slug, 0)
+            self.assertEqual(health["findings"], 1)
+            self.assertEqual(health["finding_cases"], 1)
+            self.assertEqual(health["finding_families"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

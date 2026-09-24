@@ -311,6 +311,99 @@ class FindingFamilyTests(unittest.TestCase):
 
             self.assertEqual(ws.findings.path.read_bytes(), before)
 
+    def test_integrity_is_total_over_arbitrary_family_json_types(self):
+        invalid_values = ([], {}, True, 7, 1.5)
+        event_values = {
+            "id": invalid_values,
+            "action": invalid_values,
+            "from_family_id": invalid_values,
+            "to_family_id": invalid_values,
+            "reason": invalid_values,
+            "ts": ([], {}, True, "invalid", -1, float("nan"), float("inf")),
+        }
+        for field, values in event_values.items():
+            for value in values:
+                with self.subTest(scope="event", field=field, value=value):
+                    row = structured("F001", "F001")
+                    row["family_history"][0][field] = value
+                    self.assertTrue(Workspace._finding_family_errors([row]))
+
+        for field in ("family_id", "family_root_cause", "family_case_kind",
+                      "family_separate_reason"):
+            for value in invalid_values:
+                with self.subTest(scope="record", field=field, value=value):
+                    row = structured("F001", "F001")
+                    row[field] = value
+                    self.assertTrue(Workspace._finding_family_errors([row]))
+
+        for value in ([], {}, True, 7, 1.5, ["invalid-event"]):
+            with self.subTest(scope="history", value=value):
+                row = structured("F001", "F001")
+                row["family_history"] = value
+                self.assertTrue(Workspace._finding_family_errors([row]))
+
+        huge_timestamp = structured("F001", "F001")
+        huge_timestamp["family_history"][0]["ts"] = 10 ** 1000
+        self.assertEqual(Workspace._finding_family_errors([huge_timestamp]), [])
+
+        with isolated_runtime():
+            ws = workspace("unhashable-family-action")
+            row = structured("F001", "F001")
+            row["family_history"][0]["action"] = []
+            ws.findings.append(row)
+            errors = ws.finding_family_integrity_errors()
+            self.assertIn("family event action is invalid", errors[0])
+            with self.assertRaisesRegex(ValueError, "event action is invalid"):
+                ws.finding_family_catalog()
+
+    def test_catalog_sorts_family_and_case_ids_numerically_past_999(self):
+        with isolated_runtime():
+            ws = workspace("numeric-family-order")
+            for finding_id in ("F998", "F999", "F1000"):
+                ws.findings.append(legacy(finding_id))
+            self.assertEqual(
+                [row["family_id"] for row in ws.finding_family_catalog()],
+                ["F998", "F999", "F1000"],
+            )
+
+            grouped = workspace("numeric-case-order")
+            for finding_id in ("F998", "F999", "F1000"):
+                grouped.findings.append(structured(finding_id, "F998"))
+            self.assertEqual(
+                grouped.finding_family_catalog()[0]["case_ids"],
+                ["F998", "F999", "F1000"],
+            )
+
+    def test_confirmed_counts_ignore_non_object_verdicts_and_rows(self):
+        with isolated_runtime():
+            ws = workspace("corrupt-verdict-counts")
+            string_verdict = legacy("F001")
+            string_verdict["manager_verdict"] = "confirm"
+            list_verdict = legacy("F002")
+            list_verdict["manager_verdict"] = ["confirm"]
+            invalid_severity = legacy("F003")
+            invalid_severity["manager_verdict"] = {
+                "verdict": "confirm", "severity": [],
+            }
+            valid = legacy("F004")
+            valid["manager_verdict"] = {
+                "verdict": "confirm", "severity": "P1",
+            }
+            rows = [string_verdict, list_verdict, invalid_severity, valid, [1]]
+            ws.findings.path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                [row["id"] for row in ws.confirmed_findings()],
+                ["F003", "F004"],
+            )
+            self.assertEqual(
+                [row["id"] for row in ws.confirmed_p1s()],
+                ["F004"],
+            )
+
     def test_length_and_history_bounds_fail_before_mutation(self):
         with isolated_runtime():
             ws = workspace("family-bounds")

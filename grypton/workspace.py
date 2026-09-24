@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import re
 import time
@@ -540,6 +541,14 @@ class Workspace:
     def _finding_family_id(record: dict) -> str:
         return str(record.get("family_id") or record.get("id") or "").strip()
 
+    @staticmethod
+    def _finding_id_sort_key(value: object) -> tuple[int, int, str]:
+        text = str(value or "")
+        if (len(text) <= FINDING_FAMILY_LIMITS["family_id"]
+                and re.fullmatch(r"F\d+", text)):
+            return 0, int(text[1:]), text
+        return 1, 0, text
+
     @classmethod
     def _finding_family_index(cls, rows: list[dict]) -> tuple[dict, dict, list]:
         by_id = {str(row.get("id") or ""): row for row in rows}
@@ -547,8 +556,9 @@ class Workspace:
         for row in rows:
             groups.setdefault(cls._finding_family_id(row), []).append(row)
         catalog = []
-        for family_id, members in sorted(groups.items()):
-            members.sort(key=lambda row: str(row.get("id") or ""))
+        for family_id, members in sorted(
+                groups.items(), key=lambda item: cls._finding_id_sort_key(item[0])):
+            members.sort(key=lambda row: cls._finding_id_sort_key(row.get("id")))
             anchor = by_id.get(family_id)
             root_rows = ([anchor] if anchor else []) + members
             root_cause = next((
@@ -632,10 +642,25 @@ class Workspace:
                     if not isinstance(event, dict):
                         errors.append(f"finding {finding_id} has an invalid family event")
                         break
-                    if event.get("id") != f"H{number:03d}":
+                    event_id = event.get("id")
+                    action = event.get("action")
+                    event_ts = event.get("ts")
+                    if (not isinstance(event_id, str)
+                            or event_id != f"H{number:03d}"):
                         errors.append(f"finding {finding_id} family event IDs are invalid")
-                    if event.get("action") not in {"create", "link", "relink", "materialize"}:
+                    if (not isinstance(action, str) or action not in {
+                            "create", "link", "relink", "materialize",
+                    }):
                         errors.append(f"finding {finding_id} family event action is invalid")
+                    if (event_ts is not None and (
+                            isinstance(event_ts, bool)
+                            or not isinstance(event_ts, (int, float))
+                            or (isinstance(event_ts, float)
+                                and not math.isfinite(event_ts))
+                            or event_ts < 0)):
+                        errors.append(
+                            f"finding {finding_id} family event timestamp is invalid"
+                        )
                     target = event.get("to_family_id")
                     origin = event.get("from_family_id")
                     event_reason = event.get("reason")
@@ -665,8 +690,9 @@ class Workspace:
                     key in anchor for key in FINDING_FAMILY_FIELDS):
                 errors.append(f"legacy family anchor {family_id} is not materialized")
             roots = {
-                normalize_finding_root_cause(row.get("family_root_cause", ""))
-                for row in members if row.get("family_root_cause")
+                normalize_finding_root_cause(root)
+                for row in members
+                if isinstance((root := row.get("family_root_cause")), str) and root
             }
             roots.discard("")
             if len(roots) > 1:
@@ -957,20 +983,25 @@ class Workspace:
     def confirmed_p1s(self) -> list[dict]:
         out = []
         for f in self.confirmed_findings():
-            v = f.get("manager_verdict") or {}
-            sev = (v.get("severity") or f.get("severity") or "").upper()
+            raw_verdict = f.get("manager_verdict")
+            verdict = raw_verdict if isinstance(raw_verdict, dict) else {}
+            sev = str(verdict.get("severity") or f.get("severity") or "").upper()
             if SEVERITY_RANK.get(sev) == 1:
                 out.append(f)
         return out
 
     def confirmed_findings(self) -> list[dict]:
         decisive = {"confirm", "agree", "upgrade", "downgrade"}
-        return [
-            finding for finding in self.findings.all()
-            if finding.get("status") != "suppressed-by-scope"
-            and str((finding.get("manager_verdict") or {}).get("verdict") or "").lower()
-            in decisive
-        ]
+        confirmed = []
+        for finding in self.findings.all():
+            if not isinstance(finding, dict):
+                continue
+            raw_verdict = finding.get("manager_verdict")
+            verdict = raw_verdict if isinstance(raw_verdict, dict) else {}
+            if (finding.get("status") != "suppressed-by-scope"
+                    and str(verdict.get("verdict") or "").lower() in decisive):
+                confirmed.append(finding)
+        return confirmed
 
     # ---- attack surface (R23) -------------------------------------------
 
