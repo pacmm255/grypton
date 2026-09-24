@@ -57,7 +57,9 @@ def main() -> None:
             finding = ws.record_finding(title="Synthetic object boundary", severity="P3",
                 vuln_class="access control", surface="GET /api/profile?id=N",
                 description="Synthetic UI fixture.", poc="Compare id=1 and id=2.",
-                evidence="flows/flow-smoke.http", source="fixture")
+                evidence="flows/flow-smoke.http", source="fixture",
+                root_cause="Profile lookup omits the caller identity",
+                case_kind="numeric object reference")
             ws.set_severity_verdict(finding["id"], {
                 "finding_id": finding["id"], "verdict": "confirm", "severity": "P3",
                 "confidence": 0.9, "reasoning": "Synthetic independent fixture verdict.",
@@ -65,9 +67,13 @@ def main() -> None:
                 "validator_model": config.VALIDATOR_MODEL,
                 "validator_effort": config.VALIDATOR_EFFORT,
             })
-            ws.record_finding(title="Synthetic low-priority candidate", severity="P4",
-                              description="Astra review was not explicitly requested.",
-                              source="fixture")
+            ws.record_finding(
+                title="Synthetic low-priority candidate", severity="P4",
+                vuln_class="access control", surface="GET /api/export?id=N",
+                description="Astra review was not explicitly requested.",
+                source="fixture", family_id=finding["id"],
+                case_kind="export object reference",
+            )
             ws.flows_dir.mkdir(parents=True, exist_ok=True)
             (ws.flows_dir / "flow-smoke.http").write_text(
                 "### REQUEST\nGET http://127.0.0.1:18767/api/profile?id=2\n\n### RESPONSE\nHTTP 200\n",
@@ -102,11 +108,16 @@ def main() -> None:
                     page.goto(f"http://127.0.0.1:{server.server_address[1]}")
                     page.get_by_text("Connected", exact=True).wait_for()
                     page.get_by_text("PINNED ROUTE ACTIVITY", exact=True).wait_for()
-                    page.get_by_text("FINDINGS / ASTRA VERDICTS", exact=True).wait_for()
+                    page.get_by_text(
+                        "FINDING FAMILIES / EVIDENCE CASES / ASTRA", exact=True
+                    ).wait_for()
                     assert page.locator(".team-card").count() == 3
                     assert page.locator(".case-item").count() == 1
-                    assert page.locator("#count-findings").inner_text() == "1/2"
-                    assert page.get_by_text("not-requested", exact=True).is_visible()
+                    assert page.locator("#count-findings").inner_text() == "1F / 2C"
+                    assert page.locator(".finding-family-card").count() == 1
+                    assert page.locator(".finding-case-row").count() == 2
+                    assert page.get_by_text("Astra: confirm", exact=True).is_visible()
+                    assert page.get_by_text("Astra: not-requested", exact=True).is_visible()
                     assert page.get_by_text(config.WORKER_MODEL, exact=True).is_visible()
                     assert page.get_by_text(config.MANAGER_MODEL, exact=True).is_visible()
                     assert page.get_by_text(config.VALIDATOR_MODEL, exact=True).is_visible()
@@ -122,8 +133,9 @@ def main() -> None:
             print(json.dumps({
                 "ok": True,
                 "models": [config.WORKER_MODEL, config.MANAGER_MODEL, config.VALIDATOR_MODEL],
-                "checks": ["live API", "model cards", "engagement detail", "Astra verdict",
-                           "tool and flow activity", "responsive widths", "no browser errors"],
+                "checks": ["live API", "model cards", "one grouped family", "two evidence cases",
+                           "case-level Astra state", "tool and flow activity",
+                           "responsive widths", "no browser errors"],
             }))
 
 

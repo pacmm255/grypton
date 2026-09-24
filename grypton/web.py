@@ -9,6 +9,16 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 from . import config
+from .finding_views import (
+    WEB_CASE_LIMIT,
+    WEB_FAMILY_LIMIT,
+    bounded_family_catalog,
+    confirmed_finding_cases,
+    finding_case_rows,
+    finding_family_counts,
+    finding_family_view,
+    safe_display_text,
+)
 from .scenarios import load_scenarios
 from .workspace import Workspace, list_targets
 
@@ -43,14 +53,18 @@ def _named_models(meta=None) -> dict:
 def engagement_summary(slug: str) -> dict:
     ws = Workspace(slug)
     meta = ws.load_meta()
-    findings = ws.findings.all()
-    confirmed = ws.confirmed_findings()
+    findings = finding_case_rows(ws)
+    confirmed = confirmed_finding_cases(findings)
+    families, _family_errors = finding_family_view(ws)
+    family_count, family_case_count = finding_family_counts(families)
     calls = _jsonl(ws.transcripts_dir / "provider-calls.jsonl", 10_000)
     return {"id": slug, "target": meta.target, "type": meta.target_type,
             "models": _named_models(meta),
             "status": meta.status, "turns": meta.turn_index,
             "surface": len(ws.surface.all()), "tested": len(ws.tested.all()),
-            "findings": len(findings), "confirmed": len(confirmed),
+            # Existing fields remain case-level for API compatibility.
+            "findings": len(findings), "finding_cases": family_case_count,
+            "finding_families": family_count, "confirmed": len(confirmed),
             "needs_more_evidence": sum(
                 (row.get("manager_verdict") or {}).get("verdict") == "needs-more-evidence"
                 for row in findings
@@ -77,6 +91,8 @@ def dashboard_state() -> dict:
                    "running": sum(row["status"] == "running" for row in engagements),
                    "tools": sum(row["tool_calls"] for row in engagements),
                    "findings": sum(row["findings"] for row in engagements),
+                   "finding_cases": sum(row["finding_cases"] for row in engagements),
+                   "finding_families": sum(row["finding_families"] for row in engagements),
                    "confirmed": sum(row["confirmed"] for row in engagements)},
         "engagements": engagements}
 
@@ -87,13 +103,23 @@ def engagement_detail(slug: str) -> dict:
         raise FileNotFoundError(slug)
     meta = ws.load_meta()
     constraints = ws.load_constraints()
+    families, family_errors = finding_family_view(ws)
+    visible_families, omitted_families, omitted_cases = bounded_family_catalog(
+        families, family_limit=WEB_FAMILY_LIMIT, case_limit=WEB_CASE_LIMIT,
+    )
     return {**engagement_summary(slug), "workspace": str(ws.root),
             "scope": {"in_scope": constraints.in_scope, "out_of_scope": constraints.out_of_scope,
                       "hard_rules": constraints.hard_rules,
                       "standing_instructions": constraints.standing_instructions,
                       "notes": constraints.notes},
             "surface_rows": ws.surface.all()[-100:], "tested_rows": ws.tested.all()[-100:],
-            "finding_rows": ws.findings.all()[-100:],
+            "finding_rows": finding_case_rows(ws)[-100:],
+            "finding_family_rows": visible_families,
+            "finding_family_rows_omitted": omitted_families,
+            "finding_case_rows_omitted": omitted_cases,
+            "finding_family_integrity_errors": [
+                safe_display_text(error, 500) for error in family_errors[:100]
+            ],
             "provider_rows": _jsonl(ws.transcripts_dir / "provider-calls.jsonl", 100),
             "tool_rows": _jsonl(ws.root / ".ledger/tool-calls.jsonl", 100),
             "flow_rows": [{"id": path.stem, "bytes": path.stat().st_size}

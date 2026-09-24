@@ -21,6 +21,18 @@ import time
 from urllib.parse import urlsplit
 
 from . import config
+from .finding_views import (
+    DEFAULT_TERMINAL_FAMILY_LIMIT,
+    MAX_TERMINAL_FAMILY_LIMIT,
+    confirmed_finding_cases,
+    confirmed_p1_cases,
+    finding_case_rows,
+    finding_family_counts,
+    finding_family_for_case,
+    finding_family_view,
+    safe_display_text,
+    terminal_family_lines,
+)
 from .workspace import Constraints, Workspace, list_targets
 
 
@@ -54,6 +66,18 @@ def _duration_seconds(value: str) -> int:
     if seconds <= 0:
         raise argparse.ArgumentTypeError("duration must be greater than zero")
     return seconds
+
+
+def _family_limit(value: str) -> int:
+    try:
+        limit = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("family limit must be a whole number") from exc
+    if not 1 <= limit <= MAX_TERMINAL_FAMILY_LIMIT:
+        raise argparse.ArgumentTypeError(
+            f"family limit must be between 1 and {MAX_TERMINAL_FAMILY_LIMIT}"
+        )
+    return limit
 
 
 def _target_value(ns) -> str:
@@ -423,11 +447,17 @@ def _status(slug: str) -> dict:
     except (OSError, ValueError):
         pass
     models = config.effective_role_models(meta)
+    findings = finding_case_rows(ws)
+    families, _family_errors = finding_family_view(ws)
+    family_count, family_case_count = finding_family_counts(families)
     return {"slug": slug, "target": meta.target, "status": meta.status,
             "type": meta.target_type, "turns": meta.turn_index,
-            "findings": len(ws.findings.all()),
-            "confirmed_findings": len(ws.confirmed_findings()),
-            "confirmed_p1": len(ws.confirmed_p1s()),
+            # ``findings`` remains the historical evidence-case count.
+            "findings": len(findings),
+            "finding_cases": family_case_count,
+            "finding_families": family_count,
+            "confirmed_findings": len(confirmed_finding_cases(findings)),
+            "confirmed_p1": len(confirmed_p1_cases(findings)),
             "surface": len(ws.surface.all()), "tested": len(ws.tested.all()),
             "tool_calls": _count_lines(ws.root / ".ledger" / "tool-calls.jsonl"),
             "provider_calls": by_role,
@@ -452,7 +482,8 @@ def cmd_status(ns) -> int:
         calls = row["provider_calls"]
         print(f"{row['slug']}: {row['status']} · turns={row['turns']} · tools={row['tool_calls']} · "
               f"surface={row['surface']} · tested={row['tested']} · "
-              f"findings={row['findings']} ({row['confirmed_findings']} confirmed) · "
+              f"finding families={row['finding_families']} · cases={row['finding_cases']} "
+              f"({row['confirmed_findings']} confirmed cases) · "
               f"providers=Kraude:{calls['worker']}/Kryptex:{calls['manager']}/Astra:{calls['validator']}")
     return 0
 
@@ -673,8 +704,8 @@ def _redact_program_value(value):
     return value
 
 
-def _finding_overview(row: dict | None) -> dict | None:
-    if not row:
+def _finding_overview(row: dict | None, *, family_id: str = "") -> dict | None:
+    if not isinstance(row, dict) or not row:
         return None
     verdict = row.get("manager_verdict") or {}
     return {
@@ -685,6 +716,7 @@ def _finding_overview(row: dict | None) -> dict | None:
         "status": row.get("status"),
         "validator_verdict": verdict.get("verdict"),
         "confidence": verdict.get("confidence"),
+        "family_id": family_id or row.get("id"),
     }
 
 
@@ -768,7 +800,8 @@ def cmd_overview(ns) -> int:
     row = _status(ws.slug)
     meta = ws.load_meta()
     constraints = ws.load_constraints()
-    findings = ws.findings.all()
+    findings = finding_case_rows(ws)
+    families, _family_errors = finding_family_view(ws)
     latest = findings[-1] if findings else None
     output = {
         **row,
@@ -776,7 +809,10 @@ def cmd_overview(ns) -> int:
         "out_of_scope": constraints.out_of_scope,
         "standing_instruction_count": len(constraints.standing_instructions),
         "last_directive": _redact_summary(meta.last_directive),
-        "latest_finding": _finding_overview(latest),
+        "latest_finding": _finding_overview(
+            latest,
+            family_id=finding_family_for_case(families, latest.get("id") if latest else ""),
+        ),
         "activity": _activity_snapshot(ws, max(1, min(ns.limit, 100))),
     }
     if ns.json:
@@ -786,13 +822,17 @@ def cmd_overview(ns) -> int:
     print(f"Grypton overview — {row['slug']} · {row['status']}")
     print(f"  target       {row['target']} ({row['type']})")
     print(f"  coverage     turns={row['turns']} tools={row['tool_calls']} surface={row['surface']} "
-          f"tested={row['tested']} findings={row['confirmed_findings']}/{row['findings']} confirmed")
+          f"tested={row['tested']} families={row['finding_families']} cases={row['finding_cases']} "
+          f"confirmed-cases={row['confirmed_findings']}")
     print(f"  model calls  Kraude={calls['worker']} Kryptex={calls['manager']} Astra={calls['validator']}")
     print(f"  scope        {', '.join(constraints.in_scope) or '—'}")
     if latest:
         verdict = latest.get("manager_verdict") or {}
-        print(f"  latest       {latest.get('id')} · {verdict.get('severity') or latest.get('severity', '?')} · "
-              f"{verdict.get('verdict') or latest.get('status', 'recorded')} · {latest.get('title', '')}")
+        family_id = finding_family_for_case(families, latest.get("id"))
+        print(f"  latest       {latest.get('id')} (family {family_id}) · "
+              f"{verdict.get('severity') or latest.get('severity', '?')} · "
+              f"{verdict.get('verdict') or latest.get('status', 'recorded')} · "
+              f"{safe_display_text(latest.get('title', ''), 220)}")
     else:
         print("  latest       no finding recorded")
     directive = _redact_summary(meta.last_directive)
@@ -889,17 +929,14 @@ def cmd_findings(ns) -> int:
     if not rows:
         print("No findings recorded.")
         return 0
-    for row in rows:
-        verdict = row.get("manager_verdict") or {}
-        severity = verdict.get("severity") or row.get("severity") or "?"
-        astra_state = verdict.get("verdict") or (
-            "pending"
-            if config.astra_auto_validation_required(row.get("severity", ""))
-            and row.get("status") != "suppressed-by-scope"
-            else "not-requested"
-        )
-        print(f"{row.get('id')}: {severity} · {row.get('status', 'reported')} · "
-              f"Astra={astra_state} · {row.get('title', '')}")
+    families, errors = finding_family_view(ws)
+    family_count, case_count = finding_family_counts(families)
+    print(f"Finding families: {family_count} · evidence cases: {case_count}")
+    if errors:
+        print(f"Family catalog integrity: {len(errors)} error(s); showing safe singleton cases.")
+    limit = getattr(ns, "limit", DEFAULT_TERMINAL_FAMILY_LIMIT)
+    for line in terminal_family_lines(families, limit=limit):
+        print(line)
     return 0
 
 
@@ -1037,10 +1074,12 @@ def cmd_audit(ns) -> int:
         print(f"  not requested      {len(result['validation_not_requested'])}")
         print(f"  missing flows      {len(result['missing_canonical_flows'])}")
         print(f"  scope violations   {len(result['scope_violations'])}")
+        print(f"  family integrity   {len(result['finding_family_integrity_errors'])} error(s)")
         print(f"  target/ empty      {'yes' if result['target_dir_empty'] else 'no'}")
         counts = result["counts"]
         print(f"  evidence           tools={counts['tool_calls']} flows={counts['flows']} "
-              f"surface={counts['surface']} tested={counts['tested']}")
+              f"surface={counts['surface']} tested={counts['tested']} "
+              f"families={counts['finding_families']} cases={counts['finding_cases']}")
     return 0 if result["ok"] else 1
 
 
@@ -1052,8 +1091,11 @@ def cmd_report(ns) -> int:
         return 2
     from .reporting import audit_workspace, render_report
     if ns.format == "json":
+        families, _family_errors = finding_family_view(ws)
         content = json.dumps({"audit": audit_workspace(ws),
-                              "findings": ws.findings.all()}, ensure_ascii=False, indent=2) + "\n"
+                              "findings": ws.findings.all(),
+                              "finding_families": families},
+                             ensure_ascii=False, indent=2) + "\n"
     else:
         content = render_report(ws)
     if ns.output:
@@ -1093,6 +1135,12 @@ def cmd_run_start(ns) -> int:
 def cmd_run_status(ns) -> int:
     from .runtime import public_status
     state = public_status(ns.target)
+    ws = Workspace(config.slugify(ns.target))
+    if ws.exists():
+        families, _family_errors = finding_family_view(ws)
+        family_count, case_count = finding_family_counts(families)
+        state["finding_families"] = family_count
+        state["finding_cases"] = case_count
     if ns.json:
         print(json.dumps(state, ensure_ascii=False, indent=2))
         return 0
@@ -1102,7 +1150,8 @@ def cmd_run_status(ns) -> int:
     if health:
         print(f"  health  turns={health.get('turns', 0)} tools={health.get('tool_calls', 0)} "
               f"surface={health.get('surface', 0)} tested={health.get('tested', 0)} "
-              f"findings={health.get('findings', 0)}")
+              f"finding-families={state.get('finding_families', 0)} "
+              f"cases={state.get('finding_cases', health.get('findings', 0))}")
     if state.get("events"):
         print(f"  logs    {state['events']}")
     return 0
@@ -1763,8 +1812,10 @@ def build_parser() -> argparse.ArgumentParser:
     activity.add_argument("--kind", choices=["all", "tools", "turns", "flows", "progress"], default="all")
     activity.add_argument("--limit", type=int, default=10)
     activity.add_argument("--json", action="store_true"); activity.set_defaults(func=cmd_activity)
-    findings = sub.add_parser("findings", help="List findings with independent verdicts")
+    findings = sub.add_parser("findings", help="List finding families and evidence cases")
     findings.add_argument("target"); findings.add_argument("--json", action="store_true")
+    findings.add_argument("--limit", type=_family_limit, default=DEFAULT_TERMINAL_FAMILY_LIMIT,
+                          metavar=f"1-{MAX_TERMINAL_FAMILY_LIMIT}")
     findings.set_defaults(func=cmd_findings)
     validate = sub.add_parser(
         "validate",

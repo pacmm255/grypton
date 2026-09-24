@@ -463,7 +463,7 @@ Your messages are saved as standing instructions for the engagement. Kryptex rec
 | `/activity [N]` | Show the newest `N` audited tool calls. Default: 8. |
 | `/flows [N]` | Show recent capture IDs and sizes. Default: 8. |
 | `/history [N]` | Show recent worker-turn summaries. Default: 5. |
-| `/findings` | Print the findings ledger. |
+| `/findings [N]` | Show up to `N` root-cause families with their evidence cases. Default: 20. |
 | `/surface` | Print the attack-surface ledger. |
 | `/tested` | Print the tested-techniques ledger. |
 | `/scope` | Print scope and standing instructions. |
@@ -753,6 +753,16 @@ when used.
 
 A finding must include an affected surface, issue class, impact, reproduction steps, and saved evidence. A guess or an unverified observation belongs in the surface or tested-technique records, not in a finding.
 
+Grypton keeps every proved instance as its own **evidence case** with an `F` ID.
+Cases caused by the same defect can share a **finding family**. The family uses
+its anchor case's `F` ID, so there is no second ID system to learn. A family
+describes the shared root cause; each child case keeps its own surface,
+severity, status, evidence, and Astra verdict. Grypton never invents one
+severity or verdict for the whole family.
+
+Older findings remain valid. They appear as read-only singleton families until
+they are explicitly grouped, and viewing them does not rewrite their ledger.
+
 ```mermaid
 flowchart TD
     A[Captured observation] --> B{Enough proof for a finding?}
@@ -779,8 +789,11 @@ flowchart TD
 ## Review findings
 
 ```bash
-# Short list
+# Grouped families and their evidence cases
 ./bin/grypton findings https-app-example-test
+
+# Limit the terminal view to the newest 20 families
+./bin/grypton findings https-app-example-test --limit 20
 
 # Request Astra for one lower-severity candidate
 ./bin/grypton validate https-app-example-test F003
@@ -824,7 +837,7 @@ Use these commands from another terminal while an engagement is running, or afte
 ./bin/grypton audit https-app-example-test
 ```
 
-Add `--json` to `status`, `show`, `program`, `overview`, `activity`, `findings`, `surface`, `history`, `scope`, `audit`, and selected other review commands when you need machine-readable output.
+Add `--json` to `status`, `show`, `program`, `overview`, `activity`, `findings`, `surface`, `history`, `scope`, `audit`, and selected other review commands when you need machine-readable output. For compatibility, `findings --json` is still the raw array of evidence cases. Status and overview retain their existing `findings` case count and add `finding_families` and `finding_cases`.
 
 ## Create a report
 
@@ -835,11 +848,11 @@ Add `--json` to `status`, `show`, `program`, `overview`, `activity`, `findings`,
 # Write Markdown to a file
 ./bin/grypton report https-app-example-test --output report.md
 
-# Write JSON with findings and audit data
+# Write JSON with raw cases, the compact family catalog, and audit data
 ./bin/grypton report https-app-example-test --format json --output report.json
 ```
 
-`audit` checks model routes, provider failures, required validation, flow references, scope violations, and the expected empty top-level `target/` directory.
+`audit` checks every raw evidence case, including its Astra requirement and flow references. It also checks family links, model routes, provider failures, scope violations, and the expected empty top-level `target/` directory. A broken family relation fails the audit; review views then show safe singleton cases instead of trusting that relation.
 
 ---
 
@@ -988,7 +1001,8 @@ Open `http://127.0.0.1:8765` in a browser. The dashboard shows:
 - active and stopped engagements;
 - turns, tool calls, flows, and coverage counts;
 - recent tool activity and captures;
-- attack surface, tested techniques, findings, and Astra verdicts.
+- attack surface, tested techniques, root-cause families, child evidence cases,
+  and each case's own Astra state.
 
 Use the terminal for control. Use the dashboard for a quick visual review.
 

@@ -8,6 +8,17 @@ import re
 from urllib.parse import urlsplit
 
 from . import config
+from .finding_views import (
+    confirmed_finding_cases,
+    finding_case_rows,
+    finding_case_astra_state,
+    finding_case_severity,
+    finding_family_counts,
+    finding_family_view,
+    markdown_cell,
+    markdown_inline,
+    safe_display_text,
+)
 from .tools import (check_host_scope, check_port_scope, check_raw_tcp_scope,
                     check_research_scope, check_url_scope)
 
@@ -58,9 +69,11 @@ def final_severity(finding: dict) -> str:
 def audit_workspace(ws) -> dict:
     meta = ws.load_meta()
     models = config.effective_role_models(meta)
-    findings = ws.findings.all()
+    findings = finding_case_rows(ws)
     surface = ws.surface.all()
     tested = ws.tested.all()
+    family_catalog, family_integrity_errors = finding_family_view(ws)
+    family_count, family_case_count = finding_family_counts(family_catalog)
     calls = read_jsonl(ws.transcripts_dir / "provider-calls.jsonl")
     tools = read_jsonl(ws.root / ".ledger" / "tool-calls.jsonl")
 
@@ -234,8 +247,11 @@ def audit_workspace(ws) -> dict:
         "turns": meta.turn_index,
         "models": models,
         "counts": {
+            # ``findings`` remains the historical evidence-case count.
             "findings": len(findings),
-            "confirmed_findings": len(ws.confirmed_findings()),
+            "finding_cases": family_case_count,
+            "finding_families": family_count,
+            "confirmed_findings": len(confirmed_finding_cases(findings)),
             "surface": len(surface),
             "tested": len(tested),
             "flows": len(list(ws.flows_dir.glob("flow-*.http"))),
@@ -252,21 +268,23 @@ def audit_workspace(ws) -> dict:
         "canonical_flow_references": len(references),
         "missing_canonical_flows": missing_flows,
         "scope_violations": scope_violations,
+        "finding_family_integrity_errors": family_integrity_errors,
         "target_dir_empty": target_dir_empty,
         "tool_event_failures": event_failures,
     }
     result["ok"] = not any((
         route_errors, provider_failures, unvalidated, missing_flows, scope_violations,
+        family_integrity_errors,
     )) and target_dir_empty
     return result
 
 
 def render_report(ws) -> str:
     audit = audit_workspace(ws)
-    findings = ws.findings.all()
+    families, _family_errors = finding_family_view(ws)
     lines = [
         f"# Grypton report — {ws.slug}", "",
-        f"- **Target:** `{audit['target']}`",
+        f"- **Target:** {markdown_inline(audit['target'], 500)}",
         f"- **Status:** {audit['status']}",
         f"- **Turns:** {audit['turns']}",
         f"- **Audit:** {'PASS' if audit['ok'] else 'ATTENTION REQUIRED'}", "",
@@ -281,23 +299,51 @@ def render_report(ws) -> str:
         f"- {audit['counts']['surface']} surface records and "
         f"{audit['counts']['tested']} tested techniques", "",
         "## Findings", "",
-        "| ID | Status | Severity | Astra verdict | Title |",
-        "| --- | --- | --- | --- | --- |",
+        f"- **Root-cause families:** {audit['counts']['finding_families']}",
+        f"- **Evidence cases:** {audit['counts']['finding_cases']}",
+        f"- **Confirmed cases:** {audit['counts']['confirmed_findings']}", "",
     ]
-    for finding in findings:
-        verdict = finding.get("manager_verdict") or {}
-        astra_state = verdict.get("verdict") or (
-            "pending"
-            if config.astra_auto_validation_required(finding.get("severity", ""))
-            and finding.get("status") != "suppressed-by-scope"
-            else "not requested"
-        )
-        values = [
-            finding.get("id", "?"), finding.get("status", "reported"),
-            final_severity(finding), astra_state,
-            finding.get("title", ""),
-        ]
-        lines.append("| " + " | ".join(str(v).replace("|", "\\|") for v in values) + " |")
+    if not families:
+        lines.extend(["No finding cases were recorded.", ""])
+    for family in families:
+        family_id = markdown_inline(family.get("family_id") or "?", 32)
+        root_cause = safe_display_text(family.get("root_cause"), 500)
+        if not root_cause:
+            cases = family.get("cases") or []
+            first = cases[0] if cases else {}
+            root_cause = safe_display_text(
+                first.get("vuln_class") or first.get("title")
+                or "Standalone evidence case",
+                500,
+            )
+        lines.extend([
+            f"### Family {family_id}", "",
+            f"- **Root cause:** {markdown_inline(root_cause)}",
+            f"- **Evidence cases:** {int(family.get('case_count') or 0)}",
+        ])
+        if family.get("virtual"):
+            lines.append("- **Catalog state:** singleton")
+        if family.get("separate_reason"):
+            lines.append(
+                "- **Separate-family reason:** "
+                + markdown_inline(family.get("separate_reason"), 1000)
+            )
+        lines.extend([
+            "",
+            "| Case | Status | Severity | Astra verdict | Kind | Surface | Title |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ])
+        for case in family.get("cases") or []:
+            values = [
+                case.get("id", "?"), case.get("status", "reported"),
+                finding_case_severity(case), finding_case_astra_state(case),
+                case.get("case_kind", ""), case.get("surface", ""),
+                case.get("title", ""),
+            ]
+            lines.append(
+                "| " + " | ".join(markdown_cell(value) for value in values) + " |"
+            )
+        lines.append("")
     lines.extend(["", "## Integrity", "",
         f"- Exact provider routes: {'yes' if audit['exact_routes'] else 'no'}",
         f"- Required Astra validation gaps: {len(audit['unvalidated_findings'])}",
@@ -305,6 +351,8 @@ def render_report(ws) -> str:
         f"{len(audit['validation_not_requested'])}",
         f"- Missing canonical flow references: {len(audit['missing_canonical_flows'])}",
         f"- Structured scope violations: {len(audit['scope_violations'])}",
+        f"- Finding-family integrity errors: "
+        f"{len(audit['finding_family_integrity_errors'])}",
         f"- Top-level `target/` empty: {'yes' if audit['target_dir_empty'] else 'no'}",
         "",
     ])

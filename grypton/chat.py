@@ -19,6 +19,17 @@ import textwrap
 import time
 from pathlib import Path
 
+from .finding_views import (
+    confirmed_finding_cases,
+    confirmed_p1_cases,
+    finding_case_rows,
+    finding_family_counts,
+    finding_family_for_case,
+    finding_family_view,
+    safe_display_text,
+    terminal_family_lines,
+)
+
 # Natural-language stop intent: a message made up ONLY of stop words + filler
 # (e.g. "ok enough you can stop now") halts the engine. A nuanced message like
 # "stop testing CORS but keep going" is NOT a stop — it routes to Kryptex.
@@ -444,7 +455,7 @@ Grypton Code commands
   /activity [N]          recent audited tool calls (default 8)
   /flows [N]             recent capture IDs and sizes (default 8)
   /history [N]           recent worker-turn summaries (default 5)
-  /findings              findings ledger
+  /findings [N]          finding families and evidence cases (default 20)
   /surface               attack-surface ledger
   /tested                tested-techniques ledger
   /scope                 binding scope and standing instructions
@@ -486,10 +497,13 @@ def _command_limit(argument: str, default: int) -> int:
 def _print_status(engine, renderer: Renderer) -> None:
     meta = engine.ws.load_meta()
     elapsed = int(time.time() - engine._start_time) if engine._start_time else 0
+    findings = finding_case_rows(engine.ws)
+    families, _family_errors = finding_family_view(engine.ws)
+    family_count, case_count = finding_family_counts(families)
     print(cyan(
         f"◆ status={meta.status} · turn={engine.turn_index} · elapsed={elapsed // 60}m{elapsed % 60:02d}s "
-        f"· findings={len(engine.ws.findings.all())} · surface={len(engine.ws.surface.all())} "
-        f"· P1s={len(engine.ws.confirmed_p1s())} · stream={renderer.view}"
+        f"· families={family_count} · cases={case_count} · surface={len(engine.ws.surface.all())} "
+        f"· confirmed-P1-cases={len(confirmed_p1_cases(findings))} · stream={renderer.view}"
     ))
 
 
@@ -497,20 +511,24 @@ def _print_summary(engine, renderer: Renderer) -> None:
     """A decision-oriented snapshot intended for use while a turn is running."""
     meta = engine.ws.load_meta()
     constraints = engine.ws.load_constraints()
-    findings = engine.ws.findings.all()
-    confirmed = engine.ws.confirmed_findings()
+    findings = finding_case_rows(engine.ws)
+    confirmed = confirmed_finding_cases(findings)
+    families, _family_errors = finding_family_view(engine.ws)
+    family_count, case_count = finding_family_counts(families)
     latest = findings[-1] if findings else {}
     print(bold(cyan("\n╭─ Grypton live summary")))
     print(f"│ target      {meta.target} ({meta.target_type}) · {meta.status} · turn {engine.turn_index}")
     print(f"│ coverage    surface={len(engine.ws.surface.all())} · tested={len(engine.ws.tested.all())} "
-          f"· findings={len(confirmed)}/{len(findings)} confirmed")
+          f"· families={family_count} · cases={case_count} · confirmed-cases={len(confirmed)}")
     print(f"│ scope       {', '.join(constraints.in_scope) or '—'}")
     if latest:
         verdict = latest.get("manager_verdict") or {}
         state = verdict.get("verdict") or latest.get("status", "recorded")
         severity = verdict.get("severity") or latest.get("severity", "?")
-        print(f"│ latest      {latest.get('id', '?')} · {severity} · {state} · "
-              f"{str(latest.get('title', ''))[:110]}")
+        family_id = finding_family_for_case(families, latest.get("id"))
+        title = safe_display_text(_redact_display(latest.get("title", "")), 110)
+        print(f"│ latest      {latest.get('id', '?')} (family {family_id}) · "
+              f"{severity} · {state} · {title}")
     else:
         print("│ latest      no finding recorded")
     directive = _redact_display((meta.last_directive or "").strip().replace("\n", " "))
@@ -578,7 +596,8 @@ def _print_audit(engine) -> None:
     state = green("PASS") if result.get("ok") else yellow("ATTENTION")
     print(f"Grypton audit: {state} · tools={counts.get('tool_calls', 0)} · "
           f"flows={counts.get('flows', 0)} · scope violations={len(result.get('scope_violations', []))} · "
-          f"required validation gaps={len(result.get('unvalidated_findings', []))}")
+          f"required validation gaps={len(result.get('unvalidated_findings', []))} · "
+          f"family integrity errors={len(result.get('finding_family_integrity_errors', []))}")
 
 
 def _print_context(engine) -> None:
@@ -590,13 +609,31 @@ def _print_context(engine) -> None:
             sizes[name] = (engine.ws.root / name).stat().st_size
         except OSError:
             sizes[name] = 0
+    families, _family_errors = finding_family_view(engine.ws)
+    family_count, case_count = finding_family_counts(families)
     print(bold("Context"))
     print(f"  engagement  {engine.ws.slug} · turn {engine.turn_index} · workspace {engine.ws.root}")
     print(f"  records     surface={len(engine.ws.surface.all())} · tested={len(engine.ws.tested.all())} · "
-          f"findings={len(engine.ws.findings.all())}")
+          f"finding-families={family_count} · cases={case_count}")
     print("  documents   " + " · ".join(f"{name.removesuffix('.md')}={size // 1024}k"
                                        for name, size in sizes.items()))
     print(dim("  Durable ledgers are supplied to the roles each turn; `/compact` changes terminal detail only."))
+
+
+def _print_findings(engine, limit: int) -> None:
+    families, errors = finding_family_view(engine.ws)
+    family_count, case_count = finding_family_counts(families)
+    if not case_count:
+        print(dim("No findings recorded."))
+        return
+    print(bold(f"Finding families: {family_count} · evidence cases: {case_count}"))
+    if errors:
+        print(yellow(
+            f"Family catalog integrity has {len(errors)} error(s); "
+            "showing safe singleton cases."
+        ))
+    for line in terminal_family_lines(families, limit=limit):
+        print(line)
 
 
 def _print_cost(engine) -> None:
@@ -846,8 +883,17 @@ def _route_input(engine, renderer: Renderer, text: str) -> bool:
         print(bold("Kryptex directive:"))
         print(_wrap(_redact_display(directive) or "No directive has been recorded yet.", "  "))
         return False
-    if text in ("/findings", "/surface", "/tested"):
-        doc = {"/findings": "findings.md", "/surface": "attack-surface.md",
+    if text == "/findings" or text.startswith("/findings "):
+        _, _, argument = text.partition(" ")
+        try:
+            limit = _command_limit(argument, 20)
+        except ValueError as exc:
+            print(yellow(f"Usage: /findings [1-50] ({exc})"))
+            return False
+        _print_findings(engine, limit)
+        return False
+    if text in ("/surface", "/tested"):
+        doc = {"/surface": "attack-surface.md",
                "/tested": "tested-techniques.md"}[text]
         p = engine.ws.root / doc
         print(p.read_text(errors="replace") if p.exists() else "(empty)")
