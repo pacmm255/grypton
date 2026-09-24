@@ -62,6 +62,9 @@ Before a real run, Grypton expects:
   and `/root/open` as its `keyFile`;
 - at least two unique API keys in `/root/open`, one per non-empty line, with
   private file permissions;
+- the `zai-coding-plan` provider configured with its own primary credential
+  and private spare-key file (the bundled config uses
+  `/root/.config/openclaude/zai-coding-plan.keys`);
 - Codex configured for the independent Astra validator.
 
 Never put a literal API key in Grypton configuration, a command, a report, or
@@ -1176,10 +1179,13 @@ chmod 600 /root/open
 ./bin/grypton doctor
 ```
 
-The doctor check requires at least two unique plausible keys and mode `0600` or
-stricter. The Go key pool expects one key per non-empty line. Blank lines and
-lines starting with `#` are ignored. OpenClaude also includes the primary OpenCode Go
-credential and removes duplicates. If a provider uses another credential
+The doctor reports the real deduplicated pool for each selected role: the
+provider's primary credential plus unique entries from that provider's
+`keyFile`. It requires at least two plausible credentials and mode `0600` or
+stricter for private files. The Go pool uses `/root/open`; the bundled Z.AI
+Coding Plan pool uses `/root/.config/openclaude/zai-coding-plan.keys`. Blank
+lines and lines starting with `#` are ignored. Credentials from one provider
+are never counted for another provider. If a provider uses another credential
 source, fix that source in `openclaude.config.json` or OpenCode's own supported
 connection flow.
 

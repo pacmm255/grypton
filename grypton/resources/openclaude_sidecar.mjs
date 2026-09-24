@@ -215,6 +215,7 @@ async function refreshCatalog(refresh = false) {
   });
   activeConfig = catalog.config;
   patchMuseEffort(activeConfig, catalog);
+  patchDeepSeekGoEffort(activeConfig, catalog);
   return publicCatalog(catalog);
 }
 
@@ -422,4 +423,37 @@ function patchMuseEffort(config, discovered) {
     route.effort = profile;
     if (model) model.effort = profile;
   }
+}
+
+function patchDeepSeekGoEffort(config, discovered) {
+  const routeId = 'go/deepseek-v4.1-flash';
+  const route = config?.routes?.[routeId];
+  const model = (Array.isArray(discovered?.models) ? discovered.models : [])
+    .find(candidate => candidate?.routeId === routeId);
+  if (!route || model?.provider !== 'go' || route?.model !== 'deepseek-v4.1-flash'
+      || route?.protocol !== 'chat') return;
+  if (route?.effort?.parameter) {
+    model.effort = route.effort;
+    return;
+  }
+  const levels = [...new Set((Array.isArray(model?.reasoningOptions)
+    ? model.reasoningOptions : [])
+    .filter(option => option?.type === 'effort' && Array.isArray(option.values))
+    .flatMap(option => option.values)
+    .filter(value => ['low', 'high', 'max'].includes(value)))];
+  if (!levels.length) return;
+  const profile = {
+    version: 1,
+    provider: 'opencode-go',
+    model: route.model,
+    protocol: 'chat',
+    parameter: 'reasoning_effort',
+    levels,
+    aliases: {},
+    default: 'auto',
+    providerDefault: 'high',
+    sources: ['https://api-docs.deepseek.com/guides/thinking_mode/'],
+  };
+  route.effort = profile;
+  if (model) model.effort = profile;
 }

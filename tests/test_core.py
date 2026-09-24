@@ -25,7 +25,8 @@ from grypton.bugcrowd import analyze_snapshot, matching_scope_rules, out_of_scop
 from grypton.chat import Renderer, _command_limit, _compact_tool_result, _expand_workspace_references, _route_input
 from grypton.cli import (_activity_snapshot, _browser_sandbox_check,
                          _claude_style_arguments, _constraints,
-                         _opencode_go_key_pool, _validate_requested_findings,
+                         _opencode_go_key_pool, _openclaude_provider_key_pool,
+                         _validate_requested_findings,
                          build_parser, main)
 from grypton.engine import Engine
 from grypton.hard_lab import HardLab, score_workspace
@@ -423,6 +424,56 @@ class ToolTests(unittest.TestCase):
             link = root / "open-link"
             link.symlink_to(pool)
             self.assertFalse(_opencode_go_key_pool(link)[0])
+
+    def test_provider_key_pool_doctor_check_counts_deduplicated_pool(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            auth = root / "auth.json"
+            pool = root / "zai.keys"
+            config_path = root / "openclaude.config.json"
+            primary = "fixture-primary-provider-key-1234567890"
+            spare = "fixture-spare-provider-key-0987654321"
+            auth.write_text(json.dumps({
+                "zai-coding-plan": {"type": "api", "key": primary},
+            }), encoding="utf-8")
+            auth.chmod(0o600)
+            pool.write_text(f"{primary}\n{spare}\n{spare}\n", encoding="utf-8")
+            pool.chmod(0o600)
+            config_path.write_text(json.dumps({
+                "providers": {
+                    "zai-coding-plan": {
+                        "credential": {
+                            "opencode": "zai-coding-plan",
+                            "keyFile": str(pool),
+                        },
+                    },
+                },
+            }), encoding="utf-8")
+            environment = {
+                "HOME": str(root),
+                "OPENCLAUDE_AUTH_FILE": str(auth),
+            }
+
+            ok, detail = _openclaude_provider_key_pool(
+                "zai-coding-plan", config_path=config_path,
+                environ=environment,
+            )
+            self.assertTrue(ok, detail)
+            self.assertIn("count=2", detail)
+            self.assertIn("primary=1", detail)
+            self.assertIn("key-file=1", detail)
+            self.assertNotIn(primary, detail)
+            self.assertNotIn(spare, detail)
+
+            pool.chmod(0o644)
+            ok, detail = _openclaude_provider_key_pool(
+                "zai-coding-plan", config_path=config_path,
+                environ=environment,
+            )
+            self.assertFalse(ok)
+            self.assertIn("private regular file required", detail)
+            self.assertNotIn(primary, detail)
+            self.assertNotIn(spare, detail)
 
     def test_browser_boundary_fails_closed_for_root_without_dedicated_account(self):
         with patch("grypton.cli.os.geteuid", return_value=0), \

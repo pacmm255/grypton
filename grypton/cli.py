@@ -1395,6 +1395,132 @@ def _opencode_go_key_pool(path: Path = Path("/root/open")) -> tuple[bool, str]:
     return len(keys) >= 2 and mode & 0o077 == 0, detail
 
 
+def _plausible_provider_key(value: object) -> bool:
+    """Match OpenClaude's opaque-key handling without exposing key material."""
+    if not isinstance(value, str) or len(value) < 20 or value != value.strip():
+        return False
+    return not any(character.isspace() or ord(character) < 32 or ord(character) == 127
+                   for character in value)
+
+
+def _private_key_file(path: Path) -> tuple[set[str], int, bool]:
+    """Read a bounded private key file and return only in-process opaque values."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return set(), 0, False
+    mode = stat.S_IMODE(info.st_mode)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_size > 2 * 1024 * 1024:
+        return set(), mode, False
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+        current = os.fstat(fd)
+        mode = stat.S_IMODE(current.st_mode)
+        if not stat.S_ISREG(current.st_mode) or current.st_size > 2 * 1024 * 1024:
+            os.close(fd)
+            return set(), mode, False
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as stream:
+            values = {
+                line.strip() for line in stream
+                if line.strip() and not line.strip().startswith("#")
+                and _plausible_provider_key(line.strip())
+            }
+    except OSError:
+        return set(), mode, False
+    return values, mode, mode & 0o077 == 0
+
+
+def _openclaude_provider_key_pool(
+    provider_id: str,
+    *,
+    config_path: Path | None = None,
+    environ: dict[str, str] | None = None,
+) -> tuple[bool, str]:
+    """Report one configured provider's deduplicated failover capacity.
+
+    Values remain local to this function. The returned detail contains counts,
+    source presence, and private-file modes only.
+    """
+    env = dict(os.environ if environ is None else environ)
+    path = config_path or Path(env.get(
+        "GRYPTON_OPENCLAUDE_CONFIG",
+        str(config.OPENCLAUDE_HOME / "openclaude.config.json"),
+    )).expanduser()
+    try:
+        if path.stat().st_size > 2 * 1024 * 1024:
+            return False, "configuration is too large"
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        return False, "configuration is unavailable"
+    providers = document.get("providers") if isinstance(document, dict) else None
+    provider = providers.get(provider_id) if isinstance(providers, dict) else None
+    credential = provider.get("credential") if isinstance(provider, dict) else None
+    if not isinstance(credential, dict):
+        return False, "provider credential reference is unavailable"
+
+    primary = ""
+    primary_mode: int | None = None
+    if isinstance(credential.get("env"), str):
+        candidate = env.get(credential["env"], "")
+        primary = candidate if _plausible_provider_key(candidate) else ""
+    elif isinstance(credential.get("opencode"), str):
+        home = Path(env.get("HOME") or str(Path.home())).expanduser()
+        data_home = Path(env.get("XDG_DATA_HOME") or home / ".local/share").expanduser()
+        auth_path = Path(env.get("OPENCLAUDE_AUTH_FILE") or data_home / "opencode/auth.json").expanduser()
+        try:
+            info = auth_path.lstat()
+            primary_mode = stat.S_IMODE(info.st_mode)
+            if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
+                    or info.st_size > 2 * 1024 * 1024 or primary_mode & 0o077):
+                return False, f"credential store mode={primary_mode:04o}; private regular file required"
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(auth_path, flags)
+            with os.fdopen(fd, "r", encoding="utf-8") as stream:
+                current = os.fstat(stream.fileno())
+                primary_mode = stat.S_IMODE(current.st_mode)
+                if (not stat.S_ISREG(current.st_mode)
+                        or current.st_size > 2 * 1024 * 1024
+                        or primary_mode & 0o077):
+                    return False, (
+                        f"credential store mode={primary_mode:04o}; "
+                        "private regular file required"
+                    )
+                auth = json.load(stream)
+        except (OSError, TypeError, ValueError):
+            return False, "credential store is unavailable"
+        entry = auth.get(credential["opencode"]) if isinstance(auth, dict) else None
+        candidate = entry.get("key") if isinstance(entry, dict) and entry.get("type") == "api" else ""
+        primary = candidate if _plausible_provider_key(candidate) else ""
+    elif credential.get("openclaude"):
+        return True, "private-store credential; pool capacity is managed by OpenClaude"
+    else:
+        return False, "unsupported credential reference"
+
+    pool = {primary} if primary else set()
+    additions = 0
+    key_mode: int | None = None
+    key_file = credential.get("keyFile")
+    if key_file is not None:
+        if not isinstance(key_file, str) or not Path(key_file).is_absolute():
+            return False, "key file path must be absolute"
+        values, key_mode, private = _private_key_file(Path(key_file))
+        if not private:
+            mode = f"{key_mode:04o}" if key_mode else "missing"
+            return False, f"count={len(pool)}; key-file mode={mode}; private regular file required"
+        before = len(pool)
+        pool.update(values)
+        additions = len(pool) - before
+
+    details = [f"count={len(pool)}", f"primary={1 if primary else 0}",
+               f"key-file={additions}"]
+    if key_mode is not None:
+        details.append(f"key-file mode={key_mode:04o}")
+    if primary_mode is not None:
+        details.append(f"store mode={primary_mode:04o}")
+    return len(pool) >= 2, "; ".join(details)
+
+
 def _browser_sandbox_check() -> tuple[bool, str]:
     """Report whether browse can run without a root Chromium process."""
     if os.geteuid() != 0:
@@ -1443,15 +1569,15 @@ def cmd_doctor(ns) -> int:
                    str(config.OPENCLAUDE_BIN)))
     checks.append(("OpenClaude config", (config.OPENCLAUDE_HOME / "openclaude.config.json").is_file(),
                    str(config.OPENCLAUDE_HOME / "openclaude.config.json")))
-    key_pool_ok, key_pool_detail = _opencode_go_key_pool()
-    checks.append(("OpenCode Go failover key pool", key_pool_ok, key_pool_detail))
     defaults = config.effective_role_models()
     try:
         rows = _catalog_rows()
         routes = {row["route"] for row in rows}
+        catalog_by_route = {row["route"]: row for row in rows}
         checks.append(("OpenClaude catalog", bool(rows), f"{len(rows)} available public routes"))
     except (ImportError, OSError, RuntimeError, ValueError) as exc:
         routes = set()
+        catalog_by_route = {}
         checks.append(("OpenClaude catalog", False, _redact_summary(exc)))
     for role, require_tools in (("worker", True), ("manager", False)):
         selected = defaults[role]
@@ -1464,6 +1590,10 @@ def cmd_doctor(ns) -> int:
                                     require_tools=require_tools)
             detail = f"effort={selected['effort']}" + ("; tools required" if require_tools else "")
             checks.append((name, True, detail))
+            provider = str(catalog_by_route.get(selected["route"], {}).get("provider") or "")
+            if provider:
+                pool_ok, pool_detail = _openclaude_provider_key_pool(provider)
+                checks.append((f"{role} provider {provider} key pool", pool_ok, pool_detail))
         except (OSError, RuntimeError, ValueError) as exc:
             checks.append((name, False, _redact_summary(exc)))
     mcp_ok, mcp_detail = _mcp_probe()

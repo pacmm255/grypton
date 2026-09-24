@@ -667,6 +667,33 @@ class ModelSelectionTests(unittest.IsolatedAsyncioTestCase):
     "local OpenClaude checkout and Node.js are required",
 )
 class OpenClaudeRotationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_deepseek_go_max_has_verified_chat_effort_mapping(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "openclaude.config.json"
+            document = json.loads(
+                (OPENCLAUDE_ROOT / "openclaude.config.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            document.get("routes", {}).pop("go/deepseek-v4.1-flash", None)
+            config_path.write_text(json.dumps(document), encoding="utf-8")
+            gateway = OpenClaudeGateway(
+                "go/deepseek-v4.1-flash", "max", "worker",
+                root / "transport",
+                openclaude_root=OPENCLAUDE_ROOT,
+                config_path=config_path,
+            )
+            try:
+                await gateway.start()
+                effort = gateway.model.raw.get("effort") or {}
+                self.assertEqual(effort.get("parameter"), "reasoning_effort")
+                self.assertEqual(effort.get("levels"), ["low", "high", "max"])
+                self.assertEqual(effort.get("default"), "auto")
+                self.assertEqual(effort.get("providerDefault"), "high")
+            finally:
+                await gateway.close()
+
     @staticmethod
     def _rotation_config(root: Path, port: int, *, window_ms: int,
                          include_spare: bool = True) -> Path:
