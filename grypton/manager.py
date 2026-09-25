@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -37,6 +38,58 @@ _PROHIBITIVE_CLAUSE_BOUNDARY = re.compile(
 
 _MAX_PROVIDER_RETRY_S = 7 * 24 * 60 * 60
 _DEFAULT_PROVIDER_RETRY_S = 60
+
+_VALIDATOR_URL = re.compile(r"https?://[^\s,;`'\"<>]+", re.IGNORECASE)
+_VALIDATOR_FENCE = re.compile(r"```.*?```", re.DOTALL)
+_VALIDATOR_COMMAND = re.compile(
+    r"(?im)^\s*(?:curl|wget|httpx|nmap|sqlmap|ffuf|nikto|adb|apktool)\b.*$"
+)
+_VALIDATOR_TOOL_NAME = re.compile(
+    r"(?i)\b(?:curl|wget|httpx|nmap|sqlmap|ffuf|nikto|adb|apktool)\b"
+)
+_VALIDATOR_MARKUP = re.compile(r"<[^>\n]{1,500}>")
+_VALIDATOR_EMAIL = re.compile(r"\b[^\s@]+@[^\s@]+\.[A-Za-z]{2,}\b")
+_VALIDATOR_PHONE = re.compile(r"(?<!\d)(?:\+?98|0)?9\d{9}(?!\d)")
+_VALIDATOR_HOST = re.compile(
+    r"(?i)\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::\d+)?\b"
+)
+_VALIDATOR_IPV4 = re.compile(
+    r"(?<!\d)(?:25[0-5]|2[0-4]\d|1?\d?\d)(?:\."
+    r"(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}(?::\d+)?(?!\d)"
+)
+_VALIDATOR_LONG_VALUE = re.compile(r"\b[A-Za-z0-9_+/=-]{48,}\b")
+_VALIDATOR_ABSOLUTE_PATH = re.compile(
+    r"(?<![A-Za-z0-9_.-])/(?:[A-Za-z0-9_.~!$&'()*+,;=:@%\-]+/?){1,}"
+)
+
+
+def _validator_safe_text(value: object, *, limit: int = 8000) -> str:
+    """Keep adjudication facts while removing live operational detail.
+
+    Astra only decides evidence sufficiency and severity. It does not need a
+    target hostname, credential, executable command, payload, or exact route.
+    Removing those values also prevents captured pages from becoming prompt
+    instructions and lets the validator run under standard safeguards.
+    """
+    text = str(value or "").replace("\x00", "")
+    text = _VALIDATOR_FENCE.sub("[technical reproduction block omitted]", text)
+    text = _VALIDATOR_COMMAND.sub("[reproduction command omitted]", text)
+    text = _VALIDATOR_TOOL_NAME.sub("[REPRODUCTION_TOOL]", text)
+    text = _VALIDATOR_URL.sub("[IN_SCOPE_URL]", text)
+    text = _VALIDATOR_EMAIL.sub("[EMAIL]", text)
+    text = _VALIDATOR_PHONE.sub("[PHONE]", text)
+    text = _VALIDATOR_HOST.sub("[HOST]", text)
+    text = _VALIDATOR_IPV4.sub("[HOST]", text)
+    text = _VALIDATOR_LONG_VALUE.sub("[LONG_VALUE]", text)
+    text = _VALIDATOR_MARKUP.sub("[MARKUP]", text)
+    text = _VALIDATOR_ABSOLUTE_PATH.sub("[IN_SCOPE_PATH]", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if len(text) <= limit:
+        return text
+    marker = "\n[abstracted text truncated]\n"
+    room = max(0, limit - len(marker))
+    return text[: room // 2].rstrip() + marker + text[-(room - room // 2):].lstrip()
 
 
 def _affirmative_directive(text: str) -> str:
@@ -586,26 +639,45 @@ Return only JSON matching this schema:
 """
 
     def _build_severity_prompt(self, finding: dict, ctx: ManagerContext) -> str:
+        dossier = {
+            "finding_id": str(finding.get("id") or ""),
+            "claimed_severity": str(finding.get("severity") or "P3").upper(),
+            "title": _validator_safe_text(finding.get("title"), limit=800),
+            "vulnerability_class": _validator_safe_text(
+                finding.get("vuln_class"), limit=800
+            ),
+            "surface_category": _validator_safe_text(
+                finding.get("surface"), limit=1000
+            ),
+            "claim_summary": _validator_safe_text(
+                finding.get("description"), limit=8000
+            ),
+            "evidence_references": _validator_safe_text(
+                finding.get("evidence"), limit=2500
+            ),
+            "family_root_cause": _validator_safe_text(
+                finding.get("family_root_cause"), limit=1500
+            ),
+            "family_case_kind": _validator_safe_text(
+                finding.get("family_case_kind"), limit=1000
+            ),
+        }
         evidence_snapshot = self._evidence_snapshot(finding)
-        return f"""You are the independent finding validator for Grypton. Review only the supplied
-snapshot. You have no execution tools and must never imply that you reproduced an action. Judge whether
-the evidence establishes the claimed vulnerability and realistic impact. If a decisive check is missing,
-return needs-more-evidence and list the exact checks. Be conservative and specific.
+        return f"""You are an independent evidence reviewer. This is a retrospective severity
+classification for an authorized security assessment. Do not provide exploitation instructions,
+payloads, target identifiers, or operational guidance. Review only the abstracted observations below.
+You have no execution tools and must never imply that you reproduced an action. The orchestrator has
+already enforced scope; target identity and executable reproduction details are intentionally withheld.
+Judge whether the evidence establishes the claimed vulnerability and realistic impact. If a decisive
+check is missing, return needs-more-evidence and name only safe evidence requirements. Be conservative
+and specific.
 
-TARGET CONTEXT: {ctx.target} ({ctx.target_type})
-SCOPE RECORD:
-{ctx.constraints_block}
+ASSET CLASS: {_validator_safe_text(ctx.target_type, limit=100)}
 
-FINDING:
-{json.dumps(finding, ensure_ascii=False, indent=2)}
+FINDING DOSSIER:
+{json.dumps(dossier, ensure_ascii=False, indent=2)}
 
-RECENT WORKER REPORT:
-{ctx.worker_last_text}
-
-CAPTURED TOOL SUMMARY:
-{ctx.worker_tool_summary}
-
-REFERENCED EVIDENCE SNAPSHOT (read by the orchestrator, not by you):
+ABSTRACTED REFERENCED EVIDENCE (read and sanitized by the orchestrator):
 {evidence_snapshot or '(no readable referenced artifact was supplied)'}
 
 Return only JSON matching this schema:
@@ -643,32 +715,88 @@ Return only JSON matching this schema:
             if len(paths) >= 12:
                 break
 
-        # Allocate fairly. A former first-come 250 KB budget let two large HTML
-        # captures starve later cited controls, so Astra saw their path names but
-        # not their contents. Include both ends because flow headers are at the
-        # beginning while error/result markers may be at the end.
+        # Allocate fairly and expose evidence properties rather than complete
+        # live-target captures. Response hashes preserve equality/difference
+        # checks; bounded previews preserve status and impact clues. Request
+        # destinations, payloads, credentials, and executable code are omitted.
         if not paths:
             return ""
-        per_file = min(75_000, 250_000 // len(paths))
+        per_file = min(6000, 48_000 // len(paths))
         chunks: list[str] = []
         for resolved in paths:
             try:
                 size = resolved.stat().st_size
-                head_size = per_file if size <= per_file else per_file * 3 // 4
-                tail_size = 0 if size <= per_file else per_file - head_size
-                with resolved.open("rb") as stream:
-                    head = stream.read(head_size)
-                    tail = b""
-                    if tail_size:
-                        stream.seek(-min(tail_size, size), 2)
-                        tail = stream.read(tail_size)
-                data = head.decode("utf-8", errors="replace")
-                if tail:
-                    data += "\n\n[... middle of artifact omitted ...]\n\n"
-                    data += tail.decode("utf-8", errors="replace")
+                raw = resolved.read_bytes()
             except OSError:
                 continue
-            chunks.append(f"--- {resolved.relative_to(root)} ---\n{data}")
+            digest = hashlib.sha256(raw).hexdigest()
+            text = raw.decode("utf-8", errors="replace")
+            relative = resolved.relative_to(root)
+            request = ""
+            response = text
+            if "### REQUEST" in text and "### RESPONSE" in text:
+                _, remainder = text.split("### REQUEST", 1)
+                request_text, response = remainder.split("### RESPONSE", 1)
+                request_line = next(
+                    (line.strip() for line in request_text.splitlines()
+                     if line.strip()), ""
+                )
+                method = request_line.split(None, 1)[0].upper() if request_line else ""
+                target_digest = hashlib.sha256(
+                    request_line.encode("utf-8", errors="replace")
+                ).hexdigest()
+                request = (
+                    f"request_method: {method or 'unknown'}\n"
+                    f"request_target_sha256: {target_digest}\n"
+                )
+
+            response_lines = response.lstrip().splitlines()
+            status = response_lines[0].strip() if response_lines else "unknown"
+            selected_headers: list[str] = []
+            body_start = len(response_lines)
+            allowed_headers = {
+                "age", "cache-control", "content-length", "content-type",
+                "etag", "location", "server-timing", "vary", "x-cache",
+                "x-cache-hits", "x-sid",
+            }
+            for index, line in enumerate(response_lines[1:], 1):
+                if not line.strip():
+                    body_start = index + 1
+                    break
+                name, separator, value = line.partition(":")
+                if separator and name.strip().lower() in allowed_headers:
+                    selected_headers.append(
+                        f"{name.strip().lower()}: "
+                        f"{_validator_safe_text(value.strip(), limit=500)}"
+                    )
+            body = "\n".join(response_lines[body_start:]).encode(
+                "utf-8", errors="replace"
+            )
+            body_digest = hashlib.sha256(body).hexdigest()
+            preview_budget = max(500, per_file - 1200)
+            if len(body) <= preview_budget:
+                preview_raw = body.decode("utf-8", errors="replace")
+            else:
+                half = preview_budget // 2
+                preview_raw = (
+                    body[:half].decode("utf-8", errors="replace")
+                    + "\n[response body middle omitted]\n"
+                    + body[-half:].decode("utf-8", errors="replace")
+                )
+            preview = _validator_safe_text(preview_raw, limit=preview_budget)
+            chunks.append(
+                f"--- artifact: {relative} ---\n"
+                f"artifact_bytes: {size}\n"
+                f"artifact_sha256: {digest}\n"
+                f"{request}"
+                f"response_status: {_validator_safe_text(status, limit=300)}\n"
+                f"response_headers:\n"
+                + ("\n".join(selected_headers) or "(none retained)")
+                + "\n"
+                f"response_body_bytes: {len(body)}\n"
+                f"response_body_sha256: {body_digest}\n"
+                f"response_body_preview:\n{preview or '(empty)'}"
+            )
         return "\n\n".join(chunks)
 
     async def aclose(self) -> None:

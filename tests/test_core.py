@@ -1873,6 +1873,54 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             for index in range(5):
                 self.assertIn(f"capture-{index}", snapshot)
 
+    async def test_severity_prompt_abstracts_live_target_and_reproduction_details(self):
+        with isolated_runtime():
+            ws = Workspace("validator-abstraction")
+            ws.create("https://example.test/app", "web")
+            ws.flows_dir.mkdir(parents=True, exist_ok=True)
+            flow = ws.flows_dir / "flow-1.http"
+            flow.write_text(
+                "### REQUEST\n"
+                "POST https://example.test/api/v1/action?token=fixture\n"
+                "Content-Type: application/json\n\n"
+                "{\"payload\":\"<script>fixture()</script>\"}\n\n"
+                "### RESPONSE\n"
+                "HTTP/2 200\n"
+                "content-type: application/json\n"
+                "x-cache: HIT\n\n"
+                "{\"marker\":\"fixture-marker\"}\n",
+                encoding="utf-8",
+            )
+            manager = KryptexManager(ws, "system")
+            prompt = manager._build_severity_prompt({
+                "id": "F001",
+                "title": "High-impact issue at example.test/api/v1/action",
+                "severity": "P1",
+                "vuln_class": "Broken access control",
+                "surface": "https://example.test/api/v1/action",
+                "description": (
+                    "Run curl https://example.test/api/v1/action with "
+                    "<script>fixture()</script> to reproduce."
+                ),
+                "poc": "curl https://example.test/api/v1/action",
+                "evidence": "flows/flow-1.http",
+            }, ManagerContext(
+                target="https://example.test/app",
+                target_type="web",
+                turn_index=1,
+            ))
+
+            self.assertNotIn("example.test", prompt)
+            self.assertNotIn("curl ", prompt.lower())
+            self.assertNotIn("<script>", prompt.lower())
+            self.assertNotIn("token=fixture", prompt)
+            self.assertNotIn("\"poc\"", prompt)
+            self.assertIn("request_target_sha256", prompt)
+            self.assertIn("response_body_sha256", prompt)
+            self.assertIn("response_status: HTTP/2 200", prompt)
+            self.assertIn("x-cache: HIT", prompt)
+            self.assertIn("fixture-marker", prompt)
+
     async def test_lower_severity_requires_explicit_astra_request(self):
         with isolated_runtime():
             ws = Workspace("explicit-validation")

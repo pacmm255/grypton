@@ -980,8 +980,16 @@ class OpenCodeClient:
         malformed: list[str] = []
         cleaned_lines: list[str] = []
         stream_path = self.transcripts / f"{self.role}.opencode.events.jsonl"
+        # ``timeout`` is an inactivity limit, not a wall-clock limit for the
+        # whole agentic turn.  OpenCode can legitimately spend well over 30
+        # minutes alternating between the model and tools.  Killing a call
+        # that is still emitting events discards the final answer and prevents
+        # the engine from reaching manager/validator handoff.
+        last_activity = time.monotonic()
 
         def consume_stdout_line(raw: bytes) -> None:
+            nonlocal last_activity
+            last_activity = time.monotonic()
             decoded = raw.decode("utf-8", errors="replace")
             if not decoded.strip():
                 return
@@ -1132,16 +1140,29 @@ class OpenCodeClient:
             append_jsonl(self.transcripts / "provider-calls.jsonl", record)
 
         try:
-            done, _ = await asyncio.wait(
-                (io_task, terminal_task), timeout=timeout,
-                return_when=asyncio.FIRST_COMPLETED,
-            )
+            # Poll so stdout consumption can refresh ``last_activity`` without
+            # introducing another task/event race.  The five-second ceiling is
+            # negligible beside provider timeouts and keeps cancellation
+            # responsive when a child becomes silent.
+            while True:
+                remaining = timeout - (time.monotonic() - last_activity)
+                if remaining <= 0:
+                    done = set()
+                    break
+                done, _ = await asyncio.wait(
+                    (io_task, terminal_task),
+                    timeout=min(remaining, 5.0),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if done:
+                    break
             if not done:
                 failure_class = "timeout"
                 await _terminate(self.proc)
                 await asyncio.gather(io_task, return_exceptions=True)
                 raise ProviderError(
-                    f"{self.role} OpenCode call timed out after {timeout:g}s."
+                    f"{self.role} OpenCode call timed out after "
+                    f"{timeout:g}s of inactivity."
                 )
             if terminal_task in done and terminal_task.result():
                 failure_class = "openclaude_terminal"

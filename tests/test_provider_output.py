@@ -716,6 +716,86 @@ class ProviderOutputTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_active_stream_refreshes_provider_timeout(self):
+        class _Input:
+            def write(self, value):
+                self.value = value
+
+            async def drain(self):
+                return None
+
+            def close(self):
+                return None
+
+        class _ProgressStream:
+            def __init__(self):
+                self.index = 0
+
+            async def read(self, _size):
+                if self.index >= 3:
+                    return b""
+                await asyncio.sleep(0.05)
+                self.index += 1
+                return (json.dumps({
+                    "type": "text",
+                    "sessionID": "ses-active",
+                    "part": {"text": f"provider progress {self.index}"},
+                }) + "\n").encode()
+
+        class _EmptyStream:
+            async def read(self, _size):
+                return b""
+
+        class _Process:
+            pid = 43213
+
+            def __init__(self):
+                self.stdin = _Input()
+                self.stdout = _ProgressStream()
+                self.stderr = _EmptyStream()
+                self.returncode = None
+
+            async def wait(self):
+                await asyncio.sleep(0.17)
+                self.returncode = 0
+                return 0
+
+        async def exercise():
+            with isolated_runtime():
+                workspace = config.ENGAGEMENTS_DIR / "active-timeout-call"
+                workspace.mkdir(parents=True)
+                client = OpenCodeClient(
+                    role="worker", route=config.WORKER_MODEL, effort="max",
+                    workspace=workspace, target_slug="active-timeout-call",
+                    allow_tools=True, agent_prompt="test",
+                )
+                process = _Process()
+                gateway = SimpleNamespace(
+                    model_route=f"openclaude/{config.WORKER_MODEL}",
+                    drain_events=lambda: [],
+                )
+
+                with patch.object(client, "_ensure_gateway", AsyncMock(return_value=gateway)), \
+                        patch.object(client, "_environment", return_value=({}, "fixture-secret")), \
+                        patch.object(client, "_ensure_network_broker", AsyncMock()), \
+                        patch.object(config, "require_binary", return_value="/usr/bin/true"), \
+                        patch("grypton.providers.asyncio.create_subprocess_exec",
+                              new=AsyncMock(return_value=process)):
+                    result = await client.call("active prompt", timeout=0.08)
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.session_id, "ses-active")
+                self.assertIn("provider progress 3", result.text)
+
+                records = [json.loads(line) for line in (
+                    workspace / "transcripts/provider-calls.jsonl"
+                ).read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(len(records), 1)
+                self.assertTrue(records[0]["ok"])
+                self.assertGreater(records[0]["duration_s"], 0.08)
+
+        asyncio.run(exercise())
+
     def test_stream_provider_error_records_redacted_failure(self):
         class _Input:
             def write(self, value):
