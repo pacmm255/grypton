@@ -3693,6 +3693,41 @@ def _browser_auth_fresh_probe(
             context.close()
 
 
+def _browser_auth_retryable_probe_exception(exc: BaseException) -> bool:
+    """Recognize transport failures that can be retried without changing state."""
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    if exc.__class__.__name__ == "TimeoutError":
+        # Playwright's TimeoutError is not the built-in TimeoutError.
+        return True
+    message = str(exc).lower()
+    return any(marker in message for marker in (
+        "net::err_timed_out",
+        "net::err_connection_aborted",
+        "net::err_connection_closed",
+        "net::err_connection_refused",
+        "net::err_connection_reset",
+        "net::err_internet_disconnected",
+        "net::err_name_not_resolved",
+        "net::err_network_changed",
+    ))
+
+
+def _browser_auth_probe_result_is_transient(
+    *, status: int, method: str, response_url: str, final_url: str,
+    redirect_chain: Iterable[dict],
+) -> bool:
+    """Return whether a completed probe is too incomplete/transient to judge."""
+    return bool(
+        status in {0, 408, 425, 429}
+        or status >= 500
+        or not method
+        or not response_url
+        or not final_url
+        or any(hop.get("complete") is not True for hop in redirect_chain)
+    )
+
+
 def _browser_auth_fresh_probe_with_retry(*args, **kwargs) -> dict:
     """Retry one transient read-only proof without resubmitting credentials."""
     last_error: Exception | None = None
@@ -3701,11 +3736,21 @@ def _browser_auth_fresh_probe_with_retry(*args, **kwargs) -> dict:
             result = _browser_auth_fresh_probe(*args, **kwargs)
         except Exception as exc:
             last_error = exc
-            if probe_attempt == 2:
+            if (
+                probe_attempt == 2
+                or not _browser_auth_retryable_probe_exception(exc)
+            ):
                 raise
             continue
         result["probe_attempts"] = probe_attempt
-        if int(result.get("status") or 0) > 0 or probe_attempt == 2:
+        transient = _browser_auth_probe_result_is_transient(
+            status=int(result.get("status") or 0),
+            method=str(result.get("method") or "").upper(),
+            response_url=str(result.get("response_url") or ""),
+            final_url=str(result.get("final_url") or ""),
+            redirect_chain=list(result.get("redirect_chain") or []),
+        )
+        if not transient or probe_attempt == 2:
             return result
     raise RuntimeError("browser proof did not produce a result") from last_error
 
@@ -3804,7 +3849,7 @@ def _resume_pending_browser_renewal(
             {
                 "credential": credential,
                 "session_maintenance": {
-                    "action": "pending-control-retry",
+                    "action": "pending-proof-retry",
                     "credential_submission": False,
                 },
                 "session": credentials.session_status(
@@ -3969,7 +4014,7 @@ def _resume_pending_browser_renewal(
         {
             "credential": credential,
             "session_maintenance": {
-                "action": "renewed-pending-control",
+                "action": "renewed-pending-proof",
                 "credential_submission": False,
                 "original_credential_submission_requests": 1,
                 "control_probe_attempts": int(
@@ -4752,7 +4797,11 @@ def _credential_browser_login_locked(
     control_redirected = False
     control_probe_attempts = 0
     control_failure = ""
-    pending_control_saved = False
+    retryable_proof_failure = ""
+    retryable_proof_stage = ""
+    pending_renewal_saved = False
+    pending_renewal_reason = ""
+    refresh_reservation_released = False
     cookies: list[dict] = []
     observed_cookie_sets: list[list[dict]] = []
     observed_storage_sets: list[dict] = []
@@ -4773,6 +4822,7 @@ def _credential_browser_login_locked(
     failure = ""
     phase = {"name": "initial"}
     context = None
+    page = None
     verify_header_state = {
         "active": False,
         "origin": login_origin,
@@ -4792,6 +4842,49 @@ def _credential_browser_login_locked(
                 "phase": phase["name"], "type": str(message.type),
                 "text": str(message.text)[:4000],
             })
+
+    def retain_current_browser_material() -> None:
+        """Best-effort snapshot after a transient same-context proof failure."""
+        nonlocal cookies, local_storage, session_storage, tokens
+        if context is None or page is None:
+            return
+        try:
+            latest_cookies = _browser_auth_persistable_cookies(
+                list(context.cookies()), url
+            )
+            latest_local = _browser_auth_local_storage(page)
+            latest_session = _browser_auth_session_storage(page)
+            latest_tokens = dict(tokens)
+            latest_tokens.update(_browser_auth_tokens(
+                raw_response_bodies, latest_local, latest_session
+            ))
+            credentials.canonical_browser_storage(
+                origin=login_origin, cookies=latest_cookies,
+                local_storage=latest_local,
+                session_storage=latest_session,
+            )
+            reusable = bool(
+                latest_cookies
+                or credentials.select_bearer(latest_tokens)
+                or any(
+                    str(value)
+                    for area in (latest_local, latest_session)
+                    for value in area.values()
+                )
+            )
+        except Exception:
+            # The pre-verifier snapshot is already canonical and remains the
+            # safe fallback when a pending navigation cannot be inspected.
+            return
+        if not reusable:
+            return
+        cookies = latest_cookies
+        local_storage = latest_local
+        session_storage = latest_session
+        tokens = latest_tokens
+        observed_cookie_sets.append(cookies)
+        observed_storage_sets.extend((local_storage, session_storage))
+        observed_token_sets.append(tokens)
 
     try:
         with _isolated_browser_profile(executable) as launch_profile:
@@ -5028,71 +5121,108 @@ def _credential_browser_login_locked(
                     if not blocker:
                         phase["name"] = "verify"
                         verify_header_state["active"] = True
-                        verify_response = page.goto(
-                            verify_url, wait_until="commit", timeout=timeout_ms
-                        )
-                        page.wait_for_timeout(250)
-                        verify_status = int(verify_response.status) if verify_response else 0
-                        verify_response_url = (
-                            str(verify_response.url or "")
-                            if verify_response else ""
-                        )
-                        verify_final, verify_dom, verify_visible = _browser_auth_snapshot(page)
-                        verify_final_url = verify_final
-                        verify_method = _browser_auth_response_method(verify_response)
-                        verify_redirect_chain = _browser_auth_redirect_chain(
-                            verify_response
-                        )
-                        verify_redirected = bool(verify_redirect_chain)
-                        verify_allowed, verify_reason = check_url_scope(
-                            workspace, verify_final
-                        )
-                        if not verify_allowed:
-                            raise RuntimeError(
-                                f"browser verification ended outside scope: {verify_reason}"
-                            )
                         try:
-                            verify_body = bytes(verify_response.body() or b"").decode(
-                                "utf-8", "replace"
-                            )[:MAX_RESPONSE_BYTES] if verify_response else ""
-                        except Exception:
-                            verify_body = ""
-                        verify_source = "\n".join(
-                            (verify_body, verify_visible, verify_dom)
-                        )
-                        identity_sources.append(verify_body)
-                        # Verification can rotate cookies or refresh a bearer.
-                        # Snapshot only after it completes so persisted state is current.
-                        cookies = _browser_auth_persistable_cookies(
-                            list(context.cookies()), url
-                        )
-                        local_storage = _browser_auth_local_storage(page)
-                        session_storage = _browser_auth_session_storage(page)
-                        tokens = _browser_auth_tokens(
-                            (*raw_response_bodies, verify_body), local_storage,
-                            session_storage,
-                        )
-                        observed_cookie_sets.append(cookies)
-                        observed_storage_sets.extend((local_storage, session_storage))
-                        observed_token_sets.append(tokens)
-                        changed_cookie = _browser_auth_has_cookie_delta(
-                            baseline_cookies, cookies
-                        )
-                        changed_token = any(
-                            value not in baseline_token_values
-                            for value in tokens.values()
-                        )
-                        changed_storage = (
-                            _browser_auth_has_storage_delta(
-                                baseline_storage, local_storage
+                            verify_response = page.goto(
+                                verify_url, wait_until="commit", timeout=timeout_ms
                             )
-                            or _browser_auth_has_storage_delta(
-                                baseline_session_storage, session_storage
+                            page.wait_for_timeout(250)
+                        except Exception as exc:
+                            if not _browser_auth_retryable_probe_exception(exc):
+                                raise
+                            retryable_proof_stage = "verify"
+                            retryable_proof_failure = (
+                                "Authenticated verifier was temporarily unavailable."
                             )
-                        )
-                        material_delta = bool(
-                            changed_cookie or changed_token or changed_storage
-                        )
+                            # A verifier can rotate a cookie before Playwright's
+                            # navigation promise times out.  Preserve that private
+                            # state when it can still be captured exactly.
+                            retain_current_browser_material()
+                        else:
+                            verify_status = (
+                                int(verify_response.status)
+                                if verify_response else 0
+                            )
+                            verify_response_url = (
+                                str(verify_response.url or "")
+                                if verify_response else ""
+                            )
+                            verify_final, verify_dom, verify_visible = (
+                                _browser_auth_snapshot(page)
+                            )
+                            verify_final_url = verify_final
+                            verify_method = _browser_auth_response_method(
+                                verify_response
+                            )
+                            verify_redirect_chain = _browser_auth_redirect_chain(
+                                verify_response
+                            )
+                            verify_redirected = bool(verify_redirect_chain)
+                            verify_allowed, verify_reason = check_url_scope(
+                                workspace, verify_final
+                            )
+                            if not verify_allowed:
+                                raise RuntimeError(
+                                    "browser verification ended outside scope: "
+                                    + verify_reason
+                                )
+                            try:
+                                verify_body = (
+                                    bytes(verify_response.body() or b"").decode(
+                                        "utf-8", "replace"
+                                    )[:MAX_RESPONSE_BYTES]
+                                    if verify_response else ""
+                                )
+                            except Exception:
+                                verify_body = ""
+                            verify_source = "\n".join(
+                                (verify_body, verify_visible, verify_dom)
+                            )
+                            identity_sources.append(verify_body)
+                            # Verification can rotate cookies or refresh a bearer.
+                            # Snapshot only after it completes so persisted state is current.
+                            cookies = _browser_auth_persistable_cookies(
+                                list(context.cookies()), url
+                            )
+                            local_storage = _browser_auth_local_storage(page)
+                            session_storage = _browser_auth_session_storage(page)
+                            tokens = _browser_auth_tokens(
+                                (*raw_response_bodies, verify_body), local_storage,
+                                session_storage,
+                            )
+                            observed_cookie_sets.append(cookies)
+                            observed_storage_sets.extend(
+                                (local_storage, session_storage)
+                            )
+                            observed_token_sets.append(tokens)
+                            changed_cookie = _browser_auth_has_cookie_delta(
+                                baseline_cookies, cookies
+                            )
+                            changed_token = any(
+                                value not in baseline_token_values
+                                for value in tokens.values()
+                            )
+                            changed_storage = (
+                                _browser_auth_has_storage_delta(
+                                    baseline_storage, local_storage
+                                )
+                                or _browser_auth_has_storage_delta(
+                                    baseline_session_storage, session_storage
+                                )
+                            )
+                            material_delta = bool(
+                                changed_cookie or changed_token or changed_storage
+                            )
+                            if _browser_auth_probe_result_is_transient(
+                                status=verify_status, method=verify_method,
+                                response_url=verify_response_url,
+                                final_url=verify_final_url,
+                                redirect_chain=verify_redirect_chain,
+                            ):
+                                retryable_proof_stage = "verify"
+                                retryable_proof_failure = (
+                                    "Authenticated verifier returned an incomplete "
+                                    "or transient result."
+                                )
 
                     context.close()
                     context = None
@@ -5100,7 +5230,11 @@ def _credential_browser_login_locked(
                     replay_material_ready = (
                         login_material_delta if status_mode else material_delta
                     )
-                    if not blocker and replay_material_ready:
+                    if (
+                        not blocker
+                        and replay_material_ready
+                        and not retryable_proof_failure
+                    ):
                         phase["name"] = "replay"
                         replay = _browser_auth_fresh_probe_with_retry(
                             playwright, executable, workspace, verify_url,
@@ -5173,7 +5307,13 @@ def _credential_browser_login_locked(
                             # persisted replay may already be complete.  Keep
                             # that candidate recoverable and retry only this
                             # independent anonymous proof on the next request.
-                            control_failure = str(exc)
+                            if not _browser_auth_retryable_probe_exception(exc):
+                                raise
+                            control_failure = (
+                                "Anonymous control was temporarily unavailable."
+                            )
+                            retryable_proof_stage = "control"
+                            retryable_proof_failure = control_failure
                             control_probe_attempts = 2
                         else:
                             control_status = int(control.get("status") or 0)
@@ -5210,21 +5350,18 @@ def _credential_browser_login_locked(
                                 control.get("session_storage")
                                 if isinstance(control.get("session_storage"), dict) else {},
                             ))
-                            if (
-                                control_status in {0, 408, 425, 429}
-                                or control_status >= 500
-                                or not control_method
-                                or not control_response_url
-                                or not control_final_url
-                                or any(
-                                    hop.get("complete") is not True
-                                    for hop in control_redirect_chain
-                                )
+                            if _browser_auth_probe_result_is_transient(
+                                status=control_status, method=control_method,
+                                response_url=control_response_url,
+                                final_url=control_final_url,
+                                redirect_chain=control_redirect_chain,
                             ):
                                 control_failure = (
                                     "Anonymous control returned an incomplete or "
                                     "transient result after read-only retries."
                                 )
+                                retryable_proof_stage = "control"
+                                retryable_proof_failure = control_failure
     except _BrowserStorageCaptureError:
         # The unknown tail of an oversized state value cannot be safely
         # redacted.  Discard every browser-derived observable and fail closed;
@@ -5248,13 +5385,39 @@ def _credential_browser_login_locked(
         material_delta = False
         login_material_delta = False
     except Exception as exc:
-        failure = failure or f"Headless browser authentication failed: {exc}"
+        if (
+            status_mode
+            and phase["name"] in {"verify", "replay", "control"}
+            and _browser_auth_retryable_probe_exception(exc)
+        ):
+            retryable_proof_stage = phase["name"]
+            retryable_proof_failure = (
+                "Status-differential proof was temporarily unavailable."
+            )
+            if phase["name"] == "verify":
+                retain_current_browser_material()
+        else:
+            failure = failure or f"Headless browser authentication failed: {exc}"
     finally:
         if context is not None:
             try:
                 context.close()
             except Exception:
                 pass
+
+    if (
+        status_mode
+        and replay_probe_attempts
+        and _browser_auth_probe_result_is_transient(
+            status=replay_status, method=replay_method,
+            response_url=replay_response_url, final_url=replay_final_url,
+            redirect_chain=replay_redirect_chain,
+        )
+    ):
+        retryable_proof_stage = "replay"
+        retryable_proof_failure = (
+            "Persisted replay returned an incomplete or transient result."
+        )
 
     proof_status_ok = 200 <= replay_status < 300
     control_conclusive = bool(
@@ -5268,11 +5431,10 @@ def _credential_browser_login_locked(
         and proof_status_ok
         and control_conclusive
     )
-    status_authenticated_side_proved = bool(
+    status_login_candidate_ready = bool(
         status_mode
         and attempt
         and not blocker
-        and not failure
         and login_material_delta
         and credential_submission_state["seen"] == 1
         and credential_submission_state["blocked"] == 0
@@ -5281,6 +5443,10 @@ def _credential_browser_login_locked(
         and _browser_auth_url_matches(
             final_url, status_verification["expected_post_login_url"]
         )
+    )
+    status_authenticated_side_proved = bool(
+        status_login_candidate_ready
+        and not failure
         and verify_status == status_verification["authenticated_status"]
         and _browser_auth_redirect_contract_matches(
             verify_redirect_chain, (), verify_url, verify_method,
@@ -5296,6 +5462,7 @@ def _credential_browser_login_locked(
     )
     status_proved = bool(
         status_authenticated_side_proved
+        and not retryable_proof_failure
         and not control_failure
         and control_status == status_verification["anonymous_status"]
         and _browser_auth_redirect_contract_matches(
@@ -5333,8 +5500,29 @@ def _credential_browser_login_locked(
         response_rows, secret_values, identity_values
     )
 
+    if (
+        attempt
+        and _refresh_generation is not None
+        and credential_submission_state["seen"] == 0
+        and credential_submission_state["blocked"] == 0
+    ):
+        try:
+            credentials.release_unsubmitted_refresh_attempt(
+                workspace.slug, credential,
+                generation=_refresh_generation,
+                submission_requests=credential_submission_state["seen"],
+            )
+            refresh_reservation_released = True
+        except credentials.CredentialError as exc:
+            failure = failure or (
+                "Unsubmitted credential renewal reservation could not be "
+                f"released: {exc}"
+            )
+
     established = False
-    if attempt and blocker:
+    if refresh_reservation_released:
+        pass
+    elif attempt and blocker:
         if maintenance_generation is None:
             credentials.record_login_outcome(
                 workspace.slug, credential, blocked_reason=blocker
@@ -5416,8 +5604,11 @@ def _credential_browser_login_locked(
     elif (
         attempt
         and _refresh_generation is not None
-        and status_authenticated_side_proved
-        and control_failure
+        and status_login_candidate_ready
+        and (
+            (status_authenticated_side_proved and control_failure)
+            or bool(retryable_proof_failure)
+        )
     ):
         try:
             credentials.save_pending_browser_renewal(
@@ -5427,7 +5618,12 @@ def _credential_browser_login_locked(
                 local_storage=local_storage,
                 session_storage=session_storage, tokens=tokens,
             )
-            pending_control_saved = True
+            pending_renewal_saved = True
+            pending_renewal_reason = (
+                "anonymous-control"
+                if status_authenticated_side_proved
+                else "authenticated-proof"
+            )
         except Exception as exc:
             failure = (
                 "Private pending browser renewal could not be saved: " + str(exc)
@@ -5586,9 +5782,14 @@ def _credential_browser_login_locked(
     }
     if _refresh_generation is not None:
         data["session_renewal"] = {
-            "attempted": bool(attempt),
+            "attempted": bool(attempt and not refresh_reservation_released),
             "proof_completed": established,
-            "pending_control": pending_control_saved,
+            "pending_proof": pending_renewal_saved,
+            "pending_control": (
+                pending_renewal_reason == "anonymous-control"
+            ),
+            "reservation_released": refresh_reservation_released,
+            "retryable_proof_stage": retryable_proof_stage,
         }
     if _upgrade_generation is not None:
         data["browser_state_upgrade"] = {
@@ -5614,11 +5815,16 @@ def _credential_browser_login_locked(
             f"Browser authentication stopped {position}: {blocker}.",
             data,
         )
-    if pending_control_saved:
+    if pending_renewal_saved:
+        completed_proof = (
+            "credential-bearing login, authenticated verifier, and persisted replay"
+            if pending_renewal_reason == "anonymous-control"
+            else "credential-bearing login"
+        )
         return _err(
-            "Credential renewal completed the credential-bearing login, "
-            "authenticated verifier, and persisted replay, but its anonymous "
-            "control was temporarily unavailable. The private candidate was "
+            f"Credential renewal completed the {completed_proof}, but the "
+            "remaining status-differential proof was temporarily unavailable. "
+            "The private candidate was "
             "retained; the next authenticated request will retry only read-only "
             "proofs without resubmitting the credential.",
             data,

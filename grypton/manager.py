@@ -390,7 +390,7 @@ class KryptexManager:
 
         result = await call(prompt)
         try:
-            value = _extract_json(result.text)
+            value = result.decode_structured_json(_extract_json)
             errors = _check_schema(value, schema)
             if errors:
                 raise ValueError("; ".join(errors[:12]))
@@ -404,7 +404,7 @@ class KryptexManager:
                 f"REQUIRED SCHEMA:\n{json.dumps(schema, ensure_ascii=False)}"
             )
             repaired = await call(repair, " repair")
-            value = _extract_json(repaired.text)
+            value = repaired.decode_structured_json(_extract_json)
             errors = _check_schema(value, schema)
             if errors:
                 raise ProviderError("Kryptex returned invalid structured output twice: " + "; ".join(errors[:8]))

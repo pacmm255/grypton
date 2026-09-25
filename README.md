@@ -755,11 +755,14 @@ changes the session state.
 Renewal has a separate, private limit: one credential-bearing submission for
 each previously proven session generation. The reservation is written before
 credentials enter the renewal form, survives process restarts and profile
-updates, and is shared by concurrent requests. A failed or inconclusive full
-renewal restores the old cookie and token bytes without reopening that
+updates, and is shared by concurrent requests. If no credential request was
+sent, Grypton releases the reservation. If login succeeds but a verifier,
+saved-session replay, or anonymous control is temporarily unavailable, Grypton
+keeps the candidate in private state and retries only read-only proof; it does
+not submit the credential again. An explicit proof mismatch closes that
 generation. A successful full proof advances the generation and permits one
-future renewal if that new session later expires. Replacing the named
-credential clears this renewal state along with its old private material.
+future renewal if that new session later expires. Replacing the named credential
+clears this renewal state along with its old private material.
 
 Named credentials and session material live under
 `.state/credentials/<engagement>/`, outside the engagement workspace. Private
@@ -1088,8 +1091,8 @@ Each engagement has a private directory:
 .state/engagements/<engagement>/
 ├── target.json                 saved target and run state
 ├── findings.md                 readable finding timeline
-├── attack-surface.md           discovered routes, hosts, and boundaries
-├── tested-techniques.md        attempted techniques and results
+├── attack-surface.md           canonical view of discovered routes and boundaries
+├── tested-techniques.md        canonical view of attempted techniques and results
 ├── progress.md                 turn-by-turn progress
 ├── scope-rules.md              worker-visible URLs, severities, and finding exclusions
 ├── flows/                      bounded request and response captures
@@ -1100,6 +1103,10 @@ Each engagement has a private directory:
 ```
 
 Do not edit the active ledger files while an engagement is running. Use the console or the CLI commands to add instructions and review evidence.
+The two canonical observation documents are rebuilt from their append-only
+JSONL ledgers when an engagement starts. This removes direct Markdown edits and
+keeps model-authored policy claims out of the next worker session while retaining
+the original audit records.
 
 Provider credentials stay inside OpenClaude's credential loader and private
 runtime state. The local gateway token is passed through the child process

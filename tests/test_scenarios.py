@@ -55,6 +55,16 @@ class AutonomousScenarioTests(unittest.TestCase):
         self.assertIn("finding-proof", apk)
         self.assertIn("blocked-path-recovery", apk)
 
+    def test_identity_boundary_establishes_owner_control_before_available_variants(self):
+        identity = next(
+            row for row in scenarios.load_scenarios()
+            if row["id"] == "identity-boundary-diff"
+        )
+        action = identity["priority_action"].lower()
+        self.assertLess(action.index("owner control"), action.index("then compare"))
+        self.assertIn("only the identities and states available", action)
+        self.assertIn("unavailable prerequisites", action)
+
     def test_catalog_validation_rejects_missing_priority_action(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "scenarios.json"

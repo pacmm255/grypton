@@ -325,6 +325,7 @@ class _RenewAuthHandler(BaseHTTPRequestHandler):
     delay_login_response = False
     delete_cookie_on_next_verify = False
     fail_renewal_verify = False
+    transient_renewal_verify_status = 0
     verify_header_values: list[str] = []
 
     def _send(self, status: int, body: bytes, *, content_type: str,
@@ -405,6 +406,15 @@ class _RenewAuthHandler(BaseHTTPRequestHandler):
                 self._json(418, {"error": "missing protocol header"})
                 return
             if self._authenticated():
+                if (
+                    type(self).transient_renewal_verify_status
+                    and type(self).login_posts >= 2
+                ):
+                    self._json(
+                        type(self).transient_renewal_verify_status,
+                        {"error": "temporary verifier failure"},
+                    )
+                    return
                 if (
                     type(self).fail_renewal_verify
                     and type(self).login_posts >= 2
@@ -502,6 +512,7 @@ def renew_auth_server():
     _RenewAuthHandler.delay_login_response = False
     _RenewAuthHandler.delete_cookie_on_next_verify = False
     _RenewAuthHandler.fail_renewal_verify = False
+    _RenewAuthHandler.transient_renewal_verify_status = 0
     _RenewAuthHandler.verify_header_values = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _RenewAuthHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1006,6 +1017,44 @@ class BrowserCredentialTests(unittest.TestCase):
                 1,
             )
 
+    def test_unsubmitted_refresh_reservation_is_released(self):
+        with isolated_runtime(), renew_auth_server() as port:
+            ws = self._workspace(port)
+            self._establish_renewable_session(ws, port)
+            self._expire_private_cookie(ws)
+            before = credentials.load_attempt_state(ws.slug, "primary")
+            posts = _RenewAuthHandler.login_posts
+
+            with patch(
+                "grypton.tools._browser_auth_wait_for_submit",
+                side_effect=RuntimeError("synthetic pre-submit failure"),
+            ):
+                first = dispatch(ws, "authenticated_http_request", {
+                    "url": f"http://127.0.0.1:{port}/resource",
+                    "credential": "primary",
+                })
+
+            self.assertFalse(first["ok"], first)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts)
+            self.assertEqual(first["data"]["credential_submission_requests"], 0)
+            self.assertTrue(
+                first["data"]["session_renewal"]["reservation_released"]
+            )
+            released = credentials.load_attempt_state(ws.slug, "primary")
+            self.assertEqual(released["refresh_attempted_generation"], 0)
+            self.assertEqual(
+                released["refresh_submissions"], before["refresh_submissions"]
+            )
+
+            second = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/resource",
+                "credential": "primary",
+            })
+
+            self.assertTrue(second["ok"], second)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+            self.assertEqual(_RenewAuthHandler.resource_requests, 1)
+
     def test_refresh_prelogin_blocker_never_fills_or_submits(self):
         with isolated_runtime(), renew_auth_server() as port:
             ws = self._workspace(port)
@@ -1056,6 +1105,9 @@ class BrowserCredentialTests(unittest.TestCase):
                 failed["refresh_attempted_generation"],
                 failed["proof_generation"],
             )
+            self.assertFalse(credentials.load_pending_browser_renewal(
+                ws.slug, "primary"
+            )["available"])
 
             second = dispatch(ws, "authenticated_http_request", {
                 "url": f"http://127.0.0.1:{port}/resource",
@@ -1246,7 +1298,7 @@ class BrowserCredentialTests(unittest.TestCase):
             self.assertEqual(_RenewAuthHandler.resource_requests, 1)
             self.assertEqual(
                 second["data"]["session_maintenance"]["action"],
-                "renewed-pending-control",
+                "renewed-pending-proof",
             )
             self.assertFalse(
                 second["data"]["session_maintenance"]["credential_submission"]
@@ -1261,6 +1313,275 @@ class BrowserCredentialTests(unittest.TestCase):
             self.assertFalse(credentials.load_pending_browser_renewal(
                 ws.slug, "primary"
             )["available"])
+
+    def test_replay_timeout_retains_and_promotes_renewal(self):
+        with isolated_runtime(), renew_auth_server() as port:
+            ws = self._workspace(port)
+            self._establish_renewable_session(ws, port)
+            self._expire_private_cookie(ws)
+            original_probe = tools._browser_auth_fresh_probe
+            posts = _RenewAuthHandler.login_posts
+            replay_calls = 0
+
+            def unavailable_replay(*args, **kwargs):
+                nonlocal replay_calls
+                if kwargs.get("phase") == "replay":
+                    replay_calls += 1
+                    raise TimeoutError("synthetic persistent replay timeout")
+                return original_probe(*args, **kwargs)
+
+            with patch(
+                "grypton.tools._browser_auth_fresh_probe",
+                side_effect=unavailable_replay,
+            ):
+                first = dispatch(ws, "authenticated_http_request", {
+                    "url": f"http://127.0.0.1:{port}/resource",
+                    "credential": "primary",
+                })
+
+            self.assertFalse(first["ok"], first)
+            self.assertEqual(replay_calls, 2)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+            self.assertTrue(
+                first["data"]["session_renewal"]["pending_proof"]
+            )
+            self.assertFalse(
+                first["data"]["session_renewal"]["pending_control"]
+            )
+            self.assertEqual(
+                credentials.session_status(ws.slug, "primary")["state"],
+                "renewal-pending",
+            )
+
+            second = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/resource",
+                "credential": "primary",
+            })
+
+            self.assertTrue(second["ok"], second)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+            self.assertEqual(_RenewAuthHandler.resource_requests, 1)
+            self.assertEqual(
+                second["data"]["session_maintenance"]["action"],
+                "renewed-pending-proof",
+            )
+
+    def test_transient_replay_status_retains_and_promotes_renewal(self):
+        with isolated_runtime(), renew_auth_server() as port:
+            ws = self._workspace(port)
+            self._establish_renewable_session(ws, port)
+            self._expire_private_cookie(ws)
+            original_probe = tools._browser_auth_fresh_probe
+            posts = _RenewAuthHandler.login_posts
+            replay_calls = 0
+
+            def unavailable_replay(*args, **kwargs):
+                nonlocal replay_calls
+                if kwargs.get("phase") == "replay":
+                    replay_calls += 1
+                    storage = kwargs.get("browser_storage") or {}
+                    return {
+                        "status": 503,
+                        "response_url": f"http://127.0.0.1:{port}/verify",
+                        "final_url": f"http://127.0.0.1:{port}/verify",
+                        "method": "GET", "redirect_chain": [],
+                        "body": "", "source": "",
+                        "cookies": list(kwargs.get("cookies") or []),
+                        "local_storage": dict(storage.get("local_storage") or {}),
+                        "session_storage": dict(
+                            storage.get("session_storage") or {}
+                        ),
+                    }
+                return original_probe(*args, **kwargs)
+
+            with patch(
+                "grypton.tools._browser_auth_fresh_probe",
+                side_effect=unavailable_replay,
+            ):
+                first = dispatch(ws, "authenticated_http_request", {
+                    "url": f"http://127.0.0.1:{port}/resource",
+                    "credential": "primary",
+                })
+
+            self.assertFalse(first["ok"], first)
+            self.assertEqual(replay_calls, 2)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+            self.assertTrue(first["data"]["session_renewal"]["pending_proof"])
+            self.assertEqual(
+                first["data"]["session_renewal"]["retryable_proof_stage"],
+                "replay",
+            )
+
+            second = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/resource",
+                "credential": "primary",
+            })
+
+            self.assertTrue(second["ok"], second)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+            self.assertEqual(_RenewAuthHandler.resource_requests, 1)
+
+    def test_direct_verifier_timeout_retains_rotated_session_and_promotes(self):
+        from playwright.sync_api import Page
+
+        with isolated_runtime(), renew_auth_server() as port:
+            ws = self._workspace(port)
+            self._establish_renewable_session(ws, port)
+            self._expire_private_cookie(ws)
+            before = credentials.load_attempt_state(ws.slug, "primary")
+            posts = _RenewAuthHandler.login_posts
+            origin = f"http://127.0.0.1:{port}"
+            rotated = "timeout-rotated-session-never-log"
+            original_goto = Page.goto
+            timed_out = False
+
+            def timeout_after_rotation(page, url, *args, **kwargs):
+                nonlocal timed_out
+                if (
+                    not timed_out
+                    and url == origin + "/verify"
+                    and page.url == origin + "/home"
+                    and _RenewAuthHandler.login_posts == posts + 1
+                ):
+                    timed_out = True
+                    _RenewAuthHandler.session = rotated
+                    page.context.add_cookies([{
+                        "name": "app_session", "value": rotated,
+                        "url": origin, "httpOnly": True,
+                    }])
+                    raise TimeoutError("synthetic direct verifier timeout")
+                return original_goto(page, url, *args, **kwargs)
+
+            with patch.object(Page, "goto", new=timeout_after_rotation):
+                first = dispatch(ws, "authenticated_http_request", {
+                    "url": origin + "/resource",
+                    "credential": "primary",
+                })
+
+            self.assertTrue(timed_out)
+            self.assertFalse(first["ok"], first)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+            self.assertTrue(first["data"]["session_renewal"]["pending_proof"])
+            self.assertEqual(
+                first["data"]["session_renewal"]["retryable_proof_stage"],
+                "verify",
+            )
+            self.assertEqual(
+                credentials.session_status(ws.slug, "primary")["state"],
+                "renewal-pending",
+            )
+
+            second = dispatch(ws, "authenticated_http_request", {
+                "url": origin + "/resource",
+                "credential": "primary",
+            })
+
+            self.assertTrue(second["ok"], second)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+            self.assertEqual(_RenewAuthHandler.resource_requests, 1)
+            self.assertFalse(
+                second["data"]["session_maintenance"]["credential_submission"]
+            )
+            renewed = credentials.load_attempt_state(ws.slug, "primary")
+            self.assertEqual(
+                renewed["proof_generation"], before["proof_generation"] + 1
+            )
+            self.assertEqual(renewed["refresh_attempted_generation"], 0)
+            self.assertFalse(credentials.load_pending_browser_renewal(
+                ws.slug, "primary"
+            )["available"])
+
+    def test_transient_verifier_status_retains_without_resubmission(self):
+        with isolated_runtime(), renew_auth_server() as port:
+            ws = self._workspace(port)
+            self._establish_renewable_session(ws, port)
+            self._expire_private_cookie(ws)
+            posts = _RenewAuthHandler.login_posts
+            _RenewAuthHandler.transient_renewal_verify_status = 503
+
+            first = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/resource",
+                "credential": "primary",
+            })
+
+            self.assertFalse(first["ok"], first)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+            self.assertTrue(first["data"]["session_renewal"]["pending_proof"])
+            self.assertEqual(
+                first["data"]["session_renewal"]["retryable_proof_stage"],
+                "verify",
+            )
+            _RenewAuthHandler.transient_renewal_verify_status = 0
+
+            second = dispatch(ws, "authenticated_http_request", {
+                "url": f"http://127.0.0.1:{port}/resource",
+                "credential": "primary",
+            })
+
+            self.assertTrue(second["ok"], second)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+            self.assertEqual(_RenewAuthHandler.resource_requests, 1)
+
+    def test_nonretryable_replay_exception_closes_renewal(self):
+        with isolated_runtime(), renew_auth_server() as port:
+            ws = self._workspace(port)
+            self._establish_renewable_session(ws, port)
+            self._expire_private_cookie(ws)
+            original_probe = tools._browser_auth_fresh_probe
+            posts = _RenewAuthHandler.login_posts
+            replay_calls = 0
+
+            def invalid_replay(*args, **kwargs):
+                nonlocal replay_calls
+                if kwargs.get("phase") == "replay":
+                    replay_calls += 1
+                    raise RuntimeError("synthetic nonretryable proof error")
+                return original_probe(*args, **kwargs)
+
+            with patch(
+                "grypton.tools._browser_auth_fresh_probe",
+                side_effect=invalid_replay,
+            ):
+                first = dispatch(ws, "authenticated_http_request", {
+                    "url": f"http://127.0.0.1:{port}/resource",
+                    "credential": "primary",
+                })
+
+            self.assertFalse(first["ok"], first)
+            self.assertEqual(replay_calls, 1)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+            self.assertFalse(credentials.load_pending_browser_renewal(
+                ws.slug, "primary"
+            )["available"])
+            self.assertEqual(
+                credentials.session_status(ws.slug, "primary")["state"],
+                "renewal-blocked",
+            )
+
+    def test_probe_transient_result_classification(self):
+        complete = {
+            "method": "GET", "response_url": "https://example.test/verify",
+            "final_url": "https://example.test/verify", "redirect_chain": [],
+        }
+        for status in (0, 408, 425, 429, 500, 503, 599):
+            with self.subTest(status=status):
+                self.assertTrue(tools._browser_auth_probe_result_is_transient(
+                    status=status, **complete
+                ))
+        for status in (200, 400, 401, 403, 404):
+            with self.subTest(status=status):
+                self.assertFalse(tools._browser_auth_probe_result_is_transient(
+                    status=status, **complete
+                ))
+        self.assertTrue(tools._browser_auth_probe_result_is_transient(
+            status=400, method="", response_url=complete["response_url"],
+            final_url=complete["final_url"], redirect_chain=[],
+        ))
+        self.assertTrue(tools._browser_auth_probe_result_is_transient(
+            status=400, method="GET", response_url=complete["response_url"],
+            final_url=complete["final_url"],
+            redirect_chain=[{"complete": False}],
+        ))
 
     def test_pending_renewal_profile_change_invalidates_without_probe(self):
         with isolated_runtime(), renew_auth_server() as port:

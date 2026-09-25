@@ -327,6 +327,59 @@ class ValidationRetryTests(unittest.TestCase):
             self.assertEqual(engine._coverage_rotation_cursor, 4)
             self.assertEqual(engine._proof_rotation_cursor, 2)
 
+    def test_generic_coverage_only_recovers_unusable_manager_directions(self):
+        with isolated_runtime():
+            ws = Workspace("coverage-recovery-selection")
+            ws.create("https://example.test", "web")
+            engine = Engine(ws.slug, backend="mock")
+            engine.target = "https://example.test"
+            engine.target_type = "web"
+            engine.turn_index = 4
+            engine._family_stagnation_streak = 3
+            selection = engine._next_coverage_priority(
+                exhausted=False,
+                worker_was_idle=False,
+                convergence_reason="",
+            )
+            self.assertEqual(selection.kind, "coverage")
+
+            concrete = Directive(
+                directive="Exercise the captured recovery transition with its valid control."
+            )
+            selected, applied = engine._select_next_directive(
+                concrete, selection,
+            )
+            self.assertEqual(selected, concrete.worker_message())
+            self.assertFalse(applied)
+
+            recovery_cases = [
+                Directive(directive=""),
+                Directive(directive="Remain idle."),
+                Directive(directive="Draft a responsible-disclosure report."),
+                Directive(directive="Provider fallback.", degraded=True),
+            ]
+            for manager_directive in recovery_cases:
+                with self.subTest(directive=manager_directive.directive):
+                    selected, applied = engine._select_next_directive(
+                        manager_directive, selection,
+                    )
+                    self.assertEqual(selected, selection.action)
+                    self.assertTrue(applied)
+
+            selected, applied = engine._select_next_directive(
+                concrete, selection, force_recovery=True,
+            )
+            self.assertEqual(selected, selection.action)
+            self.assertTrue(applied)
+
+            selected, applied = engine._select_next_directive(
+                concrete,
+                type(selection)(),
+                force_recovery=True,
+            )
+            self.assertEqual(selected, "")
+            self.assertFalse(applied)
+
     def test_proof_rotation_uses_every_candidate_and_bounds_manager_context(self):
         with isolated_runtime():
             ws = Workspace("proof-window")
@@ -616,7 +669,10 @@ class FamilyStagnationLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(meta.family_stagnation_streak, 3)
             self.assertEqual(meta.coverage_rotation_cursor, 1)
             self.assertEqual(meta.proof_rotation_cursor, 0)
-            self.assertEqual(meta.last_directive, contexts[2].coverage_priority)
+            self.assertEqual(
+                meta.last_directive,
+                "Exercise the next unresolved operation.",
+            )
             health = _health(ws.slug, 0)
             self.assertEqual(health["family_stagnation_streak"], 3)
             self.assertEqual(health["coverage_rotation_cursor"], 1)

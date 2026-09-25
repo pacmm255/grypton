@@ -56,6 +56,31 @@ FINDING_FAMILY_EVENT_REQUIRED_KEYS = (
 # corrupted JSON numbers small, finite, and portable across consumers.
 FINDING_FAMILY_TIMESTAMP_MAX = 10_000_000_000
 
+# Attack-surface and tested-technique rows are observations supplied by the
+# worker. They are useful durable evidence, but they are not an authority for
+# engagement policy. In particular, a model must not be able to turn prose in
+# either ledger into a supposed operator instruction that future sessions then
+# inherit from the rendered Markdown views.
+_OBSERVATION_AUTHORITY_RE = re.compile(
+    r"\b(?:"
+    r"standing[\s-]+(?:directive|instruction|rule|order)s?"
+    r"|(?:manager|operator|user|kryptex)(?:['\N{RIGHT SINGLE QUOTATION MARK}]s)?"
+    r"[\s-]+(?:(?:directive|instruction|rule|order|request)s?|"
+    r"prohibit(?:s|ed|ing)?|forb(?:id|ids|ade|idden)|withh?old|withheld)"
+    r"|(?:per|under|from|by|due[\s-]+to|because[\s-]+of)\s+(?:the\s+)?"
+    r"(?:(?:standing|manager|operator|user|kryptex)[\s-]+)?"
+    r"(?:directive|instruction|rule|order|request)s?"
+    r"|(?:otp|sign[\s-]?up|activation)"
+    r"(?:[\s/+_-]+(?:probe|flow|account|gate|gated))*"
+    r"[\s/_-]+directives?"
+    r")\b",
+    re.IGNORECASE,
+)
+_OBSERVATION_SENTENCE_SPLIT_RE = re.compile(
+    r"(?<=[.!?;])(?:\s+|$)|[\r\n]+"
+)
+_UNSUPPORTED_AUTHORITY_PLACEHOLDER = "[unsupported authority attribution removed]"
+
 
 def normalize_finding_root_cause(value: str) -> str:
     value = unicodedata.normalize("NFKC", str(value or "")).casefold()
@@ -530,8 +555,17 @@ class Workspace:
         self.render_scope_document()
 
     def render_scope_document(self) -> None:
-        """Refresh the worker-readable scope projection from durable constraints."""
-        self._render_scope()
+        """Refresh worker-readable policy and observation projections.
+
+        Engine setup calls this on every start. Rebuilding the observation
+        views here removes direct Markdown edits and reprojects raw ledger rows
+        through the authority boundary, while leaving the append-only JSONL
+        audit history untouched.
+        """
+        constraints = self.load_constraints()
+        self._render_scope(constraints)
+        self._render_surface_md(constraints)
+        self._render_tested_md(constraints)
 
     def save_program_brief(self, text: str, profile: dict) -> None:
         """Persist imported program material as manager-only engagement state."""
@@ -1227,14 +1261,12 @@ class Workspace:
     # ---- rendering -------------------------------------------------------
 
     def render_all(self) -> None:
-        """Initialise the workspace docs. The .md files are APPEND-ONLY chronological
-        logs (the .jsonl ledger is the authoritative source of truth); they are only
-        created if missing, never regenerated/clobbered — so prose the agents add,
-        prior session content, or user edits are preserved across resumes."""
+        """Initialise canonical workspace documents from their durable state."""
         self._ensure_findings_md()
-        self._ensure_surface_md()
-        self._ensure_tested_md()
-        self._render_scope()
+        constraints = self.load_constraints()
+        self._render_surface_md(constraints)
+        self._render_tested_md(constraints)
+        self._render_scope(constraints)
         if not (self.root / "progress.md").exists():
             (self.root / "progress.md").write_text(
                 f"# Progress — {self.slug}\n\n", encoding="utf-8")
@@ -1268,26 +1300,116 @@ class Workspace:
         path = self.root / "attack-surface.md"
         if path.exists():
             return
-        out = [f"# Attack Surface — {self.slug}", "",
-               "_Append-only log of EVERY observation worth keeping. Bigger is always"
-               " better — when in doubt, log it._\n"]
-        for r in self.surface.all():
-            out.append(self._fmt_surface(r))
-        _atomic_write(path, "\n".join(out).rstrip() + "\n")
+        self._render_surface_md(self.load_constraints())
 
     def _ensure_tested_md(self) -> None:
         path = self.root / "tested-techniques.md"
         if path.exists():
             return
-        out = [f"# Tested Techniques — {self.slug}", "",
-               "_Per surface/technique log so we never blindly repeat a dead path."
-               " Deliberate bypass retries are allowed and recorded as new rows."
-               " Append-only._\n",
-               "| ID | Surface | Technique | Result | Evidence |",
-               "|----|---------|-----------|--------|----------|"]
-        for r in self.tested.all():
-            out.append(self._fmt_tested(r))
-        _atomic_write(path, "\n".join(out) + "\n")
+        self._render_tested_md(self.load_constraints())
+
+    @staticmethod
+    def _normalise_policy_statement(value: object) -> str:
+        text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+        return re.sub(r"[^\w:/.-]+", " ", text, flags=re.UNICODE).strip(
+            " .:/-"
+        )
+
+    @classmethod
+    def _worker_policy_grounding(cls, constraints: Constraints) -> frozenset[str]:
+        """Return policy statements already present in the public scope model.
+
+        Manager-only hard rules, standing instructions, and notes deliberately
+        do not ground worker-visible prose. This mirrors
+        ``Constraints.to_worker_prompt_block``: only URLs, severity, and
+        out-of-scope finding categories can cross this boundary.
+        """
+        statements: set[str] = set()
+
+        def add(value: object) -> None:
+            normalised = cls._normalise_policy_statement(value)
+            if normalised:
+                statements.add(normalised)
+
+        default_severity = (
+            ", ".join(constraints.included_severities)
+            if constraints.included_severities else "all severities"
+        )
+        for item in constraints.in_scope:
+            severity = (
+                str(constraints.url_severities.get(item) or "").strip()
+                or default_severity
+            )
+            add(item)
+            add(f"{item} in scope")
+            add(f"in scope {item}")
+            add(f"{item} severity {severity}")
+            add(f"severity for {item} {severity}")
+        for category in constraints.excluded_classes:
+            add(category)
+            add(f"{category} out of scope")
+            add(f"{category} is out of scope")
+            add(f"out of scope {category}")
+        for exclusion in constraints.conditional_exclusions:
+            add(exclusion)
+        return frozenset(statements)
+
+    @classmethod
+    def _canonical_observation_text(
+            cls, value: object, grounding: frozenset[str]) -> str:
+        """Remove unsupported policy claims while retaining ordinary evidence."""
+        text = str(value or "")
+        if not _OBSERVATION_AUTHORITY_RE.search(text):
+            return text
+        rendered: list[str] = []
+        for sentence in _OBSERVATION_SENTENCE_SPLIT_RE.split(text):
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            if not _OBSERVATION_AUTHORITY_RE.search(sentence):
+                rendered.append(sentence)
+                continue
+            without_attribution = _OBSERVATION_AUTHORITY_RE.sub(" ", sentence)
+            without_attribution = re.sub(
+                r"^[\s,;:.!?()\[\]-]+|[\s,;:.!?()\[\]-]+$", "",
+                without_attribution,
+            )
+            normalised = cls._normalise_policy_statement(without_attribution)
+            if normalised and normalised in grounding:
+                # The statement is already public structured scope data. Keep
+                # its substance, but never preserve a model-authored claim
+                # about who supposedly issued it.
+                rendered.append(without_attribution)
+            elif (not rendered
+                  or rendered[-1] != _UNSUPPORTED_AUTHORITY_PLACEHOLDER):
+                rendered.append(_UNSUPPORTED_AUTHORITY_PLACEHOLDER)
+        return " ".join(rendered)
+
+    def _render_surface_md(self, constraints: Constraints) -> None:
+        path = self.root / "attack-surface.md"
+        grounding = self._worker_policy_grounding(constraints)
+        with _file_lock(self.surface.lock):
+            rows = self.surface.all()
+            out = [f"# Attack Surface — {self.slug}", "",
+                   "_Canonical view of the append-only observation ledger._\n"]
+            for record in rows:
+                out.append(self._fmt_surface(record, grounding=grounding))
+            with _file_lock(path.with_suffix(path.suffix + ".lock")):
+                _atomic_write(path, "\n".join(out).rstrip() + "\n")
+
+    def _render_tested_md(self, constraints: Constraints) -> None:
+        path = self.root / "tested-techniques.md"
+        grounding = self._worker_policy_grounding(constraints)
+        with _file_lock(self.tested.lock):
+            rows = self.tested.all()
+            out = [f"# Tested Techniques — {self.slug}", "",
+                   "_Canonical view of the append-only technique ledger._\n",
+                   "| ID | Surface | Technique | Result | Evidence |",
+                   "|----|---------|-----------|--------|----------|"]
+            for record in rows:
+                out.append(self._fmt_tested(record, grounding=grounding))
+            with _file_lock(path.with_suffix(path.suffix + ".lock")):
+                _atomic_write(path, "\n".join(out) + "\n")
 
     # ---- per-record markdown formatters ----------------------------------
 
@@ -1358,20 +1480,35 @@ class Workspace:
         lines.append("")
         return "\n".join(lines)
 
-    @staticmethod
-    def _fmt_surface(r: dict) -> str:
-        line = f"- `{r.get('id','?')}` [{r.get('kind','?')}] `{r.get('item','')}`"
-        if r.get("detail"):
-            line += f" — {r['detail']}"
-        if r.get("interesting"):
-            line += f"  ⭑ {r['interesting']}"
+    @classmethod
+    def _fmt_surface(
+            cls, r: dict, *, grounding: frozenset[str] = frozenset()) -> str:
+        kind = cls._canonical_observation_text(r.get("kind", "?"), grounding)
+        item = cls._canonical_observation_text(r.get("item", ""), grounding)
+        line = f"- `{r.get('id','?')}` [{kind}] `{item}`"
+        detail = cls._canonical_observation_text(r.get("detail", ""), grounding)
+        if detail:
+            line += f" — {detail}"
+        interesting = cls._canonical_observation_text(
+            r.get("interesting", ""), grounding,
+        )
+        if interesting:
+            line += f"  ⭑ {interesting}"
         return line
 
-    @staticmethod
-    def _fmt_tested(r: dict) -> str:
-        ev = (r.get("evidence", "") or "")[:80].replace("|", "\\|").replace("\n", " ")
-        return (f"| {r.get('id','')} | {r.get('surface','')} | "
-                f"{r.get('technique','')} | {r.get('result','')} | {ev} |")
+    @classmethod
+    def _fmt_tested(
+            cls, r: dict, *, grounding: frozenset[str] = frozenset()) -> str:
+        values = {
+            key: cls._canonical_observation_text(r.get(key, ""), grounding)
+            for key in ("surface", "technique", "result", "evidence")
+        }
+        for key, value in values.items():
+            values[key] = value.replace("|", "\\|").replace("\n", " ")
+        values["evidence"] = values["evidence"][:80]
+        return (f"| {r.get('id','')} | {values['surface']} | "
+                f"{values['technique']} | {values['result']} | "
+                f"{values['evidence']} |")
 
     # ---- append-only writers (used by record_finding etc.) ---------------
 
@@ -1403,14 +1540,22 @@ class Workspace:
 
     def _append_surface_to_md(self, rec: dict) -> None:
         self._ensure_surface_md()
-        self._append_md(self.root / "attack-surface.md", self._fmt_surface(rec))
+        grounding = self._worker_policy_grounding(self.load_constraints())
+        self._append_md(
+            self.root / "attack-surface.md",
+            self._fmt_surface(rec, grounding=grounding),
+        )
 
     def _append_tested_to_md(self, rec: dict) -> None:
         self._ensure_tested_md()
-        self._append_md(self.root / "tested-techniques.md", self._fmt_tested(rec))
+        grounding = self._worker_policy_grounding(self.load_constraints())
+        self._append_md(
+            self.root / "tested-techniques.md",
+            self._fmt_tested(rec, grounding=grounding),
+        )
 
-    def _render_scope(self) -> None:
-        c = self.load_constraints()
+    def _render_scope(self, c: Optional[Constraints] = None) -> None:
+        c = c or self.load_constraints()
         out = [f"# Scope Rules — {self.slug}", "",
                "```",
                c.to_worker_prompt_block(), "```", ""]

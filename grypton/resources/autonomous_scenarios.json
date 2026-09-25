@@ -14,10 +14,10 @@
     "id": "identity-boundary-diff",
     "title": "Identity, role, and object boundaries",
     "target_types": ["web", "api", "auto"],
-    "priority_action": "Choose one consequential authenticated operation and compare owner, peer, lower-role, anonymous, stale, and structurally altered references while preserving a known-valid control.",
+    "priority_action": "Choose one consequential authenticated operation and first capture a known-valid owner control. Then compare only the identities and states available in the engagement, such as anonymous, stale, structurally altered, or another test identity; record absent peer or lower-role identities as unavailable prerequisites and continue with available controls.",
     "moves": [
-      "map identities, roles, tenants, object ownership, and action-level permissions",
-      "compare owner, peer, lower-role, anonymous, missing, stale, and malformed references",
+      "establish a valid owner, session, object, and action baseline before boundary variants",
+      "compare available identities, roles, tenants, ownership states, and anonymous, missing, stale, or malformed references",
       "capture request and response pairs that prove the authorization boundary"
     ]
   },

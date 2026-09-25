@@ -522,10 +522,11 @@ def validate_browser_verification(value: object, *, login_url: str) -> dict:
             200 <= authenticated_status <= 299
             or 400 <= authenticated_status <= 499
         )
-        or authenticated_status in {401, 403, 429}
+        or authenticated_status in {401, 403, 408, 425, 429}
     ):
         raise CredentialError(
-            "browser authenticated status must be 2xx or 4xx except 401, 403, or 429"
+            "browser authenticated status must be 2xx or a non-transient 4xx "
+            "except 401 or 403"
         )
     if (
         isinstance(anonymous_status, bool)
@@ -1174,7 +1175,7 @@ def save_pending_browser_renewal(
     profile_revision: str, cookies: object, local_storage: object,
     session_storage: object, tokens: object,
 ) -> None:
-    """Retain an unpromoted renewal while its anonymous control is retried.
+    """Retain an unpromoted renewal while read-only proof is retried.
 
     The record is private and cannot be used by authenticated request tools.
     It is valid only for the one already-reserved renewal generation.
@@ -1490,6 +1491,44 @@ def begin_refresh_attempt(target: str, name: str, *, generation: int) -> int:
             state["refresh_blocked_reason"] = ""
             _atomic_private_json(attempt_path(target, name), {"version": 2, **state})
             return state["refresh_submissions"]
+
+
+def release_unsubmitted_refresh_attempt(
+    target: str, name: str, *, generation: int, submission_requests: int,
+) -> None:
+    """Release a renewal reservation proven not to have sent credentials."""
+    if (
+        isinstance(submission_requests, bool)
+        or not isinstance(submission_requests, int)
+        or submission_requests != 0
+    ):
+        raise CredentialError(
+            "a refresh reservation can be released only with zero submissions"
+        )
+    with session_material_lock(target, name):
+        lock_path = attempt_path(target, name).with_suffix(".lock")
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "r+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            state = load_attempt_state(target, name)
+            if (
+                not state["ever_established"]
+                or state["established"]
+                or state["proof_generation"] != generation
+                or state["refresh_attempted_generation"] != generation
+                or state["refresh_submissions"] < 1
+                or pending_browser_renewal_path(target, name).exists()
+                or pending_browser_renewal_path(target, name).is_symlink()
+            ):
+                raise CredentialError(
+                    "unsubmitted credential renewal state changed before release"
+                )
+            state["refresh_attempted_generation"] = 0
+            state["refresh_submissions"] -= 1
+            state["refresh_blocked_reason"] = ""
+            _atomic_private_json(
+                attempt_path(target, name), {"version": 2, **state}
+            )
 
 
 def begin_browser_state_upgrade(target: str, name: str, *, generation: int) -> int:

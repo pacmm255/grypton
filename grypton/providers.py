@@ -512,6 +512,9 @@ async def _terminate(proc: asyncio.subprocess.Process) -> None:
 
 @dataclass
 class OpenCodeResult:
+    # ``text`` is safe for persistence, logs, UI, and worker summaries. Manager
+    # JSON uses the private one-shot decoder below so exact credential needles
+    # cannot turn literals such as ``true`` or ``0.84`` into invalid syntax.
     text: str
     session_id: str
     events: list[dict]
@@ -521,6 +524,24 @@ class OpenCodeResult:
     cost: float = 0.0
     stderr: str = ""
     returncode: int = 0
+    _raw_text: str | None = field(default=None, repr=False, compare=False)
+    _value_redactor: Callable[[object], object] | None = field(
+        default=None, repr=False, compare=False,
+    )
+
+    def decode_structured_json(self, decoder: Callable[[str], object]):
+        """Decode raw assistant JSON once, then scrub its string leaves.
+
+        The raw payload is never returned as prose and is discarded even when
+        decoding fails. Manually constructed results retain the historical
+        behavior by decoding their already-safe ``text`` value.
+        """
+        source = self._raw_text if self._raw_text is not None else self.text
+        redactor = self._value_redactor
+        self._raw_text = None
+        self._value_redactor = None
+        value = decoder(source)
+        return redactor(value) if redactor is not None else value
 
 
 class OpenCodeClient:
@@ -983,6 +1004,7 @@ class OpenCodeClient:
             ) from exc
 
         events: list[dict] = []
+        raw_texts: list[str] = []
         malformed: list[str] = []
         cleaned_lines: list[str] = []
         stream_path = self.transcripts / f"{self.role}.opencode.events.jsonl"
@@ -1011,6 +1033,16 @@ class OpenCodeClient:
                 cleaned_lines.append(line)
                 malformed.append(line[:500])
                 return
+            # Retain only manager assistant text from the raw parsed event, and
+            # only for the lifetime of its structured result. Worker prose is
+            # never retained unredacted. Manager output has to be decoded before
+            # exact redaction needles are applied: credentials can legitimately
+            # be short strings such as ``0``, ``true``, or ``false``, whose
+            # replacement in serialized JSON breaks syntax.
+            raw_part = event.get("part") if isinstance(event.get("part"), dict) else {}
+            if (self.role == "manager" and event.get("type") == "text"
+                    and isinstance(raw_part.get("text"), str)):
+                raw_texts.append(raw_part["text"])
             event = _clean_provider_value(event, event_secrets)
             cleaned_lines.append(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
             events.append(event)
@@ -1283,6 +1315,9 @@ class OpenCodeClient:
             elif event_type == "error":
                 errors.append(str(event.get("error") or event.get("message") or event)[:1000])
 
+        raw_assistant_text = None
+        if self.role == "manager":
+            raw_assistant_text, _ = _select_assistant_text(raw_texts)
         assistant_text, text_metadata = _select_assistant_text(texts)
         duration = time.time() - started
         call_record = {
@@ -1364,6 +1399,11 @@ class OpenCodeClient:
             cost=cost,
             stderr=cleaned_stderr,
             returncode=returncode,
+            _raw_text=raw_assistant_text,
+            _value_redactor=(
+                (lambda value: _clean_provider_value(value, event_secrets))
+                if self.role == "manager" else None
+            ),
         )
 
     async def cancel(self) -> None:

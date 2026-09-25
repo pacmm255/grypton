@@ -12,7 +12,8 @@ from unittest.mock import AsyncMock, patch
 
 from grypton import config, credentials
 from grypton.manager import KryptexManager, ManagerContext
-from grypton.providers import (MAX_ASSISTANT_TEXT_CHARS, OpenCodeClient, ProviderError,
+from grypton.providers import (MAX_ASSISTANT_TEXT_CHARS, OpenCodeClient,
+                               OpenCodeResult, ProviderError,
                                _select_assistant_text, clean)
 from grypton.workspace import Workspace
 
@@ -387,8 +388,136 @@ class ProviderOutputTests(unittest.TestCase):
                 )
                 self.assertEqual(result.tools[0]["input"]["password"], "[REDACTED]")
                 self.assertNotIn("SYNTHETIC_", result.tools[0]["output"])
+                self.assertIsNone(result._raw_text)
+                self.assertIsNone(result._value_redactor)
 
         asyncio.run(exercise())
+
+    def test_manager_decodes_raw_json_before_redacting_short_needles(self):
+        class _Input:
+            def write(self, value):
+                self.value = value
+
+            async def drain(self):
+                return None
+
+            def close(self):
+                return None
+
+        class _Stream:
+            def __init__(self, payload=b""):
+                self.payload = payload
+
+            async def read(self, _size):
+                payload, self.payload = self.payload, b""
+                return payload
+
+        class _Process:
+            pid = 43219
+
+            def __init__(self, stdout):
+                self.stdin = _Input()
+                self.stdout = _Stream(stdout)
+                self.stderr = _Stream()
+                self.returncode = None
+
+            async def wait(self):
+                self.returncode = 0
+                return 0
+
+        async def exercise():
+            with isolated_runtime():
+                ws = Workspace("structured-redaction-call")
+                ws.create("https://example.test", "web")
+                streamed = []
+                client = OpenCodeClient(
+                    role="manager", route=config.MANAGER_MODEL, effort="xhigh",
+                    workspace=ws.root, target_slug=ws.slug,
+                    allow_tools=False, agent_prompt="test",
+                    event_callback=streamed.append,
+                )
+                secret = "SYNTHETIC_MANAGER_SECRET"
+                response = {
+                    "assessment": f"Observed {secret}",
+                    "directive": "Retest the strongest lead.",
+                    "corrections": [],
+                    "new_angles": [],
+                    "exhaustion_breaker": "",
+                    "scope_enforcement": [],
+                    "severity_validations": [],
+                    "to_user": "Continuing.",
+                    "continue": True,
+                    "stop_reason": "",
+                    "confidence": 0.84,
+                }
+                raw_text = json.dumps(response)
+                event = {
+                    "type": "text", "sessionID": "ses-structured",
+                    "part": {"text": raw_text},
+                }
+                process = _Process((json.dumps(event) + "\n").encode())
+                gateway = SimpleNamespace(
+                    model_route=f"openclaude/{config.MANAGER_MODEL}",
+                    drain_events=lambda: [],
+                )
+                with patch.object(client, "_ensure_gateway", AsyncMock(return_value=gateway)), \
+                        patch.object(client, "_environment", return_value=({}, "gateway-secret")), \
+                        patch.object(client, "_ensure_network_broker", AsyncMock()), \
+                        patch.object(config, "require_binary", return_value="/usr/bin/true"), \
+                        patch("grypton.providers.credentials.provider_redaction_values",
+                              return_value=(secret, "0", "true", "false")), \
+                        patch("grypton.providers.asyncio.create_subprocess_exec",
+                              new=AsyncMock(return_value=process)):
+                    result = await client.call("structured prompt")
+
+                persisted = "\n".join([
+                    (ws.transcripts_dir / "manager.opencode.events.jsonl").read_text(
+                        encoding="utf-8"
+                    ),
+                    (ws.transcripts_dir / "provider-calls.jsonl").read_text(
+                        encoding="utf-8"
+                    ),
+                ])
+                exposed = persisted + result.text + json.dumps({
+                    "events": result.events,
+                    "tools": result.tools,
+                    "streamed": streamed,
+                }) + repr(result)
+                self.assertNotIn(secret, exposed)
+                self.assertIn("[REDACTED]", result.text)
+                with self.assertRaises(json.JSONDecodeError):
+                    json.loads(result.text)
+
+                manager = KryptexManager(ws, "system")
+                manager.client.call = AsyncMock(return_value=result)
+                directive = await manager.direct(ManagerContext(
+                    target="https://example.test", target_type="web", turn_index=1,
+                ))
+
+                self.assertTrue(directive.cont)
+                self.assertEqual(directive.confidence, 0.84)
+                self.assertEqual(directive.assessment, "Observed [REDACTED]")
+                self.assertNotIn(secret, json.dumps(directive.raw))
+                self.assertIsNone(result._raw_text)
+                self.assertIsNone(result._value_redactor)
+                self.assertEqual(manager.client.call.await_count, 1)
+
+        asyncio.run(exercise())
+
+    def test_structured_decoder_clears_private_raw_text_on_failure(self):
+        secret = "SYNTHETIC_PRIVATE_RAW_SECRET"
+        result = OpenCodeResult(
+            text="[REDACTED]", session_id="ses-invalid", events=[], tools=[],
+            usage=[], duration_s=0.1, _raw_text="{invalid " + secret,
+            _value_redactor=lambda value: value,
+        )
+
+        self.assertNotIn(secret, repr(result))
+        with self.assertRaises(json.JSONDecodeError):
+            result.decode_structured_json(json.loads)
+        self.assertIsNone(result._raw_text)
+        self.assertIsNone(result._value_redactor)
+        self.assertNotIn(secret, repr(result))
 
     def test_short_credential_preserves_provider_control_fields(self):
         class _Input:

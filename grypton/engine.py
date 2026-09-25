@@ -913,15 +913,6 @@ class Engine:
                     directive_text = "Continue hunting with full depth; expand the surface if blocked."
                     continue
 
-            # Once family stagnation selects a durable rotation action, Spark's
-            # assessment cannot silently consume or replace it. Kryptex still
-            # reviews the full context and reports its assessment, while the
-            # selected affirmative action is the one Kraude receives.
-            if coverage_priority:
-                directive.directive = coverage_priority
-                directive.cont = True
-                directive.stop_reason = ""
-
             # Kryptex does not grade findings. Ignore any model-produced
             # severity verdicts; automatic P1/P2 verdicts are already durable,
             # and P3+ reaches Astra only through the explicit validate command.
@@ -931,6 +922,7 @@ class Engine:
             # A genuine program/scope boundary is binding. Machine-measured
             # convergence may also close the run. Routine blockers and an
             # unsupported "we are done" response are reframed into a new action.
+            force_manager_recovery = False
             if not directive.cont:
                 if self._manager_stop_is_binding(
                     directive,
@@ -944,7 +936,7 @@ class Engine:
                     f"({(directive.stop_reason or 'unspecified')[:140]}) — continuing per "
                     f"the engagement instructions with a new in-scope angle."))
                 if not verification_followup or not directive.worker_message():
-                    directive.directive = self._continuation_directive()
+                    force_manager_recovery = True
 
             if convergence_reason:
                 self._convergence_alerted = True
@@ -952,10 +944,16 @@ class Engine:
             # ---- P1 handling ----
             self._handle_p1s()
 
-            # Deterministic degradation already produces a context-aware action
-            # from the current ManagerContext. Preserve that action instead of
-            # flattening every provider failure into the generic continuation.
-            directive_text = directive.worker_message() or self._continuation_directive()
+            # Proof completion is a scheduled engine obligation. Generic
+            # stagnation coverage is advisory to a healthy Kryptex response and
+            # becomes authoritative only when Kryptex degraded or returned an
+            # empty, idle, retreating, or non-binding stop response.
+            directive_text, priority_applied = self._select_next_directive(
+                directive,
+                priority_selection,
+                force_recovery=force_manager_recovery,
+            )
+            directive_text = directive_text or self._continuation_directive()
 
             # Structural override: refuse to forward a directive that itself tells
             # Kraude to idle / stand by / output a stock idle sentence. Both Codex
@@ -1035,6 +1033,7 @@ class Engine:
                         else self._coverage_rotation_cursor
                     ),
                     proof_focus=priority_selection.kind == "proof",
+                    applied=priority_applied,
                 )
 
     # ------------------------------------------------------- loop helpers
@@ -1552,6 +1551,42 @@ class Engine:
             f"For {candidate['id']}, {action}. Save the paired evidence and attach "
             "the material revision with revise_finding."
         )
+
+    @staticmethod
+    def _select_next_directive(
+        directive,
+        priority_selection: _PrioritySelection,
+        *,
+        force_recovery: bool = False,
+    ) -> tuple[str, bool]:
+        """Resolve scheduled engine work against Kryptex's chosen action.
+
+        A proof-priority selection represents a concrete outstanding Astra
+        evidence request, so its bounded cadence remains authoritative. A
+        generic coverage rotation is only a recovery action: a healthy,
+        executable Kryptex directive has more current evidence and keeps
+        control. The boolean reports whether the scheduled priority was the
+        action selected for Kraude.
+        """
+        manager_text = directive.worker_message() if directive is not None else ""
+        priority = str(priority_selection.action or "").strip()
+        kind = str(priority_selection.kind or "").strip().lower()
+
+        if priority and kind == "proof":
+            return priority, True
+
+        manager_needs_recovery = (
+            force_recovery
+            or directive is None
+            or bool(getattr(directive, "degraded", False))
+            or _looks_like_idle_directive(manager_text)
+            or _looks_like_soft_retreat_directive(manager_text)
+        )
+        if priority and kind == "coverage" and manager_needs_recovery:
+            return priority, True
+        if force_recovery:
+            return "", False
+        return manager_text, False
 
     def _next_coverage_priority(
         self,
