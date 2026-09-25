@@ -3584,16 +3584,32 @@ def _browser_auth_fresh_probe(
     bearer_token: str = "",
     verify_headers: Optional[dict] = None,
     browser_storage: Optional[dict] = None,
+    bootstrap_url: str = "",
 ) -> dict:
     """Load one proof URL in a fresh browser with only supplied session material."""
+    if bootstrap_url:
+        blocked = _scope_error(workspace, bootstrap_url)
+        if blocked:
+            raise ValueError(
+                str(blocked.get("summary") or "bootstrap URL is out of scope")
+            )
+        if (
+            credentials.normalize_origin(bootstrap_url)
+            != credentials.normalize_origin(url)
+        ):
+            raise ValueError("browser proof bootstrap must use the verifier origin")
     with _isolated_browser_profile(executable) as launch_profile:
         proof_headers = dict(verify_headers or {})
         if bearer_token:
             proof_headers["Authorization"] = f"Bearer {bearer_token}"
+        proof_header_state = {
+            "active": not bool(bootstrap_url),
+            "origin": credentials.normalize_origin(url),
+            "headers": proof_headers,
+        }
         context = _launch_scoped_browser_context(
             playwright, launch_profile, workspace, denied_requests,
-            credentials.normalize_origin(url) if proof_headers else "",
-            proof_headers or None,
+            bound_header_state=proof_header_state,
         )
         try:
             if cookies:
@@ -3606,9 +3622,26 @@ def _browser_auth_fresh_probe(
                 "type": str(message.type),
                 "text": str(message.text)[:4000],
             }) if len(console) < 100 else None)
-            response = page.goto(
-                url, wait_until="domcontentloaded", timeout=timeout_ms
-            )
+            if bootstrap_url:
+                page.goto(
+                    bootstrap_url, wait_until="commit",
+                    timeout=timeout_ms,
+                )
+                page.wait_for_timeout(250)
+                bootstrap_final_url = str(page.url or "")
+                allowed, reason = check_url_scope(
+                    workspace, bootstrap_final_url
+                )
+                if not allowed:
+                    raise RuntimeError(
+                        f"{phase} browser bootstrap ended outside scope: {reason}"
+                    )
+                proof_header_state["active"] = True
+            # Proof URLs are API endpoints in many browser profiles.  Their
+            # response headers and redirect chain are the proof; waiting for a
+            # renderer lifecycle event can time out after the HTTP response is
+            # already available (observed with JSON responses behind a CDN).
+            response = page.goto(url, wait_until="commit", timeout=timeout_ms)
             page.wait_for_timeout(250)
             status = int(response.status) if response else 0
             final_url, dom, visible = _browser_auth_snapshot(page)
@@ -3637,6 +3670,23 @@ def _browser_auth_fresh_probe(
             }
         finally:
             context.close()
+
+
+def _browser_auth_fresh_probe_with_retry(*args, **kwargs) -> dict:
+    """Retry one transient read-only proof without resubmitting credentials."""
+    last_error: Exception | None = None
+    for probe_attempt in range(1, 3):
+        try:
+            result = _browser_auth_fresh_probe(*args, **kwargs)
+        except Exception as exc:
+            last_error = exc
+            if probe_attempt == 2:
+                raise
+            continue
+        result["probe_attempts"] = probe_attempt
+        if int(result.get("status") or 0) > 0 or probe_attempt == 2:
+            return result
+    raise RuntimeError("browser proof did not produce a result") from last_error
 
 
 def _browser_auth_persisted_cookies(
@@ -3866,7 +3916,7 @@ def ensure_browser_status_session(
                         )
                     )
                     with sync_playwright() as playwright:
-                        current = _browser_auth_fresh_probe(
+                        current = _browser_auth_fresh_probe_with_retry(
                             playwright, executable, workspace,
                             profile["verify_url"], phase="renewal-revalidate",
                             denied_requests=denied_requests, console=console,
@@ -3875,12 +3925,13 @@ def ensure_browser_status_session(
                             verify_headers=profile["browser"]["verify_headers"],
                             browser_storage=browser_storage,
                         )
-                        control = _browser_auth_fresh_probe(
+                        control = _browser_auth_fresh_probe_with_retry(
                             playwright, executable, workspace,
                             profile["verify_url"], phase="renewal-control",
                             denied_requests=denied_requests, console=console,
                             timeout_ms=timeout_ms,
                             verify_headers=profile["browser"]["verify_headers"],
+                            bootstrap_url=profile["login_url"],
                         )
 
                     current_source = str(current.get("source") or "")
@@ -4342,6 +4393,7 @@ def _credential_browser_login_locked(
     replay_method = ""
     replay_redirect_chain: list[dict] = []
     replay_redirected = False
+    replay_probe_attempts = 0
     control_status = 0
     control_source = ""
     control_response_url = ""
@@ -4349,6 +4401,7 @@ def _credential_browser_login_locked(
     control_method = ""
     control_redirect_chain: list[dict] = []
     control_redirected = False
+    control_probe_attempts = 0
     cookies: list[dict] = []
     observed_cookie_sets: list[list[dict]] = []
     observed_storage_sets: list[dict] = []
@@ -4401,7 +4454,7 @@ def _credential_browser_login_locked(
                 page = context.new_page()
                 page.on("console", remember_console)
                 response = page.goto(
-                    url, wait_until="domcontentloaded", timeout=timeout_ms
+                    url, wait_until="commit", timeout=timeout_ms
                 )
                 page.wait_for_timeout(250)
                 page_status = int(response.status) if response else 0
@@ -4625,7 +4678,7 @@ def _credential_browser_login_locked(
                         phase["name"] = "verify"
                         verify_header_state["active"] = True
                         verify_response = page.goto(
-                            verify_url, wait_until="domcontentloaded", timeout=timeout_ms
+                            verify_url, wait_until="commit", timeout=timeout_ms
                         )
                         page.wait_for_timeout(250)
                         verify_status = int(verify_response.status) if verify_response else 0
@@ -4698,7 +4751,7 @@ def _credential_browser_login_locked(
                     )
                     if not blocker and replay_material_ready:
                         phase["name"] = "replay"
-                        replay = _browser_auth_fresh_probe(
+                        replay = _browser_auth_fresh_probe_with_retry(
                             playwright, executable, workspace, verify_url,
                             phase="replay", denied_requests=denied_requests,
                             console=console, timeout_ms=timeout_ms,
@@ -4723,6 +4776,9 @@ def _credential_browser_login_locked(
                             replay.get("redirect_chain") or []
                         )
                         replay_redirected = bool(replay_redirect_chain)
+                        replay_probe_attempts = int(
+                            replay.get("probe_attempts") or 1
+                        )
                         replay_cookies = _browser_auth_persistable_cookies(
                             list(replay.get("cookies") or []), url
                         )
@@ -4753,11 +4809,12 @@ def _credential_browser_login_locked(
                         )
 
                         phase["name"] = "control"
-                        control = _browser_auth_fresh_probe(
+                        control = _browser_auth_fresh_probe_with_retry(
                             playwright, executable, workspace, verify_url,
                             phase="control", denied_requests=denied_requests,
                             console=console, timeout_ms=timeout_ms,
                             verify_headers=clean_verify_headers,
+                            bootstrap_url=url,
                         )
                         control_status = int(control.get("status") or 0)
                         control_response_url = str(
@@ -4772,6 +4829,9 @@ def _credential_browser_login_locked(
                             control.get("redirect_chain") or []
                         )
                         control_redirected = bool(control_redirect_chain)
+                        control_probe_attempts = int(
+                            control.get("probe_attempts") or 1
+                        )
                         observed_cookie_sets.append(
                             _browser_auth_persistable_cookies(
                                 list(control.get("cookies") or []), url
@@ -5054,6 +5114,7 @@ def _credential_browser_login_locked(
             "method": replay_method,
             "redirected": replay_redirected,
             "redirect_chain": safe_replay_redirect_chain,
+            "probe_attempts": replay_probe_attempts,
         },
         "anonymous_control": {
             "status": control_status,
@@ -5065,6 +5126,7 @@ def _credential_browser_login_locked(
             "method": control_method,
             "redirected": control_redirected,
             "redirect_chain": safe_control_redirect_chain,
+            "probe_attempts": control_probe_attempts,
         },
         "console": safe_console,
         "blocked_requests": safe_denied,
@@ -5097,8 +5159,10 @@ def _credential_browser_login_locked(
         "verify_redirect_chain": safe_verify_redirect_chain,
         "replay_status": replay_status,
         "replay_redirect_chain": safe_replay_redirect_chain,
+        "replay_probe_attempts": replay_probe_attempts,
         "control_status": control_status,
         "control_redirect_chain": safe_control_redirect_chain,
+        "control_probe_attempts": control_probe_attempts,
         "verification_mode": (
             "status-differential" if status_mode else "marker"
         ),

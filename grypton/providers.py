@@ -664,9 +664,15 @@ class OpenCodeClient:
         self._terminal_signal: asyncio.Event | None = None
         self._terminal_error = ""
         self._terminal_metadata: dict = {}
+        # OpenCode can run a nested Task whose model requests travel through
+        # OpenClaude while the parent JSON stream remains quiet.  Treat those
+        # sanitized gateway events as provider activity so a healthy nested
+        # agent is not mistaken for a hung top-level process.
+        self._gateway_activity_at = 0.0
 
     def _on_gateway_event(self, event: dict) -> None:
         """Retain sanitized OpenClaude notices and expose them to the live UI."""
+        self._gateway_activity_at = time.monotonic()
         append_jsonl(self.transcripts / "openclaude.events.jsonl", {
             "at": time.time(), "role": self.role, **event,
         })
@@ -1145,6 +1151,7 @@ class OpenCodeClient:
             # negligible beside provider timeouts and keeps cancellation
             # responsive when a child becomes silent.
             while True:
+                last_activity = max(last_activity, self._gateway_activity_at)
                 remaining = timeout - (time.monotonic() - last_activity)
                 if remaining <= 0:
                     done = set()

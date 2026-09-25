@@ -796,6 +796,93 @@ class ProviderOutputTests(unittest.TestCase):
 
         asyncio.run(exercise())
 
+    def test_nested_gateway_activity_refreshes_provider_timeout(self):
+        class _Input:
+            def write(self, value):
+                self.value = value
+
+            async def drain(self):
+                return None
+
+            def close(self):
+                return None
+
+        class _DelayedStream:
+            def __init__(self):
+                self.sent = False
+
+            async def read(self, _size):
+                if self.sent:
+                    return b""
+                await asyncio.sleep(0.16)
+                self.sent = True
+                return (json.dumps({
+                    "type": "text",
+                    "sessionID": "ses-nested-active",
+                    "part": {"text": "nested task completed"},
+                }) + "\n").encode()
+
+        class _EmptyStream:
+            async def read(self, _size):
+                return b""
+
+        class _Process:
+            pid = 43214
+
+            def __init__(self):
+                self.stdin = _Input()
+                self.stdout = _DelayedStream()
+                self.stderr = _EmptyStream()
+                self.returncode = None
+
+            async def wait(self):
+                await asyncio.sleep(0.17)
+                self.returncode = 0
+                return 0
+
+        async def exercise():
+            with isolated_runtime():
+                workspace = config.ENGAGEMENTS_DIR / "nested-active-timeout-call"
+                workspace.mkdir(parents=True)
+                client = OpenCodeClient(
+                    role="worker", route=config.WORKER_MODEL, effort="max",
+                    workspace=workspace, target_slug="nested-active-timeout-call",
+                    allow_tools=True, agent_prompt="test",
+                )
+                process = _Process()
+                gateway = SimpleNamespace(
+                    model_route=f"openclaude/{config.WORKER_MODEL}",
+                    drain_events=lambda: [],
+                )
+
+                async def nested_activity():
+                    for _ in range(3):
+                        await asyncio.sleep(0.04)
+                        client._on_gateway_event({
+                            "type": "openclaude_request",
+                            "route": config.WORKER_MODEL,
+                        })
+
+                with patch.object(client, "_ensure_gateway", AsyncMock(return_value=gateway)), \
+                        patch.object(client, "_environment", return_value=({}, "fixture-secret")), \
+                        patch.object(client, "_ensure_network_broker", AsyncMock()), \
+                        patch.object(config, "require_binary", return_value="/usr/bin/true"), \
+                        patch("grypton.providers.asyncio.create_subprocess_exec",
+                              new=AsyncMock(return_value=process)):
+                    heartbeat = asyncio.create_task(nested_activity())
+                    result = await client.call("nested prompt", timeout=0.07)
+                    await heartbeat
+
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(result.session_id, "ses-nested-active")
+                self.assertIn("nested task completed", result.text)
+                gateway_events = [json.loads(line) for line in (
+                    workspace / "transcripts/openclaude.events.jsonl"
+                ).read_text(encoding="utf-8").splitlines()]
+                self.assertEqual(len(gateway_events), 3)
+
+        asyncio.run(exercise())
+
     def test_stream_provider_error_records_redacted_failure(self):
         class _Input:
             def write(self, value):

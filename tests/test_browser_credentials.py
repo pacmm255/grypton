@@ -69,6 +69,13 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
         )
 
     def do_GET(self):
+        if self.path == "/block-dom.js":
+            time.sleep(10)
+            self._send(
+                200, b"/* delayed */",
+                content_type="application/javascript",
+            )
+            return
         if self.path == "/login":
             if type(self).mode == "page-denied":
                 self._json(401, {"error": "login page unavailable"})
@@ -107,6 +114,10 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                 "console.log(JSON.stringify(value));"
                 if type(self).mode == "client-normalizes" else ""
             )
+            blocking_script = (
+                "<script src='/block-dom.js'></script>"
+                if type(self).mode == "login-domcontentloaded-hang" else ""
+            )
             html = f"""<!doctype html><html><body>
             {challenge}
             <form id="login-form">
@@ -133,7 +144,7 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                 '{"/dashboard?unexpected=1" if type(self).mode == "status-wrong-terminal" else "/dashboard"}'
               );
             }});
-            </script></body></html>""".encode()
+            </script>{blocking_script}</body></html>""".encode()
             self._send(
                 200, html, content_type="text/html; charset=utf-8",
                 cookie=self.session if type(self).mode == "baseline-cookie" else "",
@@ -493,6 +504,58 @@ def renew_auth_server():
     _RenewAuthHandler.fail_renewal_verify = False
     _RenewAuthHandler.verify_header_values = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _RenewAuthHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server.server_address[1]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+class _BootstrapProofHandler(BaseHTTPRequestHandler):
+    def _send(self, status, body=b"", *, cookie="", location=""):
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        if location:
+            self.send_header("Location", location)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/login":
+            self._send(
+                200, b"{}", cookie="edge_ready=1; HttpOnly; Path=/"
+            )
+            return
+        if self.path == "/verify":
+            cookies = self.headers.get("Cookie", "")
+            if "edge_ready=1" not in cookies:
+                # Model an edge that leaves direct API navigation with no HTTP
+                # response until the same-origin browser entrypoint is visited.
+                self.close_connection = True
+                return
+            if "redirect_ready=1" not in cookies:
+                self._send(
+                    307, cookie="redirect_ready=1; HttpOnly; Path=/",
+                    location="/verify",
+                )
+                return
+            self._send(401, b'{"authenticated":false}')
+            return
+        self._send(404)
+
+    def log_message(self, *_args):
+        pass
+
+
+@contextmanager
+def bootstrap_proof_server():
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _BootstrapProofHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -1048,6 +1111,219 @@ class BrowserCredentialTests(unittest.TestCase):
             self.assertEqual(result["data"]["control_status"], 401)
             self.assertTrue(result["data"]["session"]["established"])
             self.assertEqual(_SpaAuthHandler.login_posts, 1)
+
+    def test_login_form_can_submit_before_domcontentloaded(self):
+        with isolated_runtime(), spa_auth_server(
+            "login-domcontentloaded-hang"
+        ) as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            credentials.save_auth_profile(
+                ws.slug, "primary", self._status_profile(port, timeout=5)
+            )
+
+            result = dispatch(
+                ws, "credential_browser_login", {"credential": "primary"}
+            )
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["data"]["matched_submission_status"], 200)
+            self.assertEqual(result["data"]["credential_submission_requests"], 1)
+            self.assertEqual(_SpaAuthHandler.login_posts, 1)
+
+    def test_transient_control_probe_retries_without_resubmitting_credential(self):
+        with isolated_runtime(), spa_auth_server("success") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            credentials.save_auth_profile(
+                ws.slug, "primary", self._status_profile(port)
+            )
+            original_probe = tools._browser_auth_fresh_probe
+            control_calls = 0
+
+            def transient_control(*args, **kwargs):
+                nonlocal control_calls
+                if kwargs.get("phase") == "control":
+                    control_calls += 1
+                    if control_calls == 1:
+                        raise TimeoutError("synthetic transient control timeout")
+                return original_probe(*args, **kwargs)
+
+            with patch(
+                "grypton.tools._browser_auth_fresh_probe",
+                side_effect=transient_control,
+            ):
+                result = dispatch(
+                    ws, "credential_browser_login", {"credential": "primary"}
+                )
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["data"]["control_probe_attempts"], 2)
+            self.assertEqual(result["data"]["replay_probe_attempts"], 1)
+            self.assertEqual(_SpaAuthHandler.login_posts, 1)
+            self.assertEqual(
+                result["data"]["credential_submission_requests"], 1
+            )
+
+    def test_control_retry_exhaustion_never_resubmits_renewal(self):
+        with isolated_runtime(), renew_auth_server() as port:
+            ws = self._workspace(port)
+            self._establish_renewable_session(ws, port)
+            self._expire_private_cookie(ws)
+            original_probe = tools._browser_auth_fresh_probe
+            posts = _RenewAuthHandler.login_posts
+            control_calls = 0
+
+            def unavailable_control(*args, **kwargs):
+                nonlocal control_calls
+                if kwargs.get("phase") == "control":
+                    control_calls += 1
+                    raise TimeoutError("synthetic persistent control timeout")
+                return original_probe(*args, **kwargs)
+
+            with patch(
+                "grypton.tools._browser_auth_fresh_probe",
+                side_effect=unavailable_control,
+            ):
+                first = dispatch(ws, "authenticated_http_request", {
+                    "url": f"http://127.0.0.1:{port}/resource",
+                    "credential": "primary",
+                })
+                second = dispatch(ws, "authenticated_http_request", {
+                    "url": f"http://127.0.0.1:{port}/resource",
+                    "credential": "primary",
+                })
+
+            self.assertFalse(first["ok"], first)
+            self.assertFalse(second["ok"], second)
+            self.assertEqual(control_calls, 2)
+            self.assertEqual(_RenewAuthHandler.login_posts, posts + 1)
+            state = credentials.load_attempt_state(ws.slug, "primary")
+            self.assertFalse(state["established"])
+            self.assertEqual(
+                state["refresh_attempted_generation"],
+                state["proof_generation"],
+            )
+
+    def test_fresh_api_proof_stops_at_response_commit(self):
+        class FakeLocator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            def evaluate(self, _script, *_args):
+                return "<html><body>proof</body></html>" if self.selector == "html" else "proof"
+
+        class FakeRequest:
+            method = "GET"
+            redirected_from = None
+
+        class FakeResponse:
+            status = 401
+            request = FakeRequest()
+
+            def __init__(self, url):
+                self.url = url
+
+            def body(self):
+                return b'{"authenticated":false}'
+
+        class FakePage:
+            def __init__(self, url):
+                self.url = url
+                self.wait_until = []
+
+            def on(self, *_args):
+                pass
+
+            def goto(self, url, *, wait_until, timeout):
+                self.url = url
+                self.wait_until.append(wait_until)
+                if wait_until == "domcontentloaded":
+                    raise TimeoutError("DOMContentLoaded never fired")
+                self.timeout = timeout
+                return FakeResponse(url)
+
+            def wait_for_timeout(self, _milliseconds):
+                pass
+
+            def locator(self, selector):
+                return FakeLocator(selector)
+
+            def evaluate(self, _script, _area):
+                return {"valid": True, "entries": []}
+
+        class FakeContext:
+            def __init__(self, page):
+                self.page = page
+
+            def new_page(self):
+                return self.page
+
+            def cookies(self):
+                return []
+
+            def close(self):
+                pass
+
+        with isolated_runtime():
+            ws = Workspace("proof-commit-test")
+            origin = "https://app.example.test"
+            url = origin + "/api/session"
+            ws.create(origin, "web")
+            ws.save_constraints(Constraints(in_scope=[origin]))
+            page = FakePage(url)
+            context = FakeContext(page)
+            with patch(
+                "grypton.tools._isolated_browser_profile"
+            ) as isolated_profile, patch(
+                "grypton.tools._launch_scoped_browser_context",
+                return_value=context,
+            ):
+                isolated_profile.return_value.__enter__.return_value = {
+                    "identity": "test-browser"
+                }
+                result = tools._browser_auth_fresh_probe(
+                    object(), "/unused/chromium", ws, url,
+                    phase="control", denied_requests=[], console=[],
+                    timeout_ms=5000,
+                )
+
+            self.assertEqual(result["status"], 401)
+            self.assertEqual(page.wait_until, ["commit"])
+
+    def test_anonymous_proof_bootstrap_recovers_blank_direct_api_navigation(self):
+        from playwright.sync_api import sync_playwright
+
+        with isolated_runtime(), bootstrap_proof_server() as port:
+            origin = f"http://127.0.0.1:{port}"
+            ws = Workspace("proof-bootstrap-test")
+            ws.create(origin, "web")
+            ws.save_constraints(Constraints(in_scope=[origin]))
+            url = origin + "/verify"
+            executable = tools._browser_executable()
+            with sync_playwright() as playwright:
+                with self.assertRaises(Exception):
+                    tools._browser_auth_fresh_probe(
+                        playwright, executable, ws, url,
+                        phase="direct-control", denied_requests=[], console=[],
+                        timeout_ms=3000,
+                    )
+                result = tools._browser_auth_fresh_probe(
+                    playwright, executable, ws, url,
+                    phase="bootstrapped-control", denied_requests=[], console=[],
+                    timeout_ms=3000, bootstrap_url=origin + "/login",
+                )
+
+            self.assertEqual(result["status"], 401)
+            self.assertEqual(result["response_url"], url)
+            self.assertEqual(result["final_url"], url)
+            self.assertEqual(
+                [hop["status"] for hop in result["redirect_chain"]], [307]
+            )
 
     def test_status_differential_accepts_configured_anonymous_self_redirect(self):
         with isolated_runtime(), spa_auth_server("status-anon-redirect") as port:
