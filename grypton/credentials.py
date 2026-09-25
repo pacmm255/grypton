@@ -50,6 +50,8 @@ _BROWSER_STORAGE_MAX_KEY_CHARS = 512
 _BROWSER_STORAGE_MAX_VALUE_CHARS = 65_536
 _BROWSER_STORAGE_MAX_TOTAL_CHARS = 1_000_000
 _BROWSER_STORAGE_MAX_COOKIES = 200
+# Promotion snapshots use the same one-megabyte private-material bound.
+_PENDING_BROWSER_SESSION_MAX_BYTES = 1_000_000
 
 
 class CredentialError(ValueError):
@@ -206,6 +208,12 @@ def browser_storage_path(target: str, name: str) -> Path:
     return _session_dir(target) / (alias + ".browser-storage.json")
 
 
+def pending_browser_renewal_path(target: str, name: str) -> Path:
+    """Return the private, unpromoted browser-renewal record path."""
+    alias = _safe_name(name, label="credential name")
+    return _session_dir(target) / (alias + ".pending-renewal.json")
+
+
 def attempt_path(target: str, name: str) -> Path:
     alias = _safe_name(name, label="credential name")
     return _session_dir(target) / (alias + ".attempts.json")
@@ -241,6 +249,7 @@ def save_credential(target: str, name: str, username: str, password: str) -> str
         })
         for path in (
             token_path(target, alias), browser_storage_path(target, alias),
+            pending_browser_renewal_path(target, alias),
             attempt_path(target, alias), cookie_jar_storage_path(target, alias),
         ):
             path.unlink(missing_ok=True)
@@ -1039,9 +1048,56 @@ def save_browser_storage(target: str, name: str, *, origin: str,
             "local_storage": canonical["local_storage"],
             "session_storage": canonical["session_storage"],
         }
-        if len(json.dumps(
-            record, ensure_ascii=False, separators=(",", ":")
-        ).encode("utf-8")) > _BROWSER_STORAGE_MAX_TOTAL_CHARS:
+        if len((json.dumps(
+            record, ensure_ascii=False
+        ) + "\n").encode("utf-8")) > _BROWSER_STORAGE_MAX_TOTAL_CHARS:
+            raise CredentialError("browser storage exceeds the private size limit")
+        _atomic_private_json(browser_storage_path(target, alias), record)
+
+
+def prepare_pending_renewal_browser_storage(
+    target: str, name: str, *, generation: int, origin: str,
+    profile_revision: str, cookies: object, local_storage: object,
+    session_storage: object,
+) -> None:
+    """Stage rich state for generation+1 before the attempt state commits it."""
+    alias = _safe_name(name, label="credential name")
+    canonical = canonical_browser_storage(
+        origin=origin, cookies=cookies, local_storage=local_storage,
+        session_storage=session_storage,
+    )
+    bound_origin = str(canonical["origin"])
+    if not re.fullmatch(r"[0-9a-f]{12}", str(profile_revision or "")):
+        raise CredentialError("authentication profile revision is invalid")
+    with session_material_lock(target, alias):
+        state = load_attempt_state(target, alias)
+        if (
+            not state["ever_established"]
+            or state["established"]
+            or state["origin"] != bound_origin
+            or state["proof_generation"] != generation
+            or state["refresh_attempted_generation"] != generation
+            or state["proof_profile_revision"] != profile_revision
+            or not load_pending_browser_renewal(target, alias).get("available")
+        ):
+            raise CredentialError(
+                "pending browser renewal changed before promotion"
+            )
+        record = {
+            "version": 1,
+            "origin": bound_origin,
+            "proof_generation": generation + 1,
+            "profile_revision": profile_revision,
+            "cookie_jar_digest": cookie_jar_digest(
+                cookie_jar_storage_path(target, alias)
+            ),
+            "cookies": canonical["cookies"],
+            "local_storage": canonical["local_storage"],
+            "session_storage": canonical["session_storage"],
+        }
+        if len((json.dumps(
+            record, ensure_ascii=False
+        ) + "\n").encode("utf-8")) > _BROWSER_STORAGE_MAX_TOTAL_CHARS:
             raise CredentialError("browser storage exceeds the private size limit")
         _atomic_private_json(browser_storage_path(target, alias), record)
 
@@ -1111,6 +1167,178 @@ def load_browser_storage(target: str, name: str) -> dict[str, object]:
             "local_storage": local,
             "session_storage": session,
         }
+
+
+def save_pending_browser_renewal(
+    target: str, name: str, *, generation: int, origin: str,
+    profile_revision: str, cookies: object, local_storage: object,
+    session_storage: object, tokens: object,
+) -> None:
+    """Retain an unpromoted renewal while its anonymous control is retried.
+
+    The record is private and cannot be used by authenticated request tools.
+    It is valid only for the one already-reserved renewal generation.
+    """
+    alias = _safe_name(name, label="credential name")
+    if not re.fullmatch(r"[0-9a-f]{12}", str(profile_revision or "")):
+        raise CredentialError("authentication profile revision is invalid")
+    canonical = canonical_browser_storage(
+        origin=origin, cookies=cookies, local_storage=local_storage,
+        session_storage=session_storage,
+    )
+    if not isinstance(tokens, dict) or len(tokens) > 100:
+        raise CredentialError("pending browser tokens are invalid")
+    safe_tokens: dict[str, str] = {}
+    token_total = 0
+    for raw_key, raw_value in tokens.items():
+        if (
+            not isinstance(raw_key, str) or not raw_key or len(raw_key) > 512
+            or not isinstance(raw_value, str) or not raw_value
+            or len(raw_value) > 16_384
+            or any(ord(char) < 0x20 or ord(char) == 0x7f for char in raw_value)
+        ):
+            raise CredentialError("pending browser tokens are invalid")
+        token_total += len(raw_key) + len(raw_value)
+        if token_total > _BROWSER_STORAGE_MAX_TOTAL_CHARS:
+            raise CredentialError("pending browser tokens exceed the private size limit")
+        safe_tokens[raw_key] = raw_value
+
+    with session_material_lock(target, alias):
+        state = load_attempt_state(target, alias)
+        bound_origin = str(canonical["origin"])
+        if (
+            not state["ever_established"]
+            or state["established"]
+            or state["proof_generation"] != generation
+            or state["refresh_attempted_generation"] != generation
+            or state["origin"] != bound_origin
+            or state["proof_profile_revision"] != profile_revision
+        ):
+            raise CredentialError(
+                "pending browser renewal does not match the reserved session proof"
+            )
+        record = {
+            "version": 1,
+            "origin": bound_origin,
+            "proof_generation": generation,
+            "profile_revision": profile_revision,
+            "created_at": time.time(),
+            "cookies": canonical["cookies"],
+            "local_storage": canonical["local_storage"],
+            "session_storage": canonical["session_storage"],
+            "tokens": safe_tokens,
+        }
+        # Match _atomic_private_json's exact default JSON encoding plus newline
+        # so every accepted record remains snapshot/rollback eligible.
+        if len((json.dumps(
+            record, ensure_ascii=False
+        ) + "\n").encode("utf-8")) > _PENDING_BROWSER_SESSION_MAX_BYTES:
+            raise CredentialError("pending browser renewal exceeds the private size limit")
+        _atomic_private_json(pending_browser_renewal_path(target, alias), record)
+
+
+def load_pending_browser_renewal(target: str, name: str) -> dict[str, object]:
+    """Load a candidate renewal only while its exact reservation is active."""
+    alias = _safe_name(name, label="credential name")
+    empty = {
+        "available": False,
+        "cookies": [],
+        "local_storage": {},
+        "session_storage": {},
+        "tokens": {},
+    }
+    with session_material_lock(target, alias):
+        path = pending_browser_renewal_path(target, alias)
+        if not path.exists() and not path.is_symlink():
+            return empty
+        value = _read_private_json(path, label="pending browser renewal")
+        if value.get("version") != 1:
+            raise CredentialError(
+                "pending browser renewal has an unsupported version"
+            )
+        try:
+            origin = normalize_origin(value.get("origin"))
+        except CredentialError as exc:
+            raise CredentialError(
+                "pending browser renewal has an invalid origin"
+            ) from exc
+        generation = value.get("proof_generation")
+        if isinstance(generation, bool) or not isinstance(generation, int):
+            raise CredentialError(
+                "pending browser renewal has an invalid proof generation"
+            )
+        revision = value.get("profile_revision")
+        if not isinstance(revision, str) or not re.fullmatch(
+            r"[0-9a-f]{12}", revision
+        ):
+            raise CredentialError(
+                "pending browser renewal has an invalid profile revision"
+            )
+        try:
+            created_at = float(value.get("created_at") or 0.0)
+        except (TypeError, ValueError) as exc:
+            raise CredentialError(
+                "pending browser renewal has an invalid creation time"
+            ) from exc
+        if not math.isfinite(created_at) or created_at <= 0:
+            raise CredentialError(
+                "pending browser renewal has an invalid creation time"
+            )
+        canonical = canonical_browser_storage(
+            origin=origin, cookies=value.get("cookies"),
+            local_storage=value.get("local_storage"),
+            session_storage=value.get("session_storage"),
+        )
+        raw_tokens = value.get("tokens")
+        if not isinstance(raw_tokens, dict) or len(raw_tokens) > 100:
+            raise CredentialError("pending browser renewal tokens are invalid")
+        safe_tokens: dict[str, str] = {}
+        token_total = 0
+        for raw_key, raw_value in raw_tokens.items():
+            if (
+                not isinstance(raw_key, str) or not raw_key or len(raw_key) > 512
+                or not isinstance(raw_value, str) or not raw_value
+                or len(raw_value) > 16_384
+                or any(ord(char) < 0x20 or ord(char) == 0x7f for char in raw_value)
+            ):
+                raise CredentialError("pending browser renewal tokens are invalid")
+            token_total += len(raw_key) + len(raw_value)
+            if token_total > _BROWSER_STORAGE_MAX_TOTAL_CHARS:
+                raise CredentialError(
+                    "pending browser renewal tokens exceed the private size limit"
+                )
+            safe_tokens[raw_key] = raw_value
+        state = load_attempt_state(target, alias)
+        if (
+            not state["ever_established"]
+            or state["established"]
+            or state["proof_generation"] != generation
+            or state["refresh_attempted_generation"] != generation
+            or state["origin"] != origin
+            or state["proof_profile_revision"] != revision
+        ):
+            # The candidate is private session material, not an audit record.
+            # Once its exact reservation can no longer promote it, retaining it
+            # only leaves unusable secrets on disk.
+            path.unlink(missing_ok=True)
+            return empty
+        return {
+            "available": True,
+            "origin": origin,
+            "proof_generation": generation,
+            "profile_revision": revision,
+            "created_at": created_at,
+            "cookies": canonical["cookies"],
+            "local_storage": canonical["local_storage"],
+            "session_storage": canonical["session_storage"],
+            "tokens": safe_tokens,
+        }
+
+
+def clear_pending_browser_renewal(target: str, name: str) -> None:
+    alias = _safe_name(name, label="credential name")
+    with session_material_lock(target, alias):
+        pending_browser_renewal_path(target, alias).unlink(missing_ok=True)
 
 def _assert_login_attempt_available(state: dict) -> None:
     if state["established"]:
@@ -1422,9 +1650,16 @@ def session_status(target: str, name: str) -> dict[str, object]:
         ):
             has_auth_cookies = True
     attempt = load_attempt_state(target, alias)
+    try:
+        has_pending_renewal = bool(
+            load_pending_browser_renewal(target, alias).get("available")
+        )
+    except CredentialError:
+        has_pending_renewal = False
     state = (
         "blocked" if attempt["blocked_reason"]
         else "authenticated" if attempt["established"]
+        else "renewal-pending" if has_pending_renewal
         else "renewal-blocked" if (
             attempt["ever_established"]
             and attempt["refresh_attempted_generation"]
@@ -1458,6 +1693,7 @@ def session_status(target: str, name: str) -> dict[str, object]:
         "has_auth_cookies": has_auth_cookies,
         "has_bearer_token": bool(select_bearer(load_tokens(target, alias))),
         "has_browser_storage": has_browser_storage,
+        "has_pending_renewal": has_pending_renewal,
         "attempts": attempt["attempts"],
         "exhausted": state == "exhausted",
         "established": attempt["established"],

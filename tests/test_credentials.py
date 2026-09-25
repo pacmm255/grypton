@@ -277,6 +277,51 @@ def probe_server():
 
 
 class CredentialIsolationTests(unittest.TestCase):
+    def test_pending_renewal_size_limit_matches_rollback_snapshot_limit(self):
+        with isolated_runtime():
+            target, alias = "pending-boundary", "primary"
+            revision = "0123456789ab"
+            origin = "https://app.example.test:443"
+            credentials.save_credential(target, alias, "user", "password")
+            credentials.begin_login_attempt(target, alias)
+            credentials.record_login_outcome(
+                target, alias, established=True, origin=origin,
+                profile_revision=revision,
+            )
+            credentials.record_session_stale(
+                target, alias, generation=1, profile_revision=revision,
+            )
+            credentials.begin_refresh_attempt(target, alias, generation=1)
+            local_storage = {
+                f"large-{index}": "x" * 65_536 for index in range(14)
+            }
+            accepted_sizes: list[int] = []
+            rejected = False
+            for count in range(11):
+                try:
+                    credentials.save_pending_browser_renewal(
+                        target, alias, generation=1, origin=origin,
+                        profile_revision=revision, cookies=[],
+                        local_storage=local_storage, session_storage={},
+                        tokens={
+                            f"token-{index}": "t" * 16_384
+                            for index in range(count)
+                        },
+                    )
+                except credentials.CredentialError:
+                    rejected = True
+                    break
+                path = credentials.pending_browser_renewal_path(target, alias)
+                accepted_sizes.append(path.stat().st_size)
+                existed, payload, mode = tools._snapshot_private_material(path)
+                self.assertTrue(existed)
+                self.assertEqual(len(payload), path.stat().st_size)
+                self.assertEqual(mode, 0o600)
+
+            self.assertTrue(accepted_sizes)
+            self.assertTrue(rejected)
+            self.assertLessEqual(max(accepted_sizes), 1_000_000)
+
     def _workspace(self, port: int) -> Workspace:
         ws = Workspace("credential-test")
         ws.create(f"http://127.0.0.1:{port}", "web")

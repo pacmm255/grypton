@@ -40,6 +40,9 @@ _FLOW_LIST_FIELD_CHARS = 4096
 _MAX_FLOW_QUERY_CHARS = 4096
 _AUTH_REVALIDATE_INTERVAL_S = 300
 _AUTH_EXPIRY_SKEW_S = 60
+# Worker turns routinely exceed five minutes.  Retain the private candidate long
+# enough for a later tool call/restart, then re-prove both sides at promotion.
+_PENDING_RENEWAL_MAX_AGE_S = 24 * 60 * 60
 
 _SENSITIVE_HEADERS = frozenset({
     "authorization", "proxy-authorization", "cookie", "set-cookie",
@@ -3617,16 +3620,33 @@ def _browser_auth_fresh_probe(
             if browser_storage:
                 _browser_auth_restore_storage(context, url, browser_storage)
             page = context.new_page()
+            bootstrap_timeout_recovered = False
             page.on("console", lambda message: console.append({
                 "phase": phase,
                 "type": str(message.type),
                 "text": str(message.text)[:4000],
             }) if len(console) < 100 else None)
             if bootstrap_url:
-                page.goto(
-                    bootstrap_url, wait_until="commit",
-                    timeout=timeout_ms,
-                )
+                try:
+                    page.goto(
+                        bootstrap_url, wait_until="commit",
+                        timeout=timeout_ms,
+                    )
+                except Exception as exc:
+                    # Some service-worker/CDN combinations leave Playwright's
+                    # navigation promise pending after the exact, scoped login
+                    # document has already committed.  The bootstrap carries no
+                    # credential and is not itself proof; the verifier response
+                    # below remains authoritative.  Continue only for that exact
+                    # timeout shape and exact bootstrap URL.
+                    if (
+                        exc.__class__.__name__ != "TimeoutError"
+                        or not _browser_auth_url_matches(
+                            str(page.url or ""), bootstrap_url
+                        )
+                    ):
+                        raise
+                    bootstrap_timeout_recovered = True
                 page.wait_for_timeout(250)
                 bootstrap_final_url = str(page.url or "")
                 allowed, reason = check_url_scope(
@@ -3667,6 +3687,7 @@ def _browser_auth_fresh_probe(
                 "cookies": list(context.cookies()),
                 "local_storage": _browser_auth_local_storage(page),
                 "session_storage": _browser_auth_session_storage(page),
+                "bootstrap_timeout_recovered": bootstrap_timeout_recovered,
             }
         finally:
             context.close()
@@ -3687,6 +3708,285 @@ def _browser_auth_fresh_probe_with_retry(*args, **kwargs) -> dict:
         if int(result.get("status") or 0) > 0 or probe_attempt == 2:
             return result
     raise RuntimeError("browser proof did not produce a result") from last_error
+
+
+def _resume_pending_browser_renewal(
+    workspace: Workspace, credential: str, profile: dict,
+    verification: dict, profile_revision: str, pending: dict,
+) -> dict:
+    """Finish a retained renewal using read-only differential probes only."""
+    pending_age = time.time() - float(pending.get("created_at") or 0.0)
+    if (
+        pending.get("profile_revision") != profile_revision
+        or pending_age > _PENDING_RENEWAL_MAX_AGE_S
+        or pending_age < -60
+    ):
+        return _err(
+            "Pending browser renewal no longer matches the current proof "
+            "contract; no probe or credential submission was performed."
+        )
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return _err("Python Playwright is not installed.")
+    executable = _browser_executable()
+    if not executable:
+        return _err(
+            "No Playwright-compatible Chromium or Chrome executable is installed."
+        )
+
+    timeout_seconds = max(5, min(int(profile["timeout"]), 120))
+    timeout_ms = timeout_seconds * 1000
+    denied_requests: list[str] = []
+    console: list[dict] = []
+    verify_url = profile["verify_url"]
+    login_url = profile["login_url"]
+    verify_headers = profile["browser"]["verify_headers"]
+    generation = int(pending["proof_generation"])
+
+    try:
+        with sync_playwright() as playwright:
+            # Prove the anonymous side first.  A failure here leaves the private
+            # candidate untouched and never reaches another credential submit.
+            control = _browser_auth_fresh_probe_with_retry(
+                playwright, executable, workspace, verify_url,
+                phase="pending-renewal-control",
+                denied_requests=denied_requests, console=console,
+                timeout_ms=timeout_ms, verify_headers=verify_headers,
+                bootstrap_url=login_url,
+            )
+            control_matches = _browser_status_probe_matches(
+                control, status=verification["anonymous_status"],
+                verify_url=verify_url,
+                redirect_statuses=verification.get(
+                    "anonymous_redirect_statuses", ()
+                ),
+            )
+            if not control_matches:
+                return _err(
+                    "Pending browser renewal remains private because the anonymous "
+                    "status-differential control is inconclusive; no credential "
+                    "was submitted.",
+                    {
+                        "credential": credential,
+                        "session_maintenance": {
+                            "action": "pending-control-inconclusive",
+                            "credential_submission": False,
+                            "control_probe_attempts": int(
+                                control.get("probe_attempts") or 1
+                            ),
+                        },
+                        "session": credentials.session_status(
+                            workspace.slug, credential
+                        ),
+                    },
+                )
+
+            pending_storage = {
+                "local_storage": dict(pending.get("local_storage") or {}),
+                "session_storage": dict(pending.get("session_storage") or {}),
+            }
+            pending_tokens = dict(pending.get("tokens") or {})
+            current = _browser_auth_fresh_probe_with_retry(
+                playwright, executable, workspace, verify_url,
+                phase="pending-renewal-verify",
+                denied_requests=denied_requests, console=console,
+                timeout_ms=timeout_ms,
+                cookies=list(pending.get("cookies") or []),
+                bearer_token=credentials.select_bearer(pending_tokens),
+                verify_headers=verify_headers,
+                browser_storage=pending_storage,
+            )
+    except Exception:
+        return _err(
+            "Pending browser renewal proof was temporarily unavailable; the "
+            "private candidate was retained and no credential was submitted.",
+            {
+                "credential": credential,
+                "session_maintenance": {
+                    "action": "pending-control-retry",
+                    "credential_submission": False,
+                },
+                "session": credentials.session_status(
+                    workspace.slug, credential
+                ),
+            },
+        )
+
+    current_matches = _browser_status_probe_matches(
+        current, status=verification["authenticated_status"],
+        verify_url=verify_url, redirect_statuses=(),
+    )
+    if not current_matches:
+        candidate_is_anonymous = (
+            _browser_status_probe_matches(
+                current, status=verification["anonymous_status"],
+                verify_url=verify_url,
+                redirect_statuses=verification.get(
+                    "anonymous_redirect_statuses", ()
+                ),
+            )
+            or _browser_status_probe_matches(
+                current, status=verification["anonymous_status"],
+                verify_url=verify_url, redirect_statuses=(),
+            )
+        )
+        if candidate_is_anonymous:
+            credentials.clear_pending_browser_renewal(
+                workspace.slug, credential
+            )
+            return _err(
+                "Pending browser renewal expired before promotion and was "
+                "invalidated; no credential was submitted and the consumed "
+                "renewal reservation remains closed.",
+                {
+                    "credential": credential,
+                    "session_maintenance": {
+                        "action": "pending-invalidated-stale",
+                        "credential_submission": False,
+                    },
+                    "session": credentials.session_status(
+                        workspace.slug, credential
+                    ),
+                },
+            )
+        return _err(
+            "Pending browser renewal remains private because its authenticated "
+            "verifier is inconclusive; no credential was submitted.",
+            {
+                "credential": credential,
+                "session_maintenance": {
+                    "action": "pending-verifier-inconclusive",
+                    "credential_submission": False,
+                    "control_probe_attempts": int(
+                        control.get("probe_attempts") or 1
+                    ),
+                    "verify_probe_attempts": int(
+                        current.get("probe_attempts") or 1
+                    ),
+                },
+                "session": credentials.session_status(
+                    workspace.slug, credential
+                ),
+            },
+        )
+
+    refreshed_cookies = _browser_auth_persistable_cookies(
+        list(current.get("cookies") or []), login_url
+    )
+    refreshed_local = (
+        current.get("local_storage")
+        if isinstance(current.get("local_storage"), dict) else {}
+    )
+    refreshed_session = (
+        current.get("session_storage")
+        if isinstance(current.get("session_storage"), dict) else {}
+    )
+    refreshed_tokens = dict(pending.get("tokens") or {})
+    refreshed_tokens.update(_browser_auth_tokens(
+        (str(current.get("body") or ""),),
+        refreshed_local, refreshed_session,
+    ))
+    if not refreshed_cookies and not credentials.select_bearer(
+        refreshed_tokens
+    ) and not any(
+        str(value)
+        for area in (refreshed_local, refreshed_session)
+        for value in area.values()
+    ):
+        return _err(
+            "Pending browser renewal produced no reusable private session "
+            "material; no credential was submitted.",
+            {
+                "credential": credential,
+                "session_maintenance": {
+                    "action": "pending-material-inconclusive",
+                    "credential_submission": False,
+                },
+                "session": credentials.session_status(
+                    workspace.slug, credential
+                ),
+            },
+        )
+
+    commit_paths = (
+        credentials.cookie_jar_storage_path(workspace.slug, credential),
+        credentials.token_path(workspace.slug, credential),
+        credentials.browser_storage_path(workspace.slug, credential),
+        credentials.attempt_path(workspace.slug, credential),
+        credentials.pending_browser_renewal_path(workspace.slug, credential),
+    )
+    snapshots = [
+        (path, _snapshot_private_material(path)) for path in commit_paths
+    ]
+    try:
+        credentials.canonical_browser_storage(
+            origin=profile["login_url"], cookies=refreshed_cookies,
+            local_storage=refreshed_local,
+            session_storage=refreshed_session,
+        )
+        _browser_auth_install_cookies(
+            workspace, credential, refreshed_cookies, login_url
+        )
+        credentials.token_path(workspace.slug, credential).unlink(missing_ok=True)
+        if refreshed_tokens:
+            credentials.save_tokens(
+                workspace.slug, credential, refreshed_tokens,
+                origin=profile["login_url"],
+            )
+        # Stage generation+1 browser state before the attempt record becomes
+        # authenticated.  The attempt transition is the final visibility
+        # commit; a process exit before it leaves the candidate private, while
+        # a process exit after it leaves a complete active generation.
+        credentials.prepare_pending_renewal_browser_storage(
+            workspace.slug, credential, generation=generation,
+            origin=profile["login_url"], profile_revision=profile_revision,
+            cookies=refreshed_cookies, local_storage=refreshed_local,
+            session_storage=refreshed_session,
+        )
+        credentials.record_refresh_outcome(
+            workspace.slug, credential, generation=generation,
+            established=True, origin=profile["login_url"],
+            profile_revision=profile_revision,
+        )
+        credentials.clear_pending_browser_renewal(
+            workspace.slug, credential
+        )
+    except Exception:
+        for path, snapshot in reversed(snapshots):
+            try:
+                _restore_private_material(path, snapshot)
+            except (OSError, credentials.CredentialError):
+                pass
+        return _err(
+            "Pending browser renewal could not be promoted atomically; its "
+            "private candidate was retained and no credential was submitted."
+        )
+
+    return _ok(
+        f"Authenticated session {credential!r} completed its retained "
+        "status-differential renewal without resubmitting the credential.",
+        {
+            "credential": credential,
+            "session_maintenance": {
+                "action": "renewed-pending-control",
+                "credential_submission": False,
+                "original_credential_submission_requests": 1,
+                "control_probe_attempts": int(
+                    control.get("probe_attempts") or 1
+                ),
+                "verify_probe_attempts": int(
+                    current.get("probe_attempts") or 1
+                ),
+                "bootstrap_timeout_recovered": bool(
+                    control.get("bootstrap_timeout_recovered")
+                ),
+            },
+            "session": credentials.session_status(
+                workspace.slug, credential
+            ),
+        },
+    )
 
 
 def _browser_auth_persisted_cookies(
@@ -3850,6 +4150,55 @@ def ensure_browser_status_session(
                         "binding for its configured authentication profile."
                     )
                 generation = int(state["proof_generation"])
+                pending = credentials.load_pending_browser_renewal(
+                    workspace.slug, credential
+                )
+                if pending.get("available"):
+                    pending_created_at = float(pending.get("created_at") or 0.0)
+                    pending_age = time.time() - pending_created_at
+                    invalid_pending_action = ""
+                    invalid_pending_summary = ""
+                    if pending.get("profile_revision") != profile_revision:
+                        invalid_pending_action = (
+                            "pending-invalidated-profile-change"
+                        )
+                        invalid_pending_summary = (
+                            "Pending browser renewal was invalidated because the "
+                            "authentication profile changed; no credential was "
+                            "submitted and the consumed renewal reservation remains "
+                            "closed."
+                        )
+                    elif (
+                        pending_age > _PENDING_RENEWAL_MAX_AGE_S
+                        or pending_age < -60
+                    ):
+                        invalid_pending_action = "pending-invalidated-expired"
+                        invalid_pending_summary = (
+                            "Pending browser renewal exceeded its 24-hour private "
+                            "retention window and was invalidated; no credential was submitted "
+                            "and the consumed renewal reservation remains closed."
+                        )
+                    if invalid_pending_action:
+                        credentials.clear_pending_browser_renewal(
+                            workspace.slug, credential
+                        )
+                        return _err(
+                            invalid_pending_summary,
+                            {
+                                "credential": credential,
+                                "session_maintenance": {
+                                    "action": invalid_pending_action,
+                                    "credential_submission": False,
+                                },
+                                "session": credentials.session_status(
+                                    workspace.slug, credential
+                                ),
+                            },
+                        )
+                    return _resume_pending_browser_renewal(
+                        workspace, credential, profile, verification,
+                        profile_revision, pending,
+                    )
                 if not _browser_session_revalidation_due(
                     workspace, credential, state, profile_revision
                 ):
@@ -4402,6 +4751,8 @@ def _credential_browser_login_locked(
     control_redirect_chain: list[dict] = []
     control_redirected = False
     control_probe_attempts = 0
+    control_failure = ""
+    pending_control_saved = False
     cookies: list[dict] = []
     observed_cookie_sets: list[list[dict]] = []
     observed_storage_sets: list[dict] = []
@@ -4809,47 +5160,71 @@ def _credential_browser_login_locked(
                         )
 
                         phase["name"] = "control"
-                        control = _browser_auth_fresh_probe_with_retry(
-                            playwright, executable, workspace, verify_url,
-                            phase="control", denied_requests=denied_requests,
-                            console=console, timeout_ms=timeout_ms,
-                            verify_headers=clean_verify_headers,
-                            bootstrap_url=url,
-                        )
-                        control_status = int(control.get("status") or 0)
-                        control_response_url = str(
-                            control.get("response_url") or ""
-                        )
-                        control_source = str(control.get("source") or "")
-                        control_body = str(control.get("body") or "")
-                        identity_sources.append(control_body)
-                        control_final_url = str(control.get("final_url") or "")
-                        control_method = str(control.get("method") or "").upper()
-                        control_redirect_chain = list(
-                            control.get("redirect_chain") or []
-                        )
-                        control_redirected = bool(control_redirect_chain)
-                        control_probe_attempts = int(
-                            control.get("probe_attempts") or 1
-                        )
-                        observed_cookie_sets.append(
-                            _browser_auth_persistable_cookies(
-                                list(control.get("cookies") or []), url
+                        try:
+                            control = _browser_auth_fresh_probe_with_retry(
+                                playwright, executable, workspace, verify_url,
+                                phase="control", denied_requests=denied_requests,
+                                console=console, timeout_ms=timeout_ms,
+                                verify_headers=clean_verify_headers,
+                                bootstrap_url=url,
                             )
-                        )
-                        observed_token_sets.append(_browser_auth_tokens(
-                            (control_body,),
-                            control.get("local_storage")
-                            if isinstance(control.get("local_storage"), dict) else {},
-                            control.get("session_storage")
-                            if isinstance(control.get("session_storage"), dict) else {},
-                        ))
-                        observed_storage_sets.extend((
-                            control.get("local_storage")
-                            if isinstance(control.get("local_storage"), dict) else {},
-                            control.get("session_storage")
-                            if isinstance(control.get("session_storage"), dict) else {},
-                        ))
+                        except Exception as exc:
+                            # The credential-bearing request, verifier, and
+                            # persisted replay may already be complete.  Keep
+                            # that candidate recoverable and retry only this
+                            # independent anonymous proof on the next request.
+                            control_failure = str(exc)
+                            control_probe_attempts = 2
+                        else:
+                            control_status = int(control.get("status") or 0)
+                            control_response_url = str(
+                                control.get("response_url") or ""
+                            )
+                            control_source = str(control.get("source") or "")
+                            control_body = str(control.get("body") or "")
+                            identity_sources.append(control_body)
+                            control_final_url = str(control.get("final_url") or "")
+                            control_method = str(control.get("method") or "").upper()
+                            control_redirect_chain = list(
+                                control.get("redirect_chain") or []
+                            )
+                            control_redirected = bool(control_redirect_chain)
+                            control_probe_attempts = int(
+                                control.get("probe_attempts") or 1
+                            )
+                            observed_cookie_sets.append(
+                                _browser_auth_persistable_cookies(
+                                    list(control.get("cookies") or []), url
+                                )
+                            )
+                            observed_token_sets.append(_browser_auth_tokens(
+                                (control_body,),
+                                control.get("local_storage")
+                                if isinstance(control.get("local_storage"), dict) else {},
+                                control.get("session_storage")
+                                if isinstance(control.get("session_storage"), dict) else {},
+                            ))
+                            observed_storage_sets.extend((
+                                control.get("local_storage")
+                                if isinstance(control.get("local_storage"), dict) else {},
+                                control.get("session_storage")
+                                if isinstance(control.get("session_storage"), dict) else {},
+                            ))
+                            if (
+                                control_status in {0, 408, 425, 429}
+                                or control_status >= 500
+                                or not control_method
+                                or not control_response_url
+                                or not control_final_url
+                                or any(
+                                    hop.get("complete") is not True
+                                    for hop in control_redirect_chain
+                                )
+                            ):
+                                control_failure = (
+                                    "Anonymous control returned an incomplete or "
+                                    "transient result after read-only retries."
+                                )
     except _BrowserStorageCaptureError:
         # The unknown tail of an oversized state value cannot be safely
         # redacted.  Discard every browser-derived observable and fail closed;
@@ -4893,7 +5268,7 @@ def _credential_browser_login_locked(
         and proof_status_ok
         and control_conclusive
     )
-    status_proved = bool(
+    status_authenticated_side_proved = bool(
         status_mode
         and attempt
         and not blocker
@@ -4918,6 +5293,10 @@ def _credential_browser_login_locked(
         )
         and _browser_auth_url_matches(replay_response_url, verify_url)
         and _browser_auth_url_matches(replay_final_url, verify_url)
+    )
+    status_proved = bool(
+        status_authenticated_side_proved
+        and not control_failure
         and control_status == status_verification["anonymous_status"]
         and _browser_auth_redirect_contract_matches(
             control_redirect_chain,
@@ -5034,6 +5413,28 @@ def _credential_browser_login_locked(
                 except (OSError, credentials.CredentialError):
                     pass
             failure = failure or f"Private browser session could not be saved: {exc}"
+    elif (
+        attempt
+        and _refresh_generation is not None
+        and status_authenticated_side_proved
+        and control_failure
+    ):
+        try:
+            credentials.save_pending_browser_renewal(
+                workspace.slug, credential,
+                generation=_refresh_generation, origin=login_origin,
+                profile_revision=_profile_revision, cookies=cookies,
+                local_storage=local_storage,
+                session_storage=session_storage, tokens=tokens,
+            )
+            pending_control_saved = True
+        except Exception as exc:
+            failure = (
+                "Private pending browser renewal could not be saved: " + str(exc)
+            )
+            credentials.record_refresh_outcome(
+                workspace.slug, credential, generation=_refresh_generation
+            )
     elif attempt:
         if maintenance_generation is None:
             credentials.record_login_outcome(workspace.slug, credential)
@@ -5127,6 +5528,9 @@ def _credential_browser_login_locked(
             "redirected": control_redirected,
             "redirect_chain": safe_control_redirect_chain,
             "probe_attempts": control_probe_attempts,
+            "failure": _browser_redact_identity_text(
+                control_failure, secret_values, identity_values
+            ),
         },
         "console": safe_console,
         "blocked_requests": safe_denied,
@@ -5184,6 +5588,7 @@ def _credential_browser_login_locked(
         data["session_renewal"] = {
             "attempted": bool(attempt),
             "proof_completed": established,
+            "pending_control": pending_control_saved,
         }
     if _upgrade_generation is not None:
         data["browser_state_upgrade"] = {
@@ -5207,6 +5612,15 @@ def _credential_browser_login_locked(
         )
         return _err(
             f"Browser authentication stopped {position}: {blocker}.",
+            data,
+        )
+    if pending_control_saved:
+        return _err(
+            "Credential renewal completed the credential-bearing login, "
+            "authenticated verifier, and persisted replay, but its anonymous "
+            "control was temporarily unavailable. The private candidate was "
+            "retained; the next authenticated request will retry only read-only "
+            "proofs without resubmitting the credential.",
             data,
         )
     if failure:
