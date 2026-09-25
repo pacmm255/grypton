@@ -1812,10 +1812,46 @@ class Engine:
         ).upper()
         raw_url = str(args.get("url") or "")
         if raw_url:
-            split = urlsplit(raw_url if "://" in raw_url else "//" + raw_url)
-            scheme = split.scheme.lower() or "https"
-            host = (split.hostname or "").lower().rstrip(".")
-            port = f":{split.port}" if split.port else ""
+            # Tool arguments are historical model output and therefore an
+            # untrusted input boundary.  In particular, a browser may record a
+            # local ``data:text/html,...`` document.  Treating that value as a
+            # scheme-less host turns ``text`` into a purported port and makes
+            # ``SplitResult.port`` raise ValueError while an engine resume is
+            # rebuilding its novelty counters.  Local/non-web schemes are not
+            # network probes, so omit them.  Malformed HTTP(S) values likewise
+            # cannot contribute a useful, stable signature.
+            value = raw_url.strip()
+            lower_value = value.casefold()
+            if lower_value.startswith(("http://", "https://", "//")):
+                candidate = value
+            elif re.match(r"^[a-z][a-z0-9+.-]*:", value, re.IGNORECASE):
+                # Preserve the common scheme-less ``host:port/path`` form.
+                # Every other explicit scheme (data:, blob:, about:, file:,
+                # javascript:, and unknown schemes) is local/non-HTTP here.
+                possible_host, after_colon = value.split(":", 1)
+                host_like = (
+                    "." in possible_host
+                    or possible_host.casefold() == "localhost"
+                )
+                candidate = (
+                    "//" + value
+                    if host_like and after_colon.partition("/")[0].isdigit()
+                    else ""
+                )
+            else:
+                candidate = "//" + value
+            if not candidate:
+                return ""
+            try:
+                split = urlsplit(candidate)
+                scheme = split.scheme.lower() or "https"
+                host = (split.hostname or "").lower().rstrip(".")
+                parsed_port = split.port
+            except (TypeError, ValueError):
+                return ""
+            if scheme not in {"http", "https"} or not host:
+                return ""
+            port = f":{parsed_port}" if parsed_port else ""
             path = re.sub(r"/+", "/", split.path or "/")
             query_keys = sorted({key for key, _ in parse_qsl(split.query, keep_blank_values=True)})
             shape = f"{scheme}://{host}{port}{path}"

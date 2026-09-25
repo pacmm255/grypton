@@ -27,12 +27,14 @@ from grypton.runtime import (
     _advance_health_deadline,
     _descendant_pgids,
     _engine_argv,
+    _failure_streak,
     _paths,
     _provider_call_window_active,
     _provider_call_window_begin,
     _provider_call_window_complete,
     _process_snapshot,
     _safe_error,
+    _restart_delay,
     _signal_process_groups,
     engine_lock_is_available,
     engine_lock_path,
@@ -104,6 +106,17 @@ class _HungProcess:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_restart_backoff_escalates_to_fifteen_minute_cap(self):
+        self.assertEqual(
+            [_restart_delay(streak) for streak in range(1, 13)],
+            [2, 4, 8, 16, 30, 60, 120, 300, 600, 900, 900, 900],
+        )
+
+    def test_failure_streak_resets_after_sustained_engine_runtime(self):
+        self.assertEqual(_failure_streak(9, None), (10, True))
+        self.assertEqual(_failure_streak(9, 299.999), (10, True))
+        self.assertEqual(_failure_streak(9, 300.0), (1, False))
+
     def test_health_deadline_stays_anchored_and_skips_missed_slots(self):
         # The first health check is immediate; completing it at t=100 anchors
         # the ten-minute cadence at 700, 1300, 1900, and so on.
@@ -306,6 +319,52 @@ class RuntimeTests(unittest.TestCase):
             self.assertNotIn("brief", json.dumps(public_status(ws.slug)).lower())
             spec = json.loads(paths["spec"].read_text(encoding="utf-8"))
             self.assertTrue(spec["run_until_deadline"])
+
+    def test_background_start_accepts_live_supervisor_already_retrying_engine(self):
+        with runtime_home():
+            ws = Workspace("retrying-at-readiness")
+            ws.create("example.test", "web")
+            fake = _Process(returncode=None)
+
+            def matching(pid, role, slug, run_id):
+                return role == "supervise" and pid == fake.pid
+
+            def retrying_state(*args, **kwargs):
+                pointer = config.RUNTIME_DIR / "supervisors/retrying-at-readiness/current.json"
+                run_id = json.loads(pointer.read_text(encoding="utf-8"))["run_id"]
+                path = _paths(ws.slug, run_id)["state"]
+                current = json.loads(path.read_text(encoding="utf-8"))
+                current.update({
+                    "status": "restarting",
+                    "supervisor_pid": fake.pid,
+                    "consecutive_immediate_failures": 1,
+                })
+                path.write_text(json.dumps(current), encoding="utf-8")
+                return fake
+
+            with patch(
+                    "grypton.runtime.subprocess.Popen", side_effect=retrying_state
+                ), patch(
+                    "grypton.runtime.pid_matches", side_effect=matching
+                ), patch("grypton.runtime.time.sleep"):
+                state = start_background(
+                    ws,
+                    brief="fixture",
+                    backend="mock",
+                    max_run_seconds=60,
+                    max_turns=0,
+                    stop_on_p1=False,
+                    worker_model="mock/worker",
+                    worker_effort="max",
+                    manager_model="mock/manager",
+                    manager_effort="xhigh",
+                    health_interval_seconds=600,
+                    restart_limit=2,
+                )
+
+            self.assertEqual(state["status"], "restarting")
+            self.assertTrue(state["alive"])
+            self.assertEqual(state["consecutive_immediate_failures"], 1)
 
     def test_engine_child_receives_private_deadline_mode(self):
         with runtime_home():
@@ -622,6 +681,68 @@ class RuntimeTests(unittest.TestCase):
             state = public_status(ws.slug)
             self.assertEqual(state["status"], "completed")
             self.assertEqual(state["restarts"], 1)
+
+    def test_indefinite_supervisor_keeps_recovering_with_observable_streak(self):
+        with runtime_home():
+            ws = Workspace("unlimited-backoff")
+            ws.create("example.test", "web")
+            run_id = "20260923T000000Z-00000023"
+            paths = _paths(ws.slug, run_id)
+            _write_json(paths["spec"], {
+                "slug": ws.slug,
+                "run_id": run_id,
+                "deadline_at": None,
+                "run_mode": "until-finding",
+                "until_severity": "P1",
+                "health_interval_seconds": 600,
+                "restart_limit": None,
+            })
+            _write_json(paths["state"], {
+                "slug": ws.slug,
+                "run_id": run_id,
+                "status": "starting",
+                "restarts": 0,
+            })
+            _write_json(
+                config.RUNTIME_DIR / "supervisors/unlimited-backoff/current.json",
+                {"run_id": run_id},
+            )
+            processes = [
+                _Process(pid=44700 + index, returncode=7)
+                for index in range(11)
+            ]
+            after = {
+                "workspace_status": "failed",
+                "tool_calls": 0,
+                "effectful_tool_starts": 0,
+            }
+            with patch(
+                    "grypton.runtime.subprocess.Popen", side_effect=processes
+                ) as popen, patch(
+                    "grypton.runtime._health", return_value=after
+                ), patch(
+                    "grypton.runtime._astra_completion_count",
+                    side_effect=[0] * 11 + [1],
+                ), patch(
+                    "grypton.runtime._restart_delay", return_value=0
+                ), patch("grypton.runtime.time.sleep"):
+                self.assertEqual(supervise(ws.slug, run_id), 0)
+
+            self.assertEqual(popen.call_count, 11)
+            state = public_status(ws.slug)
+            self.assertEqual(state["status"], "completed")
+            self.assertEqual(state["restarts"], 11)
+            self.assertEqual(state["consecutive_failures"], 11)
+            self.assertEqual(state["consecutive_immediate_failures"], 11)
+            events = [
+                json.loads(line)
+                for line in paths["events"].read_text(encoding="utf-8").splitlines()
+            ]
+            scheduled = [row for row in events if row["event"] == "restart_scheduled"]
+            self.assertEqual(len(scheduled), 11)
+            self.assertEqual(scheduled[-1]["consecutive_failures"], 11)
+            self.assertEqual(scheduled[-1]["consecutive_immediate_failures"], 11)
+            self.assertTrue(scheduled[-1]["immediate_failure"])
 
     def test_abnormal_exit_with_active_native_provider_window_is_not_restarted(self):
         with runtime_home():

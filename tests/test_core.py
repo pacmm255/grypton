@@ -2420,6 +2420,82 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(repeat["novel"], 0)
             self.assertEqual(repeat["repeated"], 1)
 
+    def test_network_signature_skips_local_and_malformed_urls(self):
+        local_urls = [
+            "data:text/html,<script>document.body.textContent='ok'</script>",
+            "blob:https://example.test/6d26dfef-5487-4e29-b397-a024ba24ef5f",
+            "about:blank",
+            "file:///tmp/local.html",
+            "javascript:void(0)",
+            "tel:12345",
+            "urn:12345",
+        ]
+        for url in local_urls:
+            with self.subTest(url=url):
+                self.assertEqual(Engine._network_signature({
+                    "name": "grypton_browse", "input": {"url": url},
+                }), "")
+
+        for url in (
+            "https://example.test:text/path",
+            "https://[not-an-ipv6-address/path",
+            "/relative/path",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(Engine._network_signature({
+                    "name": "grypton_http_request", "input": {"url": url},
+                }), "")
+
+        self.assertEqual(
+            Engine._network_signature({
+                "name": "grypton_http_request",
+                "input": {"url": "example.test:8443/path?a=1"},
+            }),
+            "http_request|GET|https://example.test:8443/path?a",
+        )
+
+    def test_novelty_rehydration_skips_invalid_historical_urls(self):
+        with isolated_runtime():
+            ws = Workspace("novelty-invalid-history")
+            ws.create("https://example.test", "web")
+            engine = Engine("novelty-invalid-history", backend="mock")
+            records = [{
+                "turn": 1,
+                "tools": [
+                    {
+                        "name": "grypton_browse",
+                        "input": {
+                            "url": (
+                                "data:text/html,<div id=r>pre</div><script>"
+                                "document.getElementById('r').textContent='done'"
+                                "</script>"
+                            ),
+                        },
+                    },
+                    {
+                        "name": "grypton_http_request",
+                        "input": {"url": "https://example.test:text/bad"},
+                    },
+                    {
+                        "name": "grypton_http_request",
+                        "input": {"url": "https://example.test/healthy?nonce=1"},
+                    },
+                ],
+            }]
+            (ws.transcripts_dir / "turns.jsonl").write_text(
+                "".join(json.dumps(row) + "\n" for row in records),
+                encoding="utf-8",
+            )
+
+            # This is the first operation in Engine._run_loop on a resumed
+            # workspace.  Historical model output must never abort startup.
+            engine._rehydrate_novelty_state()
+
+            self.assertEqual(
+                engine._network_signatures,
+                {"http_request|GET|https://example.test/healthy?nonce": 1},
+            )
+
     def test_surface_novelty_does_not_reward_numbered_sentinels(self):
         first = {"kind": "cache", "item": "Interval sentinel checkpoint #33"}
         second = {"kind": "cache", "item": "Interval sentinel checkpoint #84"}

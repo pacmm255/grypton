@@ -29,6 +29,8 @@ from .workspace import Workspace
 
 _RUN_ID_RX = re.compile(r"^\d{8}T\d{6}Z-[0-9a-f]{8}$")
 _SUPERVISED_RUN_ENV = "GRYPTON_SUPERVISOR_RUN_ID"
+_RESTART_BACKOFF_SECONDS = (2, 4, 8, 16, 30, 60, 120, 300, 600, 900)
+_SUSTAINED_ENGINE_RUNTIME_SECONDS = 300.0
 
 
 @dataclass(frozen=True)
@@ -595,6 +597,10 @@ def _start_background_locked(
         "health_interval_seconds": interval,
         "restart_limit": retries,
         "restarts": 0,
+        "consecutive_failures": 0,
+        "consecutive_immediate_failures": 0,
+        "retry_delay_seconds": 0,
+        "next_retry_at": None,
         "supervisor_pid": 0,
         "engine_pid": 0,
         "last_health": {},
@@ -632,7 +638,7 @@ def _start_background_locked(
     while time.monotonic() < ready_by:
         current = _read_json(paths["state"])
         if (int(current.get("supervisor_pid") or 0) == process.pid
-                and current.get("status") == "running"
+                and current.get("status") in {"running", "restarting"}
                 and pid_matches(process.pid, "supervise", ws.slug, run_id)):
             _append_event(paths["events"], "supervisor_ready", supervisor_pid=process.pid)
             return public_status(ws.slug)
@@ -687,7 +693,9 @@ def public_status(slug: str) -> dict[str, Any]:
         "version", "run_id", "slug", "started_at", "deadline_at", "ended_at",
         "health_interval_seconds", "restart_limit", "restarts", "supervisor_pid",
         "engine_pid", "last_health", "last_exit_code", "stop_reason", "updated_at",
-        "run_mode", "until_severity", "restart_policy",
+        "run_mode", "until_severity", "restart_policy", "consecutive_failures",
+        "consecutive_immediate_failures", "retry_delay_seconds", "next_retry_at",
+        "last_engine_runtime_seconds",
     )
     result = {key: state.get(key) for key in allowed if key in state}
     result.update({"status": status, "alive": alive, "events": str(paths["events"])})
@@ -1038,9 +1046,24 @@ def _advance_health_deadline(
     return scheduled_at + (slots * interval)
 
 
-def _restart_delay(restarts: int) -> int:
-    """Bound retry backoff without constructing an unbounded exponent."""
-    return 30 if restarts >= 5 else 2 ** max(0, restarts)
+def _restart_delay(consecutive_failures: int) -> int:
+    """Return bounded backoff for one uninterrupted engine-failure streak."""
+    index = max(1, int(consecutive_failures)) - 1
+    return _RESTART_BACKOFF_SECONDS[min(index, len(_RESTART_BACKOFF_SECONDS) - 1)]
+
+
+def _failure_streak(previous: int, runtime_seconds: float | None) -> tuple[int, bool]:
+    """Advance a failure streak, resetting after a sustained engine runtime.
+
+    A spawn failure has no runtime and is necessarily immediate. A child that
+    stayed alive for five minutes has demonstrated enough liveness that its
+    next recovery starts at the shortest delay again.
+    """
+    immediate = (
+        runtime_seconds is None
+        or runtime_seconds < _SUSTAINED_ENGINE_RUNTIME_SECONDS
+    )
+    return ((max(0, int(previous)) + 1) if immediate else 1, immediate)
 
 
 def supervise(slug: str, run_id: str) -> int:
@@ -1096,6 +1119,8 @@ def supervise(slug: str, run_id: str) -> int:
     signal.signal(signal.SIGINT, on_stop)
     interval = int(spec["health_interval_seconds"])
     restarts = 0
+    consecutive_failures = 0
+    consecutive_immediate_failures = 0
     exit_status = "failed"
     stop_reason = "supervisor failure"
     child: subprocess.Popen | None = None
@@ -1136,30 +1161,81 @@ def supervise(slug: str, run_id: str) -> int:
                     exit_status, stop_reason = "failed", "restart limit reached"
                     break
                 restarts += 1
-                _state_update(paths["state"], state, status="restarting", restarts=restarts,
-                              engine_pid=0)
-                retry_until = time.time() + _restart_delay(restarts)
+                consecutive_failures, _ = _failure_streak(
+                    consecutive_failures, None
+                )
+                consecutive_immediate_failures += 1
+                delay = _restart_delay(consecutive_failures)
+                retry_until = time.time() + delay
                 if deadline is not None:
                     retry_until = min(retry_until, deadline)
+                _state_update(
+                    paths["state"],
+                    state,
+                    status="restarting",
+                    restarts=restarts,
+                    engine_pid=0,
+                    consecutive_failures=consecutive_failures,
+                    consecutive_immediate_failures=consecutive_immediate_failures,
+                    retry_delay_seconds=delay,
+                    next_retry_at=retry_until,
+                )
+                _append_event(
+                    paths["events"],
+                    "restart_scheduled",
+                    restart=restarts,
+                    previous_failure="spawn",
+                    consecutive_failures=consecutive_failures,
+                    consecutive_immediate_failures=consecutive_immediate_failures,
+                    delay_seconds=delay,
+                    next_retry_at=retry_until,
+                )
                 while time.time() < retry_until and not stop_requested:
                     time.sleep(0.25)
                 continue
 
+            engine_started_at = time.monotonic()
             _write_text_private(paths["engine_pid"], f"{child.pid}\n")
-            _state_update(paths["state"], state, status="running", engine_pid=child.pid,
-                          restarts=restarts)
+            _state_update(
+                paths["state"],
+                state,
+                status="running",
+                engine_pid=child.pid,
+                restarts=restarts,
+                retry_delay_seconds=0,
+                next_retry_at=None,
+            )
             _append_event(paths["events"], "engine_started", engine_pid=child.pid,
                           restart=restarts)
             next_health = 0.0
             timed_out = False
             stopped = False
             threshold_met = False
+            backoff_reset = False
             observed_groups = _descendant_pgids(child.pid)
             while child.poll() is None:
                 _merge_process_groups(
                     observed_groups, _descendant_pgids(child.pid)
                 )
                 now = time.time()
+                engine_runtime = max(0.0, time.monotonic() - engine_started_at)
+                if (not backoff_reset
+                        and consecutive_failures
+                        and engine_runtime >= _SUSTAINED_ENGINE_RUNTIME_SECONDS):
+                    consecutive_failures = 0
+                    consecutive_immediate_failures = 0
+                    backoff_reset = True
+                    _state_update(
+                        paths["state"],
+                        state,
+                        consecutive_failures=0,
+                        consecutive_immediate_failures=0,
+                    )
+                    _append_event(
+                        paths["events"],
+                        "restart_backoff_reset",
+                        engine_runtime_seconds=round(engine_runtime, 3),
+                    )
                 if stop_requested:
                     stopped = True
                     _state_update(paths["state"], state, status="stopping")
@@ -1202,13 +1278,25 @@ def supervise(slug: str, run_id: str) -> int:
                 break
 
             returncode = int(child.wait())
+            engine_runtime = max(0.0, time.monotonic() - engine_started_at)
             # The engine may have been killed after spawning providers in their
             # own sessions. Reap the groups observed while it was alive even
             # though their PPID may already have changed.
             cleanup_complete = _stop_engine(child, observed_groups)
-            _append_event(paths["events"], "engine_exited", returncode=returncode,
-                          restart=restarts)
-            _state_update(paths["state"], state, last_exit_code=returncode, engine_pid=0)
+            _append_event(
+                paths["events"],
+                "engine_exited",
+                returncode=returncode,
+                restart=restarts,
+                engine_runtime_seconds=round(engine_runtime, 3),
+            )
+            _state_update(
+                paths["state"],
+                state,
+                last_exit_code=returncode,
+                last_engine_runtime_seconds=round(engine_runtime, 3),
+                engine_pid=0,
+            )
             try:
                 paths["engine_pid"].unlink(missing_ok=True)
             except OSError:
@@ -1257,12 +1345,39 @@ def supervise(slug: str, run_id: str) -> int:
                 break
 
             restarts += 1
-            _state_update(paths["state"], state, status="restarting", restarts=restarts)
-            _append_event(paths["events"], "restart_scheduled", restart=restarts,
-                          previous_returncode=returncode)
-            until = time.time() + _restart_delay(restarts)
+            consecutive_failures, immediate = _failure_streak(
+                consecutive_failures, engine_runtime
+            )
+            if immediate:
+                consecutive_immediate_failures += 1
+            else:
+                consecutive_immediate_failures = 0
+            delay = _restart_delay(consecutive_failures)
+            until = time.time() + delay
             if deadline is not None:
                 until = min(until, deadline)
+            _state_update(
+                paths["state"],
+                state,
+                status="restarting",
+                restarts=restarts,
+                consecutive_failures=consecutive_failures,
+                consecutive_immediate_failures=consecutive_immediate_failures,
+                retry_delay_seconds=delay,
+                next_retry_at=until,
+            )
+            _append_event(
+                paths["events"],
+                "restart_scheduled",
+                restart=restarts,
+                previous_returncode=returncode,
+                consecutive_failures=consecutive_failures,
+                consecutive_immediate_failures=consecutive_immediate_failures,
+                immediate_failure=immediate,
+                engine_runtime_seconds=round(engine_runtime, 3),
+                delay_seconds=delay,
+                next_retry_at=until,
+            )
             while time.time() < until and not stop_requested:
                 time.sleep(0.25)
     finally:
