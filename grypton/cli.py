@@ -1611,6 +1611,57 @@ def cmd_auth(ns) -> int:
     from . import credentials
 
     target = config.slugify(ns.target)
+    if ns.auth_command in {"begin-browser-step-up", "continue-browser"}:
+        if os.environ.get("GRYPTON_ENGAGEMENT_DIR"):
+            print(
+                "ERROR: browser MFA continuation is available only from an operator shell.",
+                file=sys.stderr,
+            )
+            return 2
+        workspace = Workspace(target)
+        if not workspace.exists():
+            print(f"ERROR: no engagement {target!r}.", file=sys.stderr)
+            return 2
+        from . import tools
+        if ns.auth_command == "begin-browser-step-up":
+            result = tools.credential_browser_begin_step_up(
+                workspace, credential=ns.name, timeout=ns.timeout
+            )
+        else:
+            try:
+                otp = getpass.getpass("One-time code: ")
+            except (EOFError, KeyboardInterrupt):
+                print("ERROR: MFA continuation was cancelled.", file=sys.stderr)
+                return 2
+            otp_redactions = tools._serialized_secret_variants((otp,))
+            try:
+                result = tools.credential_browser_step_up(
+                    workspace, credential=ns.name, otp=otp,
+                    otp_selector=ns.otp_selector,
+                    submit_selector=ns.submit_selector,
+                    password_submit_selector=ns.password_submit_selector,
+                    timeout=ns.timeout,
+                )
+                safe_summary = tools.redact_sensitive_text(
+                    result.get("summary"), otp_redactions
+                )
+            except Exception:
+                result = {"ok": False}
+                safe_summary = "Browser MFA continuation failed."
+            finally:
+                # Minimize the lifetime of the direct reference. CPython strings
+                # cannot be reliably wiped, but this value is never serialized.
+                otp_redactions = ()
+                otp = ""
+        if ns.auth_command == "begin-browser-step-up":
+            safe_summary = str(
+                result.get("summary") or "Authentication action failed."
+            )
+        else:
+            safe_summary = safe_summary or "Authentication action failed."
+        stream = sys.stdout if result.get("ok") else sys.stderr
+        print(safe_summary, file=stream)
+        return 0 if result.get("ok") else 2
     if ns.auth_command == "list":
         aliases = credentials.list_credentials(target)
         if ns.json:
@@ -2095,6 +2146,34 @@ def build_parser() -> argparse.ArgumentParser:
     auth_list.add_argument("target", help="Engagement slug or target")
     auth_list.add_argument("--json", action="store_true")
     auth_list.set_defaults(func=cmd_auth)
+    auth_begin_step_up = auth_sub.add_parser(
+        "begin-browser-step-up",
+        help="Privately send one saved-profile identifier request and retain its MFA page",
+    )
+    auth_begin_step_up.add_argument("target", help="Engagement slug or target")
+    auth_begin_step_up.add_argument("--name", default="primary", help="Credential alias")
+    auth_begin_step_up.add_argument("--timeout", type=int, default=45)
+    auth_begin_step_up.set_defaults(func=cmd_auth)
+    auth_continue = auth_sub.add_parser(
+        "continue-browser",
+        help="Prompt privately for a one-time code and continue the retained browser login",
+    )
+    auth_continue.add_argument("target", help="Engagement slug or target")
+    auth_continue.add_argument("--name", default="primary", help="Credential alias")
+    auth_continue.add_argument(
+        "--otp-selector", default="",
+        help="Override the discovered OTP input selector",
+    )
+    auth_continue.add_argument(
+        "--submit-selector", default="",
+        help="Override the discovered OTP action selector",
+    )
+    auth_continue.add_argument(
+        "--password-submit-selector", default="",
+        help="Override the discovered post-OTP password action selector",
+    )
+    auth_continue.add_argument("--timeout", type=int, default=45)
+    auth_continue.set_defaults(func=cmd_auth)
     auth_configure = auth_sub.add_parser(
         "configure", help="Configure private automatic authentication routing"
     )

@@ -16,10 +16,117 @@ from .workspace import Workspace
 MAX_BROKER_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_BROKER_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_REQUEST_BODY_BYTES = 1_000_000
+MAX_PRIVATE_VALUE_BYTES = 4096
 
 
 class NetworkBrokerError(RuntimeError):
     """The scoped shell network broker cannot be started safely."""
+
+
+class PrivateEgressProxyBroker:
+    """Share an in-memory proxy only with the operator-owned MCP subprocess."""
+
+    def __init__(self, socket_path: Path, value: str):
+        self.socket_path = socket_path
+        self.value = str(value)
+        self.peer_uid = os.getuid()
+        self.server: asyncio.AbstractServer | None = None
+        self._socket_inode = 0
+
+    def healthy(self) -> bool:
+        if self.server is None:
+            return False
+        try:
+            info = self.socket_path.stat(follow_symlinks=False)
+        except OSError:
+            return False
+        return stat.S_ISSOCK(info.st_mode) and info.st_ino == self._socket_inode
+
+    async def start(self) -> None:
+        if self.healthy():
+            return
+        await self.close()
+        if not self.value or len(self.value.encode("utf-8")) > MAX_PRIVATE_VALUE_BYTES:
+            raise NetworkBrokerError("private egress proxy setting is invalid")
+        directory = self.socket_path.parent
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if self.socket_path.is_symlink():
+            raise NetworkBrokerError("private egress broker socket path is unsafe")
+        try:
+            existing = self.socket_path.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            existing = None
+        if existing is not None:
+            if not stat.S_ISSOCK(existing.st_mode):
+                raise NetworkBrokerError("private egress broker socket path is occupied")
+            self.socket_path.unlink()
+        try:
+            self.server = await asyncio.start_unix_server(
+                self._handle, path=str(self.socket_path), limit=1025,
+            )
+            os.chmod(self.socket_path, 0o600)
+            self._socket_inode = self.socket_path.stat(follow_symlinks=False).st_ino
+        except BaseException as exc:
+            await self.close()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise NetworkBrokerError(
+                "private egress broker failed to start"
+            ) from exc
+
+    async def close(self) -> None:
+        if self.server is not None:
+            self.server.close()
+            await self.server.wait_closed()
+            self.server = None
+        try:
+            info = self.socket_path.stat(follow_symlinks=False)
+        except OSError:
+            info = None
+        if info is not None and stat.S_ISSOCK(info.st_mode):
+            try:
+                self.socket_path.unlink()
+            except OSError:
+                pass
+        self._socket_inode = 0
+
+    async def _handle(self, reader: asyncio.StreamReader,
+                      writer: asyncio.StreamWriter) -> None:
+        response: dict[str, Any]
+        try:
+            if ScopedNetworkBroker._peer_uid(writer) != self.peer_uid:
+                raise NetworkBrokerError("private egress broker peer was rejected")
+            raw = await reader.readline()
+            if not raw or len(raw) > 1024 or not raw.endswith(b"\n"):
+                raise NetworkBrokerError("private egress broker request is invalid")
+            try:
+                request = json.loads(raw)
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise NetworkBrokerError(
+                    "private egress broker request is invalid"
+                ) from exc
+            if not isinstance(request, dict) or request != {"operation": "egress_proxy"}:
+                raise NetworkBrokerError("private egress broker operation is unsupported")
+            response = {"ok": True, "value": self.value}
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            response = {
+                "ok": False,
+                "error": str(exc) if isinstance(exc, NetworkBrokerError)
+                else "private egress broker failed",
+            }
+        try:
+            writer.write(
+                (json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8")
+            )
+            await writer.drain()
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except (ConnectionError, OSError):
+                pass
 
 
 class ScopedNetworkBroker:

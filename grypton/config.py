@@ -8,10 +8,12 @@ import json
 import os
 import re
 import shutil
+import socket
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
+from urllib.parse import unquote, urlsplit
 
 # --------------------------------------------------------------------------
 # Repository / Grypton home layout
@@ -61,6 +63,105 @@ BIN_DIR = (
 KRYPTON_HOME = GRYPTON_HOME                      # compatibility for restored modules
 OPENCLAUDE_HOME = Path(os.environ.get("GRYPTON_OPENCLAUDE_HOME", "/root/openclaude")).resolve()
 OPENCLAUDE_BIN = OPENCLAUDE_HOME / "bin" / "openclaude.mjs"
+
+# The operator-facing proxy value stays in the supervising Grypton process.
+# Tool subprocesses receive only a private Unix-socket rendezvous path so the
+# proxy URL (including optional credentials) never enters provider state.
+EGRESS_PROXY_ENV = "GRYPTON_EGRESS_PROXY"
+PRIVATE_EGRESS_PROXY_SOCKET_ENV = "GRYPTON_PRIVATE_EGRESS_PROXY_SOCKET"
+_MAX_EGRESS_PROXY_BYTES = 4096
+
+
+def _proxy_from_private_socket(path: str) -> str:
+    """Read one in-memory proxy value from the supervising process."""
+    if (
+        not path or len(path.encode("utf-8")) > 4096
+        or "\x00" in path or not os.path.isabs(path)
+    ):
+        raise ValueError("Private egress proxy setting is unavailable.")
+    request = b'{"operation":"egress_proxy"}\n'
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(2)
+            connection.connect(path)
+            connection.sendall(request)
+            while True:
+                block = connection.recv(4096)
+                if not block:
+                    break
+                chunks.append(block)
+                total += len(block)
+                if total > (_MAX_EGRESS_PROXY_BYTES * 2) + 1024:
+                    raise ValueError("Private egress proxy setting is unavailable.")
+    except (OSError, ValueError) as exc:
+        raise ValueError("Private egress proxy setting is unavailable.") from exc
+    try:
+        envelope = json.loads(b"".join(chunks))
+        value = envelope.get("value") if envelope.get("ok") is True else None
+    except (AttributeError, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("Private egress proxy setting is unavailable.") from exc
+    if not isinstance(value, str):
+        raise ValueError("Private egress proxy setting is unavailable.")
+    return value
+
+
+def private_egress_proxy(environ: Optional[dict[str, str]] = None) -> str:
+    """Return a validated private HTTP(S) proxy without making it observable."""
+    source = os.environ if environ is None else environ
+    raw = str(source.get(EGRESS_PROXY_ENV) or "").strip()
+    if not raw:
+        socket_path = str(source.get(PRIVATE_EGRESS_PROXY_SOCKET_ENV) or "").strip()
+        if socket_path:
+            raw = _proxy_from_private_socket(socket_path).strip()
+    if not raw:
+        return ""
+    if (
+        len(raw.encode("utf-8")) > _MAX_EGRESS_PROXY_BYTES
+        or any(char.isspace() or ord(char) < 0x20 or ord(char) == 0x7f for char in raw)
+    ):
+        raise ValueError("Private egress proxy setting is invalid.")
+    try:
+        parsed = urlsplit(raw)
+        parsed_port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Private egress proxy setting is invalid.") from exc
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.query or parsed.fragment
+        or parsed.path not in {"", "/"}
+        or (parsed_port is not None and not 1 <= parsed_port <= 65535)
+    ):
+        raise ValueError("Private egress proxy setting is invalid.")
+    return raw
+
+
+def private_egress_proxy_redaction_values(proxy: str) -> tuple[str, ...]:
+    """Return proxy forms that subprocess or provider diagnostics may echo."""
+    raw = str(proxy or "")
+    if not raw:
+        return ()
+    values = {raw}
+    try:
+        parsed = urlsplit(raw)
+        if parsed.hostname:
+            values.add(parsed.hostname)
+            endpoint = (
+                f"[{parsed.hostname}]" if ":" in parsed.hostname
+                else parsed.hostname
+            )
+            if parsed.port is not None:
+                endpoint += f":{parsed.port}"
+            values.add(endpoint)
+        if parsed.username is not None:
+            values.add(unquote(parsed.username))
+        if parsed.password is not None:
+            values.add(unquote(parsed.password))
+    except ValueError:
+        pass
+    return tuple(sorted((value for value in values if value), key=len, reverse=True))
 
 
 # --------------------------------------------------------------------------

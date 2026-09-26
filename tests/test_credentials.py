@@ -1553,6 +1553,55 @@ else:
                     tools._authentication_blocker(body, "HTTP/1.1 200 OK"), ""
                 )
 
+    def test_pending_browser_step_up_is_private_bound_and_one_shot(self):
+        with isolated_runtime():
+            target, alias = "step-up-target", "primary"
+            origin = "https://app.example.test:443"
+            credentials.save_credential(target, alias, "user", "password")
+            attempt = credentials.begin_login_attempt(target, alias)
+            credentials.record_login_outcome(
+                target, alias, blocked_reason="MFA/OTP challenge was presented"
+            )
+            credentials.save_pending_browser_step_up(
+                target, alias, attempt=attempt, origin=origin,
+                challenge_url="https://app.example.test/login",
+                profile_revision="0123456789ab",
+                cookies=[{
+                    "name": "challenge", "value": "challenge-session-value",
+                    "domain": "app.example.test", "path": "/", "expires": -1,
+                    "httpOnly": True, "secure": True, "sameSite": "Lax",
+                }],
+                local_storage={"anonymous_id": "private-anonymous-value"},
+                session_storage={}, tokens={},
+                otp_selector="input.otp__digit", otp_fields=5,
+                submit_selector="",
+            )
+
+            path = credentials.pending_browser_step_up_path(target, alias)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertFalse(path.is_relative_to(config.ENGAGEMENTS_DIR))
+            self.assertNotIn("839201", path.read_text())
+            self.assertEqual(
+                credentials.session_status(target, alias)["state"],
+                "step-up-pending",
+            )
+            pending = credentials.load_pending_browser_step_up(target, alias)
+            self.assertTrue(pending["available"])
+            self.assertNotIn("839201", json.dumps(pending))
+
+            reserved = credentials.reserve_pending_browser_step_up(target, alias)
+            self.assertTrue(reserved["reserved"])
+            self.assertFalse(
+                credentials.load_pending_browser_step_up(target, alias)["available"]
+            )
+            with self.assertRaisesRegex(
+                credentials.CredentialError, "already used"
+            ):
+                credentials.reserve_pending_browser_step_up(target, alias)
+            self.assertEqual(
+                credentials.session_status(target, alias)["attempts"], 1
+            )
+
     def test_cookie_jar_symlink_is_rejected(self):
         with isolated_runtime() as root:
             credentials.save_credential("target", "primary", "u", "p")

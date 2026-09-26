@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -45,6 +46,8 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
     password = "browser-password-never-log"
     session = "browser-session-never-log"
     token = "browser-token-never-log"
+    otp = "839201"
+    challenge_session = "browser-challenge-session-never-log"
     mode = "success"
     login_posts = 0
     verify_requests = 0
@@ -79,6 +82,68 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
         if self.path == "/login":
             if type(self).mode == "page-denied":
                 self._json(401, {"error": "login page unavailable"})
+                return
+            if type(self).mode == "staged-otp":
+                html = b"""<!doctype html><html><body><main id='app'></main>
+                <script>
+                const app = document.getElementById('app');
+                sessionStorage.setItem('anonymous_id',
+                  sessionStorage.getItem('anonymous_id') || 'browser-anonymous-id');
+                function render() {
+                  const stage = sessionStorage.getItem('stage') || 'phone';
+                  if (stage === 'phone') {
+                    app.innerHTML = `<form id="phone-form"><input id="phone_number">
+                      <button id="submit-btn" type="submit">Send code</button></form>`;
+                    document.getElementById('phone-form').onsubmit = async (event) => {
+                      event.preventDefault();
+                      const response = await fetch('/api/send-otp', {method:'POST',
+                        headers:{'Content-Type':'application/json'}, body:JSON.stringify({
+                          phone_number:document.getElementById('phone_number').value,
+                          anonymous_id:sessionStorage.getItem('anonymous_id')})});
+                      if (response.ok) { sessionStorage.setItem('stage','otp'); render(); }
+                    };
+                  } else if (stage === 'otp') {
+                    app.innerHTML = `<p>Enter verification code</p><form id="otp-form">
+                      ${Array.from({length:6}, (_, i) => `<input class="otp__digit"
+                        data-index="${i}" inputmode="numeric" maxlength="1">`).join('')}
+                      <input id="otp" type="hidden"></form>`;
+                    for (const input of document.querySelectorAll('.otp__digit')) {
+                      input.oninput = async () => {
+                        const otp = Array.from(document.querySelectorAll('.otp__digit'))
+                          .map(item => item.value).join('');
+                        document.getElementById('otp').value = otp;
+                        if (otp.length !== 6) return;
+                        const response = await fetch('/api/verify-otp', {method:'POST',
+                          headers:{'Content-Type':'application/json'}, body:JSON.stringify({
+                            phone_number:'09123456789', otp,
+                            anonymous_id:sessionStorage.getItem('anonymous_id')})});
+                        if (response.ok) { const value = await response.json();
+                          sessionStorage.setItem('verification_token', value.token);
+                          sessionStorage.setItem('stage','password'); render(); }
+                      };
+                    }
+                  } else {
+                    app.innerHTML = `<form id="password-form"><input id="verification_token">
+                      <input id="password" type="password"><button id="password-submit-btn"
+                      type="submit">Sign in</button></form>`;
+                    document.getElementById('verification_token').value =
+                      sessionStorage.getItem('verification_token') || '';
+                    document.getElementById('password-form').onsubmit = async (event) => {
+                      event.preventDefault();
+                      const response = await fetch('/api/login-stage', {method:'POST',
+                        headers:{'Content-Type':'application/json'}, body:JSON.stringify({
+                          phone_number:'09123456789', password:document.getElementById('password').value,
+                          token:document.getElementById('verification_token').value})});
+                      if (response.ok) location.assign('/dashboard');
+                    };
+                  }
+                }
+                render();
+                </script></body></html>"""
+                self._send(
+                    200, html, content_type="text/html; charset=utf-8",
+                    cookie=type(self).challenge_session,
+                )
                 return
             challenge = (
                 "<p id='challenge'>CAPTCHA challenge active</p>"
@@ -138,6 +203,12 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
               }});
               const value = await response.json();
               document.getElementById('result').textContent = JSON.stringify(value);
+              if (value.otp_required) {{
+                sessionStorage.setItem('otp_challenge', 'active');
+                document.getElementById('result').innerHTML =
+                  '<p>Enter verification code</p>' +
+                  '<input class="otp__digit" maxlength="1">'.repeat(6);
+              }}
               {identity_console}
               if (value.access_token) console.log(value.access_token);
               if (response.ok && !value.otp_required) window.location.assign(
@@ -239,6 +310,39 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_POST(self):
+        if type(self).mode == "staged-otp" and self.path in {
+            "/api/send-otp", "/api/verify-otp", "/api/login-stage",
+        }:
+            length = int(self.headers.get("Content-Length", "0"))
+            try:
+                value = json.loads(self.rfile.read(length).decode())
+            except ValueError:
+                value = {}
+            if self.path == "/api/send-otp":
+                type(self).login_posts += 1
+                self._json(
+                    202 if value.get("phone_number") == "09123456789" else 400,
+                    {"otp_required": True},
+                )
+                return
+            if self.path == "/api/verify-otp":
+                self._json(
+                    200 if value.get("otp") == type(self).otp else 401,
+                    {"token": "stage-verification-token-never-log"}
+                    if value.get("otp") == type(self).otp
+                    else {"error": "invalid otp code"},
+                )
+                return
+            accepted = (
+                value.get("password") == type(self).password
+                and value.get("token") == "stage-verification-token-never-log"
+            )
+            self._json(
+                200 if accepted else 401,
+                {"authenticated": accepted},
+                cookie=type(self).session if accepted else "",
+            )
+            return
         if self.path != "/api/login":
             self._json(404, {"error": "not found"})
             return
@@ -2337,6 +2441,99 @@ class BrowserCredentialTests(unittest.TestCase):
                 )
                 self.assertEqual(_SpaAuthHandler.login_posts, attempts)
 
+    def test_private_cli_style_staged_otp_continuation_reuses_one_attempt(self):
+        with isolated_runtime(), spa_auth_server("staged-otp") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            profile = self._status_profile(port)
+            profile["username_transform"] = "stored"
+            profile["browser"].update({
+                "username_selector": "#phone_number",
+                "password_selector": "#password",
+                "submit_selector": "#submit-btn",
+            })
+            profile["browser"]["verification"]["login_status"] = 202
+            credentials.save_auth_profile(ws.slug, "primary", profile)
+
+            started = tools.credential_browser_begin_step_up(
+                ws, credential="primary", timeout=10
+            )
+            self.assertTrue(started["ok"], started)
+            self.assertTrue(started["data"]["otp_control_discovered"])
+            self.assertEqual(started["data"]["otp_fields"], 6)
+            self.assertEqual(
+                credentials.session_status(ws.slug, "primary")["state"],
+                "step-up-pending",
+            )
+
+            not_submitted = tools.credential_browser_step_up(
+                ws, credential="primary", otp=_SpaAuthHandler.otp,
+                otp_selector="#missing-otp-control", timeout=10,
+            )
+            self.assertFalse(not_submitted["ok"], not_submitted)
+            self.assertNotIn(_SpaAuthHandler.otp, json.dumps(not_submitted))
+            self.assertTrue(
+                credentials.load_pending_browser_step_up(
+                    ws.slug, "primary"
+                )["available"]
+            )
+
+            completed = tools.credential_browser_step_up(
+                ws, credential="primary", otp=_SpaAuthHandler.otp,
+                password_submit_selector="#password-submit-btn", timeout=10,
+            )
+            self.assertTrue(completed["ok"], completed)
+            self.assertEqual(completed["data"]["otp_submission_requests"], 1)
+            self.assertEqual(completed["data"]["password_submission_requests"], 1)
+            self.assertTrue(completed["data"]["session"]["established"])
+            self.assertEqual(completed["data"]["session"]["attempts"], 1)
+            self.assertFalse(
+                credentials.pending_browser_step_up_path(
+                    ws.slug, "primary"
+                ).exists()
+            )
+            for root in (ws.root, config.CREDENTIALS_DIR / ws.slug):
+                for path in root.rglob("*"):
+                    if path.is_file():
+                        self.assertNotIn(
+                            _SpaAuthHandler.otp,
+                            path.read_text(encoding="utf-8", errors="ignore"),
+                            path,
+                        )
+
+    def test_browser_login_retains_discovered_step_up_for_private_cli(self):
+        with isolated_runtime(), spa_auth_server("otp") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            profile = self._status_profile(port)
+            profile["browser"]["verification"]["login_status"] = 202
+            credentials.save_auth_profile(ws.slug, "primary", profile)
+
+            result = dispatch(
+                ws, "credential_browser_login", {"credential": "primary"}
+            )
+
+            self.assertFalse(result["ok"], result)
+            self.assertTrue(result["data"]["step_up"]["pending"])
+            self.assertTrue(
+                result["data"]["step_up"]["otp_control_discovered"]
+            )
+            self.assertEqual(result["data"]["step_up"]["otp_fields"], 6)
+            self.assertEqual(
+                credentials.session_status(ws.slug, "primary")["state"],
+                "step-up-pending",
+            )
+            pending = credentials.load_pending_browser_step_up(
+                ws.slug, "primary"
+            )
+            self.assertEqual(pending["attempt"], 1)
+            self.assertEqual(pending["profile_revision"],
+                             credentials.auth_profile_revision(profile))
+
     def test_false_challenge_fields_and_negative_text_are_not_blockers(self):
         for observation in (
             '{"otp_required": false}',
@@ -2349,6 +2546,25 @@ class BrowserCredentialTests(unittest.TestCase):
                 self.assertEqual(_browser_auth_blocker(observation, (200,)), "")
         self.assertIn("MFA/OTP", _browser_auth_blocker('{"otp": true}', (200,)))
         self.assertIn("CAPTCHA", _browser_auth_blocker('{"captcha": true}', (200,)))
+
+    def test_private_browser_proxy_separates_credentials_from_server(self):
+        with patch.dict(os.environ, {
+            "GRYPTON_EGRESS_PROXY": (
+                "http://proxy-user:proxy-password@127.0.0.1:8097"
+            ),
+        }):
+            proxy = tools._private_browser_proxy()
+            safe_error = tools._browser_safe_error(RuntimeError(
+                "proxy-user proxy-password 127.0.0.1:8097"
+            ))
+        self.assertEqual(proxy["server"], "http://127.0.0.1:8097")
+        self.assertEqual(proxy["username"], "proxy-user")
+        self.assertEqual(proxy["password"], "proxy-password")
+        self.assertNotIn("proxy-user", proxy["server"])
+        self.assertNotIn("proxy-password", proxy["server"])
+        self.assertNotIn("proxy-user", safe_error)
+        self.assertNotIn("proxy-password", safe_error)
+        self.assertNotIn("127.0.0.1", safe_error)
 
     def test_failed_login_is_single_attempt_and_is_not_retried(self):
         with isolated_runtime(), spa_auth_server("failed") as port:
@@ -2431,6 +2647,8 @@ class BrowserCredentialTests(unittest.TestCase):
             )
         names = {item["name"] for item in response["result"]["tools"]}
         self.assertIn("credential_browser_login", names)
+        self.assertNotIn("credential_browser_step_up", names)
+        self.assertNotIn("credential_browser_begin_step_up", names)
 
 
 if __name__ == "__main__":

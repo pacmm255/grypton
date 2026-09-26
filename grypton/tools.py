@@ -43,6 +43,7 @@ _AUTH_EXPIRY_SKEW_S = 60
 # Worker turns routinely exceed five minutes.  Retain the private candidate long
 # enough for a later tool call/restart, then re-prove both sides at promotion.
 _PENDING_RENEWAL_MAX_AGE_S = 24 * 60 * 60
+_PENDING_STEP_UP_MAX_AGE_S = 15 * 60
 
 _SENSITIVE_HEADERS = frozenset({
     "authorization", "proxy-authorization", "cookie", "set-cookie",
@@ -980,6 +981,40 @@ def _endpoint_auth_observation(response: str, status_line: str) -> dict[str, obj
     }
 
 
+@contextmanager
+def _anonymous_subprocess_config(value: str):
+    """Expose short-lived tool configuration through anonymous memory only."""
+    try:
+        config_fd = os.memfd_create("grypton-private-config", os.MFD_CLOEXEC)
+    except (AttributeError, OSError) as exc:
+        raise OSError("anonymous tool configuration is unavailable") from exc
+    try:
+        payload = value.encode("utf-8")
+        offset = 0
+        while offset < len(payload):
+            written = os.write(config_fd, payload[offset:])
+            if written <= 0:
+                raise OSError("anonymous tool configuration write failed")
+            offset += written
+        os.lseek(config_fd, 0, os.SEEK_SET)
+        yield f"/proc/self/fd/{config_fd}", config_fd
+    finally:
+        os.close(config_fd)
+
+
+def _proxy_redaction_values(proxy: str) -> tuple[str, ...]:
+    """Return private proxy forms that transport diagnostics might echo."""
+    return _serialized_secret_variants(
+        config.private_egress_proxy_redaction_values(proxy)
+    )
+
+
+def _curl_proxy_config(proxy: str, *, tunnel: bool) -> str:
+    """Build curl config content without placing the private URL in argv."""
+    escaped = proxy.replace("\\", "\\\\").replace('"', '\\"')
+    return f'proxy = "{escaped}"\n' + ("proxytunnel\n" if tunnel else "")
+
+
 def _save_flow(workspace: Workspace, method: str, url: str, headers: Optional[dict],
                body: Optional[str], response: str, *, transport: str,
                returncode: int, stderr: str = "",
@@ -1042,13 +1077,15 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
                  timeout: int = 30, follow_redirects: bool = False,
                  insecure: bool = False, transport: str = "curl", proxy: str = "",
                  _response_body_already_decoded: bool = False,
+                 _private_egress_proxy: Optional[str] = None,
                  _secret_values: Iterable[str] = (),
                  _cookie_jar: Optional[Path] = None,
                  _bearer_token: str = "", _bearer_origin: str = "",
                  _session_identity: Optional[tuple[str, str, str]] = None,
                  _capture_headers: Optional[dict] = None,
                  _capture_body: Optional[str] = None,
-                 _response_observation: Optional[dict] = None) -> dict:
+                 _response_observation: Optional[dict] = None,
+                 _response_payload: Optional[dict] = None) -> dict:
     blocked = _scope_error(workspace, url)
     if blocked:
         return blocked
@@ -1064,6 +1101,15 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
     method = method.strip().upper() or "GET"
     if not re.fullmatch(r"[A-Z]{1,20}", method):
         return _err("Invalid HTTP method.")
+
+    private_proxy = str(_private_egress_proxy or "")
+    if _private_egress_proxy is None and not proxy:
+        try:
+            private_proxy = config.private_egress_proxy()
+        except ValueError as exc:
+            return _err(str(exc))
+    effective_proxy = proxy or private_proxy
+    proxy_secrets = _proxy_redaction_values(private_proxy)
 
     try:
         request_origin = credentials.normalize_origin(url)
@@ -1110,8 +1156,6 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
         argv += ["--request", method]
     if insecure:
         argv.append("--insecure")
-    if proxy:
-        argv += ["--proxy", proxy]
 
     private_tmp = config.RUNTIME_DIR / "http-tmp" / workspace.slug
     private_tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1148,8 +1192,6 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
         if body is not None:
             argv += ["--data-binary", "@-"]
             request_input = body.encode("utf-8")
-        argv += ["--", url]
-
         capture_path = private_tmp / f".curl-{time.time_ns()}.capture"
         fd = os.open(
             capture_path,
@@ -1157,10 +1199,27 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
             0o600,
         )
         with os.fdopen(fd, "wb") as capture:
-            result = subprocess.run(
-                argv, input=request_input, stdout=capture, stderr=subprocess.PIPE,
-                timeout=timeout + 5, env=_minimal_local_environment(), umask=0o077,
-            )
+            run_kwargs = {
+                "input": request_input,
+                "stdout": capture,
+                "stderr": subprocess.PIPE,
+                "timeout": timeout + 5,
+                "env": _minimal_local_environment(),
+                "umask": 0o077,
+            }
+            if effective_proxy:
+                tunnel = bool(private_proxy and urlsplit(private_proxy).scheme.lower()
+                              in {"http", "https"})
+                proxy_config = _curl_proxy_config(effective_proxy, tunnel=tunnel)
+                with _anonymous_subprocess_config(proxy_config) as (path, config_fd):
+                    result = subprocess.run(
+                        [*argv, "--config", path, "--", url],
+                        pass_fds=(config_fd,), **run_kwargs,
+                    )
+            else:
+                result = subprocess.run(
+                    [*argv, "--", url], **run_kwargs,
+                )
         response_header_bytes = response_header_path.stat().st_size
         # `curl --head` writes its headers to stdout as well as --dump-header.
         # Ignore that duplicate stream so one network response yields one block.
@@ -1177,7 +1236,10 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
     except subprocess.TimeoutExpired:
         return _err(f"HTTP request timed out after {timeout}s; it was not retried.")
     except OSError as exc:
-        return _err(f"HTTP transport failed before a response was captured: {exc}")
+        detail = redact_sensitive_text(exc, proxy_secrets)
+        return _err(
+            "HTTP transport failed before a response was captured: " + detail
+        )
     finally:
         if capture_path is not None:
             capture_path.unlink(missing_ok=True)
@@ -1217,6 +1279,7 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
         except credentials.CredentialError as exc:
             return _err(f"Refused unsafe bearer-token state: {exc}")
     secrets_to_hide = tuple(str(value) for value in _secret_values if str(value))
+    secrets_to_hide += proxy_secrets
     secrets_to_hide += tuple(extracted.values())
     if response_location:
         secrets_to_hide += _serialized_secret_variants(
@@ -1241,6 +1304,15 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
         if status_lines and status_lines[0].startswith("HTTP/")
         else "no HTTP status"
     )
+    if isinstance(_response_payload, dict):
+        # Internal consumers such as target-scoped research need the complete
+        # bounded body while retaining http_request's private proxy transport,
+        # TLS verification, flow redaction, and non-following redirect policy.
+        _response_payload.update({
+            "body": raw_response_body,
+            "location": response_location,
+            "status_line": status,
+        })
     data = {
         "status_line": status,
         "response": safe_output[:MAX_INLINE_RESPONSE_CHARS],
@@ -2176,6 +2248,15 @@ class Goja:
 
     @classmethod
     def start(cls, wait_s: float = 10.0) -> dict:
+        try:
+            private_proxy = config.private_egress_proxy()
+        except ValueError as exc:
+            return _err(str(exc))
+        if private_proxy:
+            return _err(
+                "Goja cannot start while private egress is configured; "
+                "goja_request uses the private curl fallback instead."
+            )
         with cls._lock():
             current = cls._inspect_unlocked()
             if current["running"]:
@@ -2301,6 +2382,32 @@ class Goja:
 
     @classmethod
     def request(cls, workspace: Workspace, url: str, **kwargs) -> dict:
+        blocked = _scope_error(workspace, url)
+        if blocked:
+            return blocked
+        try:
+            private_proxy = config.private_egress_proxy()
+        except ValueError as exc:
+            return _err(str(exc))
+        if private_proxy:
+            # Goja's raw tunnel modes can silently dial directly when given an
+            # HTTP(S) upstream, and its managed config is persistent. Use the
+            # anonymous curl route whenever private egress is required so no
+            # request can fall through to a direct Goja upstream.
+            result = http_request(
+                workspace, url,
+                transport="goja-private-egress-fallback",
+                _private_egress_proxy=private_proxy,
+                **kwargs,
+            )
+            result["summary"] = (
+                "Goja fingerprinting was unavailable with private egress; "
+                "used the private curl fallback. "
+                + str(result.get("summary") or "")
+            ).rstrip()
+            if isinstance(result.get("data"), dict):
+                result["data"]["goja_fingerprinting"] = False
+            return result
         started = cls.start()
         if not started["ok"]:
             return started
@@ -2550,20 +2657,47 @@ def httpx_probe(workspace: Workspace, targets: str) -> dict:
         if not allowed:
             return _err(f"Scope blocked {value}: {reason}.")
     try:
+        private_proxy = config.private_egress_proxy()
+    except ValueError as exc:
+        return _err(str(exc))
+    try:
         tool_home = config.RUNTIME_DIR / "httpx" / workspace.slug
         tool_home.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(tool_home, 0o700)
         env = _minimal_local_environment()
         env.update({"HOME": str(tool_home), "XDG_CONFIG_HOME": str(tool_home)})
-        result = subprocess.run(
-            [binary, "-silent", "-status-code", "-title", "-tech-detect", "-no-color"],
-            input=("\n".join(values) + "\n").encode(), capture_output=True,
-            timeout=180, env=env, umask=0o077,
+        argv = [
+            binary, "-silent", "-status-code", "-title", "-tech-detect",
+            "-no-color",
+        ]
+        run_kwargs = {
+            "input": ("\n".join(values) + "\n").encode(),
+            "capture_output": True,
+            "timeout": 180,
+            "env": env,
+            "umask": 0o077,
+        }
+        if private_proxy:
+            # ProjectDiscovery httpx accepts its proxy through the standard
+            # config key. An inherited pipe keeps the private URL out of argv,
+            # the provider environment, and persistent configuration files.
+            proxy_config = "proxy: " + json.dumps(private_proxy) + "\n"
+            with _anonymous_subprocess_config(proxy_config) as (path, config_fd):
+                result = subprocess.run(
+                    [*argv, "-config", path], pass_fds=(config_fd,), **run_kwargs,
+                )
+        else:
+            result = subprocess.run(argv, **run_kwargs)
+    except (OSError, subprocess.SubprocessError) as exc:
+        detail = redact_sensitive_text(
+            str(exc), _proxy_redaction_values(private_proxy)
         )
-    except subprocess.SubprocessError as exc:
-        return _err(f"httpx failed: {exc}")
+        return _err(f"httpx failed: {detail}")
+    output = result.stdout.decode("utf-8", "replace")[:200_000]
+    if private_proxy:
+        output = redact_sensitive_text(output, _proxy_redaction_values(private_proxy))
     return _ok(f"httpx completed for {len(values)} scoped target(s).",
-               {"output": result.stdout.decode("utf-8", "replace")[:200_000]})
+               {"output": output})
 
 
 _BROWSER_ACCOUNT = "grypton-browser"
@@ -2579,7 +2713,6 @@ def _browser_executable() -> str:
     shell wrapper that points into root's Playwright cache and adds sandbox-
     disabling flags.  The dedicated browser identity cannot use that private
     cache.  The packaged ``chrome.real`` keeps Chrome's normal setuid sandbox
-    and its adjacent resources.
     """
     candidates = (
         Path("/opt/google/chrome/chrome.real"),
@@ -2588,6 +2721,48 @@ def _browser_executable() -> str:
         Path(config.find_binary("chromium") or ""),
     )
     return next((str(path) for path in candidates if path.is_file()), "")
+
+
+def _private_browser_proxy() -> dict[str, str] | None:
+    """Read an operator-only Chromium proxy without exposing it in tool data."""
+    raw = str(config.private_egress_proxy() or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = urlsplit(raw)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("private browser proxy setting is invalid") from exc
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname or parsed.query or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise ValueError("private browser proxy setting is invalid")
+    host = parsed.hostname
+    rendered_host = f"[{host}]" if ":" in host else host
+    server = f"{parsed.scheme.lower()}://{rendered_host}"
+    if port is not None:
+        server += f":{port}"
+    proxy = {"server": server}
+    if parsed.username is not None:
+        proxy["username"] = unquote(parsed.username)
+    if parsed.password is not None:
+        proxy["password"] = unquote(parsed.password)
+    return proxy
+
+
+def _browser_safe_error(exc: BaseException,
+                        secret_values: Iterable[str] = ()) -> str:
+    """Render a browser failure without reflecting the private proxy route."""
+    try:
+        raw_proxy = config.private_egress_proxy()
+    except ValueError:
+        return "private browser transport configuration is invalid"
+    proxy_values = _proxy_redaction_values(raw_proxy) if raw_proxy else ()
+    return redact_sensitive_text(
+        str(exc), (*tuple(secret_values), *proxy_values)
+    )
 
 
 @contextmanager
@@ -2699,22 +2874,32 @@ def _launch_scoped_browser_context(playwright, launch_profile: dict,
     launch_options = {}
     if launch_timeout_ms is not None:
         launch_options["timeout"] = max(1, int(launch_timeout_ms))
-    context = playwright.chromium.launch_persistent_context(
-        user_data_dir=launch_profile["profile"],
-        headless=True,
-        executable_path=launch_profile["executable"],
-        ignore_default_args=["--enable-unsafe-swiftshader"],
-        env=launch_profile["environment"],
-        chromium_sandbox=True,
-        ignore_https_errors=True,
-        service_workers="block",
-        args=["--disable-gpu", "--disable-software-rasterizer",
-              "--disable-gpu-compositing", "--disable-dev-shm-usage",
-              "--disable-background-networking", "--disable-webrtc-multiple-routes",
-              "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-              "--disable-features=WebTransport"],
-        **launch_options,
-    )
+    private_proxy = _private_browser_proxy()
+    if private_proxy:
+        launch_options["proxy"] = private_proxy
+    try:
+        context = playwright.chromium.launch_persistent_context(
+            user_data_dir=launch_profile["profile"],
+            headless=True,
+            executable_path=launch_profile["executable"],
+            ignore_default_args=["--enable-unsafe-swiftshader"],
+            env=launch_profile["environment"],
+            chromium_sandbox=True,
+            ignore_https_errors=True,
+            service_workers="block",
+            args=["--disable-gpu", "--disable-software-rasterizer",
+                  "--disable-gpu-compositing", "--disable-dev-shm-usage",
+                  "--disable-background-networking", "--disable-webrtc-multiple-routes",
+                  "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                  "--disable-features=WebTransport"],
+            **launch_options,
+        )
+    except Exception as exc:
+        if private_proxy:
+            raise RuntimeError(
+                "browser launch through the private egress route failed"
+            ) from None
+        raise
     if hasattr(context, "route_web_socket"):
         # Browser WebSockets do not carry an HTTP path that Grypton's request
         # capture can audit, so keep them closed in scoped mode.
@@ -2854,7 +3039,7 @@ def browse(workspace: Workspace, url: str, *, timeout: int = 45) -> dict:
                 context.close()
             except Exception:
                 pass
-        return _err(f"Headless browser failed: {exc}",
+        return _err(f"Headless browser failed: {_browser_safe_error(exc)}",
                     {"blocked_requests": denied_requests, "console": console})
     output.write_bytes(html)
     rendered = f"HTTP {status}\nFinal-URL: {final_url}\n\n" + html.decode("utf-8", "replace")
@@ -3047,6 +3232,61 @@ def _browser_auth_wait_for_submit(page, locator, timeout_ms: int) -> None:
         page.wait_for_timeout(min(100, remaining_ms))
 
 
+def _browser_auth_discover_step_up_controls(page) -> dict[str, object]:
+    """Find conservative OTP and action selectors in the rendered challenge."""
+    otp_candidates = (
+        "input[autocomplete='one-time-code']",
+        "input.otp__digit",
+        "input#otp",
+        "input[name*='otp' i]",
+        "input[id*='otp' i]",
+        "input[data-testid*='otp' i]",
+        "input[name*='verification' i]",
+        "input[id*='verification' i]",
+        "input[name*='code' i]",
+        "input[id*='code' i]",
+        "input[inputmode='numeric'][maxlength='1']",
+    )
+    action_candidates = (
+        "button[type='submit']",
+        "form button:not([type])",
+        "input[type='submit']",
+        "button[data-testid*='otp' i]",
+        "button[data-testid*='verify' i]",
+        "[role='button'][data-testid*='verify' i]",
+        "button[id*='verify' i]",
+        "button[id*='password-submit' i]",
+        "button[id*='login' i]",
+    )
+
+    def visible_count(selector: str) -> int:
+        try:
+            locator = page.locator(selector)
+            return sum(
+                1 for index in range(min(int(locator.count()), 12))
+                if locator.nth(index).is_visible()
+            )
+        except Exception:
+            return 0
+
+    otp_selector = ""
+    otp_fields = 0
+    for candidate in otp_candidates:
+        count = visible_count(candidate)
+        if count:
+            otp_selector, otp_fields = candidate, count
+            break
+    submit_selector = next(
+        (candidate for candidate in action_candidates if visible_count(candidate)),
+        "",
+    )
+    return {
+        "otp_selector": otp_selector,
+        "otp_fields": otp_fields,
+        "submit_selector": submit_selector,
+    }
+
+
 def _browser_auth_collect_responses(responses: list[dict],
                                     workspace: Workspace,
                                     secret_values: Iterable[str]):
@@ -3101,7 +3341,7 @@ def _browser_auth_collect_responses(responses: list[dict],
         except Exception as exc:
             rows.append({
                 "phase": str(observed.get("phase") or "login"),
-                "error": redact_sensitive_text(str(exc), secrets)[:1000],
+                "error": _browser_safe_error(exc, secrets)[:1000],
             })
     return rows, raw_bodies, statuses
 
@@ -4629,7 +4869,9 @@ def credential_browser_login(
                 workspace.slug, credential
             )
             profile_revision = (
-                credentials.auth_profile_revision(profile) if profile else ""
+                credentials.auth_profile_revision(profile)
+                if isinstance(profile, dict)
+                and profile.get("strategy") == "browser" else ""
             )
             with credentials.session_material_lock(workspace.slug, credential):
                 return _credential_browser_login_locked(
@@ -4801,6 +5043,11 @@ def _credential_browser_login_locked(
     retryable_proof_stage = ""
     pending_renewal_saved = False
     pending_renewal_reason = ""
+    pending_step_up_saved = False
+    pending_step_up_failure = ""
+    step_up_controls: dict[str, object] = {
+        "otp_selector": "", "otp_fields": 0, "submit_selector": "",
+    }
     refresh_reservation_released = False
     cookies: list[dict] = []
     observed_cookie_sets: list[list[dict]] = []
@@ -5087,6 +5334,8 @@ def _credential_browser_login_locked(
                     blocker = _browser_auth_blocker(
                         "\n".join(raw_response_bodies), response_statuses
                     ) or _browser_auth_blocker(visible_text)
+                    if blocker.startswith("MFA/OTP"):
+                        step_up_controls = _browser_auth_discover_step_up_controls(page)
                     cookies = _browser_auth_persistable_cookies(
                         list(context.cookies()), url
                     )
@@ -5397,7 +5646,10 @@ def _credential_browser_login_locked(
             if phase["name"] == "verify":
                 retain_current_browser_material()
         else:
-            failure = failure or f"Headless browser authentication failed: {exc}"
+            failure = failure or (
+                "Headless browser authentication failed: "
+                + _browser_safe_error(exc, secret_values)
+            )
     finally:
         if context is not None:
             try:
@@ -5527,6 +5779,36 @@ def _credential_browser_login_locked(
             credentials.record_login_outcome(
                 workspace.slug, credential, blocked_reason=blocker
             )
+            if blocker.startswith("MFA/OTP"):
+                if not _profile_revision:
+                    pending_step_up_failure = (
+                        "a saved browser authentication profile is required for "
+                        "human MFA continuation"
+                    )
+                elif (
+                    not failure
+                    and credential_submission_state["seen"] == 1
+                    and credential_submission_state["blocked"] == 0
+                    and matched_submission_count == 1
+                ):
+                    try:
+                        credentials.save_pending_browser_step_up(
+                            workspace.slug, credential, attempt=attempt,
+                            origin=login_origin, challenge_url=final_url,
+                            profile_revision=_profile_revision, cookies=cookies,
+                            local_storage=local_storage,
+                            session_storage=session_storage, tokens=tokens,
+                            otp_selector=str(
+                                step_up_controls.get("otp_selector") or ""
+                            ),
+                            otp_fields=int(step_up_controls.get("otp_fields") or 0),
+                            submit_selector=str(
+                                step_up_controls.get("submit_selector") or ""
+                            ),
+                        )
+                        pending_step_up_saved = True
+                    except credentials.CredentialError as exc:
+                        pending_step_up_failure = str(exc)
         elif _upgrade_generation is not None:
             credentials.record_browser_state_upgrade_outcome(
                 workspace.slug, credential,
@@ -5773,6 +6055,22 @@ def _credential_browser_login_locked(
         "login_session_material": login_material_delta,
         "login_api_responses": response_rows,
         "auth_blocker": blocker,
+        "step_up": {
+            "pending": pending_step_up_saved,
+            "otp_control_discovered": bool(
+                step_up_controls.get("otp_selector")
+            ),
+            "otp_fields": int(step_up_controls.get("otp_fields") or 0),
+            "action_control_discovered": bool(
+                step_up_controls.get("submit_selector")
+            ),
+            "continuation": (
+                f"grypton auth continue-browser {workspace.slug} "
+                f"--name {credential}"
+                if pending_step_up_saved else ""
+            ),
+            "unavailable_reason": pending_step_up_failure,
+        },
         "flow": str(flow),
         "html_path": str(html_path),
         "blocked_requests": safe_denied,
@@ -5811,8 +6109,13 @@ def _credential_browser_login_locked(
             f"after attempt {attempt}" if attempt
             else "before credential submission"
         )
+        continuation = (
+            " A private human continuation is ready."
+            if pending_step_up_saved else ""
+        )
         return _err(
-            f"Browser authentication stopped {position}: {blocker}.",
+            f"Browser authentication stopped {position}: {blocker}."
+            + continuation,
             data,
         )
     if pending_renewal_saved:
@@ -5893,6 +6196,863 @@ def _credential_browser_login_locked(
     return _err(
         f"Browser login attempt {attempt} remains unverified because {reason}. "
         f"Capture saved to {flow.name}.",
+        data,
+    )
+
+
+def _browser_step_up_input(page, selector: str, code: str, timeout_ms: int,
+                           *, fill: bool = True):
+    locator = page.locator(selector)
+    visible = [
+        locator.nth(index) for index in range(min(int(locator.count()), 12))
+        if locator.nth(index).is_visible()
+    ]
+    if not visible:
+        raise ValueError("OTP selector did not resolve to a visible input")
+    if len(visible) == 1:
+        control = visible[0]
+        details = control.evaluate(
+            "el => ({tag: el.tagName.toLowerCase(), type: "
+            "(el.getAttribute('type') || '').toLowerCase(), disabled: !!el.disabled})"
+        )
+        if (
+            str((details or {}).get("tag") or "") != "input"
+            or str((details or {}).get("type") or "") not in {
+                "", "text", "tel", "number", "password",
+            }
+            or bool((details or {}).get("disabled"))
+        ):
+            raise ValueError("OTP selector did not resolve to a compatible input")
+        if fill:
+            control.fill(code, timeout=timeout_ms)
+        return control, 1
+    if len(visible) != len(code):
+        raise ValueError(
+            "OTP selector resolved to multiple inputs whose count does not match the code"
+        )
+    if fill:
+        for control, character in zip(visible, code):
+            control.fill(character, timeout=timeout_ms)
+    return visible[-1], len(visible)
+
+
+def credential_browser_begin_step_up(
+    workspace: Workspace,
+    *,
+    credential: str,
+    timeout: int = 45,
+) -> dict:
+    """Send one saved-profile identifier request and retain its MFA page privately."""
+    try:
+        with credentials.auth_profile_lock(workspace.slug, credential):
+            profile = credentials.load_auth_profile_optional(
+                workspace.slug, credential
+            )
+            if not isinstance(profile, dict) or profile.get("strategy") != "browser":
+                return _err(
+                    "Starting a browser MFA challenge requires a saved browser authentication profile."
+                )
+            revision = credentials.auth_profile_revision(profile)
+            with credentials.session_material_lock(workspace.slug, credential):
+                credentials.ensure_login_attempt_available(
+                    workspace.slug, credential
+                )
+                return _credential_browser_begin_step_up_locked(
+                    workspace, credential=credential, profile=profile,
+                    profile_revision=revision, timeout=timeout,
+                )
+    except (ValueError, credentials.CredentialError) as exc:
+        return _err(str(exc))
+
+
+def _credential_browser_begin_step_up_locked(
+    workspace: Workspace, *, credential: str, profile: dict,
+    profile_revision: str, timeout: int,
+) -> dict:
+    login_url = str(profile["login_url"])
+    blocked = _scope_error(workspace, login_url)
+    if blocked:
+        return blocked
+    try:
+        origin = credentials.normalize_origin(login_url)
+        secret = credentials.load_credential(workspace.slug, credential)
+        username = credentials.normalize_login_username(
+            secret["username"], profile["username_transform"]
+        )
+        username_selector = _browser_auth_selector(
+            profile["browser"].get("username_selector"),
+            label="Username", default=_BROWSER_USERNAME_SELECTOR,
+        )
+        submit_selector = _browser_auth_selector(
+            profile["browser"].get("submit_selector"),
+            label="Submit", default=_BROWSER_SUBMIT_SELECTOR,
+        )
+    except (ValueError, credentials.CredentialError) as exc:
+        return _err(str(exc))
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return _err("Python Playwright is not installed.")
+    executable = _browser_executable()
+    if not executable:
+        return _err("No Playwright-compatible Chromium or Chrome executable is installed.")
+
+    timeout_seconds = max(5, min(int(timeout), 120))
+    timeout_ms = timeout_seconds * 1000
+    username_secrets = _serialized_secret_variants(
+        _login_username_redaction_values(
+            secret["username"], profile["username_transform"]
+        )
+    )
+    denied_requests: list[str] = []
+    pending_responses: list[dict] = []
+    cookies: list[dict] = []
+    local_storage: dict = {}
+    session_storage: dict = {}
+    tokens: dict[str, str] = {}
+    controls: dict[str, object] = {
+        "otp_selector": "", "otp_fields": 0, "submit_selector": "",
+    }
+    final_url = login_url
+    attempt = 0
+    failure = ""
+    blocker = ""
+    context = None
+    submission_state = {
+        "active": False,
+        "username_values": username_secrets,
+        "password_values": username_secrets,
+        "seen": 0,
+        "blocked": 0,
+    }
+    try:
+        with _isolated_browser_profile(executable) as launch_profile:
+            with sync_playwright() as playwright:
+                context = _launch_scoped_browser_context(
+                    playwright, launch_profile, workspace, denied_requests,
+                    credential_submission_state=submission_state,
+                    exact_origin=origin,
+                )
+                page = context.new_page()
+                page.goto(login_url, wait_until="commit", timeout=timeout_ms)
+                page.wait_for_timeout(250)
+                username_control = _browser_auth_locator(
+                    page, username_selector, role="username", timeout_ms=timeout_ms
+                )
+                submit_control = _browser_auth_locator(
+                    page, submit_selector, role="submit", timeout_ms=timeout_ms
+                )
+                capture_session, pending_responses = (
+                    _browser_auth_enable_response_capture(
+                        context, page, workspace, denied_requests,
+                        username_secrets, username_secrets,
+                    )
+                )
+                try:
+                    attempt = credentials.begin_login_attempt(
+                        workspace.slug, credential
+                    )
+                    submission_state["active"] = True
+                    username_control.fill(username, timeout=timeout_ms)
+                    page.wait_for_timeout(100)
+                    if not submission_state["seen"]:
+                        _browser_auth_wait_for_submit(
+                            page, submit_control, timeout_ms
+                        )
+                        submit_control.click(timeout=timeout_ms)
+                    deadline = time.monotonic() + timeout_seconds
+                    while time.monotonic() < deadline:
+                        controls = _browser_auth_discover_step_up_controls(page)
+                        if submission_state["seen"] and controls["otp_selector"]:
+                            page.wait_for_timeout(250)
+                            break
+                        page.wait_for_timeout(100)
+                finally:
+                    submission_state["active"] = False
+                    try:
+                        capture_session.send("Fetch.disable")
+                    except Exception:
+                        pass
+                final_url, _, visible = _browser_auth_snapshot(page)
+                if credentials.normalize_origin(final_url) != origin:
+                    raise RuntimeError("MFA challenge ended outside the login origin")
+                _, raw_bodies, statuses = _browser_auth_collect_responses(
+                    pending_responses, workspace, username_secrets
+                )
+                blocker = _browser_auth_blocker(
+                    "\n".join(raw_bodies), statuses
+                ) or _browser_auth_blocker(visible)
+                controls = _browser_auth_discover_step_up_controls(page)
+                if controls["otp_selector"] and not blocker:
+                    blocker = "MFA/OTP challenge was presented"
+                cookies = _browser_auth_persistable_cookies(
+                    list(context.cookies()), login_url
+                )
+                local_storage = _browser_auth_local_storage(page)
+                session_storage = _browser_auth_session_storage(page)
+                tokens = _browser_auth_tokens(
+                    raw_bodies, local_storage, session_storage
+                )
+                if int(submission_state["seen"] or 0) != 1:
+                    failure = "Exactly one identifier submission request was not observed."
+                elif submission_state["blocked"]:
+                    failure = "A duplicate identifier submission was blocked."
+                elif not blocker.startswith("MFA/OTP"):
+                    failure = blocker or "The rendered page did not present an MFA challenge."
+                context.close()
+                context = None
+    except Exception as exc:
+        failure = failure or (
+            "Browser MFA challenge start failed: "
+            + _browser_safe_error(exc, username_secrets)
+        )
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+    pending_saved = False
+    if attempt and not failure and blocker.startswith("MFA/OTP"):
+        try:
+            credentials.record_login_outcome(
+                workspace.slug, credential, blocked_reason=blocker
+            )
+            credentials.save_pending_browser_step_up(
+                workspace.slug, credential, attempt=attempt, origin=origin,
+                challenge_url=final_url, profile_revision=profile_revision,
+                cookies=cookies, local_storage=local_storage,
+                session_storage=session_storage, tokens=tokens,
+                otp_selector=str(controls.get("otp_selector") or ""),
+                otp_fields=int(controls.get("otp_fields") or 0),
+                submit_selector=str(controls.get("submit_selector") or ""),
+            )
+            pending_saved = True
+        except credentials.CredentialError as exc:
+            failure = str(exc)
+    elif attempt and blocker:
+        credentials.record_login_outcome(
+            workspace.slug, credential, blocked_reason=blocker
+        )
+    elif attempt:
+        credentials.record_login_outcome(workspace.slug, credential)
+
+    data = {
+        "credential": credential,
+        "attempt": attempt,
+        "identifier_submission_requests": int(submission_state["seen"] or 0),
+        "blocked_duplicate_submissions": int(submission_state["blocked"] or 0),
+        "otp_control_discovered": bool(controls.get("otp_selector")),
+        "otp_fields": int(controls.get("otp_fields") or 0),
+        "action_control_discovered": bool(controls.get("submit_selector")),
+        "session": credentials.session_status(workspace.slug, credential),
+    }
+    if pending_saved:
+        return _ok(
+            "The browser sent one identifier request and retained the MFA challenge privately; enter the human code with auth continue-browser.",
+            data,
+        )
+    return _err(failure or "The MFA challenge was not retained.", data)
+
+
+def credential_browser_step_up(
+    workspace: Workspace,
+    *,
+    credential: str,
+    otp: str,
+    otp_selector: str = "",
+    submit_selector: str = "",
+    password_submit_selector: str = "",
+    timeout: int = 45,
+) -> dict:
+    """Privately continue one saved browser login challenge with a human OTP."""
+    code = str(otp or "")
+    code_secrets = _serialized_secret_variants((code,))
+    try:
+        if (
+            not code or len(code) > 128
+            or any(ord(char) < 0x20 or ord(char) == 0x7f for char in code)
+        ):
+            return _err("The one-time code must be 1-128 printable characters.")
+        override_otp = (
+            _browser_auth_selector(otp_selector, label="OTP", default="")
+            if str(otp_selector or "").strip() else ""
+        )
+        override_submit = (
+            _browser_auth_selector(submit_selector, label="OTP action", default="")
+            if str(submit_selector or "").strip() else ""
+        )
+        override_password_submit = (
+            _browser_auth_selector(
+                password_submit_selector, label="Password action", default=""
+            )
+            if str(password_submit_selector or "").strip() else ""
+        )
+        with credentials.auth_profile_lock(workspace.slug, credential):
+            profile = credentials.load_auth_profile_optional(
+                workspace.slug, credential
+            )
+            if not isinstance(profile, dict) or profile.get("strategy") != "browser":
+                return _err(
+                    "Human MFA continuation requires the saved browser authentication profile."
+                )
+            secret = credentials.load_credential(workspace.slug, credential)
+            password = secret["password"]
+            password_secrets = _serialized_secret_variants((password,))
+            revision = credentials.auth_profile_revision(profile)
+            with credentials.session_material_lock(workspace.slug, credential):
+                pending = credentials.load_pending_browser_step_up(
+                    workspace.slug, credential
+                )
+                if not pending.get("available"):
+                    return _err("No unused browser MFA continuation is available.")
+                if pending.get("profile_revision") != revision:
+                    credentials.clear_pending_browser_step_up(
+                        workspace.slug, credential
+                    )
+                    return _err(
+                        "The browser authentication profile changed after the MFA challenge."
+                    )
+                if time.time() - float(pending.get("created_at") or 0) > (
+                    _PENDING_STEP_UP_MAX_AGE_S
+                ):
+                    credentials.clear_pending_browser_step_up(
+                        workspace.slug, credential
+                    )
+                    return _err("The pending browser MFA continuation expired.")
+                challenge_url = str(pending.get("challenge_url") or "")
+                verify_url = str(profile.get("verify_url") or "")
+                login_url = str(profile.get("login_url") or "")
+                for candidate in (challenge_url, verify_url, login_url):
+                    blocked = _scope_error(workspace, candidate)
+                    if blocked:
+                        return blocked
+                origin = str(pending.get("origin") or "")
+                if any(
+                    credentials.normalize_origin(candidate) != origin
+                    for candidate in (challenge_url, verify_url, login_url)
+                ):
+                    return _err(
+                        "The pending MFA continuation no longer matches the profile origin."
+                    )
+                selected_otp = override_otp or str(
+                    pending.get("otp_selector") or ""
+                )
+                if not selected_otp:
+                    return _err(
+                        "No OTP control was discovered; supply --otp-selector to the private CLI."
+                    )
+                selected_submit = override_submit or str(
+                    pending.get("submit_selector") or ""
+                )
+                return _credential_browser_step_up_locked(
+                    workspace, credential=credential, code=code,
+                    code_secrets=code_secrets, password=password,
+                    password_secrets=password_secrets, pending=pending, profile=profile,
+                    profile_revision=revision, otp_selector=selected_otp,
+                    submit_selector=selected_submit,
+                    password_submit_selector=override_password_submit,
+                    timeout=timeout,
+                )
+    except (ValueError, credentials.CredentialError) as exc:
+        return _err(redact_sensitive_text(str(exc), code_secrets))
+
+
+def _credential_browser_step_up_locked(
+    workspace: Workspace,
+    *,
+    credential: str,
+    code: str,
+    code_secrets: tuple[str, ...],
+    password: str,
+    password_secrets: tuple[str, ...],
+    pending: dict,
+    profile: dict,
+    profile_revision: str,
+    otp_selector: str,
+    submit_selector: str,
+    password_submit_selector: str,
+    timeout: int,
+) -> dict:
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return _err("Python Playwright is not installed.")
+    executable = _browser_executable()
+    if not executable:
+        return _err("No Playwright-compatible Chromium or Chrome executable is installed.")
+
+    timeout_seconds = max(5, min(int(timeout), 120))
+    timeout_ms = timeout_seconds * 1000
+    origin = str(pending["origin"])
+    challenge_url = str(pending["challenge_url"])
+    login_url = str(profile["login_url"])
+    verify_url = str(profile["verify_url"])
+    browser = profile["browser"]
+    verify_headers = _browser_auth_verify_headers(browser.get("verify_headers"))
+    verification = browser.get("verification")
+    success_marker = str(profile.get("success_marker") or "")
+    denied_requests: list[str] = []
+    pending_responses: list[dict] = []
+    console: list[dict] = []
+    post_submit_url = ""
+    verify_status = replay_status = control_status = 0
+    verify_source = replay_source = control_source = ""
+    verify_response_url = verify_final_url = verify_method = ""
+    replay_response_url = replay_final_url = replay_method = ""
+    control_response_url = control_final_url = control_method = ""
+    verify_chain: list[dict] = []
+    replay_chain: list[dict] = []
+    control_chain: list[dict] = []
+    cookies: list[dict] = []
+    local_storage: dict = {}
+    session_storage: dict = {}
+    tokens: dict[str, str] = {}
+    failure = ""
+    submitted = 0
+    password_submitted = 0
+    blocked_duplicates = 0
+    password_blocked_duplicates = 0
+    password_stage = False
+    continuation_reserved = False
+    fields_used = 0
+    context = None
+    submission_state = {
+        "active": False,
+        "username_values": code_secrets,
+        "password_values": code_secrets,
+        "seen": 0,
+        "blocked": 0,
+    }
+    verify_header_state = {
+        "active": False, "origin": origin, "headers": verify_headers,
+    }
+    runtime_secrets = tuple(sorted(
+        {*code_secrets, *password_secrets}, key=len, reverse=True
+    ))
+
+    try:
+        with _isolated_browser_profile(executable) as launch_profile:
+            with sync_playwright() as playwright:
+                context = _launch_scoped_browser_context(
+                    playwright, launch_profile, workspace, denied_requests,
+                    bound_header_state=verify_header_state,
+                    credential_submission_state=submission_state,
+                    exact_origin=origin,
+                )
+                if pending.get("cookies"):
+                    context.add_cookies(list(pending["cookies"]))
+                _browser_auth_restore_storage(context, challenge_url, pending)
+                page = context.new_page()
+                page.on("console", lambda message: console.append({
+                    "type": str(message.type), "text": str(message.text)[:4000],
+                }) if len(console) < 100 else None)
+                page.goto(challenge_url, wait_until="commit", timeout=timeout_ms)
+                page.wait_for_timeout(250)
+                current_url, _, _ = _browser_auth_snapshot(page)
+                allowed, reason = check_url_scope(workspace, current_url)
+                if not allowed or credentials.normalize_origin(current_url) != origin:
+                    raise RuntimeError(
+                        "restored MFA page ended outside its exact origin"
+                        + (f": {reason}" if reason else "")
+                    )
+                input_control, fields_used = _browser_step_up_input(
+                    page, otp_selector, code, timeout_ms, fill=False
+                )
+                action = None
+                if submit_selector:
+                    action = _browser_auth_locator(
+                        page, submit_selector, role="submit", timeout_ms=timeout_ms
+                    )
+
+                # The reservation is persisted only after the restored page and
+                # controls are known to be usable, immediately before the OTP can
+                # leave this process. A crash after this point must not replay it.
+                credentials.reserve_pending_browser_step_up(
+                    workspace.slug, credential
+                )
+                continuation_reserved = True
+                capture_session, pending_responses = (
+                    _browser_auth_enable_response_capture(
+                        context, page, workspace, denied_requests,
+                        code_secrets, code_secrets,
+                    )
+                )
+                try:
+                    submission_state["active"] = True
+                    # Re-fill after reservation so an input handler cannot send
+                    # the code before the durable one-shot boundary exists.
+                    input_control, fields_used = _browser_step_up_input(
+                        page, otp_selector, code, timeout_ms
+                    )
+                    page.wait_for_timeout(100)
+                    if not submission_state["seen"]:
+                        if action is not None:
+                            _browser_auth_wait_for_submit(
+                                page, action, timeout_ms
+                            )
+                            action.click(timeout=timeout_ms)
+                        else:
+                            input_control.press("Enter", timeout=timeout_ms)
+                    deadline = time.monotonic() + timeout_seconds
+                    while time.monotonic() < deadline:
+                        if submission_state["seen"]:
+                            page.wait_for_timeout(500)
+                            break
+                        page.wait_for_timeout(100)
+                finally:
+                    submission_state["active"] = False
+                    try:
+                        capture_session.send("Fetch.disable")
+                    except Exception:
+                        pass
+                submitted = int(submission_state["seen"] or 0)
+                blocked_duplicates = int(submission_state["blocked"] or 0)
+                if submitted != 1 or blocked_duplicates:
+                    failure = "Exactly one OTP submission request was not observed."
+                _, raw_bodies, response_statuses = _browser_auth_collect_responses(
+                    pending_responses, workspace, runtime_secrets
+                )
+                otp_observation = "\n".join(raw_bodies)
+                if re.search(
+                    r"(?i)\b(?:invalid|incorrect|wrong|expired|rejected)\b.{0,40}"
+                    r"\b(?:otp|code|token)\b|\b(?:otp|code|token)\b.{0,40}"
+                    r"\b(?:invalid|incorrect|wrong|expired|rejected)\b",
+                    otp_observation,
+                ):
+                    failure = "The supplied MFA code was rejected or expired."
+
+                # Some staged logins exchange the OTP for a short-lived token,
+                # then reveal the saved-password form in the same browser
+                # session. Submit that form once as part of the original login
+                # attempt; OTP-only sites simply skip this stage.
+                password_selector = _browser_auth_selector(
+                    browser.get("password_selector"), label="Password",
+                    default=_BROWSER_PASSWORD_SELECTOR,
+                )
+                password_control = page.locator(password_selector).first
+                password_deadline = time.monotonic() + min(5, timeout_seconds)
+                while not failure and time.monotonic() < password_deadline:
+                    try:
+                        if password_control.is_visible():
+                            password_stage = True
+                            break
+                    except Exception:
+                        pass
+                    expected = (
+                        str(verification.get("expected_post_login_url") or "")
+                        if isinstance(verification, dict) else ""
+                    )
+                    if expected and _browser_auth_url_matches(str(page.url or ""), expected):
+                        break
+                    page.wait_for_timeout(100)
+                if not failure and password_stage:
+                    password_control = _browser_auth_locator(
+                        page, password_selector, role="password", timeout_ms=timeout_ms
+                    )
+                    discovered_action = _browser_auth_discover_step_up_controls(page)
+                    password_action_selector = (
+                        password_submit_selector
+                        or str(discovered_action.get("submit_selector") or "")
+                    )
+                    password_action = None
+                    if password_action_selector:
+                        password_action = _browser_auth_locator(
+                            page, password_action_selector, role="submit",
+                            timeout_ms=timeout_ms,
+                        )
+                    submission_state.update({
+                        "active": False,
+                        "username_values": password_secrets,
+                        "password_values": password_secrets,
+                        "seen": 0,
+                        "blocked": 0,
+                    })
+                    password_capture, password_responses = (
+                        _browser_auth_enable_response_capture(
+                            context, page, workspace, denied_requests,
+                            password_secrets, password_secrets,
+                        )
+                    )
+                    try:
+                        submission_state["active"] = True
+                        password_control.fill(password, timeout=timeout_ms)
+                        page.wait_for_timeout(100)
+                        if not submission_state["seen"]:
+                            if password_action is not None:
+                                _browser_auth_wait_for_submit(
+                                    page, password_action, timeout_ms
+                                )
+                                password_action.click(timeout=timeout_ms)
+                            else:
+                                password_control.press("Enter", timeout=timeout_ms)
+                        deadline = time.monotonic() + timeout_seconds
+                        while time.monotonic() < deadline:
+                            if submission_state["seen"]:
+                                page.wait_for_timeout(500)
+                                break
+                            page.wait_for_timeout(100)
+                    finally:
+                        submission_state["active"] = False
+                        try:
+                            password_capture.send("Fetch.disable")
+                        except Exception:
+                            pass
+                    password_submitted = int(submission_state["seen"] or 0)
+                    password_blocked_duplicates = int(
+                        submission_state["blocked"] or 0
+                    )
+                    if password_submitted != 1 or password_blocked_duplicates:
+                        failure = (
+                            "Exactly one password submission request was not observed."
+                        )
+                    _, password_bodies, password_statuses = (
+                        _browser_auth_collect_responses(
+                            password_responses, workspace, runtime_secrets
+                        )
+                    )
+                    raw_bodies.extend(password_bodies)
+                    response_statuses.extend(password_statuses)
+
+                post_submit_url, _, visible = _browser_auth_snapshot(page)
+                allowed, reason = check_url_scope(workspace, post_submit_url)
+                if not allowed or credentials.normalize_origin(post_submit_url) != origin:
+                    raise RuntimeError(
+                        "MFA continuation ended outside its exact origin"
+                        + (f": {reason}" if reason else "")
+                    )
+                blocker = _browser_auth_blocker(
+                    "\n".join(raw_bodies), response_statuses
+                ) or _browser_auth_blocker(visible)
+                if blocker:
+                    failure = (
+                        "The MFA challenge remained active or authentication was rejected."
+                    )
+
+                if not failure:
+                    verify_header_state["active"] = True
+                    verify_response = page.goto(
+                        verify_url, wait_until="commit", timeout=timeout_ms
+                    )
+                    page.wait_for_timeout(250)
+                    verify_status = int(verify_response.status) if verify_response else 0
+                    verify_response_url = str(verify_response.url or "") if verify_response else ""
+                    verify_final_url, verify_dom, verify_visible = _browser_auth_snapshot(page)
+                    verify_method = _browser_auth_response_method(verify_response)
+                    verify_chain = _browser_auth_redirect_chain(verify_response)
+                    try:
+                        verify_body = bytes(verify_response.body() or b"").decode(
+                            "utf-8", "replace"
+                        )[:MAX_RESPONSE_BYTES] if verify_response else ""
+                    except Exception:
+                        verify_body = ""
+                    verify_source = "\n".join((verify_body, verify_visible, verify_dom))
+                    cookies = _browser_auth_persistable_cookies(
+                        list(context.cookies()), challenge_url
+                    )
+                    local_storage = _browser_auth_local_storage(page)
+                    session_storage = _browser_auth_session_storage(page)
+                    tokens = _browser_auth_tokens(
+                        (*raw_bodies, verify_body), local_storage, session_storage
+                    )
+                context.close()
+                context = None
+
+                reusable = bool(
+                    cookies or credentials.select_bearer(tokens)
+                    or local_storage or session_storage
+                )
+                private_values = [
+                    *(str(cookie.get("value") or "") for cookie in cookies),
+                    *local_storage.values(), *session_storage.values(), *tokens.values(),
+                ]
+                if any(
+                    secret and secret in value
+                    for secret in code_secrets for value in private_values
+                ):
+                    failure = "The application retained the OTP in browser session material."
+                if not failure and reusable:
+                    replay = _browser_auth_fresh_probe_with_retry(
+                        playwright, executable, workspace, verify_url,
+                        phase="step-up-replay", denied_requests=denied_requests,
+                        console=console, timeout_ms=timeout_ms, cookies=cookies,
+                        bearer_token=credentials.select_bearer(tokens),
+                        verify_headers=verify_headers,
+                        browser_storage={
+                            "local_storage": local_storage,
+                            "session_storage": session_storage,
+                        },
+                    )
+                    replay_status = int(replay.get("status") or 0)
+                    replay_response_url = str(replay.get("response_url") or "")
+                    replay_final_url = str(replay.get("final_url") or "")
+                    replay_method = str(replay.get("method") or "").upper()
+                    replay_chain = list(replay.get("redirect_chain") or [])
+                    replay_source = str(replay.get("source") or "")
+                    cookies = _browser_auth_persistable_cookies(
+                        list(replay.get("cookies") or []), challenge_url
+                    )
+                    local_storage = dict(replay.get("local_storage") or {})
+                    session_storage = dict(replay.get("session_storage") or {})
+                    replay_tokens = _browser_auth_tokens(
+                        (str(replay.get("body") or ""),),
+                        local_storage, session_storage,
+                    )
+                    tokens.update(replay_tokens)
+                    control = _browser_auth_fresh_probe_with_retry(
+                        playwright, executable, workspace, verify_url,
+                        phase="step-up-control", denied_requests=denied_requests,
+                        console=console, timeout_ms=timeout_ms,
+                        verify_headers=verify_headers, bootstrap_url=login_url,
+                    )
+                    control_status = int(control.get("status") or 0)
+                    control_response_url = str(control.get("response_url") or "")
+                    control_final_url = str(control.get("final_url") or "")
+                    control_method = str(control.get("method") or "").upper()
+                    control_chain = list(control.get("redirect_chain") or [])
+                    control_source = str(control.get("source") or "")
+                elif not failure:
+                    failure = "MFA continuation produced no reusable browser session material."
+    except Exception as exc:
+        failure = failure or (
+            "Browser MFA continuation failed: "
+            + _browser_safe_error(exc, runtime_secrets)
+        )
+    finally:
+        if context is not None:
+            try:
+                context.close()
+            except Exception:
+                pass
+
+    final_private_values = [
+        *(str(cookie.get("value") or "") for cookie in cookies),
+        *local_storage.values(), *session_storage.values(), *tokens.values(),
+    ]
+    if any(
+        secret and secret in value
+        for secret in code_secrets for value in final_private_values
+    ):
+        failure = "The application retained the OTP in browser session material."
+
+    if isinstance(verification, dict):
+        expected_post_login = str(verification["expected_post_login_url"])
+        proved = bool(
+            not failure
+            and _browser_auth_url_matches(post_submit_url, expected_post_login)
+            and verify_status == verification["authenticated_status"]
+            and _browser_auth_redirect_contract_matches(
+                verify_chain, (), verify_url, verify_method
+            )
+            and _browser_auth_url_matches(verify_response_url, verify_url)
+            and _browser_auth_url_matches(verify_final_url, verify_url)
+            and replay_status == verification["authenticated_status"]
+            and _browser_auth_redirect_contract_matches(
+                replay_chain, (), verify_url, replay_method
+            )
+            and _browser_auth_url_matches(replay_response_url, verify_url)
+            and _browser_auth_url_matches(replay_final_url, verify_url)
+            and control_status == verification["anonymous_status"]
+            and _browser_auth_redirect_contract_matches(
+                control_chain,
+                verification.get("anonymous_redirect_statuses", ()),
+                verify_url, control_method,
+            )
+            and _browser_auth_url_matches(control_response_url, verify_url)
+            and _browser_auth_url_matches(control_final_url, verify_url)
+        )
+        mode = "status-differential"
+    else:
+        control_conclusive = bool(
+            (200 <= control_status < 300 or control_status in {401, 403, 404})
+            and success_marker not in control_source
+        )
+        proved = bool(
+            not failure and success_marker
+            and 200 <= replay_status < 300
+            and success_marker in replay_source
+            and control_conclusive
+        )
+        mode = "marker"
+
+    established = False
+    if proved:
+        snapshots: list[tuple[Path, tuple[bool, bytes, int]]] = []
+        try:
+            credentials.canonical_browser_storage(
+                origin=origin, cookies=cookies, local_storage=local_storage,
+                session_storage=session_storage,
+            )
+            paths = (
+                credentials.cookie_jar_storage_path(workspace.slug, credential),
+                credentials.token_path(workspace.slug, credential),
+                credentials.browser_storage_path(workspace.slug, credential),
+                credentials.attempt_path(workspace.slug, credential),
+            )
+            snapshots = [(path, _snapshot_private_material(path)) for path in paths]
+            _browser_auth_install_cookies(
+                workspace, credential, cookies, challenge_url
+            )
+            if tokens:
+                credentials.save_tokens(
+                    workspace.slug, credential, tokens, origin=origin
+                )
+            credentials.record_login_outcome(
+                workspace.slug, credential, established=True, origin=origin,
+                profile_revision=profile_revision,
+            )
+            credentials.save_browser_storage(
+                workspace.slug, credential, origin=origin, cookies=cookies,
+                local_storage=local_storage, session_storage=session_storage,
+            )
+            established = True
+        except Exception as exc:
+            for path, snapshot in reversed(snapshots):
+                try:
+                    _restore_private_material(path, snapshot)
+                except (OSError, credentials.CredentialError):
+                    pass
+            failure = (
+                "Private browser session could not be saved: "
+                + _browser_safe_error(exc, runtime_secrets)
+            )
+
+    try:
+        if established or continuation_reserved:
+            credentials.clear_pending_browser_step_up(
+                workspace.slug, credential
+            )
+        if continuation_reserved and not established:
+            credentials.record_login_outcome(
+                workspace.slug, credential,
+                blocked_reason="MFA/OTP continuation requires operator action",
+            )
+    except credentials.CredentialError as exc:
+        failure = failure or str(exc)
+
+    data = {
+        "credential": credential,
+        "attempt": int(pending["attempt"]),
+        "verification_mode": mode,
+        "otp_submission_requests": submitted,
+        "blocked_duplicate_submissions": blocked_duplicates,
+        "otp_fields": fields_used,
+        "password_stage": password_stage,
+        "password_submission_requests": password_submitted,
+        "blocked_duplicate_password_submissions": password_blocked_duplicates,
+        "verify_status": verify_status,
+        "replay_status": replay_status,
+        "control_status": control_status,
+        "session": credentials.session_status(workspace.slug, credential),
+    }
+    if established:
+        return _ok(
+            f"Browser session {credential!r} passed {mode} proof after private MFA continuation; the one-time code was not persisted.",
+            data,
+        )
+    return _err(
+        failure or "Browser MFA continuation did not satisfy the configured session proof.",
         data,
     )
 
@@ -6986,6 +8146,11 @@ def artifact_download(workspace: Workspace, url: str, filename: str, *, timeout:
     curl = config.find_binary("curl")
     if not curl:
         return _err("curl is not installed.")
+    try:
+        private_proxy = config.private_egress_proxy()
+    except ValueError as exc:
+        return _err(str(exc))
+    proxy_secrets = _proxy_redaction_values(private_proxy)
     timeout = max(1, min(int(timeout), 120))
     max_bytes = 256 * 1024 * 1024
     workspace.loot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -7000,16 +8165,34 @@ def artifact_download(workspace: Workspace, url: str, filename: str, *, timeout:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
             os.close(fd)
             created.append(path)
-        result = subprocess.run(
-            [curl, "--disable", "--silent", "--show-error", "--fail",
-             "--max-time", str(timeout), "--connect-timeout", str(min(timeout, 15)),
-             "--max-filesize", str(max_bytes), "--dump-header", str(headers),
-             "--output", str(temporary), "--", url],
-            capture_output=True, timeout=timeout + 5,
-            env=_minimal_local_environment(), umask=0o077,
-        )
+        argv = [
+            curl, "--disable", "--silent", "--show-error", "--fail",
+            "--max-time", str(timeout),
+            "--connect-timeout", str(min(timeout, 15)),
+            "--max-filesize", str(max_bytes),
+            "--dump-header", str(headers),
+            "--output", str(temporary),
+        ]
+        run_kwargs = {
+            "capture_output": True,
+            "timeout": timeout + 5,
+            "env": _minimal_local_environment(),
+            "umask": 0o077,
+        }
+        if private_proxy:
+            proxy_config = _curl_proxy_config(private_proxy, tunnel=True)
+            with _anonymous_subprocess_config(proxy_config) as (path, config_fd):
+                result = subprocess.run(
+                    [*argv, "--config", path, "--", url],
+                    pass_fds=(config_fd,), **run_kwargs,
+                )
+        else:
+            result = subprocess.run([*argv, "--", url], **run_kwargs)
         if result.returncode:
-            detail = redact_sensitive_text(result.stderr.decode("utf-8", "replace")[-2000:])
+            detail = redact_sensitive_text(
+                result.stderr.decode("utf-8", "replace")[-2000:],
+                proxy_secrets,
+            )
             return _err("Artifact download failed: " + detail)
         size = temporary.stat().st_size
         if size > max_bytes:
@@ -7023,14 +8206,19 @@ def artifact_download(workspace: Workspace, url: str, filename: str, *, timeout:
         response_headers = headers.read_text(
             encoding="utf-8", errors="replace"
         ) if headers.exists() else ""
+        response_headers = redact_sensitive_text(response_headers, proxy_secrets)
         flow = _save_flow(workspace, "GET", url, {}, None,
                           response_headers + f"\n[Binary saved: {destination.name}; sha256={digest}]",
-                          transport="artifact-download", returncode=0)
+                          transport="artifact-download", returncode=0,
+                          secret_values=proxy_secrets)
         return _ok(f"Saved {destination.name} ({size} bytes) and {flow.name}.",
                    {"path": str(destination), "sha256": digest, "flow": str(flow),
                     "bytes": size})
     except (OSError, subprocess.SubprocessError) as exc:
-        return _err(f"Artifact download failed: {redact_sensitive_text(exc)}")
+        return _err(
+            "Artifact download failed: "
+            + redact_sensitive_text(exc, proxy_secrets)
+        )
     finally:
         for path in created:
             path.unlink(missing_ok=True)
@@ -7679,19 +8867,70 @@ def _research_request_once(parsed, destinations: list[tuple], timeout: float):
     raise TimeoutError("research connection deadline reached")
 
 
+def _research_request_once_via_private_egress(
+    workspace: Workspace, url: str, proxy: str, timeout: float,
+):
+    """Fetch one target hop through private egress without following redirects."""
+    observation: dict[str, object] = {}
+    result = http_request(
+        workspace,
+        url,
+        method="GET",
+        headers={"User-Agent": "Grypton-Research/3.0"},
+        timeout=max(1, int(timeout)),
+        transport="research-private-egress",
+        _private_egress_proxy=proxy,
+        _response_payload=observation,
+    )
+    if not result.get("ok"):
+        raise RuntimeError(
+            str(result.get("summary") or "private research transport failed")
+        )
+    status_line = str(observation.get("status_line") or "")
+    match = re.match(r"^HTTP/\S+\s+(\d{3})(?:\s+(.*))?$", status_line)
+    if match is None:
+        raise RuntimeError("private research transport returned no HTTP status")
+    payload = observation.get("body")
+    if not isinstance(payload, bytes):
+        raise RuntimeError("private research transport returned no response body")
+    return (
+        int(match.group(1)),
+        str(match.group(2) or ""),
+        str(observation.get("location") or "") or None,
+        payload,
+    )
+
+
 def research(workspace: Workspace, url: str, *, timeout: int = 30) -> dict:
     timeout_seconds = max(1, min(int(timeout), 60))
     current_url = url
+    proxy_secrets: set[str] = set()
     try:
         for redirect_count in range(_RESEARCH_MAX_REDIRECTS + 1):
-            blocked, parsed, destinations = _research_resolved_destinations(
-                workspace, current_url
-            )
-            if blocked:
-                return blocked
-            status, reason, location, payload = _research_request_once(
-                parsed, destinations, timeout_seconds
-            )
+            allowed, scope_reason = check_research_scope(workspace, current_url)
+            if not allowed:
+                return _err(f"Scope blocked research URL: {scope_reason}.")
+            parsed = urlsplit(current_url)
+            hostname = (parsed.hostname or "").rstrip(".")
+            private_proxy = ""
+            if _research_target_related(workspace, hostname):
+                private_proxy = config.private_egress_proxy()
+            if private_proxy:
+                proxy_secrets.update(_proxy_redaction_values(private_proxy))
+                status, reason, location, payload = (
+                    _research_request_once_via_private_egress(
+                        workspace, current_url, private_proxy, timeout_seconds
+                    )
+                )
+            else:
+                blocked, parsed, destinations = _research_resolved_destinations(
+                    workspace, current_url
+                )
+                if blocked:
+                    return blocked
+                status, reason, location, payload = _research_request_once(
+                    parsed, destinations, timeout_seconds
+                )
             if status in _RESEARCH_REDIRECT_STATUSES:
                 if not location:
                     return _err("Research redirect did not provide a Location header.")
@@ -7700,19 +8939,31 @@ def research(workspace: Workspace, url: str, *, timeout: int = 30) -> dict:
                 current_url = urljoin(current_url, location)
                 continue
             if status >= 400:
-                return _err(f"Research fetch failed: HTTP {status} {reason}".rstrip())
+                safe_reason = redact_sensitive_text(reason, proxy_secrets)
+                return _err(
+                    f"Research fetch failed: HTTP {status} {safe_reason}".rstrip()
+                )
             final_allowed, final_reason = check_research_scope(workspace, current_url)
             if not final_allowed:
                 return _err(f"Scope blocked research URL: {final_reason}.")
-            data = payload.decode("utf-8", "replace")
+            data = redact_sensitive_text(
+                payload.decode("utf-8", "replace"), proxy_secrets
+            )
+            safe_url = redact_sensitive_text(current_url, proxy_secrets)
+            safe_host = redact_sensitive_text(
+                urlsplit(url).hostname or "", proxy_secrets
+            )
             return _ok(
-                f"Fetched approved documentation from {urlsplit(url).hostname} "
+                f"Fetched approved documentation from {safe_host} "
                 f"({len(data)} characters).",
-                {"text": data, "final_url": current_url},
+                {"text": data, "final_url": safe_url},
             )
         return _err("Research fetch exceeded the redirect limit.")
     except Exception as exc:
-        return _err(f"Research fetch failed: {redact_sensitive_text(exc)}")
+        return _err(
+            "Research fetch failed: "
+            + redact_sensitive_text(exc, proxy_secrets)
+        )
 
 
 def inventory() -> dict:

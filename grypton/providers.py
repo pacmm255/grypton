@@ -17,7 +17,8 @@ from typing import Callable, Optional
 
 from . import config, credentials
 from .native_shell import NativeShellError, NativeShellSpec, prepare_native_shell
-from .network_broker import NetworkBrokerError, ScopedNetworkBroker
+from .network_broker import (NetworkBrokerError, PrivateEgressProxyBroker,
+                             ScopedNetworkBroker)
 from .openclaude import OpenClaudeError, OpenClaudeGateway
 
 
@@ -682,6 +683,12 @@ class OpenCodeClient:
         self.gateway: OpenClaudeGateway | None = None
         self.native_shell: NativeShellSpec | None = None
         self.network_broker: ScopedNetworkBroker | None = None
+        self.private_egress_broker: PrivateEgressProxyBroker | None = None
+        self._private_egress_proxy = ""
+        self._private_egress_socket = (
+            config.RUNTIME_DIR / "egress"
+            / f"{hashlib.sha256(os.urandom(32)).hexdigest()[:20]}.sock"
+        )
         self._terminal_signal: asyncio.Event | None = None
         self._terminal_error = ""
         self._terminal_metadata: dict = {}
@@ -785,10 +792,37 @@ class OpenCodeClient:
             )
         try:
             await self.network_broker.start()
+            if self._private_egress_proxy:
+                private_socket = self._private_egress_socket_path()
+                if (
+                    self.private_egress_broker is None
+                    or self.private_egress_broker.socket_path != private_socket
+                    or self.private_egress_broker.value != self._private_egress_proxy
+                ):
+                    if self.private_egress_broker is not None:
+                        await self.private_egress_broker.close()
+                    self.private_egress_broker = PrivateEgressProxyBroker(
+                        private_socket, self._private_egress_proxy
+                    )
+                await self.private_egress_broker.start()
+            elif self.private_egress_broker is not None:
+                await self.private_egress_broker.close()
+                self.private_egress_broker = None
         except NetworkBrokerError as exc:
+            if self.private_egress_broker is not None:
+                await self.private_egress_broker.close()
+                self.private_egress_broker = None
+            if self.network_broker is not None:
+                await self.network_broker.close()
+                self.network_broker = None
+            self._private_egress_proxy = ""
             raise ProviderError(
                 f"{self.role} scoped network broker is unavailable: {exc}"
             ) from exc
+
+    def _private_egress_socket_path(self) -> Path:
+        """Return a bounded operator-only socket path independent of slug length."""
+        return self._private_egress_socket
 
     def _environment(self) -> tuple[dict, str]:
         if self.gateway is None:
@@ -820,6 +854,14 @@ class OpenCodeClient:
                 raise ProviderError(
                     f"{self.role} native shell isolation is unavailable: {exc}"
                 ) from exc
+
+        if self.allow_tools:
+            try:
+                self._private_egress_proxy = config.private_egress_proxy()
+            except ValueError as exc:
+                raise ProviderError(str(exc)) from exc
+        else:
+            self._private_egress_proxy = ""
 
         permissions = self._permissions(
             self.allow_tools,
@@ -857,6 +899,17 @@ class OpenCodeClient:
         if self.allow_tools:
             assert self.native_shell is not None
             inline["shell"] = str(self.native_shell.launcher)
+            mcp_environment = {
+                "GRYPTON_HOME": str(config.GRYPTON_HOME),
+                "GRYPTON_TARGET": self.target_slug,
+                "KRYPTON_HOME": str(config.GRYPTON_HOME),
+                "KRYPTON_TARGET": self.target_slug,
+                "PYTHONPATH": str(config.SOURCE_ROOT),
+            }
+            if self._private_egress_proxy:
+                mcp_environment[config.PRIVATE_EGRESS_PROXY_SOCKET_ENV] = str(
+                    self._private_egress_socket_path()
+                )
             inline["mcp"] = {
                 "grypton": {
                     "type": "local",
@@ -864,13 +917,7 @@ class OpenCodeClient:
                     "cwd": str(config.GRYPTON_HOME),
                     "enabled": True,
                     "timeout": MCP_TIMEOUT_MS,
-                    "environment": {
-                        "GRYPTON_HOME": str(config.GRYPTON_HOME),
-                        "GRYPTON_TARGET": self.target_slug,
-                        "KRYPTON_HOME": str(config.GRYPTON_HOME),
-                        "KRYPTON_TARGET": self.target_slug,
-                        "PYTHONPATH": str(config.SOURCE_ROOT),
-                    },
+                    "environment": mcp_environment,
                 }
             }
 
@@ -939,9 +986,13 @@ class OpenCodeClient:
                 "replay_safe": True,
             }
             raise
-        event_secrets = (secret, *credentials.provider_redaction_values(
-            self.target_slug
-        ))
+        event_secrets = (
+            secret,
+            *config.private_egress_proxy_redaction_values(
+                self._private_egress_proxy
+            ),
+            *credentials.provider_redaction_values(self.target_slug),
+        )
         transport_route = gateway.model_route
         argv = [
             binary, "run", "--pure", "--format", "json",
@@ -1415,6 +1466,10 @@ class OpenCodeClient:
         if self.network_broker is not None:
             await self.network_broker.close()
             self.network_broker = None
+        if self.private_egress_broker is not None:
+            await self.private_egress_broker.close()
+            self.private_egress_broker = None
+        self._private_egress_proxy = ""
 
 
 class CodexValidator:

@@ -330,6 +330,9 @@ class OpenClaudeAdapterTests(unittest.TestCase):
                 "providers": {
                     "fixture": {"credential": {"env": "FIXTURE_PROVIDER_KEY"}},
                     "anthropic": {"credential": {"openclaude": "anthropic"}},
+                    "proxy-misuse": {
+                        "credential": {"env": "GRYPTON_EGRESS_PROXY"}
+                    },
                 },
             }), encoding="utf-8")
             opencode_path = root / "opencode.jsonc"
@@ -355,6 +358,9 @@ class OpenClaudeAdapterTests(unittest.TestCase):
                 "GITHUB_TOKEN": "fixture-source-secret",
                 "OPENAI_API_KEY": "fixture-unconfigured-provider-secret",
                 "HTTPS_PROXY": "http://fixture-proxy.invalid:8080",
+                "GRYPTON_EGRESS_PROXY": (
+                    "http://proxy-user:proxy-password@proxy.invalid:8080"
+                ),
                 "NODE_OPTIONS": "--require=/tmp/fixture-secret-hook.js",
             }
             child = _openclaude_child_environment(
@@ -372,6 +378,7 @@ class OpenClaudeAdapterTests(unittest.TestCase):
             for name in (
                 "OPENCODE_MISSING_KEY", "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN",
                 "OPENAI_API_KEY", "HTTPS_PROXY", "NODE_OPTIONS",
+                "GRYPTON_EGRESS_PROXY",
             ):
                 self.assertNotIn(name, child)
 

@@ -721,6 +721,30 @@ without a profile keeps the explicitly requested tool behavior:
 4. `authenticated_http_request` uses the verified cookie or bearer session for
    later scoped requests.
 
+For a staged browser login that sends an identifier before showing the OTP
+form, an operator can start and finish the same private web session with:
+
+```bash
+./bin/grypton auth begin-browser-step-up ENGAGEMENT --name primary
+./bin/grypton auth continue-browser ENGAGEMENT --name primary
+```
+
+The second command reads the one-time code with a hidden terminal prompt; there
+is deliberately no OTP command-line or MCP argument. Grypton restores the
+origin-bound challenge cookies and browser storage, submits the code once, and
+submits the stored password once if the configured password control appears.
+It then runs the profile's normal live, fresh-replay, and anonymous-control
+proof before promoting the session. Standard OTP inputs and submit controls are
+discovered from the rendered challenge. `--otp-selector`, `--submit-selector`,
+and `--password-submit-selector` provide operator-only overrides when discovery
+is inconclusive. A step-up detected by `credential_browser_login` is retained
+the same way when a saved browser profile and resumable browser state exist.
+
+Browser authentication uses the same private `GRYPTON_EGRESS_PROXY` route as
+the other network transports. The proxy value, including optional credentials,
+stays in the supervisor/private broker boundary and is redacted from browser
+errors and saved artifacts.
+
 Both login tools require a scoped verification URL. HTTP profiles and marker
 browser profiles also require exact, non-secret text that appears only after a
 successful login. They do not treat an HTTP `200` as proof by itself.
@@ -751,6 +775,13 @@ denial without clearing the established state and rolls back any cookie or
 token changes made by a denied, failed, or non-2xx/3xx response. The response is
 still returned as an endpoint observation. Only a complete authentication proof
 changes the session state.
+
+A human MFA continuation remains part of the already-counted login attempt.
+Its pending challenge and selector hints live only in the private credential
+store, are bound to the exact profile revision and origin, expire after fifteen
+minutes, and permit one OTP-bearing request. The OTP is never written to the
+engagement workspace, transcript, tool ledger, capture, command line, or tool
+result.
 
 Renewal has a separate, private limit: one credential-bearing submission for
 each previously proven session generation. The reservation is written before
@@ -909,6 +940,15 @@ tool calls remain in the OpenCode provider event log. A manual MCP subset is
 available through `grypton tools`; use its help for the exact public
 subcommands. The tool-group table below describes the full MCP surface
 available to Kraude.
+
+Set `GRYPTON_EGRESS_PROXY` before starting Grypton to route scoped
+`http_request` traffic (including native curl, replay, and authenticated HTTP),
+Playwright browser traffic, and ProjectDiscovery httpx through one `http://` or
+`https://` proxy (credentialed URLs are supported).
+The value stays in supervisor memory: MCP receives an operator-only Unix socket
+reference, subprocess configuration uses anonymous memory, and proxy details
+are excluded from captures, ledgers, provider environments, and tool output.
+When the variable is unset, these tools keep their direct transport behavior.
 
 Start by seeing what is available:
 

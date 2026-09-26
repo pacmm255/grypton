@@ -24,6 +24,7 @@ from typing import Any, Callable, Mapping, Optional
 
 
 TOKEN_ENV = "GRYPTON_OPENCLAUDE_GATEWAY_TOKEN"
+_PRIVATE_TOOL_ENV = frozenset({"GRYPTON_EGRESS_PROXY"})
 DEFAULT_OPENCLAUDE_ROOT = Path("/root/openclaude")
 _PROTOCOL_VERSION = 1
 _MAX_PROTOCOL_BYTES = 32 * 1024 * 1024
@@ -194,7 +195,8 @@ def _credential_env_names(
         if not isinstance(credential, Mapping):
             continue
         name = credential.get("env")
-        if isinstance(name, str) and _ENV_NAME.fullmatch(name):
+        if (isinstance(name, str) and _ENV_NAME.fullmatch(name)
+                and name not in _PRIVATE_TOOL_ENV):
             names.add(name)
         if credential.get("openclaude") == "anthropic":
             names.add("ANTHROPIC_API_KEY")
@@ -207,11 +209,13 @@ def _credential_env_names(
         options = provider.get("options") if isinstance(provider.get("options"), Mapping) else {}
         match = _ENV_REFERENCE.fullmatch(str(options.get("apiKey") or ""))
         if match:
-            names.add(match.group(1))
+            if match.group(1) not in _PRIVATE_TOOL_ENV:
+                names.add(match.group(1))
             continue
         candidates = provider.get("env") if isinstance(provider.get("env"), list) else []
         for name in candidates:
             if (isinstance(name, str) and _ENV_NAME.fullmatch(name)
+                    and name not in _PRIVATE_TOOL_ENV
                     and str(environ.get(name) or "").strip()):
                 names.add(name)
                 break

@@ -214,6 +214,12 @@ def pending_browser_renewal_path(target: str, name: str) -> Path:
     return _session_dir(target) / (alias + ".pending-renewal.json")
 
 
+def pending_browser_step_up_path(target: str, name: str) -> Path:
+    """Return the private, one-shot browser step-up record path."""
+    alias = _safe_name(name, label="credential name")
+    return _session_dir(target) / (alias + ".pending-step-up.json")
+
+
 def attempt_path(target: str, name: str) -> Path:
     alias = _safe_name(name, label="credential name")
     return _session_dir(target) / (alias + ".attempts.json")
@@ -250,6 +256,7 @@ def save_credential(target: str, name: str, username: str, password: str) -> str
         for path in (
             token_path(target, alias), browser_storage_path(target, alias),
             pending_browser_renewal_path(target, alias),
+            pending_browser_step_up_path(target, alias),
             attempt_path(target, alias), cookie_jar_storage_path(target, alias),
         ):
             path.unlink(missing_ok=True)
@@ -1378,6 +1385,216 @@ def load_pending_browser_renewal(target: str, name: str) -> dict[str, object]:
         }
 
 
+def _canonical_pending_tokens(value: object, *, label: str) -> dict[str, str]:
+    if not isinstance(value, dict) or len(value) > 100:
+        raise CredentialError(f"{label} tokens are invalid")
+    output: dict[str, str] = {}
+    total = 0
+    for raw_key, raw_value in value.items():
+        if (
+            not isinstance(raw_key, str) or not raw_key or len(raw_key) > 512
+            or not isinstance(raw_value, str) or not raw_value
+            or len(raw_value) > 16_384
+            or any(ord(char) < 0x20 or ord(char) == 0x7f for char in raw_value)
+        ):
+            raise CredentialError(f"{label} tokens are invalid")
+        total += len(raw_key) + len(raw_value)
+        if total > _BROWSER_STORAGE_MAX_TOTAL_CHARS:
+            raise CredentialError(f"{label} tokens exceed the private size limit")
+        output[raw_key] = raw_value
+    return output
+
+
+def _step_up_selector(value: object, *, label: str, optional: bool = False) -> str:
+    selector = str(value or "").strip()
+    if optional and not selector:
+        return ""
+    if (
+        not selector or len(selector) > 500
+        or any(ord(char) < 0x20 or ord(char) == 0x7f for char in selector)
+    ):
+        raise CredentialError(f"{label} is invalid")
+    return selector
+
+
+def save_pending_browser_step_up(
+    target: str, name: str, *, attempt: int, origin: str,
+    challenge_url: str, profile_revision: str, cookies: object,
+    local_storage: object, session_storage: object, tokens: object,
+    otp_selector: str, otp_fields: int, submit_selector: str = "",
+) -> None:
+    """Retain one origin-bound MFA continuation without retaining its OTP."""
+    alias = _safe_name(name, label="credential name")
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        raise CredentialError("pending browser step-up attempt is invalid")
+    if not re.fullmatch(r"[0-9a-f]{12}", str(profile_revision or "")):
+        raise CredentialError("authentication profile revision is invalid")
+    canonical = canonical_browser_storage(
+        origin=origin, cookies=cookies, local_storage=local_storage,
+        session_storage=session_storage,
+    )
+    try:
+        challenge_origin = normalize_origin(challenge_url)
+        parsed_challenge = urlsplit(str(challenge_url or ""))
+    except CredentialError as exc:
+        raise CredentialError("pending browser step-up URL is invalid") from exc
+    if (
+        challenge_origin != canonical["origin"]
+        or parsed_challenge.username is not None
+        or parsed_challenge.password is not None
+        or len(str(challenge_url)) > 8192
+    ):
+        raise CredentialError("pending browser step-up URL is invalid")
+    otp_control = _step_up_selector(
+        otp_selector, label="OTP selector", optional=True
+    )
+    action_control = _step_up_selector(
+        submit_selector, label="OTP action selector", optional=True
+    )
+    if isinstance(otp_fields, bool) or not isinstance(otp_fields, int) or not 0 <= otp_fields <= 12:
+        raise CredentialError("pending browser step-up field count is invalid")
+    safe_tokens = _canonical_pending_tokens(tokens, label="pending browser step-up")
+    reusable = bool(
+        canonical["cookies"] or canonical["local_storage"]
+        or canonical["session_storage"] or safe_tokens
+    )
+    if not reusable:
+        raise CredentialError("MFA challenge did not expose resumable private browser state")
+    with session_material_lock(target, alias):
+        state = load_attempt_state(target, alias)
+        if (
+            state["attempts"] != attempt or state["established"]
+            or "MFA/OTP" not in state["blocked_reason"]
+        ):
+            raise CredentialError("pending browser step-up does not match the login attempt")
+        record = {
+            "version": 1,
+            "attempt": attempt,
+            "origin": canonical["origin"],
+            "challenge_url": str(challenge_url),
+            "profile_revision": str(profile_revision),
+            "created_at": time.time(),
+            "reserved": False,
+            "cookies": canonical["cookies"],
+            "local_storage": canonical["local_storage"],
+            "session_storage": canonical["session_storage"],
+            "tokens": safe_tokens,
+            "otp_selector": otp_control,
+            "otp_fields": otp_fields,
+            "submit_selector": action_control,
+        }
+        if len((json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")) > (
+            _PENDING_BROWSER_SESSION_MAX_BYTES
+        ):
+            raise CredentialError("pending browser step-up exceeds the private size limit")
+        _atomic_private_json(pending_browser_step_up_path(target, alias), record)
+
+
+def _load_pending_browser_step_up_unlocked(target: str, name: str) -> dict[str, object]:
+    alias = _safe_name(name, label="credential name")
+    path = pending_browser_step_up_path(target, alias)
+    empty = {"available": False, "reserved": False}
+    if not path.exists() and not path.is_symlink():
+        return empty
+    value = _read_private_json(path, label="pending browser step-up")
+    if value.get("version") != 1:
+        raise CredentialError("pending browser step-up has an unsupported version")
+    attempt = value.get("attempt")
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        raise CredentialError("pending browser step-up attempt is invalid")
+    try:
+        origin = normalize_origin(value.get("origin"))
+        challenge_url = str(value.get("challenge_url") or "")
+        challenge_origin = normalize_origin(challenge_url)
+        parsed_challenge = urlsplit(challenge_url)
+    except CredentialError as exc:
+        raise CredentialError("pending browser step-up URL is invalid") from exc
+    if (
+        challenge_origin != origin or len(challenge_url) > 8192
+        or parsed_challenge.username is not None
+        or parsed_challenge.password is not None
+    ):
+        raise CredentialError("pending browser step-up URL is invalid")
+    revision = value.get("profile_revision")
+    if not isinstance(revision, str) or not re.fullmatch(r"[0-9a-f]{12}", revision):
+        raise CredentialError("pending browser step-up profile revision is invalid")
+    try:
+        created_at = float(value.get("created_at") or 0.0)
+    except (TypeError, ValueError) as exc:
+        raise CredentialError("pending browser step-up creation time is invalid") from exc
+    if not math.isfinite(created_at) or created_at <= 0:
+        raise CredentialError("pending browser step-up creation time is invalid")
+    if not isinstance(value.get("reserved"), bool):
+        raise CredentialError("pending browser step-up reservation is invalid")
+    canonical = canonical_browser_storage(
+        origin=origin, cookies=value.get("cookies"),
+        local_storage=value.get("local_storage"),
+        session_storage=value.get("session_storage"),
+    )
+    tokens = _canonical_pending_tokens(
+        value.get("tokens"), label="pending browser step-up"
+    )
+    otp_selector = _step_up_selector(
+        value.get("otp_selector"), label="OTP selector", optional=True
+    )
+    submit_selector = _step_up_selector(
+        value.get("submit_selector"), label="OTP action selector", optional=True
+    )
+    otp_fields = value.get("otp_fields")
+    if isinstance(otp_fields, bool) or not isinstance(otp_fields, int) or not 0 <= otp_fields <= 12:
+        raise CredentialError("pending browser step-up field count is invalid")
+    state = load_attempt_state(target, alias)
+    if (
+        state["attempts"] != attempt or state["established"]
+        or "MFA/OTP" not in state["blocked_reason"]
+    ):
+        path.unlink(missing_ok=True)
+        return empty
+    return {
+        "available": not value["reserved"],
+        "reserved": value["reserved"],
+        "attempt": attempt,
+        "origin": origin,
+        "challenge_url": challenge_url,
+        "profile_revision": revision,
+        "created_at": created_at,
+        "cookies": canonical["cookies"],
+        "local_storage": canonical["local_storage"],
+        "session_storage": canonical["session_storage"],
+        "tokens": tokens,
+        "otp_selector": otp_selector,
+        "otp_fields": otp_fields,
+        "submit_selector": submit_selector,
+    }
+
+
+def load_pending_browser_step_up(target: str, name: str) -> dict[str, object]:
+    """Return safe-to-resume private state for one unconsumed MFA challenge."""
+    with session_material_lock(target, name):
+        return _load_pending_browser_step_up_unlocked(target, name)
+
+
+def reserve_pending_browser_step_up(target: str, name: str) -> dict[str, object]:
+    """Atomically consume the one permitted human OTP submission."""
+    alias = _safe_name(name, label="credential name")
+    with session_material_lock(target, alias):
+        pending = _load_pending_browser_step_up_unlocked(target, alias)
+        if not pending.get("available"):
+            if pending.get("reserved"):
+                raise CredentialError("the pending MFA continuation was already used")
+            raise CredentialError("no pending MFA continuation is available")
+        record = {key: value for key, value in pending.items() if key != "available"}
+        record.update({"version": 1, "reserved": True, "reserved_at": time.time()})
+        _atomic_private_json(pending_browser_step_up_path(target, alias), record)
+        return {**pending, "available": False, "reserved": True}
+
+
+def clear_pending_browser_step_up(target: str, name: str) -> None:
+    alias = _safe_name(name, label="credential name")
+    with session_material_lock(target, alias):
+        pending_browser_step_up_path(target, alias).unlink(missing_ok=True)
+
+
 def clear_pending_browser_renewal(target: str, name: str) -> None:
     alias = _safe_name(name, label="credential name")
     with session_material_lock(target, alias):
@@ -1737,8 +1954,15 @@ def session_status(target: str, name: str) -> dict[str, object]:
         )
     except CredentialError:
         has_pending_renewal = False
+    try:
+        has_pending_step_up = bool(
+            load_pending_browser_step_up(target, alias).get("available")
+        )
+    except CredentialError:
+        has_pending_step_up = False
     state = (
-        "blocked" if attempt["blocked_reason"]
+        "step-up-pending" if has_pending_step_up
+        else "blocked" if attempt["blocked_reason"]
         else "authenticated" if attempt["established"]
         else "renewal-pending" if has_pending_renewal
         else "renewal-blocked" if (
@@ -1775,6 +1999,7 @@ def session_status(target: str, name: str) -> dict[str, object]:
         "has_bearer_token": bool(select_bearer(load_tokens(target, alias))),
         "has_browser_storage": has_browser_storage,
         "has_pending_renewal": has_pending_renewal,
+        "has_pending_step_up": has_pending_step_up,
         "attempts": attempt["attempts"],
         "exhausted": state == "exhausted",
         "established": attempt["established"],

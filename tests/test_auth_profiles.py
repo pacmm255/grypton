@@ -479,6 +479,45 @@ class AuthProfileCliTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertIn("require --verification-mode", error)
 
+    def test_cli_mfa_code_uses_private_prompt_and_never_appears_in_output(self):
+        with isolated_runtime():
+            ws = self._workspace()
+            private_code = "839201-private-test-code"
+            safe_result = {
+                "ok": True,
+                "summary": (
+                    "Browser session passed private MFA continuation "
+                    + private_code
+                ),
+                "data": {"otp_submission_requests": 1},
+            }
+            with (
+                patch("grypton.cli.getpass.getpass", return_value=private_code),
+                patch(
+                    "grypton.tools.credential_browser_step_up",
+                    return_value=safe_result,
+                ) as continuation,
+            ):
+                code, output, error = self._run([
+                    "auth", "continue-browser", ws.slug,
+                    "--name", "primary",
+                    "--otp-selector", "input.otp__digit",
+                    "--password-submit-selector", "#password-submit-btn",
+                ])
+
+            self.assertEqual(code, 0, error)
+            self.assertNotIn(private_code, output + error)
+            self.assertNotIn(private_code, " ".join([
+                "auth", "continue-browser", ws.slug,
+                "--name", "primary",
+            ]))
+            self.assertEqual(continuation.call_args.kwargs["otp"], private_code)
+            self.assertEqual(
+                continuation.call_args.kwargs["password_submit_selector"],
+                "#password-submit-btn",
+            )
+            self.assertFalse((ws.root / ".ledger" / "tool-calls.jsonl").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
