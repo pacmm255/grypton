@@ -357,6 +357,11 @@ class TargetMeta:
     proof_rotation_cursor: int = 0     # durable P1/P2 evidence-gap cursor
     proof_rotation_after_id: str = ""  # last proof case selected for fair resume
     proof_rotation_epoch_max_id: str = ""  # fixed tail for the active proof round
+    proof_dispatch_fingerprints: dict[str, str] = field(default_factory=dict)
+    # A case is forced once for each distinct evidence/Astra-check state.  A
+    # material revision or a changed Astra request produces a new fingerprint
+    # and makes the case schedulable again without trapping the worker on an
+    # unchanged prerequisite forever.
     family_stagnation_streak: int = 0  # completed turns without a new family
     validation_retry_cursor: int = 0   # fair cursor for stranded Astra work
     validation_retry_after_id: str = ""  # last stranded case attempted

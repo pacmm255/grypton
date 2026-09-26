@@ -519,6 +519,70 @@ class ProviderOutputTests(unittest.TestCase):
         self.assertIsNone(result._value_redactor)
         self.assertNotIn(secret, repr(result))
 
+    def test_low_specificity_session_values_do_not_corrupt_public_output(self):
+        with isolated_runtime():
+            target = "session-redaction-specificity"
+            credentials.save_credential(target, "primary", "Q", "Z")
+            opaque_token = "token-G7mQ2vR9xL4pN8sK6dW3"
+            opaque_storage = "storage-J4qP8vN2xR7mK5sD9wL6"
+            opaque_cookie = "cookie-N8rW3kP7xM2vL9qD5sJ4"
+            credentials.save_tokens(target, "primary", {
+                "boolean": "true",
+                "counter": "0",
+                "opaque": opaque_token,
+            }, origin="https://example.test")
+            credentials._atomic_private_json(  # type: ignore[attr-defined]
+                credentials.browser_storage_path(target, "primary"),
+                {
+                    "local_storage": {
+                        "enabled": "false",
+                        "counter": "0",
+                        "state": "authenticated",
+                        "opaque": opaque_storage,
+                    },
+                    "session_storage": {
+                        "flag": "sessionStorage",
+                        "repeat": "falsefalsefalse",
+                    },
+                    "cookies": [
+                        {"value": "1"},
+                        {"value": opaque_cookie},
+                    ],
+                },
+            )
+            cookie_jar = credentials.cookie_jar_storage_path(target, "primary")
+            cookie_jar.write_text(
+                "example.test\tFALSE\t/\tTRUE\t0\tflag\tfalse\n"
+                f"example.test\tFALSE\t/\tTRUE\t0\tsession\t{opaque_cookie}\n",
+                encoding="utf-8",
+            )
+            cookie_jar.chmod(0o600)
+
+            needles = credentials.provider_redaction_values(target)
+
+            # Named credentials are still exact-redacted even when only one
+            # character long. The specificity gate applies to session-derived
+            # values only.
+            self.assertIn("Q", needles)
+            self.assertIn("Z", needles)
+            for secret in (opaque_token, opaque_storage, opaque_cookie):
+                self.assertIn(secret, needles)
+            for public_state in (
+                "0", "1", "true", "false", "authenticated",
+                "sessionStorage", "falsefalsefalse",
+            ):
+                self.assertNotIn(public_state, needles)
+
+            public = "F030 continue=true authenticated=false confidence=0"
+            self.assertEqual(clean(public, needles), public)
+            self.assertEqual(
+                clean(
+                    f"opaque echoes: {opaque_token} {opaque_storage} {opaque_cookie}",
+                    needles,
+                ),
+                "opaque echoes: [REDACTED] [REDACTED] [REDACTED]",
+            )
+
     def test_short_credential_preserves_provider_control_fields(self):
         class _Input:
             def write(self, value):

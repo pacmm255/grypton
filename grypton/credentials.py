@@ -325,6 +325,46 @@ def list_credentials(target: str) -> list[str]:
     )
 
 
+_LOW_SPECIFICITY_SESSION_VALUES = frozenset({
+    "active", "anonymous", "authenticated", "disabled", "enabled", "error",
+    "false", "failed", "failure", "guest", "inactive", "none", "null",
+    "off", "on", "pending", "success", "true", "undefined", "user", "yes",
+    "no",
+})
+
+
+def _specific_session_redaction_value(value: object) -> str:
+    """Return an exact-redaction needle only when it is sufficiently specific.
+
+    Browser storage and cookie jars routinely contain public state such as
+    ``0``, ``true``, and ``enabled``.  Treating those values as global substring
+    needles corrupts unrelated provider events and public transcripts.  Session
+    material still receives contextual header/assignment redaction elsewhere;
+    this gate applies only to the extra, context-free exact replacement list.
+    """
+    if isinstance(value, bool) or value is None:
+        return ""
+    text = str(value)
+    if not text or len(text) > 131_072 or len(text) < 8:
+        return ""
+    folded = text.strip().casefold()
+    if (not folded or folded in _LOW_SPECIFICITY_SESSION_VALUES
+            or re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?", folded)):
+        return ""
+
+    # Empirical information content is a conservative specificity estimate.
+    # Forty-eight bits excludes repeated flags and common state labels while
+    # retaining ordinary opaque bearer tokens, UUIDs, and session cookies.
+    counts: dict[str, int] = {}
+    for char in text:
+        counts[char] = counts.get(char, 0) + 1
+    length = len(text)
+    information_bits = -sum(
+        count * math.log2(count / length) for count in counts.values()
+    )
+    return text if information_bits >= 48 else ""
+
+
 def provider_redaction_values(target: str) -> tuple[str, ...]:
     """Return bounded credential/session variants for provider-log scrubbing.
 
@@ -341,8 +381,10 @@ def provider_redaction_values(target: str) -> tuple[str, ...]:
     except (CredentialError, OSError):
         return ()
 
-    def add(value: object) -> None:
+    def add(value: object, *, session_material: bool = False) -> None:
         text = str(value or "")
+        if session_material:
+            text = _specific_session_redaction_value(value)
         if not text or len(text) > 131_072 or len(values) >= 4096:
             return
         values.add(text)
@@ -373,7 +415,7 @@ def provider_redaction_values(target: str) -> tuple[str, ...]:
                 pass
         try:
             for token in load_tokens(target, alias).values():
-                add(token)
+                add(token, session_material=True)
         except (CredentialError, OSError):
             pass
         try:
@@ -385,19 +427,19 @@ def provider_redaction_values(target: str) -> tuple[str, ...]:
                 values_in_area = stored.get(area)
                 if isinstance(values_in_area, dict):
                     for item in values_in_area.values():
-                        add(item)
+                        add(item, session_material=True)
             stored_cookies = stored.get("cookies")
             if isinstance(stored_cookies, list):
                 for cookie in stored_cookies:
                     if isinstance(cookie, dict):
-                        add(cookie.get("value"))
+                        add(cookie.get("value"), session_material=True)
         except (CredentialError, OSError):
             pass
         try:
             cookie_path = cookie_jar_storage_path(target, alias)
             for row in _cookie_rows(cookie_path):
                 if len(row) >= 7:
-                    add(row[6])
+                    add(row[6], session_material=True)
         except (CredentialError, OSError):
             pass
     return tuple(sorted(values, key=len, reverse=True))

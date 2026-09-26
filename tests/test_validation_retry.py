@@ -160,7 +160,7 @@ class ValidationRetryTests(unittest.TestCase):
             ws.set_severity_verdict(evidence_gap["id"], {
                 "finding_id": evidence_gap["id"],
                 "verdict": "needs-more-evidence",
-                "severity": "P3",
+                "severity": "P2",
                 "validator_model": config.VALIDATOR_MODEL,
                 "validator_effort": config.VALIDATOR_EFFORT,
                 "independent_checks": [
@@ -215,6 +215,105 @@ class ValidationRetryTests(unittest.TestCase):
                 [row["id"] for row in context.validation_backlog],
                 [evidence_gap["id"]],
             )
+
+    def test_astra_assessed_lower_severity_is_not_forced_as_proof_work(self):
+        with isolated_runtime():
+            ws = Workspace("assessed-proof-severity")
+            ws.create("https://example.test", "web")
+            low = ws.record_finding(
+                title="Claimed critical but bounded", severity="P1",
+            )
+            ws.set_severity_verdict(low["id"], {
+                "finding_id": low["id"],
+                "verdict": "needs-more-evidence",
+                "severity": "P5",
+                "validator_model": config.VALIDATOR_MODEL,
+                "validator_effort": config.VALIDATOR_EFFORT,
+                "independent_checks": ["Obtain an unavailable server-side fact."],
+            })
+            high = ws.record_finding(
+                title="Plausibly high impact", severity="P2",
+            )
+            ws.set_severity_verdict(high["id"], {
+                "finding_id": high["id"],
+                "verdict": "needs-more-evidence",
+                "severity": "P2",
+                "validator_model": config.VALIDATOR_MODEL,
+                "validator_effort": config.VALIDATOR_EFFORT,
+                "independent_checks": ["Capture one owner/peer control pair."],
+            })
+
+            backlog = Engine._high_severity_proof_backlog(ws.findings.all())
+            self.assertEqual([row["id"] for row in backlog], [high["id"]])
+
+    def test_degraded_validation_retry_uses_bounded_turn_cadence(self):
+        with isolated_runtime():
+            ws = Workspace("validation-retry-cadence")
+            ws.create("https://example.test", "web")
+            finding = ws.record_finding(title="Transport retry", severity="P1")
+            ws.set_severity_verdict(finding["id"], {
+                "finding_id": finding["id"],
+                "verdict": "needs-more-evidence",
+                "severity": "P1",
+                "degraded": True,
+                "validator_model": config.VALIDATOR_MODEL,
+                "validator_effort": config.VALIDATOR_EFFORT,
+            })
+            engine = Engine(ws.slug, backend="mock")
+
+            engine.turn_index = 1
+            self.assertEqual(engine._validation_turn_findings([]), [])
+            # A new case is still validated immediately rather than waiting for
+            # the retry cadence.
+            self.assertEqual(
+                [row["id"] for row in engine._validation_turn_findings([finding])],
+                [finding["id"]],
+            )
+            engine.turn_index = 12
+            self.assertEqual(
+                [row["id"] for row in engine._validation_turn_findings([])],
+                [finding["id"]],
+            )
+
+    def test_proof_dispatch_waits_for_a_materially_changed_astra_contract(self):
+        with isolated_runtime():
+            ws = Workspace("proof-dispatch-fingerprint")
+            ws.create("https://example.test", "web")
+            finding = ws.record_finding(
+                title="High evidence gap", severity="P2", evidence="initial",
+            )
+            verdict = {
+                "finding_id": finding["id"],
+                "verdict": "needs-more-evidence",
+                "severity": "P2",
+                "validator_model": config.VALIDATOR_MODEL,
+                "validator_effort": config.VALIDATOR_EFFORT,
+                "independent_checks": ["Capture a peer control."],
+            }
+            ws.set_severity_verdict(finding["id"], verdict)
+            engine = Engine(ws.slug, backend="mock")
+
+            first = engine._scheduled_proof_backlog()
+            self.assertEqual([row["id"] for row in first], [finding["id"]])
+            fingerprint = first[0]["_proof_fingerprint"]
+            engine._proof_dispatch_fingerprints[finding["id"]] = fingerprint
+            self.assertEqual(engine._scheduled_proof_backlog(), [])
+            self.assertEqual(engine._bounded_proof_backlog(), [])
+
+            ws.revise_finding(
+                finding["id"], reason="new paired evidence", evidence="revised",
+            )
+            # The revision first routes to immediate Astra revalidation.
+            self.assertEqual(engine._scheduled_proof_backlog(), [])
+            ws.set_severity_verdict_if_absent(
+                finding["id"], verdict,
+                expected_revalidation_revision="R001",
+                replace_degraded=True,
+                replace_untrusted_validator=True,
+            )
+            reopened = engine._scheduled_proof_backlog()
+            self.assertEqual([row["id"] for row in reopened], [finding["id"]])
+            self.assertNotEqual(reopened[0]["_proof_fingerprint"], fingerprint)
 
     def test_legacy_evidence_gap_is_revalidated_instead_of_entering_proof_queue(self):
         with isolated_runtime():
@@ -619,6 +718,10 @@ class FamilyStagnationLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(meta.proof_rotation_cursor, 1)
             self.assertEqual(meta.proof_rotation_after_id, "F001")
             self.assertEqual(meta.proof_rotation_epoch_max_id, "F001")
+            self.assertRegex(
+                meta.proof_dispatch_fingerprints.get("F001", ""),
+                r"^[0-9a-f]{64}$",
+            )
             self.assertEqual(meta.coverage_rotation_cursor, 0)
             self.assertEqual(meta.last_directive, contexts[2].coverage_priority)
 

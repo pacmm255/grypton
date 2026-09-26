@@ -833,12 +833,14 @@ flowchart TD
 ```
 
 Astra reviews the saved evidence snapshot. It does not perform live target actions during validation.
-When Astra requests more evidence for a P1/P2 candidate, its bounded independent
-checks remain in Kryptex's proof backlog across turns and restarts. Kraude is
-periodically sent every requested check for the next fairly rotated case and
-attaches new proof with `revise_finding`.
-If Astra itself has a provider or transport error, Grypton retries Astra instead;
-that outage is not presented to Kraude as an evidence gap.
+When Astra still assesses a candidate as P1 or P2 and requests more evidence,
+Grypton sends its bounded independent checks to Kraude once for that evidence
+version. A material `revise_finding` update or a changed Astra proof request
+makes the case eligible again. This keeps an unavailable prerequisite from
+replacing Spark's exploration direction every few turns.
+If Astra itself has a provider or transport error, Grypton retries the stranded
+case on a paced cadence while new and materially revised P1/P2 cases still run
+immediately. A provider outage is never presented to Kraude as an evidence gap.
 
 ---
 

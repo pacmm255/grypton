@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 from collections import Counter
 from dataclasses import dataclass
+import hashlib
 import json
 import time
 import traceback
@@ -118,7 +119,9 @@ _WORKER_RETRY_POLL_S = 1.0
 _MAX_WORKER_FAILURE_TOOL_COUNT = 10_000
 _FAMILY_PRIORITY_THRESHOLD = 3
 _PROOF_PRIORITY_FREQUENCY = 3
+_VALIDATION_RETRY_FREQUENCY = 12
 _MAX_PROOF_BACKLOG = 6
+_MAX_PROOF_DISPATCH_FINGERPRINTS = 256
 _PARTIAL_TOOL_RECOVERY_ACTION = (
     "Continue from the durable results already recorded. Select a different "
     "highest-impact unresolved lead in the recorded attack surface, test it "
@@ -132,6 +135,7 @@ class _PrioritySelection:
     kind: str = ""
     record_id: str = ""
     epoch_max_id: str = ""
+    proof_fingerprint: str = ""
 
 
 # Detached deadline runs treat the supervisor deadline as their completion
@@ -244,6 +248,7 @@ class Engine:
         self._proof_rotation_cursor = 0
         self._proof_rotation_after_id = ""
         self._proof_rotation_epoch_max_id = ""
+        self._proof_dispatch_fingerprints: dict[str, str] = {}
         self._validation_retry_cursor = 0
         self._validation_retry_after_id = ""
         self._validation_retry_epoch_max_id = ""
@@ -329,6 +334,9 @@ class Engine:
         raw_proof_cursor = getattr(meta, "proof_rotation_cursor", 0)
         raw_proof_after_id = getattr(meta, "proof_rotation_after_id", "")
         raw_proof_epoch_max_id = getattr(meta, "proof_rotation_epoch_max_id", "")
+        raw_proof_dispatch_fingerprints = getattr(
+            meta, "proof_dispatch_fingerprints", {}
+        )
         raw_family_streak = getattr(meta, "family_stagnation_streak", 0)
         raw_validation_cursor = getattr(meta, "validation_retry_cursor", 0)
         raw_validation_after_id = getattr(meta, "validation_retry_after_id", "")
@@ -358,6 +366,21 @@ class Engine:
             and re.fullmatch(r"F\d+", raw_proof_epoch_max_id)
             else ""
         )
+        self._proof_dispatch_fingerprints = {}
+        if isinstance(raw_proof_dispatch_fingerprints, dict):
+            for finding_id, fingerprint in raw_proof_dispatch_fingerprints.items():
+                if (
+                    len(self._proof_dispatch_fingerprints)
+                    >= _MAX_PROOF_DISPATCH_FINGERPRINTS
+                ):
+                    break
+                if (
+                    isinstance(finding_id, str)
+                    and re.fullmatch(r"F\d+", finding_id)
+                    and isinstance(fingerprint, str)
+                    and re.fullmatch(r"[0-9a-f]{64}", fingerprint)
+                ):
+                    self._proof_dispatch_fingerprints[finding_id] = fingerprint
         self._family_stagnation_streak = (
             min(raw_family_streak, 1_000_000_000)
             if isinstance(raw_family_streak, int)
@@ -1022,6 +1045,27 @@ class Engine:
                 meta_changes["proof_rotation_epoch_max_id"] = (
                     self._proof_rotation_epoch_max_id
                 )
+                if (
+                    priority_applied
+                    and priority_selection.record_id
+                    and re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        priority_selection.proof_fingerprint,
+                    )
+                ):
+                    self._proof_dispatch_fingerprints[
+                        priority_selection.record_id
+                    ] = priority_selection.proof_fingerprint
+                    # Keep the newest finding IDs when old terminal cases leave
+                    # behind scheduler state.  Only digests enter target.json.
+                    ordered_dispatches = sorted(
+                        self._proof_dispatch_fingerprints.items(),
+                        key=lambda item: Workspace._finding_id_sort_key(item[0]),
+                    )[-_MAX_PROOF_DISPATCH_FINGERPRINTS:]
+                    self._proof_dispatch_fingerprints = dict(ordered_dispatches)
+                    meta_changes["proof_dispatch_fingerprints"] = dict(
+                        self._proof_dispatch_fingerprints
+                    )
             self.ws.update_meta(**meta_changes)
             if coverage_priority:
                 self.emit(
@@ -1384,7 +1428,7 @@ class Engine:
         return [current.get(str(finding.get("id")), finding) for finding in findings]
 
     def _validation_turn_findings(self, new_findings: list[dict]) -> list[dict]:
-        """Include revisions and one durable Astra transport retry per turn."""
+        """Include revisions and a paced durable Astra transport retry."""
         self._selected_validation_retry_id = ""
         self._selected_validation_retry_epoch_max_id = ""
         current = self.ws.findings.all()
@@ -1415,14 +1459,33 @@ class Engine:
         # turn, including after an engine restart. Rotate durably so one
         # repeatable failure cannot starve later candidates. Trusted evidence
         # gaps stay out until Kraude attaches a material revision.
-        retryable = []
+        immediate_retryable = []
+        paced_retryable = []
         for finding in current:
             fid = str(finding.get("id") or "")
             if (
                 fid and fid not in seen
                 and self._automatic_validation_candidates([finding])
             ):
-                retryable.append(finding)
+                verdict = finding.get("manager_verdict")
+                if isinstance(verdict, dict) and verdict.get("degraded") is True:
+                    paced_retryable.append(finding)
+                else:
+                    # A legacy, missing-provenance, or malformed verdict has
+                    # not yet received one current Astra attempt. Give it that
+                    # attempt immediately; if transport fails, the persisted
+                    # degraded result enters the paced queue on later turns.
+                    immediate_retryable.append(finding)
+        # New and materially revised P1/P2 cases are still validated above in
+        # the same turn.  Only provider/transport retries use this cadence.  A
+        # persistent quota outage otherwise consumes one Astra call on every
+        # completed worker turn and can crowd out discovery for hours.
+        retryable = immediate_retryable
+        if (
+            not retryable
+            and self.turn_index % _VALIDATION_RETRY_FREQUENCY == 0
+        ):
+            retryable = paced_retryable
         if retryable:
             selected_index, epoch_max_id = self._next_id_slot(
                 retryable,
@@ -1456,6 +1519,14 @@ class Engine:
                 "needs-more-evidence", "pending",
             }:
                 continue
+            # The claimed severity decides whether Astra runs.  Once Astra has
+            # reviewed the claim, its trusted assessed severity decides whether
+            # the engine may repeatedly pre-empt Kryptex for proof collection.
+            # A worker-claimed P1 that Astra assesses as P3-P5 remains visible
+            # in the finding record but is not forced into every proof cadence.
+            assessed = str(verdict.get("severity") or "").strip().upper()
+            if not config.astra_auto_validation_required(assessed):
+                continue
             raw_checks = verdict.get("independent_checks")
             checks = raw_checks if isinstance(raw_checks, list) else []
             backlog.append({
@@ -1481,14 +1552,60 @@ class Engine:
 
     def _bounded_proof_backlog(self) -> list[dict]:
         """Return a rotating, prompt-sized view of every durable proof gap."""
-        backlog = self._high_severity_proof_backlog(self.ws.findings.all())
+        backlog = self._scheduled_proof_backlog()
         if not backlog:
             return []
         start, _epoch_max_id = self._next_proof_slot(backlog)
         return [
-            backlog[(start + offset) % len(backlog)]
+            {
+                key: value
+                for key, value in backlog[(start + offset) % len(backlog)].items()
+                if key != "_proof_fingerprint"
+            }
             for offset in range(min(len(backlog), _MAX_PROOF_BACKLOG))
         ]
+
+    @staticmethod
+    def _proof_fingerprint(finding: dict) -> str:
+        """Identify one proof request without persisting its evidence text."""
+        verdict = finding.get("manager_verdict")
+        if not isinstance(verdict, dict):
+            verdict = {}
+        payload = {
+            "id": str(finding.get("id") or ""),
+            "evidence": str(finding.get("evidence") or ""),
+            "last_revised_at": finding.get("last_revised_at"),
+            "astra_revision": str(
+                finding.get(ASTRA_REVALIDATION_REVISION_FIELD) or ""
+            ),
+            "verdict": str(verdict.get("verdict") or ""),
+            "severity": str(verdict.get("severity") or ""),
+            "independent_checks": verdict.get("independent_checks")
+            if isinstance(verdict.get("independent_checks"), list) else [],
+        }
+        encoded = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _scheduled_proof_backlog(self) -> list[dict]:
+        """Return proof gaps not yet dispatched for their current evidence."""
+        findings = self.ws.findings.all()
+        by_id = {
+            str(finding.get("id") or ""): finding
+            for finding in findings if isinstance(finding, dict)
+        }
+        scheduled = []
+        for candidate in self._high_severity_proof_backlog(findings):
+            finding_id = str(candidate.get("id") or "")
+            fingerprint = self._proof_fingerprint(by_id.get(finding_id, {}))
+            if self._proof_dispatch_fingerprints.get(finding_id) == fingerprint:
+                continue
+            scheduled.append({
+                **candidate,
+                "_proof_fingerprint": fingerprint,
+            })
+        return scheduled
 
     def _next_proof_slot(self, backlog: list[dict]) -> tuple[int, str]:
         """Select the next case inside a fixed round, then admit new IDs."""
@@ -1595,7 +1712,7 @@ class Engine:
         worker_was_idle: bool,
         convergence_reason: str,
     ) -> _PrioritySelection:
-        backlog = self._high_severity_proof_backlog(self.ws.findings.all())
+        backlog = self._scheduled_proof_backlog()
         # Proof acquisition has its own cadence. New lower-severity families do
         # not reset it, so a P1/P2 evidence request cannot be starved by endless
         # discovery. The cursor advances only when the selected directive and
@@ -1613,6 +1730,7 @@ class Engine:
                 "proof",
                 candidate_id,
                 epoch_max_id,
+                str(candidate.get("_proof_fingerprint") or ""),
             )
         if self._family_stagnation_streak < _FAMILY_PRIORITY_THRESHOLD:
             return _PrioritySelection()
