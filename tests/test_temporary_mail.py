@@ -817,6 +817,161 @@ class TemporaryMailboxTests(unittest.TestCase):
             stored = credentials.load_mailbox(workspace.slug, "signup")
             self.assertEqual(stored["delivered"], {"message-1": ["otp"]})
 
+    def test_poll_extracts_russian_confirmation_code(self):
+        with isolated_runtime():
+            workspace = authorized_workspace()
+            record = mailbox_record()
+            credentials.save_mailbox(workspace.slug, "signup", record)
+            credentials.save_credential(
+                workspace.slug, "signup", record["address"], record["target_password"]
+            )
+
+            def provider(method, path, *, payload=None, bearer="", timeout=20):
+                self.assertEqual(bearer, record["bearer_token"])
+                if path == "/messages?page=1":
+                    return {"hydra:member": [{"id": "message-ru"}]}
+                if path == "/messages/message-ru":
+                    return {
+                        "id": "message-ru",
+                        "from": {"address": "accounts@pachca.example"},
+                        "subject": "Ваш код подтверждения",
+                        "text": (
+                            "Ваш код подтверждения в Пачке: 731905. "
+                            "Код действителен в течение 15 минут."
+                        ),
+                        "html": [],
+                    }
+                self.fail(path)
+
+            with patch("grypton.temporary_mail._request_json", side_effect=provider):
+                result = dispatch(workspace, "temporary_mailbox_poll", {
+                    "alias": "signup", "kind": "otp",
+                    "sender_domain": "pachca.example", "timeout": 1,
+                })
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["data"]["ready"])
+            self.assertEqual(result["data"]["value"], "731905")
+            self.assertNotIn("Код действителен", json.dumps(result))
+
+    def test_otp_extraction_rejects_unlabelled_number(self):
+        messages = (
+            {
+                "subject": "Invoice 731905",
+                "text": "Your account invoice number is 731905.",
+                "html": [],
+            },
+            {
+                "subject": "Ваш промокод",
+                "text": "Промокод: 731905.",
+                "html": [],
+            },
+            {
+                "subject": "Заказ",
+                "text": "Код заказа: 731905.",
+                "html": [],
+            },
+            {
+                "subject": "Адрес",
+                "text": "Почтовый код: 731905.",
+                "html": [],
+            },
+            {
+                "subject": "Ваш код подтверждения",
+                "text": "Номер заказа: 731905.",
+                "html": [],
+            },
+            {
+                "subject": "Authentication support",
+                "text": "Authentication support request reference: 731905.",
+                "html": [],
+            },
+            {
+                "subject": "Security newsletter",
+                "text": "Security newsletter issue number is 731905.",
+                "html": [],
+            },
+            {
+                "subject": "Login activity",
+                "text": "Login activity report reference: 731905.",
+                "html": [],
+            },
+            {
+                "subject": "Authentication ref",
+                "text": "Authentication ref: 731905.",
+                "html": [],
+            },
+            {
+                "subject": "Security issue",
+                "text": "Security issue: 731905.",
+                "html": [],
+            },
+            {
+                "subject": "Login report",
+                "text": "Login report: 731905.",
+                "html": [],
+            },
+            {
+                "subject": "Confirmation order",
+                "text": "Confirmation order: 731905.",
+                "html": [],
+            },
+            {
+                "subject": "Заказ",
+                "text": "Код подтверждения заказа: 731905.",
+                "html": [],
+            },
+            {
+                "subject": "Скидка",
+                "text": "Промокод 731905 — код подтверждения скидки.",
+                "html": [],
+            },
+        )
+        for message in messages:
+            with self.subTest(subject=message["subject"]):
+                self.assertEqual(
+                    temporary_mail._extract(
+                        "otp", message, lambda _url: False
+                    ),
+                    "",
+                )
+
+    def test_otp_extraction_accepts_exact_subject_and_standalone_body(self):
+        for message in (
+            {
+                "subject": "Your verification code",
+                "text": "731905",
+                "html": [],
+            },
+            {
+                "subject": "Ваш код подтверждения",
+                "text": "731905.",
+                "html": [],
+            },
+        ):
+            with self.subTest(subject=message["subject"]):
+                self.assertEqual(
+                    temporary_mail._extract(
+                        "otp", message, lambda _url: False
+                    ),
+                    "731905",
+                )
+
+    def test_otp_extraction_accepts_label_is_punctuation(self):
+        for text in (
+            "Your verification code is: 731905",
+            "OTP is: 731905",
+            "Authentication code is: 731905",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    temporary_mail._extract(
+                        "otp",
+                        {"subject": "", "text": text, "html": []},
+                        lambda _url: False,
+                    ),
+                    "731905",
+                )
+
     def test_poll_returns_only_in_scope_confirmation_link(self):
         with isolated_runtime():
             workspace = authorized_workspace()

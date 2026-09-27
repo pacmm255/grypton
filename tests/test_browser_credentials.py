@@ -3542,6 +3542,7 @@ class BrowserCredentialTests(unittest.TestCase):
                             path.read_text(encoding="utf-8", errors="ignore"),
                             path,
                         )
+
             self.assertEqual(
                 credentials.session_status(ws.slug, "primary")["state"],
                 "step-up-pending",
@@ -3587,6 +3588,51 @@ class BrowserCredentialTests(unittest.TestCase):
                             path.read_text(encoding="utf-8", errors="ignore"),
                             path,
                         )
+
+    def test_discovers_grouped_numeric_otp_without_maxlength(self):
+        from playwright.sync_api import sync_playwright
+
+        executable = tools._browser_executable()
+        self.assertTrue(executable)
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(
+                headless=True, executable_path=executable,
+                args=["--no-sandbox"],
+            )
+            try:
+                page = browser.new_page()
+                page.set_content(
+                    "<form><p>Enter the verification code</p>" + (
+                        '<input type="text" inputmode="numeric">' * 6
+                    ) + "</form>"
+                )
+                controls = tools._browser_auth_discover_step_up_controls(page)
+                self.assertEqual(
+                    controls["otp_selector"],
+                    "input[type='text'][inputmode='numeric']",
+                )
+                self.assertEqual(controls["otp_fields"], 6)
+
+                page.set_content(
+                    '<input type="text" inputmode="numeric" name="company_size">'
+                )
+                controls = tools._browser_auth_discover_step_up_controls(page)
+                self.assertEqual(controls["otp_selector"], "")
+                self.assertEqual(controls["otp_fields"], 0)
+
+                page.set_content(
+                    "<p>Enter the verification code</p>"
+                    "<form>" + (
+                        '<input type="text" inputmode="numeric">' * 3
+                    ) + "</form><form>" + (
+                        '<input type="text" inputmode="numeric">' * 3
+                    ) + "</form>"
+                )
+                controls = tools._browser_auth_discover_step_up_controls(page)
+                self.assertEqual(controls["otp_selector"], "")
+                self.assertEqual(controls["otp_fields"], 0)
+            finally:
+                browser.close()
 
     def test_step_up_combines_persisted_origin_with_declared_otp_endpoint(self):
         with isolated_runtime(), cross_origin_signup_servers() as ports:

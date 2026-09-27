@@ -30,16 +30,47 @@ _DOMAIN = re.compile(
     r"(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
     r"[A-Za-z]{2,63}\Z"
 )
+_OTP_EN_LABEL = (
+    r"(?:(?:verification|confirmation|security|login|auth(?:entication)?|"
+    r"one[ -]?time)\s+(?:code|password|pin)"
+    r"|otp(?:\s+(?:code|password|pin))?)"
+)
+_OTP_EN_SEPARATOR = r"(?:\s|&nbsp;|[:#.,;!?—–-]){0,12}"
 _OTP = re.compile(
-    r"(?is)(?:verification|confirmation|security|one[ -]?time|login|auth|otp)"
-    r"(?:\s|&nbsp;|<[^>]+>|[:#-]){0,20}(?:code|password|pin)?"
-    r"(?:\s|&nbsp;|<[^>]+>|[A-Za-z:()#-]){0,24}\b([0-9]{4,8})\b"
+    r"(?is)\b" + _OTP_EN_LABEL + r"\b" + _OTP_EN_SEPARATOR
+    + r"(?:is\b" + _OTP_EN_SEPARATOR + r")?\b([0-9]{4,8})\b"
 )
 _OTP_REVERSED = re.compile(
-    r"(?is)\b([0-9]{4,8})\b(?:\s|&nbsp;|<[^>]+>|[:#-]){0,20}"
-    r"(?:verification|confirmation|security|one[ -]?time|login|auth|otp)"
-    r"(?:\s+(?:code|password|pin))?"
+    r"(?is)\b([0-9]{4,8})\b" + _OTP_EN_SEPARATOR
+    + r"(?:is\s+)?(?:your\s+)?" + _OTP_EN_LABEL
+    + r"\b(?!\s+[A-Za-z])"
 )
+_OTP_RU_LABEL = (
+    r"(?:\b[Кк]од\s+(?:подтверждения|безопасности|для\s+входа|авторизации|доступа)\b"
+    r"|\b[Оо]дноразов(?:ый|ого)\s+(?:код|пароль)\b)"
+)
+_OTP_RU_SEPARATOR = (
+    # Permit a single title-cased product name, as in "в Пачке", while
+    # refusing arbitrary suffixes such as "код подтверждения заказа".
+    r"(?:\s+в\s+[A-ZА-ЯЁ][A-Za-zА-Яа-яЁё0-9._-]{1,31})?"
+    r"(?:\s|&nbsp;|[:#.,;!?—–-]){0,12}"
+)
+_OTP_RU = re.compile(
+    r"(?s)" + _OTP_RU_LABEL + _OTP_RU_SEPARATOR
+    + r"(?:это\s+)?\b([0-9]{4,8})\b"
+)
+_OTP_RU_REVERSED = re.compile(
+    r"(?s)\b([0-9]{4,8})\b"
+    r"(?:\s|&nbsp;|[:#.,;!?—–-]){0,12}" + _OTP_RU_LABEL
+    + r"(?!\s+[A-Za-zА-Яа-яЁё])"
+)
+_OTP_SUBJECT_EN = re.compile(
+    r"(?is)\s*(?:your\s+)?" + _OTP_EN_LABEL + r"\s*[.!:—–-]?\s*\Z"
+)
+_OTP_SUBJECT_RU = re.compile(
+    r"(?s)\s*(?:[Вв]аш\s+)?" + _OTP_RU_LABEL + r"\s*[.!:—–-]?\s*\Z"
+)
+_OTP_STANDALONE = re.compile(r"(?s)\s*([0-9]{4,8})\s*[.!]?\s*\Z")
 _LINK = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 _VERIFY_WORDS = re.compile(
     r"(?i)(?:verify|verification|confirm|confirmation|activate|activation|signup|register)"
@@ -293,7 +324,7 @@ def create(workspace: Workspace, alias: str) -> dict:
         }
 
 
-def _message_text(message: dict) -> str:
+def _message_parts(message: dict) -> tuple[str, ...]:
     html = message.get("html")
     if isinstance(html, list):
         html_text = " ".join(str(item) for item in html[:8])
@@ -301,11 +332,19 @@ def _message_text(message: dict) -> str:
         html_text = html
     else:
         html_text = ""
-    return " ".join((
+    return tuple(
+        value[:262_144]
+        for value in (
         str(message.get("subject") or ""),
         str(message.get("text") or ""),
         _plain_html(html_text),
-    ))[:262_144]
+        )
+        if value
+    )
+
+
+def _message_text(message: dict) -> str:
+    return " ".join(_message_parts(message))[:262_144]
 
 
 def _sender_domain(message: dict) -> str:
@@ -316,10 +355,31 @@ def _sender_domain(message: dict) -> str:
 
 def _extract(kind: str, message: dict,
              scope_check: Callable[[str], bool]) -> str:
-    text = _message_text(message)
     if kind == "otp":
-        match = _OTP.search(text) or _OTP_REVERSED.search(text)
-        return match.group(1) if match else ""
+        # Keep subject, plain text, and HTML text as separate matching
+        # boundaries. A label-only subject must never consume an unrelated
+        # order, invoice, or date number from the body.
+        for part in _message_parts(message):
+            match = (
+                _OTP.search(part) or _OTP_REVERSED.search(part)
+                or _OTP_RU.search(part) or _OTP_RU_REVERSED.search(part)
+            )
+            if match:
+                return match.group(1)
+        # Some providers put the complete OTP label in the subject and only
+        # the digits in the body. Cross that boundary solely for an exact
+        # subject label and a standalone body value; never join a label-only
+        # subject to an invoice, order, postal, or promotional number.
+        subject = unescape(str(message.get("subject") or ""))
+        if _OTP_SUBJECT_EN.fullmatch(subject) or _OTP_SUBJECT_RU.fullmatch(subject):
+            parts = _message_parts(message)
+            body_parts = parts[1:] if subject and parts else parts
+            for part in body_parts:
+                match = _OTP_STANDALONE.fullmatch(part)
+                if match:
+                    return match.group(1)
+        return ""
+    text = _message_text(message)
     subject = str(message.get("subject") or "")
     for raw in _LINK.findall(text):
         candidate = unescape(raw).rstrip(".,;:!?)]}>")

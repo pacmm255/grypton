@@ -4347,6 +4347,14 @@ def _browser_auth_discover_step_up_controls(page) -> dict[str, object]:
         "input[id*='code' i]",
         "input[inputmode='numeric'][maxlength='1']",
     )
+    # Some OTP widgets render a group of single-character numeric inputs
+    # without a maxlength attribute or semantic name. A lone numeric input is
+    # too ambiguous (phone, quantity, company size), so accept this broad
+    # selector only when it identifies a conventional four-to-eight-field OTP
+    # group. Pachca's current six-field email-code widget has this shape.
+    grouped_otp_candidates = (
+        "input[type='text'][inputmode='numeric']",
+    )
     action_candidates = (
         "button[type='submit']",
         "form button:not([type])",
@@ -4369,6 +4377,39 @@ def _browser_auth_discover_step_up_controls(page) -> dict[str, object]:
         except Exception:
             return 0
 
+    def grouped_visible_count(selector: str) -> int:
+        """Recognize one co-located six-box email-code widget."""
+        try:
+            return int(page.evaluate(
+                r"""selector => {
+                    const visible = element => {
+                      const style = getComputedStyle(element);
+                      const box = element.getBoundingClientRect();
+                      return style.visibility !== 'hidden' &&
+                        style.display !== 'none' && box.width > 0 && box.height > 0;
+                    };
+                    const fields = Array.from(document.querySelectorAll(selector))
+                      .filter(visible);
+                    if (fields.length !== 6 || fields.some(field => field.value)) {
+                      return 0;
+                    }
+                    const form = fields[0].closest('form');
+                    if (!form || fields.some(field => field.closest('form') !== form)) {
+                      return 0;
+                    }
+                    const signature = fields[0].className;
+                    if (fields.some(field => field.className !== signature)) {
+                      return 0;
+                    }
+                    const text = (form.innerText || '').toLowerCase();
+                    const challenge = /(?:verification|confirmation|one[- ]?time|otp)\s+(?:code|password|pin)|(?:enter|sent|email)\s+(?:the\s+)?code|код.{0,50}(?:подтверж|письм|почт|вход)|(?:подтверж|письм|почт|вход).{0,50}код/i;
+                    return challenge.test(text) ? fields.length : 0;
+                }""",
+                selector,
+            ))
+        except Exception:
+            return 0
+
     otp_selector = ""
     otp_fields = 0
     for candidate in otp_candidates:
@@ -4376,6 +4417,12 @@ def _browser_auth_discover_step_up_controls(page) -> dict[str, object]:
         if count:
             otp_selector, otp_fields = candidate, count
             break
+    if not otp_selector:
+        for candidate in grouped_otp_candidates:
+            count = grouped_visible_count(candidate)
+            if count:
+                otp_selector, otp_fields = candidate, count
+                break
     submit_selector = next(
         (candidate for candidate in action_candidates if visible_count(candidate)),
         "",
