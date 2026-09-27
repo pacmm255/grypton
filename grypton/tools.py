@@ -28,7 +28,7 @@ from urllib.parse import (parse_qsl, quote, quote_plus, unquote, urlencode,
                           urljoin, urlsplit, urlunsplit)
 import zipfile
 
-from . import config, credentials
+from . import config, credentials, request_policy
 from .workspace import Workspace
 
 MAX_RESPONSE_BYTES = 2_000_000
@@ -1140,6 +1140,21 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
         return _err(str(exc))
     if _bearer_token and not any(key.lower() == "authorization" for key in clean_headers):
         clean_headers["Authorization"] = f"Bearer {_bearer_token}"
+    try:
+        policy_origin, transport_policy = request_policy.policy_for_url(
+            workspace.slug, url
+        )
+        mandatory_headers = request_policy.resolved_headers(
+            workspace.slug, transport_policy
+        )
+        clean_headers = request_policy.merge_mandatory_headers(
+            clean_headers, mandatory_headers
+        )
+    except request_policy.RequestPolicyError as exc:
+        return _err(f"Request policy blocked the request: {exc}.")
+    policy_secrets = _serialized_secret_variants(
+        request_policy.secret_values(mandatory_headers)
+    )
 
     argv = [curl, "--disable", "--silent", "--show-error"]
     # The managed Goja HTTPS replay path decodes supported compressed bodies
@@ -1165,6 +1180,9 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
     capture_path: Optional[Path] = None
     started = time.time()
     try:
+        request_policy.enforce_rate_limit(
+            workspace.slug, policy_origin, transport_policy
+        )
         response_header_path = (
             private_tmp / f".curl-{time.time_ns()}.response-headers"
         )
@@ -1236,7 +1254,7 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
     except subprocess.TimeoutExpired:
         return _err(f"HTTP request timed out after {timeout}s; it was not retried.")
     except OSError as exc:
-        detail = redact_sensitive_text(exc, proxy_secrets)
+        detail = redact_sensitive_text(exc, (*proxy_secrets, *policy_secrets))
         return _err(
             "HTTP transport failed before a response was captured: " + detail
         )
@@ -1280,6 +1298,7 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
             return _err(f"Refused unsafe bearer-token state: {exc}")
     secrets_to_hide = tuple(str(value) for value in _secret_values if str(value))
     secrets_to_hide += proxy_secrets
+    secrets_to_hide += policy_secrets
     secrets_to_hide += tuple(extracted.values())
     if response_location:
         secrets_to_hide += _serialized_secret_variants(
@@ -1291,7 +1310,12 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
     stderr = redact_sensitive_text(
         result.stderr[:8000].decode("utf-8", "replace"), secrets_to_hide
     )
-    flow_headers = clean_headers if _capture_headers is None else _capture_headers
+    flow_headers = (
+        clean_headers if _capture_headers is None
+        else request_policy.merge_mandatory_headers(
+            _safe_headers(_capture_headers), mandatory_headers
+        )
+    )
     flow_body = body if _capture_body is None else _capture_body
     flow = _save_flow(
         workspace, method, url, flow_headers, flow_body, safe_output,
@@ -1308,8 +1332,11 @@ def http_request(workspace: Workspace, url: str, *, method: str = "GET",
         # Internal consumers such as target-scoped research need the complete
         # bounded body while retaining http_request's private proxy transport,
         # TLS verification, flow redaction, and non-following redirect policy.
+        safe_payload_body = redact_sensitive_text(
+            raw_response_body.decode("utf-8", "replace"), policy_secrets
+        ).encode("utf-8")
         _response_payload.update({
-            "body": raw_response_body,
+            "body": safe_payload_body,
             "location": response_location,
             "status_line": status,
         })
@@ -2635,13 +2662,28 @@ def httpx_probe(workspace: Workspace, targets: str) -> dict:
     values = [value for value in re.split(r"[\s,]+", targets.strip()) if value]
     if not values or len(values) > 500:
         return _err("Supply between 1 and 500 scoped hosts or URLs.")
+    policy_entries: list[tuple[str, str, Optional[dict], dict[str, str]]] = []
     for value in values:
         if "://" in value:
             allowed, reason = check_url_scope(workspace, value)
+            try:
+                policy_origin, transport_policy = request_policy.policy_for_url(
+                    workspace.slug, value
+                )
+                mandatory_headers = request_policy.resolved_headers(
+                    workspace.slug, transport_policy
+                )
+            except request_policy.RequestPolicyError as exc:
+                return _err(f"Request policy blocked httpx: {exc}.")
         else:
             try:
                 parsed = urlsplit("//" + value)
                 host = parsed.hostname or ""
+                if request_policy.policies_for_host(workspace.slug, host):
+                    return _err(
+                        "Policy-bound httpx targets require an explicit scoped URL "
+                        "so mandatory headers remain exact-origin."
+                    )
                 if not host or not _non_url_rule_authorizes(workspace, host, parsed.port):
                     allowed, reason = False, (
                         "bare httpx targets require a non-URL host/domain/CIDR scope rule; "
@@ -2654,8 +2696,53 @@ def httpx_probe(workspace: Workspace, targets: str) -> dict:
                     )
             except ValueError:
                 allowed, reason = False, "invalid host or port"
+            policy_origin, transport_policy, mandatory_headers = "", None, {}
         if not allowed:
             return _err(f"Scope blocked {value}: {reason}.")
+        policy_entries.append((
+            value, policy_origin, transport_policy, mandatory_headers,
+        ))
+    policy_bound = any(policy is not None for _, _, policy, _ in policy_entries)
+    if policy_bound and any("://" not in value for value in values):
+        return _err(
+            "Policy-bound httpx batches require explicit scoped URLs for every target."
+        )
+    if policy_bound and any(
+        policy is None for _, _, policy, _ in policy_entries
+    ):
+        return _err(
+            "Split policy-bound and unbound origins into separate httpx calls."
+        )
+
+    # A ProjectDiscovery probe may make several internal requests for one input
+    # (scheme fallback, redirects, and technology checks). Its process-wide
+    # integer limiter cannot preserve a fractional ceiling or share one exact
+    # bucket with browser/curl traffic. Keep policy-bound probes on the central
+    # one-request transport so every outbound request receives the mandatory
+    # headers and participates in the cross-process engagement bucket.
+    if policy_bound:
+        rows = []
+        for value, _origin, _policy, policy_headers in policy_entries:
+            result = http_request(
+                workspace, value, method="GET", transport="httpx-policy-fallback"
+            )
+            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            secrets = _serialized_secret_variants(
+                request_policy.secret_values(policy_headers)
+            )
+            rows.append({
+                "url": redact_sensitive_text(value, secrets),
+                "ok": bool(result.get("ok")),
+                "status_line": str(data.get("status_line") or ""),
+                "flow": str(data.get("flow") or ""),
+            })
+            if not result.get("ok"):
+                return _err("Policy-bound httpx fallback failed.", {"results": rows})
+        return _ok(
+            f"httpx-compatible policy probe completed for {len(rows)} scoped target(s).",
+            {"results": rows, "transport": "scoped-http-fallback"},
+        )
+
     try:
         private_proxy = config.private_egress_proxy()
     except ValueError as exc:
@@ -2975,6 +3062,33 @@ def _launch_scoped_browser_context(playwright, launch_profile: dict,
                 if same_origin:
                     request_headers = dict(route.request.headers)
                     request_headers.update(active_headers)
+            try:
+                policy_origin, transport_policy = request_policy.policy_for_url(
+                    workspace.slug, request_url
+                )
+                mandatory_headers = request_policy.resolved_headers(
+                    workspace.slug, transport_policy
+                )
+                request_policy.enforce_rate_limit(
+                    workspace.slug, policy_origin, transport_policy
+                )
+            except (OSError, request_policy.RequestPolicyError):
+                if network_state is not None:
+                    network_state["blocked"] = int(
+                        network_state.get("blocked") or 0
+                    ) + 1
+                    network_state["policy_blocked"] = int(
+                        network_state.get("policy_blocked") or 0
+                    ) + 1
+                if len(denied_requests) < 100:
+                    denied_requests.append(request_url)
+                route.abort("blockedbyclient")
+                return
+            if mandatory_headers:
+                request_headers = request_policy.merge_mandatory_headers(
+                    request_headers or dict(route.request.headers),
+                    mandatory_headers,
+                )
             if request_headers is None:
                 route.continue_()
             else:
@@ -3003,6 +3117,12 @@ def browse(workspace: Workspace, url: str, *, timeout: int = 45) -> dict:
     executable = _browser_executable()
     if not executable:
         return _err("No Playwright-compatible Chromium or Chrome executable is installed.")
+    try:
+        policy_secrets = _serialized_secret_variants(
+            request_policy.all_resolved_secret_values(workspace.slug)
+        )
+    except request_policy.RequestPolicyError as exc:
+        return _err(f"Request policy blocked the browser: {exc}.")
     output = workspace.scratch_dir / f"page-{time.time_ns()}.html"
     denied_requests: list[str] = []
     console: list[dict] = []
@@ -3039,15 +3159,32 @@ def browse(workspace: Workspace, url: str, *, timeout: int = 45) -> dict:
                 context.close()
             except Exception:
                 pass
-        return _err(f"Headless browser failed: {_browser_safe_error(exc)}",
-                    {"blocked_requests": denied_requests, "console": console})
-    output.write_bytes(html)
-    rendered = f"HTTP {status}\nFinal-URL: {final_url}\n\n" + html.decode("utf-8", "replace")
+        return _err(
+            f"Headless browser failed: {_browser_safe_error(exc, policy_secrets)}",
+            {
+                "blocked_requests": [
+                    redact_sensitive_text(item, policy_secrets)
+                    for item in denied_requests
+                ],
+                "console": _redacted_capture_value(console, policy_secrets),
+            },
+        )
+    safe_html = redact_sensitive_text(
+        html.decode("utf-8", "replace"), policy_secrets
+    ).encode("utf-8")
+    safe_final_url = redact_sensitive_text(final_url, policy_secrets)
+    safe_console = _redacted_capture_value(console, policy_secrets)
+    safe_denied = [
+        redact_sensitive_text(item, policy_secrets) for item in denied_requests
+    ]
+    output.write_bytes(safe_html)
+    rendered = f"HTTP {status}\nFinal-URL: {safe_final_url}\n\n" + safe_html.decode("utf-8", "replace")
     flow = _save_flow(workspace, "GET", url, {}, None, rendered,
-                      transport="playwright-chromium", returncode=0)
+                      transport="playwright-chromium", returncode=0,
+                      secret_values=policy_secrets)
     data = {"html_path": str(output), "flow": str(flow), "status": status,
-            "final_url": final_url, "blocked_requests": denied_requests,
-            "console": console, "browser_identity": browser_identity}
+            "final_url": safe_final_url, "blocked_requests": safe_denied,
+            "console": safe_console, "browser_identity": browser_identity}
     if not html:
         return _err(f"Headless browser returned an empty DOM; capture saved to {flow.name}.", data)
     return _ok(f"Chromium saved {len(html)} bytes to {output.name} and {flow.name}.", data)
@@ -3209,6 +3346,85 @@ def _browser_auth_locator(page, selector: str, *, role: str, timeout_ms: int):
     if not accepted:
         raise ValueError(f"{role} selector did not resolve to a compatible form control")
     return locator
+
+
+def _browser_auth_registration_controls(
+    fields: Optional[dict], checkbox_selectors: Optional[list],
+) -> tuple[dict[str, str], list[str]]:
+    """Validate bounded, non-secret signup controls before launching Chromium."""
+    if fields is None:
+        fields = {}
+    if checkbox_selectors is None:
+        checkbox_selectors = []
+    if not isinstance(fields, dict) or len(fields) > 20:
+        raise ValueError("Signup fields must be an object with at most 20 entries.")
+    if not isinstance(checkbox_selectors, list) or len(checkbox_selectors) > 10:
+        raise ValueError("Signup checkboxes must be a list with at most 10 selectors.")
+    clean_fields: dict[str, str] = {}
+    for raw_selector, raw_value in fields.items():
+        selector = _browser_auth_selector(
+            raw_selector, label="Signup field", default=""
+        )
+        if not isinstance(raw_value, str) or len(raw_value) > 500 or any(
+            ord(char) < 0x20 and char not in "\t" for char in raw_value
+        ):
+            raise ValueError(
+                "Signup field values must be printable strings of at most 500 characters."
+            )
+        clean_fields[selector] = raw_value
+    clean_checkboxes = list(dict.fromkeys(
+        _browser_auth_selector(value, label="Signup checkbox", default="")
+        for value in checkbox_selectors
+    ))
+    return clean_fields, clean_checkboxes
+
+
+def _browser_auth_fill_registration_controls(
+    page, fields: dict[str, str], checkbox_selectors: list[str], *, timeout_ms: int,
+) -> None:
+    """Fill ordinary text/select controls and affirm listed checkboxes only."""
+    for selector, value in fields.items():
+        locator = page.locator(selector).first
+        locator.wait_for(state="visible", timeout=timeout_ms)
+        details = locator.evaluate(
+            """el => ({tag: el.tagName.toLowerCase(),
+                        type: (el.getAttribute('type') || '').toLowerCase(),
+                        disabled: !!el.disabled})"""
+        )
+        tag = str((details or {}).get("tag") or "")
+        input_type = str((details or {}).get("type") or "")
+        if bool((details or {}).get("disabled")):
+            raise ValueError("signup field control is disabled")
+        if tag == "select":
+            locator.select_option(value=value, timeout=timeout_ms)
+        elif tag == "textarea" or (
+            tag == "input" and input_type in {
+                "", "text", "email", "tel", "number", "search", "url",
+                "date", "datetime-local", "month", "time", "week",
+            }
+        ):
+            locator.fill(value, timeout=timeout_ms)
+        else:
+            raise ValueError(
+                "signup field selector did not resolve to a text or select control"
+            )
+    for selector in checkbox_selectors:
+        locator = page.locator(selector).first
+        locator.wait_for(state="visible", timeout=timeout_ms)
+        details = locator.evaluate(
+            """el => ({tag: el.tagName.toLowerCase(),
+                        type: (el.getAttribute('type') || '').toLowerCase(),
+                        disabled: !!el.disabled})"""
+        )
+        if (
+            str((details or {}).get("tag") or "") != "input"
+            or str((details or {}).get("type") or "") != "checkbox"
+            or bool((details or {}).get("disabled"))
+        ):
+            raise ValueError(
+                "signup checkbox selector did not resolve to an enabled checkbox"
+            )
+        locator.check(timeout=timeout_ms)
 
 
 def _browser_auth_wait_for_submit(page, locator, timeout_ms: int) -> None:
@@ -4860,6 +5076,8 @@ def credential_browser_login(
     success_marker: str = "",
     verify_headers: Optional[dict] = None,
     verification: Optional[dict] = None,
+    registration_fields: Optional[dict] = None,
+    registration_checkboxes: Optional[list] = None,
     timeout: int = 45,
 ) -> dict:
     """Serialize one complete browser login proof with other session writers."""
@@ -4882,6 +5100,8 @@ def credential_browser_login(
                     submit_selector=submit_selector,
                     verify_url=verify_url, success_marker=success_marker,
                     verify_headers=verify_headers, verification=verification,
+                    registration_fields=registration_fields,
+                    registration_checkboxes=registration_checkboxes,
                     timeout=timeout, _profile_revision=profile_revision,
                 )
     except credentials.CredentialError as exc:
@@ -4901,6 +5121,8 @@ def _credential_browser_login_locked(
     success_marker: str = "",
     verify_headers: Optional[dict] = None,
     verification: Optional[dict] = None,
+    registration_fields: Optional[dict] = None,
+    registration_checkboxes: Optional[list] = None,
     timeout: int = 45,
     _refresh_generation: Optional[int] = None,
     _upgrade_generation: Optional[int] = None,
@@ -4955,6 +5177,11 @@ def _credential_browser_login_locked(
         submit_selector = _browser_auth_selector(
             submit_selector, label="Submit", default=_BROWSER_SUBMIT_SELECTOR
         )
+        registration_fields, registration_checkboxes = (
+            _browser_auth_registration_controls(
+                registration_fields, registration_checkboxes
+            )
+        )
         if success_marker and (
             len(success_marker) > 200
             or any(ord(char) < 0x20 for char in success_marker)
@@ -5001,8 +5228,12 @@ def _credential_browser_login_locked(
     username_redactions = _login_username_redaction_values(
         secret["username"], username_transform
     )
+    try:
+        policy_values = request_policy.all_resolved_secret_values(workspace.slug)
+    except request_policy.RequestPolicyError as exc:
+        return _err(f"Request policy blocked browser authentication: {exc}.")
     secret_values = _serialized_secret_variants((
-        *username_redactions, secret["password"],
+        *username_redactions, secret["password"], *policy_values,
     ))
     denied_requests: list[str] = []
     console: list[dict] = []
@@ -5199,6 +5430,10 @@ def _credential_browser_login_locked(
                     phase["name"] = "login"
                     capture_session = None
                     try:
+                        _browser_auth_fill_registration_controls(
+                            page, registration_fields, registration_checkboxes,
+                            timeout_ms=timeout_ms,
+                        )
                         if maintenance_generation is not None:
                             # Renewal persists its one-submission reservation and
                             # starts capture before secrets enter the form.  Input
@@ -6299,11 +6534,16 @@ def _credential_browser_begin_step_up_locked(
 
     timeout_seconds = max(5, min(int(timeout), 120))
     timeout_ms = timeout_seconds * 1000
-    username_secrets = _serialized_secret_variants(
-        _login_username_redaction_values(
+    try:
+        policy_values = request_policy.all_resolved_secret_values(workspace.slug)
+    except request_policy.RequestPolicyError as exc:
+        return _err(f"Request policy blocked browser authentication: {exc}.")
+    username_secrets = _serialized_secret_variants((
+        *_login_username_redaction_values(
             secret["username"], profile["username_transform"]
-        )
-    )
+        ),
+        *policy_values,
+    ))
     denied_requests: list[str] = []
     pending_responses: list[dict] = []
     cookies: list[dict] = []
@@ -6465,6 +6705,7 @@ def credential_browser_step_up(
     submit_selector: str = "",
     password_submit_selector: str = "",
     timeout: int = 45,
+    _continuation_observation: Optional[dict] = None,
 ) -> dict:
     """Privately continue one saved browser login challenge with a human OTP."""
     code = str(otp or "")
@@ -6499,7 +6740,13 @@ def credential_browser_step_up(
                 )
             secret = credentials.load_credential(workspace.slug, credential)
             password = secret["password"]
-            password_secrets = _serialized_secret_variants((password,))
+            policy_values = request_policy.all_resolved_secret_values(
+                workspace.slug
+            )
+            code_secrets = _serialized_secret_variants((code, *policy_values))
+            password_secrets = _serialized_secret_variants((
+                password, *policy_values,
+            ))
             revision = credentials.auth_profile_revision(profile)
             with credentials.session_material_lock(workspace.slug, credential):
                 pending = credentials.load_pending_browser_step_up(
@@ -6554,6 +6801,7 @@ def credential_browser_step_up(
                     submit_selector=selected_submit,
                     password_submit_selector=override_password_submit,
                     timeout=timeout,
+                    continuation_observation=_continuation_observation,
                 )
     except (ValueError, credentials.CredentialError) as exc:
         return _err(redact_sensitive_text(str(exc), code_secrets))
@@ -6574,6 +6822,7 @@ def _credential_browser_step_up_locked(
     submit_selector: str,
     password_submit_selector: str,
     timeout: int,
+    continuation_observation: Optional[dict] = None,
 ) -> dict:
     try:
         from playwright.sync_api import sync_playwright
@@ -6673,6 +6922,8 @@ def _credential_browser_step_up_locked(
                     workspace.slug, credential
                 )
                 continuation_reserved = True
+                if isinstance(continuation_observation, dict):
+                    continuation_observation["reserved"] = True
                 capture_session, pending_responses = (
                     _browser_auth_enable_response_capture(
                         context, page, workspace, denied_requests,
@@ -7773,6 +8024,7 @@ def authenticated_browser_request(
                 runtime_values: list[str] = [
                     secret["username"], secret["password"], *tokens.values(),
                     *new_tokens.values(), *private_headers.values(),
+                    *request_policy.all_resolved_secret_values(workspace.slug),
                 ]
                 for browser_cookies in (
                     rich_state.get("cookies") or [], final_cookies,
@@ -8041,11 +8293,28 @@ def dns_lookup(workspace: Workspace, host: str) -> dict:
     return _ok(f"Resolved {host} to {len(rows)} address(es).", rows)
 
 
+def _policy_blocks_raw_transport(workspace: Workspace, host: str,
+                                 operation: str) -> Optional[dict]:
+    try:
+        policies = request_policy.policies_for_host(workspace.slug, host)
+    except request_policy.RequestPolicyError as exc:
+        return _err(f"Request policy blocked {operation}: {exc}.")
+    if policies:
+        return _err(
+            f"Request policy blocked {operation}: this host requires HTTP "
+            "identification headers and a shared request-rate bucket that raw "
+            "transport cannot apply."
+        )
+    return None
+
+
 def tls_certificate(workspace: Workspace, host: str, *, port: int = 443) -> dict:
     port = max(1, min(int(port), 65535))
     allowed, reason = check_port_scope(workspace, host, port)
     if not allowed:
         return _err(f"Scope blocked {host}:{port}: {reason}.")
+    if blocked := _policy_blocks_raw_transport(workspace, host, "TLS inspection"):
+        return blocked
     try:
         context = ssl.create_default_context()
         with socket.create_connection((host, port), timeout=10) as raw:
@@ -8068,6 +8337,8 @@ def port_scan(workspace: Workspace, host: str, ports: Iterable[int], *, timeout_
         allowed, reason = check_port_scope(workspace, host, port)
         if not allowed:
             return _err(f"Scope blocked {host}:{port}: {reason}.")
+    if blocked := _policy_blocks_raw_transport(workspace, host, "port scanning"):
+        return blocked
     opened = []
     for port in normalized:
         try:
@@ -8093,6 +8364,8 @@ def tcp_exchange(workspace: Workspace, host: str, port: int, payload: str, *, ti
     allowed, reason = check_raw_tcp_scope(workspace, host, port)
     if not allowed:
         return _err(f"Scope blocked {host}:{port}: {reason}.")
+    if blocked := _policy_blocks_raw_transport(workspace, host, "TCP exchange"):
+        return blocked
     if not isinstance(payload, str) or not payload.strip() or "\x00" in payload:
         return _err("TCP payload must be one non-empty text frame.")
     if len(payload.encode("utf-8")) > 16_000:
@@ -8151,16 +8424,33 @@ def artifact_download(workspace: Workspace, url: str, filename: str, *, timeout:
     except ValueError as exc:
         return _err(str(exc))
     proxy_secrets = _proxy_redaction_values(private_proxy)
+    try:
+        policy_origin, transport_policy = request_policy.policy_for_url(
+            workspace.slug, url
+        )
+        mandatory_headers = request_policy.resolved_headers(
+            workspace.slug, transport_policy
+        )
+    except request_policy.RequestPolicyError as exc:
+        return _err(f"Request policy blocked the artifact download: {exc}.")
+    policy_secrets = _serialized_secret_variants(
+        request_policy.secret_values(mandatory_headers)
+    )
+    transport_secrets = (*proxy_secrets, *policy_secrets)
     timeout = max(1, min(int(timeout), 120))
     max_bytes = 256 * 1024 * 1024
     workspace.loot_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(workspace.loot_dir, 0o700)
-    workspace.scratch_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(workspace.scratch_dir, 0o700)
-    temporary = workspace.loot_dir / f".{destination.name}.{time.time_ns()}.part"
-    headers = workspace.scratch_dir / f"download-{time.time_ns()}.headers"
+    private_tmp = config.RUNTIME_DIR / "artifact-tmp" / workspace.slug
+    private_tmp.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(private_tmp, 0o700)
+    temporary = private_tmp / f".{destination.name}.{time.time_ns()}.part"
+    headers = private_tmp / f"download-{time.time_ns()}.headers"
     created: list[Path] = []
     try:
+        request_policy.enforce_rate_limit(
+            workspace.slug, policy_origin, transport_policy
+        )
         for path in (temporary, headers):
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
             os.close(fd)
@@ -8179,9 +8469,14 @@ def artifact_download(workspace: Workspace, url: str, filename: str, *, timeout:
             "env": _minimal_local_environment(),
             "umask": 0o077,
         }
+        private_config = "".join(
+            "header = " + json.dumps(f"{name}: {value}") + "\n"
+            for name, value in mandatory_headers.items()
+        )
         if private_proxy:
-            proxy_config = _curl_proxy_config(private_proxy, tunnel=True)
-            with _anonymous_subprocess_config(proxy_config) as (path, config_fd):
+            private_config += _curl_proxy_config(private_proxy, tunnel=True)
+        if private_config:
+            with _anonymous_subprocess_config(private_config) as (path, config_fd):
                 result = subprocess.run(
                     [*argv, "--config", path, "--", url],
                     pass_fds=(config_fd,), **run_kwargs,
@@ -8191,33 +8486,49 @@ def artifact_download(workspace: Workspace, url: str, filename: str, *, timeout:
         if result.returncode:
             detail = redact_sensitive_text(
                 result.stderr.decode("utf-8", "replace")[-2000:],
-                proxy_secrets,
+                transport_secrets,
             )
             return _err("Artifact download failed: " + detail)
         size = temporary.stat().st_size
         if size > max_bytes:
             return _err("Artifact download exceeded the 256 MB limit.")
         digest_state = hashlib.sha256()
+        policy_needles = [
+            value.encode("utf-8") for value in policy_secrets if value
+        ]
+        overlap = max((len(value) for value in policy_needles), default=1) - 1
+        tail = b""
+        reflected_policy_value = False
         with temporary.open("rb") as stream:
             while block := stream.read(1024 * 1024):
                 digest_state.update(block)
+                window = tail + block
+                if any(value in window for value in policy_needles):
+                    reflected_policy_value = True
+                    break
+                tail = window[-overlap:] if overlap else b""
+        if reflected_policy_value:
+            return _err(
+                "Artifact download was discarded because the response reflected "
+                "private request-policy material."
+            )
         digest = digest_state.hexdigest()
         os.replace(temporary, destination)
         response_headers = headers.read_text(
             encoding="utf-8", errors="replace"
         ) if headers.exists() else ""
-        response_headers = redact_sensitive_text(response_headers, proxy_secrets)
-        flow = _save_flow(workspace, "GET", url, {}, None,
+        response_headers = redact_sensitive_text(response_headers, transport_secrets)
+        flow = _save_flow(workspace, "GET", url, mandatory_headers, None,
                           response_headers + f"\n[Binary saved: {destination.name}; sha256={digest}]",
                           transport="artifact-download", returncode=0,
-                          secret_values=proxy_secrets)
+                          secret_values=transport_secrets)
         return _ok(f"Saved {destination.name} ({size} bytes) and {flow.name}.",
                    {"path": str(destination), "sha256": digest, "flow": str(flow),
                     "bytes": size})
     except (OSError, subprocess.SubprocessError) as exc:
         return _err(
             "Artifact download failed: "
-            + redact_sensitive_text(exc, proxy_secrets)
+            + redact_sensitive_text(exc, transport_secrets)
         )
     finally:
         for path in created:
@@ -8821,7 +9132,8 @@ def _pinned_research_socket(destination: tuple, timeout: float, source_address=N
         raise
 
 
-def _research_request_once(parsed, destinations: list[tuple], timeout: float):
+def _research_request_once(parsed, destinations: list[tuple], timeout: float,
+                           headers: Optional[dict] = None):
     """Issue one direct GET to a checked address while retaining the URL hostname."""
     hostname = (parsed.hostname or "").rstrip(".")
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -8851,7 +9163,9 @@ def _research_request_once(parsed, destinations: list[tuple], timeout: float):
 
         connection._create_connection = create_connection
         try:
-            connection.request("GET", path, headers={"User-Agent": "Grypton-Research/3.0"})
+            connection.request("GET", path, headers=headers or {
+                "User-Agent": "Grypton-Research/3.0"
+            })
             response = connection.getresponse()
             status = int(response.status)
             reason = str(response.reason or "")
@@ -8912,6 +9226,15 @@ def research(workspace: Workspace, url: str, *, timeout: int = 30) -> dict:
                 return _err(f"Scope blocked research URL: {scope_reason}.")
             parsed = urlsplit(current_url)
             hostname = (parsed.hostname or "").rstrip(".")
+            policy_origin, transport_policy = request_policy.policy_for_url(
+                workspace.slug, current_url
+            )
+            mandatory_headers = request_policy.resolved_headers(
+                workspace.slug, transport_policy
+            )
+            proxy_secrets.update(_serialized_secret_variants(
+                request_policy.secret_values(mandatory_headers)
+            ))
             private_proxy = ""
             if _research_target_related(workspace, hostname):
                 private_proxy = config.private_egress_proxy()
@@ -8928,8 +9251,14 @@ def research(workspace: Workspace, url: str, *, timeout: int = 30) -> dict:
                 )
                 if blocked:
                     return blocked
+                request_policy.enforce_rate_limit(
+                    workspace.slug, policy_origin, transport_policy
+                )
+                research_headers = request_policy.merge_mandatory_headers(
+                    {"User-Agent": "Grypton-Research/3.0"}, mandatory_headers
+                )
                 status, reason, location, payload = _research_request_once(
-                    parsed, destinations, timeout_seconds
+                    parsed, destinations, timeout_seconds, research_headers
                 )
             if status in _RESEARCH_REDIRECT_STATUSES:
                 if not location:

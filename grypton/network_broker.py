@@ -223,8 +223,11 @@ class ScopedNetworkBroker:
                 request = json.loads(raw)
             except (UnicodeDecodeError, ValueError) as exc:
                 raise NetworkBrokerError("broker request is invalid") from exc
-            if not isinstance(request, dict) or request.get("operation") != "http_request":
+            if not isinstance(request, dict) or request.get("operation") not in {
+                "http_request", "httpx_probe",
+            }:
                 raise NetworkBrokerError("broker operation is unsupported")
+            operation = str(request["operation"])
             arguments = request.get("arguments")
             if not isinstance(arguments, dict):
                 raise NetworkBrokerError("broker request is invalid")
@@ -232,13 +235,23 @@ class ScopedNetworkBroker:
             resolved = Workspace(self.target_slug)
             if resolved.root.resolve() != self.workspace:
                 raise NetworkBrokerError("broker workspace binding is invalid")
-            allowed_keys = {
-                "url", "method", "headers", "body", "timeout",
-                "follow_redirects", "insecure",
-            }
+            allowed_keys = (
+                {
+                    "url", "method", "headers", "body", "timeout",
+                    "follow_redirects", "insecure",
+                }
+                if operation == "http_request" else {"targets"}
+            )
             if set(arguments) - allowed_keys:
                 raise NetworkBrokerError("broker request contains unsupported fields")
-            if arguments.get("body") is None:
+            if operation == "httpx_probe":
+                targets = arguments.get("targets")
+                if (
+                    not isinstance(targets, str) or not targets.strip()
+                    or len(targets.encode("utf-8")) > 100_000
+                ):
+                    raise NetworkBrokerError("broker httpx targets are invalid")
+            elif arguments.get("body") is None:
                 arguments = {key: value for key, value in arguments.items()
                              if key != "body"}
             elif (not isinstance(arguments["body"], str)
@@ -249,7 +262,7 @@ class ScopedNetworkBroker:
             # effect-intent logging, redacted auditing, and flow capture.
             from .toolserver import dispatch
             result = await asyncio.to_thread(
-                dispatch, resolved, "http_request", arguments
+                dispatch, resolved, operation, arguments
             )
             response = {"ok": True, "result": result}
         except asyncio.CancelledError:
@@ -409,6 +422,83 @@ def main():
         if not response.endswith("\\n"): sys.stdout.write("\\n")
     if not result.get("ok"):
         print("curl: " + str(result.get("summary") or "request denied"), file=sys.stderr)
+        raise SystemExit(22)
+    raise SystemExit(0)
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def httpx_wrapper_source(socket_path: Path) -> str:
+    """Return a narrow ProjectDiscovery-style client for the Unix broker."""
+    path_literal = repr(str(socket_path))
+    return f'''#!/usr/bin/python3
+import json
+import socket
+import sys
+
+SOCKET_PATH = {path_literal}
+
+def fail(message, code=2):
+    print("httpx: " + message, file=sys.stderr)
+    raise SystemExit(code)
+
+def main():
+    argv = sys.argv[1:]
+    targets = []
+    index = 0
+    ignored = {{"-silent", "-status-code", "-title", "-tech-detect", "-no-color"}}
+    while index < len(argv):
+        arg = argv[index]
+        if arg in ignored:
+            index += 1
+        elif arg in ("-u", "--url"):
+            if index + 1 >= len(argv): fail(arg + " requires a URL")
+            targets.append(argv[index + 1]); index += 2
+        elif arg.startswith("-"):
+            fail("unsupported option " + arg)
+        else:
+            targets.append(arg); index += 1
+    if not targets:
+        targets = [line.strip() for line in sys.stdin if line.strip()]
+    if not targets: fail("no target supplied")
+    request = {{
+        "operation": "httpx_probe",
+        "arguments": {{"targets": "\\n".join(targets)}},
+    }}
+    payload = (json.dumps(request, ensure_ascii=False) + "\\n").encode()
+    try:
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(200)
+        connection.connect(SOCKET_PATH)
+        connection.sendall(payload)
+        chunks = []
+        total = 0
+        while True:
+            block = connection.recv(65536)
+            if not block: break
+            chunks.append(block); total += len(block)
+            if total > {MAX_BROKER_RESPONSE_BYTES}:
+                fail("broker response exceeded limit", 7)
+        connection.close()
+        envelope = json.loads(b"".join(chunks))
+    except (OSError, ValueError, TypeError):
+        fail("scoped network broker is unavailable", 7)
+    if not envelope.get("ok"):
+        fail(str(envelope.get("error") or "scoped probe failed"), 7)
+    result = envelope.get("result") or {{}}
+    data = result.get("data") if isinstance(result.get("data"), dict) else {{}}
+    output = data.get("output")
+    if isinstance(output, str) and output:
+        sys.stdout.write(output)
+        if not output.endswith("\\n"): sys.stdout.write("\\n")
+    elif isinstance(data.get("results"), list):
+        for row in data["results"]:
+            if isinstance(row, dict):
+                print(str(row.get("url") or "") + " [" + str(row.get("status_line") or "") + "]")
+    if not result.get("ok"):
+        print("httpx: " + str(result.get("summary") or "probe denied"), file=sys.stderr)
         raise SystemExit(22)
     raise SystemExit(0)
 

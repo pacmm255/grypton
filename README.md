@@ -569,6 +569,70 @@ replays use the same URL check. A path-limited URL rule does not authorize DNS,
 TLS, port scanning, raw TCP, or a bare-host HTTP probe because those operations
 cannot preserve the recorded path boundary.
 
+## Required request headers and rate limits
+
+Some programs require every request to carry an identification header and set
+one rate limit across several application origins. Create the engagement
+without starting it, configure each exact origin, and then start the run:
+
+```bash
+./bin/grypton init \
+  --target "https://app.example.test" \
+  --in-scope "https://app.example.test,https://api.example.test" \
+  --create-only
+
+./bin/grypton policy set https-app-example-test \
+  --origin "https://app.example.test" \
+  --max-rps 5 \
+  --rate-bucket program \
+  --header X-Research-Id
+
+./bin/grypton policy set https-app-example-test \
+  --origin "https://api.example.test" \
+  --max-rps 5 \
+  --rate-bucket program \
+  --header X-Research-Id
+
+./bin/grypton policy show https-app-example-test
+./bin/grypton run start https-app-example-test --duration 12h
+```
+
+`--header` accepts a header name. Grypton prompts privately for its value, so
+the value does not enter shell history, model prompts, terminal output, or flow
+captures. `policy show` displays only the origin, header names, rate, and bucket.
+Policies in the same bucket share one counter across origins and must use the
+same maximum rate.
+
+For one origin, the same policy can be recorded during creation:
+
+```bash
+./bin/grypton init \
+  --target "https://app.example.test" \
+  --policy-origin "https://app.example.test" \
+  --policy-max-rps 5 \
+  --policy-header X-Research-Id \
+  --create-only
+```
+
+When a required header is the address of a temporary mailbox that Grypton will
+create later, bind the header to the mailbox alias instead of storing a
+placeholder:
+
+```bash
+./bin/grypton policy set https-app-example-test \
+  --origin "https://app.example.test" \
+  --max-rps 5 \
+  --rate-bucket program \
+  --header-from-mailbox X-User-Id=research
+```
+
+The policy becomes usable as soon as the private `research` mailbox exists.
+Until then, matching requests fail closed. Grypton applies these policies to
+ordinary and authenticated HTTP, Chromium requests, Goja, downloads, research,
+flow replay, ProjectDiscovery httpx, and the sandboxed curl/httpx commands. TLS,
+port-scan, and raw-TCP tools stop before connecting when a host has an HTTP
+request policy they cannot carry.
+
 ## Bugcrowd brief preflight
 
 Save the current public brief JSON first. Then inspect it:
@@ -807,6 +871,62 @@ forms of those values from the rendered DOM, relevant application responses,
 console messages, blocked-route records, tool results, and audit rows. Profile
 URLs are checked against the current engagement scope when configured and again
 when used.
+
+## Temporary mail for a test account
+
+When an imported program brief explicitly describes creating a test account,
+does not require assigned credentials or a particular email domain, and does
+not prohibit temporary mail, Grypton makes four additional worker tools
+available:
+
+- `temporary_mailbox_create` creates one [Mail.tm](https://docs.mail.tm/) address and
+  a private target-account credential under the same alias. It returns the
+  address and alias. The generated Mail.tm password, Mail.tm bearer token, and
+  target password never enter the prompt or tool result.
+- `temporary_mailbox_poll` returns one requested numeric OTP or one confirmation
+  URL. Confirmation URLs must pass the engagement's normal URL-scope check.
+  It never returns a message body or attachment.
+- `temporary_account_browser_signup` fills one in-scope signup form with the
+  paired private email/password, bounded non-secret text/select fields, and
+  explicitly listed checkboxes. It uses the existing single-submission session
+  proof and reports an observed CAPTCHA as a blocker.
+- `temporary_account_browser_continue` privately polls a numeric email OTP and
+  supplies it to one retained browser step-up. The OTP stays out of model
+  output and tool arguments; the saved browser profile runs the normal proof.
+
+All four tools check the private structured program profile every time. A missing
+or older profile, a brief that only mentions assigned credentials, or a rule
+against disposable email disables the capability before any Mail.tm request.
+For an engagement created from a non-Bugcrowd policy, an operator can record
+the same structured grant without adding prose to a model prompt:
+
+```bash
+./bin/grypton program ENGAGEMENT \
+  --allow-temporary-mail \
+  --policy-source 'https://example.com/security/bug-bounty' \
+  --self-created-accounts-permitted \
+  --disposable-mail-not-prohibited
+```
+
+The two confirmations assert what the cited public policy says; they do not
+expand target scope. Revoke the grant immediately with
+`grypton program ENGAGEMENT --revoke-temporary-mail` if the policy changes.
+Mailbox records live under the engagement's private credential directory with
+mode `0600`. Creation is idempotent, so resuming with the same alias reuses the
+record rather than creating another mailbox. The signup tool and existing
+credential tools resolve the paired target password only inside the trusted
+transport process, without showing it to Kraude.
+
+Mail.tm is the fixed provider; its documented account, token, domain, and
+message endpoints are used without redirects. After a signup that requires a
+confirmation link, poll for the link, request the in-scope URL, and then use
+the paired alias with the normal login tool to prove the session. A signup OTP
+can be polled directly or submitted privately with the continuation tool when
+a compatible browser profile retained the challenge. Grypton reports a
+CAPTCHA instead of solving it. Mail.tm availability, target rejection of
+disposable domains, vendor-hosted confirmation links outside scope,
+non-numeric verification codes, multi-page registration, and forms requiring
+file uploads remain explicit limitations.
 
 ---
 

@@ -266,18 +266,24 @@ def prepare_native_shell(
         os.chmod(directory, 0o700)
 
     broker_socket = broker_dir / "http.sock"
-    from .network_broker import curl_wrapper_source
-    curl_wrapper = native_bin / "curl"
-    wrapper_tmp = native_bin / ".curl.tmp"
-    wrapper_fd = os.open(
-        wrapper_tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW, 0o500
-    )
-    with os.fdopen(wrapper_fd, "w", encoding="utf-8") as stream:
-        stream.write(curl_wrapper_source(broker_socket))
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.replace(wrapper_tmp, curl_wrapper)
-    os.chmod(curl_wrapper, 0o500)
+    from .network_broker import curl_wrapper_source, httpx_wrapper_source
+    for name, source in (
+        ("curl", curl_wrapper_source(broker_socket)),
+        ("httpx", httpx_wrapper_source(broker_socket)),
+    ):
+        wrapper = native_bin / name
+        wrapper_tmp = native_bin / f".{name}.tmp"
+        wrapper_fd = os.open(
+            wrapper_tmp,
+            os.O_CREAT | os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW,
+            0o500,
+        )
+        with os.fdopen(wrapper_fd, "w", encoding="utf-8") as stream:
+            stream.write(source)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(wrapper_tmp, wrapper)
+        os.chmod(wrapper, 0o500)
 
     launcher = runtime / "native-shell"
     content = (

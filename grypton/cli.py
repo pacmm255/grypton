@@ -444,6 +444,16 @@ def cmd_init(ns) -> int:
     except (ValueError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
+    if not getattr(ns, "policy_origin", "") and (
+        getattr(ns, "policy_max_rps", None) is not None
+        or getattr(ns, "policy_header", [])
+        or getattr(ns, "policy_header_from_mailbox", [])
+    ):
+        print(
+            "ERROR: request-policy options require --policy-origin",
+            file=sys.stderr,
+        )
+        return 2
     slug = config.slugify(target)
     ws = Workspace(slug)
     if ws.exists() and not ns.force:
@@ -456,12 +466,31 @@ def cmd_init(ns) -> int:
         ws.update_meta(target=target, target_type=ns.type, turn_index=0,
                        last_directive="", worker_uuid="", manager_session_id="")
     ws.save_constraints(constraints)
+    if getattr(ns, "policy_origin", ""):
+        if getattr(ns, "policy_max_rps", None) is None:
+            print("ERROR: --policy-origin requires --policy-max-rps", file=sys.stderr)
+            return 2
+        try:
+            _set_request_policy(
+                ws,
+                origin=ns.policy_origin,
+                max_rps=ns.policy_max_rps,
+                header_names=ns.policy_header,
+                mailbox_headers=ns.policy_header_from_mailbox,
+                rate_bucket=ns.policy_rate_bucket,
+            )
+        except (OSError, ValueError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
     profile = getattr(ns, "_bugcrowd_profile", None)
     if profile:
         # Workspace stores these under manager-only operator state. Preserve the
         # original import for audit/re-import while Kraude receives only the
         # structured Constraints projection in its workspace and system prompt.
         ws.save_program_brief(profile["brief_text"], profile)
+    if getattr(ns, "create_only", False):
+        print(f"Created engagement {ws.slug}. Configure it, then use `grypton run start {ws.slug}`.")
+        return 0
     return _run_engagement(ws, ns, brief=ns.brief or f"Assess {target} within recorded scope.", fresh=True)
 
 
@@ -571,7 +600,7 @@ def cmd_show(ns) -> int:
 
 
 def cmd_program(ns) -> int:
-    """Show an imported program snapshot to the operator only."""
+    """Show or update structured program policy from an operator shell."""
     if os.environ.get("GRYPTON_ENGAGEMENT_DIR"):
         print("ERROR: program snapshots are available only from an operator shell.",
               file=sys.stderr)
@@ -581,6 +610,94 @@ def cmd_program(ns) -> int:
     except ValueError as exc:
         print(f"ERROR: {exc}.", file=sys.stderr)
         return 2
+
+    allow_mail = bool(getattr(ns, "allow_temporary_mail", False))
+    revoke_mail = bool(getattr(ns, "revoke_temporary_mail", False))
+    policy_source = str(getattr(ns, "policy_source", "") or "").strip()
+    accounts_permitted = bool(
+        getattr(ns, "self_created_accounts_permitted", False)
+    )
+    disposable_not_prohibited = bool(
+        getattr(ns, "disposable_mail_not_prohibited", False)
+    )
+    grant_fields_present = bool(
+        policy_source or accounts_permitted or disposable_not_prohibited
+    )
+    if grant_fields_present and not allow_mail:
+        print(
+            "ERROR: temporary-mail policy evidence options require "
+            "--allow-temporary-mail.", file=sys.stderr,
+        )
+        return 2
+    if allow_mail:
+        if not (policy_source and accounts_permitted and disposable_not_prohibited):
+            print(
+                "ERROR: --allow-temporary-mail requires --policy-source, "
+                "--self-created-accounts-permitted, and "
+                "--disposable-mail-not-prohibited.", file=sys.stderr,
+            )
+            return 2
+        try:
+            parsed_source = urlsplit(policy_source)
+        except ValueError:
+            parsed_source = None
+        if (
+            parsed_source is None
+            or parsed_source.scheme != "https"
+            or not parsed_source.hostname
+            or parsed_source.username is not None
+            or parsed_source.password is not None
+            or parsed_source.query
+            or parsed_source.fragment
+            or len(policy_source) > 4096
+            or any(ord(char) < 0x20 or ord(char) == 0x7f for char in policy_source)
+        ):
+            print(
+                "ERROR: --policy-source must be a public HTTPS URL without "
+                "credentials, query, or fragment.", file=sys.stderr,
+            )
+            return 2
+    if allow_mail or revoke_mail:
+        try:
+            profile = ws.load_program_profile() if ws.program_profile_path.is_file() else {}
+            if allow_mail:
+                conflicts = [
+                    label for label, active in (
+                        ("automation prohibited", profile.get("automation_prohibited") is True),
+                        ("self-created accounts prohibited",
+                         profile.get("self_created_account_prohibited") is True),
+                        ("assigned credentials required", profile.get("credential_requirement") is True),
+                        ("disposable mail prohibited", profile.get("disposable_email_prohibited") is True),
+                    ) if active
+                ]
+                if conflicts:
+                    raise ValueError(
+                        "the existing imported program profile conflicts with this grant: "
+                        + ", ".join(conflicts)
+                    )
+                profile.update({
+                    "account_workflows_supported": True,
+                    "self_created_account_permission": True,
+                    "credential_requirement": False,
+                    "disposable_email_prohibited": False,
+                    "temporary_mail_account_bootstrap_allowed": True,
+                    "temporary_mail_policy_source": policy_source,
+                    "temporary_mail_policy_basis": "operator-structured-assertion",
+                    "temporary_mail_policy_recorded_at": int(time.time()),
+                })
+            else:
+                profile.update({
+                    "temporary_mail_account_bootstrap_allowed": False,
+                    "temporary_mail_policy_basis": "operator-revoked",
+                    "temporary_mail_policy_recorded_at": int(time.time()),
+                })
+            ws.save_program_profile(profile)
+        except (OSError, ValueError) as exc:
+            print(
+                f"ERROR: structured program policy for {ws.slug} could not be updated: {exc}.",
+                file=sys.stderr,
+            )
+            return 2
 
     brief_present = ws.program_brief_path.is_file()
     profile_present = ws.program_profile_path.is_file()
@@ -596,7 +713,7 @@ def cmd_program(ns) -> int:
         if ns.json:
             print(json.dumps(payload, ensure_ascii=False, indent=2))
         else:
-            print(f"No stored Bugcrowd program snapshot for {ws.slug}.")
+            print(f"No stored program policy snapshot for {ws.slug}.")
         return 0
 
     try:
@@ -1109,6 +1226,136 @@ def cmd_scope(ns) -> int:
     else:
         print(ws.load_constraints().to_prompt_block())
     return 0
+
+
+def _policy_origin_is_scoped(ws: Workspace, origin: str) -> bool:
+    """Accept a policy only for an origin already represented by scope."""
+    from . import credentials
+    from .tools import check_url_scope
+
+    constraints = ws.load_constraints()
+    for rule in constraints.in_scope:
+        try:
+            if credentials.normalize_origin(rule) == origin:
+                return True
+        except credentials.CredentialError:
+            continue
+    allowed, _reason = check_url_scope(ws, origin + "/")
+    return allowed
+
+
+def _prompt_policy_headers(names: list[str]) -> dict[str, str]:
+    from .request_policy import canonical_headers
+
+    # Validate names and case-insensitive duplicates before asking for any
+    # private value. Temporary sentinel values never leave this process.
+    if len({str(name).strip().lower() for name in names}) != len(names):
+        raise ValueError(
+            "mandatory request headers contain a case-insensitive duplicate"
+        )
+    canonical_headers({name: "x" for name in names})
+    return {
+        name: getpass.getpass(f"Value for mandatory header {name}: ")
+        for name in names
+    }
+
+
+def _policy_mailbox_sources(values: list[str]) -> dict[str, dict[str, str]]:
+    from .request_policy import canonical_header_sources
+
+    sources: dict[str, dict[str, str]] = {}
+    seen: set[str] = set()
+    for value in values:
+        name, separator, alias = str(value or "").partition("=")
+        if not separator or not name.strip() or not alias.strip():
+            raise ValueError(
+                "--header-from-mailbox must use HEADER=MAILBOX_ALIAS"
+            )
+        normalized = name.strip().lower()
+        if normalized in seen:
+            raise ValueError(
+                "mailbox-backed request headers contain a case-insensitive duplicate"
+            )
+        seen.add(normalized)
+        sources[name.strip()] = {
+            "kind": "mailbox-address", "alias": alias.strip(),
+        }
+    return canonical_header_sources(sources)
+
+
+def _set_request_policy(ws: Workspace, *, origin: str, max_rps: float,
+                        header_names: list[str], mailbox_headers: list[str],
+                        rate_bucket: str = "engagement") -> dict:
+    from . import request_policy
+
+    canonical_origin = request_policy.canonical_origin(origin)
+    if not _policy_origin_is_scoped(ws, canonical_origin):
+        raise request_policy.RequestPolicyError(
+            "request policy origin is not represented by this engagement's scope"
+        )
+    header_sources = _policy_mailbox_sources(mailbox_headers)
+    request_policy.canonical_header_sources(
+        header_sources,
+        static_headers={name: "x" for name in header_names},
+    )
+    headers = _prompt_policy_headers(header_names)
+    result = request_policy.set_origin_policy(
+        ws.slug,
+        canonical_origin,
+        headers=headers,
+        header_sources=header_sources,
+        max_requests_per_second=max_rps,
+        rate_bucket=rate_bucket,
+    )
+    ws.render_scope_document()
+    return result
+
+
+def cmd_policy(ns) -> int:
+    from . import request_policy
+
+    try:
+        ws = _existing_workspace(ns.target)
+        if ns.policy_command == "show":
+            rows = request_policy.public_view(ws.slug)
+            if ns.json:
+                print(json.dumps(rows, ensure_ascii=False, indent=2))
+            elif not rows:
+                print("No request policies configured.")
+            else:
+                for row in rows:
+                    names = ", ".join(row["mandatory_header_names"]) or "none"
+                    print(
+                        f"{row['origin']}  max={row['max_requests_per_second']:g} req/s  "
+                        f"bucket={row['rate_bucket']}  mandatory headers={names}"
+                    )
+            return 0
+        if ns.policy_command == "set":
+            row = _set_request_policy(
+                ws,
+                origin=ns.origin,
+                max_rps=ns.max_rps,
+                header_names=ns.header,
+                mailbox_headers=ns.header_from_mailbox,
+                rate_bucket=ns.rate_bucket,
+            )
+            names = ", ".join(row["mandatory_header_names"]) or "none"
+            print(
+                f"Request policy saved for {row['origin']}: "
+                f"max {row['max_requests_per_second']:g} req/s; "
+                f"shared bucket {row['rate_bucket']}; mandatory headers: {names}."
+            )
+            return 0
+        removed = request_policy.remove_origin_policy(ws.slug, ns.origin)
+        if removed:
+            ws.render_scope_document()
+            print("Request policy removed.")
+            return 0
+        print("ERROR: no request policy exists for that exact origin.", file=sys.stderr)
+        return 2
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
 
 def cmd_audit(ns) -> int:
@@ -2049,6 +2296,31 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--include", default=""); init.add_argument("--in-scope", default="")
     init.add_argument("--out-scope", default=""); init.add_argument("--rule", action="append", default=[])
     init.add_argument("--authorization-file"); init.add_argument("--bugcrowd-brief")
+    init.add_argument(
+        "--policy-origin",
+        help="Exact HTTP(S) origin for a mandatory request policy",
+    )
+    init.add_argument(
+        "--policy-max-rps", type=float,
+        help="Maximum requests per second for --policy-origin",
+    )
+    init.add_argument(
+        "--policy-header", action="append", default=[], metavar="NAME",
+        help="Mandatory header name; its value is prompted privately (repeatable)",
+    )
+    init.add_argument(
+        "--policy-header-from-mailbox", action="append", default=[],
+        metavar="NAME=ALIAS",
+        help="Resolve a mandatory header from a private temporary-mail alias",
+    )
+    init.add_argument(
+        "--policy-rate-bucket", default="engagement", metavar="NAME",
+        help="Shared rate bucket across configured origins (default: engagement)",
+    )
+    init.add_argument(
+        "--create-only", action="store_true",
+        help="Create and configure the engagement without starting providers",
+    )
     init.add_argument("--force", action="store_true")
     _run_options(init); init.set_defaults(func=cmd_init)
     plan = sub.add_parser("plan", help="Preview scope, models, and playbooks without starting a run")
@@ -2073,9 +2345,30 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("target"); show.add_argument("--json", action="store_true")
     show.set_defaults(func=cmd_show)
     program = sub.add_parser(
-        "program", help="Show the stored operator-only Bugcrowd program snapshot"
+        "program", help="Show or update the stored operator-only program policy"
     )
     program.add_argument("target"); program.add_argument("--json", action="store_true")
+    mail_policy = program.add_mutually_exclusive_group()
+    mail_policy.add_argument(
+        "--allow-temporary-mail", action="store_true",
+        help="Record a structured program grant for temporary-mail account bootstrap",
+    )
+    mail_policy.add_argument(
+        "--revoke-temporary-mail", action="store_true",
+        help="Disable temporary-mail account bootstrap for this engagement",
+    )
+    program.add_argument(
+        "--policy-source", metavar="HTTPS_URL",
+        help="Public program-policy page supporting the structured grant",
+    )
+    program.add_argument(
+        "--self-created-accounts-permitted", action="store_true",
+        help="Confirm the cited program policy permits researcher-created accounts",
+    )
+    program.add_argument(
+        "--disposable-mail-not-prohibited", action="store_true",
+        help="Confirm the cited program policy does not prohibit disposable mail",
+    )
     program.set_defaults(func=cmd_program)
     overview = sub.add_parser("overview", aliases=["inspect"],
                               help="Show a compact engagement picture and current next step")
@@ -2110,6 +2403,42 @@ def build_parser() -> argparse.ArgumentParser:
     scope = sub.add_parser("scope", help="Show binding scope and standing instructions")
     scope.add_argument("target"); scope.add_argument("--json", action="store_true")
     scope.set_defaults(func=cmd_scope)
+    policy = sub.add_parser(
+        "policy", help="Manage private exact-origin request headers and rate ceilings"
+    )
+    policy_sub = policy.add_subparsers(dest="policy_command", required=True)
+    policy_show = policy_sub.add_parser(
+        "show", help="Show origins, header names, and rates without values"
+    )
+    policy_show.add_argument("target")
+    policy_show.add_argument("--json", action="store_true")
+    policy_show.set_defaults(func=cmd_policy)
+    policy_set = policy_sub.add_parser(
+        "set", help="Set or replace one exact-origin request policy"
+    )
+    policy_set.add_argument("target")
+    policy_set.add_argument("--origin", required=True)
+    policy_set.add_argument("--max-rps", required=True, type=float)
+    policy_set.add_argument(
+        "--rate-bucket", default="engagement", metavar="NAME",
+        help="Shared bucket name used to aggregate rates across origins",
+    )
+    policy_set.add_argument(
+        "--header", action="append", default=[], metavar="NAME",
+        help="Mandatory header name; its value is prompted privately (repeatable)",
+    )
+    policy_set.add_argument(
+        "--header-from-mailbox", action="append", default=[],
+        metavar="NAME=ALIAS",
+        help="Resolve a mandatory header from a private temporary-mail alias",
+    )
+    policy_set.set_defaults(func=cmd_policy)
+    policy_remove = policy_sub.add_parser(
+        "remove", help="Remove one exact-origin request policy"
+    )
+    policy_remove.add_argument("target")
+    policy_remove.add_argument("--origin", required=True)
+    policy_remove.set_defaults(func=cmd_policy)
     audit = sub.add_parser("audit", help="Verify routes, validation, scope, and evidence integrity")
     audit.add_argument("target"); audit.add_argument("--json", action="store_true")
     audit.set_defaults(func=cmd_audit)
@@ -2265,7 +2594,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 _COMMAND_NAMES = {
     "init", "plan", "resume", "status", "ls", "show", "program", "overview", "inspect", "activity", "tail",
-    "findings", "validate", "auth", "surface", "history", "scope", "audit", "report", "stop", "models",
+    "findings", "validate", "auth", "surface", "history", "scope", "policy", "audit", "report", "stop", "models",
     "run", "doctor", "tools", "scenarios", "bugcrowd-brief", "lab", "benchmark", "serve", "demo",
 }
 _COMPAT_VALUE_OPTIONS = {
@@ -2274,6 +2603,8 @@ _COMPAT_VALUE_OPTIONS = {
     "--auto-stop-time", "--duration", "--until-severity", "--health-interval", "--restart-limit",
     "--console", "--model", "--kraude-model", "--kraude-effort",
     "--kryptex-model", "--kryptex-effort", "--permission-mode", "--backend",
+    "--policy-origin", "--policy-max-rps", "--policy-header",
+    "--policy-header-from-mailbox", "--policy-rate-bucket",
 }
 
 

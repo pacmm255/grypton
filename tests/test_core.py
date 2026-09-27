@@ -2215,21 +2215,21 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-    async def test_worker_uses_one_fresh_session_after_429_pool_exhaustion(self):
+    async def test_worker_uses_one_fresh_session_after_pool_exhaustion(self):
         with isolated_runtime():
             worker = OpenCodeWorker(WorkerSpec(
                 session_uuid="ses-heavy", cwd=config.ENGAGEMENTS_DIR / "worker-429",
                 system_prompt="scope projection", extra_env={"GRYPTON_TARGET": "worker-429"},
             ))
             worker.client.call = AsyncMock(side_effect=[
-                self._worker_pool_exhausted(tool_count=2),
-                self._worker_pool_exhausted(tool_count=1),
+                self._worker_pool_exhausted(400, tool_count=2),
+                self._worker_pool_exhausted(400, tool_count=1),
             ])
             directive = "Credential alias: primary. Check whether it can authenticate."
 
             with self.assertRaises(WorkerError) as first:
                 await worker.run_turn(directive)
-            self.assertEqual(first.exception.metadata["upstream_status"], 429)
+            self.assertEqual(first.exception.metadata["upstream_status"], 400)
             self.assertEqual(first.exception.metadata["tool_count"], 2)
             self.assertEqual(worker.session_id, "")
             self.assertEqual(worker.spec.session_uuid, "")
@@ -2250,12 +2250,9 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
                 for call in worker.client.call.await_args_list
             ))
 
-    async def test_worker_does_not_reset_session_for_other_terminal_failures(self):
+    async def test_worker_does_not_reset_session_for_unclassified_terminal_failures(self):
         with isolated_runtime():
             cases = [
-                self._worker_pool_exhausted(401),
-                self._worker_pool_exhausted(402),
-                self._worker_pool_exhausted(403),
                 ProviderError("unrelated HTTP 429", metadata={
                     "source": "openclaude", "type": "openclaude_terminal",
                     "role": "worker", "reason": "provider_terminal",

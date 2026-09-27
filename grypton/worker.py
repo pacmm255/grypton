@@ -214,11 +214,10 @@ class OpenCodeWorker:
                 and metadata.get("type") == "openclaude_terminal"
                 and metadata.get("role") == "worker"
                 and metadata.get("reason") == "credential_pool_exhausted"
-                and metadata.get("upstream_status") == 429
             ):
                 # OpenCode sessions can retain provider-specific conversation
-                # state across calls. Consume one fresh-session recovery for a
-                # consecutive 429 exhaustion burst. The engine retries from
+                # state across calls. Consume one fresh-session recovery for an
+                # exhausted credential-pool burst. The engine retries from
                 # durable workspace state and suppresses exact replay whenever
                 # the native-capable provider process may have executed work.
                 self.session_id = ""

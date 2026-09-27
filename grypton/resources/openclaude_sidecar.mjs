@@ -163,11 +163,14 @@ async function moduleFrom(relative) {
   return import(pathToFileURL(join(root, relative)).href);
 }
 
-let readConfig, loadCredentialPool, readCatalog, startGateway, packageVersion = '';
+let readConfig, loadCredentialPool, readCatalog, startGateway;
+let OVERFLOW_PATTERN, THINKING_ERROR_PATTERNS;
+let packageVersion = '';
 try {
   ({ readConfig, loadCredentialPool } = await moduleFrom('src/config.mjs'));
   ({ readCatalog } = await moduleFrom('src/catalog.mjs'));
   ({ startGateway } = await moduleFrom('src/gateway.mjs'));
+  ({ OVERFLOW_PATTERN, THINKING_ERROR_PATTERNS } = await moduleFrom('src/anthropic.mjs'));
   const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
   packageVersion = cleanText(pkg.version, 80);
 } catch (error) {
@@ -183,28 +186,95 @@ let selectedRoute = '';
 let selectedEffort = '';
 let shuttingDown = false;
 
-async function rotateRateLimitedCredential(input, init, observe) {
-  const response = await fetch(input, init);
-  observe?.(response, init);
-  if (response.status !== 429) return response;
+const MAX_CREDENTIAL_POOL = 64;
+const MAX_ERROR_CLASSIFICATION_BYTES = 65_536;
 
-  // OpenClaude normally treats an unqualified 429 as a transient provider
-  // burst and retries the same key for the configured retry window. Grypton
-  // has a credential pool and needs to traverse it once instead. Replace only
-  // the private error body with a classification token OpenClaude already
-  // recognizes as key-specific exhaustion; preserve the upstream status and
-  // retry metadata. Provider error bodies are never exposed or retained.
-  try { await response.body?.cancel(); } catch {}
+function aborted(signal) {
+  if (!signal?.aborted) return null;
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException('The operation was aborted.', 'AbortError');
+}
+
+async function boundedErrorResponse(response, signal) {
+  const reader = response.body?.getReader();
+  if (!reader) return { text: '', response };
+  const chunks = [];
+  let length = 0;
+  try {
+    while (length < MAX_ERROR_CLASSIFICATION_BYTES) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const part = value.subarray(0, MAX_ERROR_CLASSIFICATION_BYTES - length);
+      chunks.push(part);
+      length += part.length;
+    }
+  } catch {} finally {
+    try { await reader.cancel(); } catch {}
+    try { reader.releaseLock(); } catch {}
+  }
+  const abortError = aborted(signal);
+  if (abortError) throw abortError;
+  const body = Buffer.concat(chunks);
+  const headers = new Headers(response.headers);
+  headers.delete('content-length');
+  headers.delete('content-encoding');
+  headers.delete('transfer-encoding');
+  return {
+    text: body.toString('utf8'),
+    response: new Response(body, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    }),
+  };
+}
+
+function openClaudeRecoveryKind(status, text) {
+  if (![400, 413, 422].includes(status)) return '';
+  if (OVERFLOW_PATTERN.test(text)) return 'overflow';
+  if (![400, 422].includes(status)) return '';
+  const normalized = text.toLowerCase().replaceAll('`', '');
+  return /encrypted_content|reasoning item/i.test(text)
+    || THINKING_ERROR_PATTERNS.some(
+      pattern => pattern.test(text) || pattern.test(normalized),
+    )
+    ? 'thinking' : '';
+}
+
+function canonicalThinkingResponse(response) {
   const headers = new Headers(response.headers);
   headers.set('content-type', 'application/json');
   headers.delete('content-length');
   headers.delete('content-encoding');
   headers.delete('transfer-encoding');
-  return new Response(JSON.stringify({ error: { type: 'GoUsageLimit' } }), {
+  return new Response(JSON.stringify({
+    error: {
+      type: 'invalid_request_error',
+      message: 'reasoning item encrypted_content was rejected due to an invalid signature in thinking block',
+    },
+  }), {
     status: response.status,
     statusText: response.statusText,
     headers,
   });
+}
+
+function configForExactRoute(config, routeId) {
+  const route = config?.routes?.[routeId];
+  const provider = route && config?.providers?.[route.provider];
+  if (!route || !provider) throw new Error('Selected OpenClaude route is incomplete.');
+  const restricted = structuredClone(config);
+  restricted.routes = { [routeId]: structuredClone(route) };
+  restricted.providers = { [route.provider]: structuredClone(provider) };
+  restricted.defaultRoute = routeId;
+  restricted.fastRoute = routeId;
+  restricted.reasoningRoute = routeId;
+  restricted.fallbacks = {};
+  delete restricted.aliases;
+  delete restricted.council;
+  delete restricted.legacyRoutes;
+  return restricted;
 }
 
 async function refreshCatalog(refresh = false) {
@@ -236,107 +306,282 @@ async function start(route, effort, port) {
   }
   selectedRoute = route;
   selectedEffort = effort || '';
-  let poolSize = 0;
   let credentialPool = [];
-  let terminalSent = false;
-  // OpenClaude retains its own spent-key cooldowns. Mirror only hashed
-  // identities here so pool exhaustion remains observable when a later
-  // request starts with one or more keys already benched.
-  const credentialFailures = new Map();
-  const pruneCredentialFailures = () => {
-    const now = Date.now();
-    for (const [fingerprint, until] of credentialFailures) {
-      if (until <= now) credentialFailures.delete(fingerprint);
-    }
-  };
-  const poolRetryAfterSeconds = () => {
-    pruneCredentialFailures();
-    if (!credentialPool.length) return 0;
-    const deadlines = credentialPool.map(entry => credentialFailures.get(entry?.fingerprint));
-    if (deadlines.some(deadline => !(Number.isFinite(deadline) && deadline > Date.now()))) {
-      return 0;
-    }
-    const remaining = Math.ceil((Math.min(...deadlines) - Date.now()) / 1000);
-    return Math.max(1, Math.min(7 * 86400, remaining));
-  };
-  const requestCredential = init => {
+  const credentialCooldowns = new Map();
+  const credentialStatuses = new Map();
+  const requestStates = new WeakMap();
+  const requestCredential = (init, pool = credentialPool) => {
     const headers = new Headers(init?.headers || {});
     const bearer = String(headers.get('authorization') || '').replace(/^Bearer\s+/i, '');
     const apiKey = String(headers.get('x-api-key') || '');
-    return credentialPool.find(entry => entry?.key === bearer || entry?.key === apiKey);
+    return pool.find(entry => entry?.key === bearer || entry?.key === apiKey);
   };
-  const observeCredentialResponse = (response, init) => {
-    pruneCredentialFailures();
-    const entry = requestCredential(init);
-    if (!entry?.fingerprint) return;
-    if (response.ok) return;
-    // OpenClaude rotates every 401, 402 and 403, while Grypton's fetch wrapper
-    // classifies every Go 429 as key-specific before OpenClaude sees it. Track
-    // the same response classes here so a refusal that exhausts the pool is
-    // observable even though current OpenClaude correctly returns it without
-    // emitting the older "waiting" notice.
-    if (![401, 402, 403, 429].includes(response.status)) return;
-    const retryAfter = Number(response.headers.get('retry-after'));
+  const initForCredential = (init, key) => {
+    const headers = new Headers(init?.headers || {});
+    let replaced = false;
+    if (/^Bearer\s+/i.test(String(headers.get('authorization') || ''))) {
+      headers.set('authorization', `Bearer ${key}`);
+      replaced = true;
+    }
+    if (headers.has('x-api-key')) {
+      headers.set('x-api-key', key);
+      replaced = true;
+    }
+    if (!replaced) throw new Error('Provider credential header is unavailable.');
+    return { ...init, headers };
+  };
+  const retryAfterSeconds = response => {
+    const retryAfter = Number(response?.headers?.get?.('retry-after'));
+    if (Number.isFinite(retryAfter) && retryAfter > 0) {
+      return Math.max(1, Math.min(7 * 86400, Math.ceil(retryAfter)));
+    }
+    const status = Number(response?.status || 0);
     const configured = Number(activeConfig?.retry?.keyCooldownMs);
-    const fallback = response.status === 429
-      ? 60_000
-      : Number.isSafeInteger(configured) && configured > 0 ? configured : 900_000;
-    const cooldown = Number.isFinite(retryAfter) && retryAfter > 0
-      ? Math.round(retryAfter * 1000) : fallback;
-    const boundedCooldown = Math.max(1_000, Math.min(cooldown, 7 * 86_400_000));
-    credentialFailures.set(entry.fingerprint, Date.now() + boundedCooldown);
-    if (!terminalSent && credentialPool.length > 0
-        && credentialPool.every(item => credentialFailures.has(item.fingerprint))) {
-      terminalSent = true;
+    const fallbackMs = [401, 402, 403].includes(status)
+      ? Number.isSafeInteger(configured) && configured > 0 ? configured : 900_000
+      : 60_000;
+    return Math.max(1, Math.min(7 * 86400, Math.ceil(fallbackMs / 1000)));
+  };
+  const pruneCooldowns = () => {
+    const now = Date.now();
+    for (const [fingerprint, until] of credentialCooldowns) {
+      if (until <= now) {
+        credentialCooldowns.delete(fingerprint);
+        credentialStatuses.delete(fingerprint);
+      }
+    }
+  };
+  const poolRetryAfterSeconds = pool => {
+    pruneCooldowns();
+    if (!pool.length) return 0;
+    const deadlines = pool.map(entry => credentialCooldowns.get(entry.fingerprint));
+    if (deadlines.some(deadline => !(Number.isFinite(deadline) && deadline > Date.now()))) {
+      return 0;
+    }
+    return Math.max(
+      1,
+      Math.min(7 * 86400, Math.ceil((Math.min(...deadlines) - Date.now()) / 1000)),
+    );
+  };
+  const bench = (entry, status, seconds) => {
+    const bounded = Math.max(1, Math.min(7 * 86400, Number(seconds) || 60));
+    credentialCooldowns.set(entry.fingerprint, Date.now() + (bounded * 1000));
+    credentialStatuses.set(entry.fingerprint, status);
+  };
+  const stateFor = init => {
+    const signal = init?.signal;
+    if (signal && requestStates.has(signal)) return requestStates.get(signal);
+    pruneCooldowns();
+    const pool = credentialPool.slice();
+    const current = requestCredential(init, pool);
+    const usable = pool.filter(
+      entry => !(credentialCooldowns.get(entry.fingerprint) > Date.now()),
+    );
+    const ordered = current && usable.some(
+      entry => entry.fingerprint === current.fingerprint,
+    )
+      ? [current, ...usable.filter(entry => entry.fingerprint !== current.fingerprint)]
+      : usable;
+    const state = {
+      signal,
+      pool,
+      ordered,
+      current,
+      tried: new Set(),
+      terminal: false,
+      lastStatus: 0,
+      retryAfterSeconds: 0,
+      finalRecovery: false,
+    };
+    if (signal) requestStates.set(signal, state);
+    return state;
+  };
+  const releaseState = state => {
+    if (state?.signal) requestStates.delete(state.signal);
+  };
+  const fetchWithCredentialRotation = async (input, init) => {
+    const state = stateFor(init);
+    // A provider transport without a pool-backed bearer or API-key header does
+    // not expose a safe credential substitution point.
+    if (!state.current) {
+      releaseState(state);
+      return fetch(input, init);
+    }
+    if (!state.ordered.length) {
+      const retry = poolRetryAfterSeconds(state.pool) || 60;
+      const statuses = state.pool
+        .map(entry => credentialStatuses.get(entry.fingerprint))
+        .filter(status => Number.isSafeInteger(status));
       emit('terminal', {
         route: selectedRoute,
         reason: 'credential_pool_exhausted',
-        upstreamStatus: response.status,
-        poolSize: credentialPool.length,
-        retryAfterSeconds: poolRetryAfterSeconds(),
+        upstreamStatus: statuses.at(-1) || 0,
+        poolSize: state.pool.length,
+        retryAfterSeconds: retry,
+      });
+      releaseState(state);
+      return new Response(JSON.stringify({
+        error: { type: 'GryptonCredentialPoolExhausted' },
+      }), {
+        status: 400,
+        headers: {
+          'content-type': 'application/json',
+          'retry-after': String(retry),
+        },
       });
     }
+
+    let finalResponse = null;
+    for (const entry of state.ordered) {
+      if (state.tried.has(entry.fingerprint)) continue;
+      if (init?.signal?.aborted) {
+        releaseState(state);
+        throw new DOMException('The operation was aborted.', 'AbortError');
+      }
+      state.tried.add(entry.fingerprint);
+      let response;
+      try {
+        response = await fetch(
+          input,
+          entry.fingerprint === state.current.fingerprint
+            ? init : initForCredential(init, entry.key),
+        );
+      } catch (error) {
+        if (init?.signal?.aborted || error?.name === 'AbortError') {
+          releaseState(state);
+          throw error;
+        }
+        state.lastStatus = 0;
+        state.retryAfterSeconds = Math.max(state.retryAfterSeconds, 60);
+        bench(entry, 0, 60);
+        const hasNext = state.ordered.some(
+          candidate => !state.tried.has(candidate.fingerprint),
+        );
+        if (hasNext) {
+          emit('notice', {
+            route: selectedRoute,
+            message: 'provider connection failed before a response; continuing on key from the configured pool',
+          });
+          continue;
+        }
+      }
+
+      if (response?.ok) {
+        // Once successful response headers exist, ownership of the body passes
+        // to OpenClaude. A later stream failure must never replay the request.
+        credentialCooldowns.delete(entry.fingerprint);
+        credentialStatuses.delete(entry.fingerprint);
+        releaseState(state);
+        return response;
+      }
+      if (response) {
+        const retry = retryAfterSeconds(response);
+        let bounded;
+        try {
+          bounded = await boundedErrorResponse(response, init?.signal);
+        } catch (error) {
+          releaseState(state);
+          throw error;
+        }
+        response = bounded.response;
+        const abortError = aborted(init?.signal);
+        if (abortError) {
+          releaseState(state);
+          throw abortError;
+        }
+        const recovery = openClaudeRecoveryKind(response.status, bounded.text);
+        if (recovery === 'thinking') response = canonicalThinkingResponse(response);
+        state.lastStatus = response.status;
+        state.retryAfterSeconds = Math.max(
+          state.retryAfterSeconds,
+          retry,
+        );
+        if (!recovery) bench(entry, response.status, retry);
+        finalResponse = response;
+        state.finalRecovery = Boolean(recovery);
+      }
+      const hasNext = state.ordered.some(
+        candidate => !state.tried.has(candidate.fingerprint),
+      );
+      if (hasNext) {
+        try { await response?.body?.cancel(); } catch {}
+        const abortError = aborted(init?.signal);
+        if (abortError) {
+          releaseState(state);
+          throw abortError;
+        }
+        finalResponse = null;
+        emit('notice', {
+          route: selectedRoute,
+          message: `provider returned HTTP ${response?.status || 0}; continuing on key from the configured pool`,
+        });
+        continue;
+      }
+    }
+
+    const abortError = aborted(init?.signal);
+    if (abortError) {
+      releaseState(state);
+      throw abortError;
+    }
+    if (finalResponse) {
+      if (state.finalRecovery) {
+        releaseState(state);
+        return finalResponse;
+      }
+      try { await finalResponse.body?.cancel(); } catch {}
+      const abortAfterCancel = aborted(init?.signal);
+      if (abortAfterCancel) {
+        releaseState(state);
+        throw abortAfterCancel;
+      }
+    }
+    if (!state.terminal) {
+      state.terminal = true;
+      const retry = poolRetryAfterSeconds(state.pool)
+        || state.retryAfterSeconds || 60;
+      emit('terminal', {
+        route: selectedRoute,
+        reason: 'credential_pool_exhausted',
+        upstreamStatus: state.lastStatus,
+        poolSize: state.pool.length,
+        retryAfterSeconds: retry,
+      });
+      state.retryAfterSeconds = retry;
+    }
+    releaseState(state);
+    return new Response(JSON.stringify({
+      error: { type: 'GryptonCredentialPoolExhausted' },
+    }), {
+      status: 400,
+      headers: {
+        'content-type': 'application/json',
+        'retry-after': String(state.retryAfterSeconds || 60),
+      },
+    });
   };
-  gateway = await startGateway(activeConfig, {
+  const exactConfig = configForExactRoute(activeConfig, selectedRoute);
+  gateway = await startGateway(exactConfig, {
     token,
     ...(Number.isSafeInteger(port) && port >= 0 && port <= 65535 ? { port } : {}),
-    getConfig: () => activeConfig,
-    fetch: (input, init) => rotateRateLimitedCredential(
-      input, init, observeCredentialResponse,
-    ),
+    getConfig: () => configForExactRoute(activeConfig, selectedRoute),
+    fetch: fetchWithCredentialRotation,
     credentialPoolLoader: async provider => {
       const pool = await loadCredentialPool(provider, process.env);
-      credentialPool = Array.isArray(pool) ? pool : [];
-      poolSize = credentialPool.length;
-      pruneCredentialFailures();
-      terminalSent = false;
+      if (!Array.isArray(pool) || !pool.length) {
+        throw new Error('No provider credential is available.');
+      }
+      if (pool.length > MAX_CREDENTIAL_POOL) {
+        throw new Error(
+          `Provider credential pool exceeds the ${MAX_CREDENTIAL_POOL}-entry limit.`,
+        );
+      }
+      credentialPool = pool.slice();
       return credentialPool;
     },
     effortForRoute: routeId => routeId === selectedRoute && selectedEffort && selectedEffort !== 'auto'
       ? selectedEffort : undefined,
-    onNotice: value => {
-      const message = String(value?.message || '');
-      emit('notice', value);
-      // This fixed OpenClaude notice is emitted only after a credential-class
-      // failure when every key is already benched and the gateway is about to
-      // sleep. Response observation above handles refusals such as 403 without
-      // interpreting or retaining their provider body here.
-      const exhausted = message.match(
-        /^every key for this provider is spent or limited; waiting (\d+)s\b/i,
-      );
-      if (!terminalSent && poolSize > 0 && exhausted) {
-        const retryAfterSeconds = Number(exhausted[1]);
-        terminalSent = true;
-        emit('terminal', {
-          route: value?.route || selectedRoute,
-          reason: 'credential_pool_exhausted',
-          upstreamStatus: 0,
-          poolSize,
-          retryAfterSeconds: Number.isSafeInteger(retryAfterSeconds)
-            ? Math.max(1, Math.min(7 * 86400, retryAfterSeconds)) : 0,
-        });
-      }
-    },
+    onNotice: value => emit('notice', value),
     onRequest: value => emit('request', value),
     onEffort: value => emit('effort', value),
   });

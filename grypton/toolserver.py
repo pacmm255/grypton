@@ -10,7 +10,7 @@ import sys
 import time
 from typing import Callable
 
-from . import config, credentials, tools
+from . import config, credentials, temporary_mail, tools
 from .providers import append_jsonl
 from .workspace import (ASTRA_REVALIDATION_REVISION_FIELD,
                         FINDING_FAMILY_LIMITS, FINDING_NARRATIVE_FIELDS,
@@ -186,6 +186,110 @@ def _http(ws, args):
 
 def _credential_status(ws, args):
     return tools.credential_status(ws, args.get("credential", ""))
+
+
+def _temporary_mailbox_create(ws, args):
+    try:
+        return temporary_mail.create(ws, args.get("alias", ""))
+    except temporary_mail.TemporaryMailboxError as exc:
+        return {"ok": False, "summary": str(exc)}
+
+
+def _temporary_mailbox_poll(ws, args):
+    try:
+        return temporary_mail.poll(
+            ws, args.get("alias", ""), kind=args.get("kind", "otp"),
+            sender_domain=args.get("sender_domain", ""),
+            timeout=args.get("timeout", 30),
+            scope_check=lambda url: tools.check_url_scope(ws, url)[0],
+        )
+    except temporary_mail.TemporaryMailboxError as exc:
+        return {"ok": False, "summary": str(exc)}
+
+
+def _temporary_account_browser_signup(ws, args):
+    alias = args.get("alias", "")
+    try:
+        temporary_mail.require_mailbox(ws, alias)
+    except (temporary_mail.TemporaryMailboxError, credentials.CredentialError) as exc:
+        return {"ok": False, "summary": str(exc)}
+    return tools.credential_browser_login(
+        ws, args.get("url", ""), credential=alias,
+        username_selector=args.get("email_selector", "input[type='email']"),
+        password_selector=args.get("password_selector", "input[type='password']"),
+        submit_selector=args.get("submit_selector", "button[type='submit']"),
+        verify_url=args.get("verify_url", ""),
+        success_marker=args.get("success_marker", ""),
+        registration_fields=args.get("fields"),
+        registration_checkboxes=args.get("checkboxes"),
+        timeout=args.get("timeout", 45),
+    )
+
+
+def _temporary_account_browser_continue(ws, args):
+    alias = args.get("alias", "")
+    try:
+        temporary_mail.require_mailbox(ws, alias)
+        profile = credentials.load_auth_profile_optional(ws.slug, alias)
+        if not isinstance(profile, dict) or profile.get("strategy") != "browser":
+            return {
+                "ok": False,
+                "summary": "A saved browser authentication profile is required for signup continuation.",
+            }
+        pending = credentials.load_pending_browser_step_up(ws.slug, alias)
+        if not pending.get("available"):
+            return {
+                "ok": False,
+                "summary": "No unused browser signup challenge is available.",
+            }
+        mailbox_result = temporary_mail.poll(
+            ws, alias, kind="otp",
+            sender_domain=args.get("sender_domain", ""),
+            timeout=args.get("mail_timeout", 30),
+            scope_check=lambda url: tools.check_url_scope(ws, url)[0],
+            consume=False,
+        )
+    except (temporary_mail.TemporaryMailboxError, credentials.CredentialError) as exc:
+        return {"ok": False, "summary": str(exc)}
+    mailbox_data = (
+        mailbox_result.get("data")
+        if isinstance(mailbox_result.get("data"), dict) else {}
+    )
+    code = str(mailbox_data.get("value") or "")
+    message_id = str(mailbox_data.get("_message_id") or "")
+    if not code:
+        return {
+            "ok": True,
+            "summary": f"No matching OTP arrived for temporary mailbox {alias!r}.",
+            "data": {"alias": alias, "ready": False},
+        }
+    continuation_observation: dict[str, bool] = {}
+    result = tools.credential_browser_step_up(
+        ws, credential=alias, otp=code,
+        otp_selector=args.get("otp_selector", ""),
+        submit_selector=args.get("submit_selector", ""),
+        password_submit_selector=args.get("password_submit_selector", ""),
+        timeout=args.get("browser_timeout", 45),
+        _continuation_observation=continuation_observation,
+    )
+    if continuation_observation.get("reserved"):
+        try:
+            temporary_mail.mark_delivered(ws, alias, message_id, "otp")
+        except temporary_mail.TemporaryMailboxError:
+            return {
+                "ok": False,
+                "summary": "The browser continuation completed, but its private mailbox marker could not be saved.",
+            }
+    output = dict(result)
+    data = output.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    else:
+        data = dict(data)
+    data["mailbox_alias"] = alias
+    data["ready"] = bool(output.get("ok"))
+    output["data"] = data
+    return output
 
 
 def _auth_dispatch_metadata(requested: str, effective: str, *,
@@ -609,6 +713,52 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
     "credential_status": (
         "List named credential aliases and session state metadata.",
         _object({"credential": _string("Optional credential alias")}), _credential_status),
+    "temporary_mailbox_create": (
+        "Create a policy-permitted Mail.tm address and paired private target credential.",
+        _object({"alias": _string("Mailbox and target credential alias")}, ("alias",)),
+        _temporary_mailbox_create),
+    "temporary_mailbox_poll": (
+        "Poll a private Mail.tm inbox for one OTP or in-scope confirmation link.",
+        _object({
+            "alias": _string("Mailbox alias"),
+            "kind": {"type": "string", "enum": ["otp", "link"]},
+            "sender_domain": _string("Optional expected sender domain"),
+            "timeout": {"type": "integer", "minimum": 1, "maximum": 120},
+        }, ("alias", "kind")), _temporary_mailbox_poll),
+    "temporary_account_browser_signup": (
+        "Submit one policy-permitted browser signup with a paired private mailbox credential.",
+        _object({
+            "url": _string("In-scope signup page"),
+            "alias": _string("Paired mailbox and target credential alias"),
+            "verify_url": _string("Scoped same-origin page that proves the session"),
+            "success_marker": _string("Exact non-secret authenticated marker"),
+            "email_selector": _string("Email input CSS selector"),
+            "password_selector": _string("Password input CSS selector"),
+            "submit_selector": _string("Signup submit CSS selector"),
+            "fields": {
+                "type": "object", "maxProperties": 20,
+                "additionalProperties": {"type": "string", "maxLength": 500},
+                "description": "CSS selectors mapped to non-secret text or select values",
+            },
+            "checkboxes": {
+                "type": "array", "maxItems": 10,
+                "items": {"type": "string"},
+                "description": "Checkbox selectors to affirm for signup",
+            },
+            "timeout": {"type": "integer", "minimum": 5, "maximum": 120},
+        }, ("url", "alias", "verify_url", "success_marker")),
+        _temporary_account_browser_signup),
+    "temporary_account_browser_continue": (
+        "Continue one retained browser signup challenge with a private mailbox OTP.",
+        _object({
+            "alias": _string("Paired mailbox and target credential alias"),
+            "sender_domain": _string("Optional expected sender domain"),
+            "otp_selector": _string("Optional OTP input CSS selector"),
+            "submit_selector": _string("Optional OTP submit CSS selector"),
+            "password_submit_selector": _string("Optional password-stage submit selector"),
+            "mail_timeout": {"type": "integer", "minimum": 1, "maximum": 120},
+            "browser_timeout": {"type": "integer", "minimum": 5, "maximum": 120},
+        }, ("alias",)), _temporary_account_browser_continue),
     "credential_login": (
         "Authenticate with a named private credential and capture the resulting "
         "application behavior.",
@@ -905,11 +1055,14 @@ def _redacted(value, secret_values=()):
 
 
 def _audit_secret_values(workspace: Workspace, name: str, args: dict) -> tuple[str, ...]:
-    if name not in {"credential_login", "credential_browser_login"}:
+    if name not in {
+        "credential_login", "credential_browser_login",
+        "temporary_account_browser_signup", "temporary_account_browser_continue",
+    }:
         return ()
     try:
         secret = credentials.load_credential(
-            workspace.slug, str(args.get("credential") or "")
+            workspace.slug, str(args.get("credential") or args.get("alias") or "")
         )
     except credentials.CredentialError:
         return ()

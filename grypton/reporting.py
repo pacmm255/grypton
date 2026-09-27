@@ -29,6 +29,8 @@ NETWORK_TOOLS = {
     "http_request", "httpx_probe", "browse", "dns_lookup", "tls_certificate",
     "port_scan", "subdomain_enum", "goja_request", "flow_replay", "artifact_download",
     "tcp_exchange", "research", "credential_login", "credential_browser_login",
+    "temporary_mailbox_create", "temporary_mailbox_poll",
+    "temporary_account_browser_signup", "temporary_account_browser_continue",
     "authenticated_http_request", "authenticated_browser_request",
 }
 

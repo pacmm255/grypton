@@ -37,15 +37,16 @@ def isolated_runtime():
             yield root
 
 
-def exhausted_pool_error(*, retry_after_s: int = 60, tool_count: int = 0) -> WorkerError:
+def exhausted_pool_error(*, retry_after_s: int = 60, tool_count: int = 0,
+                         upstream_status: int = 429) -> WorkerError:
     return WorkerError(
-        "worker OpenClaude credential pool exhausted (upstream HTTP 429).",
+        f"worker OpenClaude credential pool exhausted (upstream HTTP {upstream_status}).",
         metadata={
             "source": "openclaude",
             "type": "openclaude_terminal",
             "role": "worker",
             "reason": "credential_pool_exhausted",
-            "upstream_status": 429,
+            "upstream_status": upstream_status,
             "pool_size": 3,
             "retry_after_s": retry_after_s,
             "tool_count": tool_count,
@@ -135,6 +136,65 @@ class DeadlineWorkerRetryTests(unittest.IsolatedAsyncioTestCase):
             } for event in retry_events))
             progress = (ws.root / "progress.md").read_text(encoding="utf-8")
             self.assertEqual(progress.count("transient Kraude provider failure"), 5)
+
+    async def test_http_400_pool_exhaustion_recovers_without_replaying_action(self):
+        with isolated_runtime():
+            config.CONFIG.max_turns = 1
+            config.CONFIG.max_run_seconds = 0
+            config.CONFIG.exhaustion_threshold = 99
+            config.CONFIG.passive_stagnation_limit = 99
+            config.CONFIG.repetitive_probe_turn_limit = 99
+
+            ws = Workspace("http-400-provider-retry")
+            ws.create("https://example.test", "web")
+            events: list[tuple[str, dict]] = []
+            engine = Engine(
+                ws.slug,
+                backend="mock",
+                run_until_stopped=True,
+                emit=lambda kind, **payload: events.append((kind, payload)),
+            )
+            opening = "perform the one-time scoped action"
+            await engine.setup(
+                brief=opening,
+                target="https://example.test",
+                target_type="web",
+            )
+            engine.worker.run_turn = AsyncMock(side_effect=[
+                exhausted_pool_error(
+                    retry_after_s=3,
+                    tool_count=1,
+                    upstream_status=400,
+                ),
+                TurnResult(
+                    assistant_text="continued on a different recorded lead",
+                    tool_uses=[{"name": "http_request", "input": {}}],
+                    result={"is_error": False},
+                ),
+            ])
+            engine.worker.ensure_started = AsyncMock()
+            engine._wait_for_worker_retry = AsyncMock(return_value=True)
+
+            await engine.run()
+
+            directives = [item.args[0] for item in engine.worker.run_turn.await_args_list]
+            self.assertEqual(directives[0], opening)
+            self.assertNotEqual(directives[1], opening)
+            self.assertIn("different highest-impact unresolved lead", directives[1])
+            self.assertEqual(engine.turn_index, 1)
+            engine._wait_for_worker_retry.assert_awaited_once_with(3)
+            retry_events = [
+                payload for kind, payload in events
+                if kind == "worker_provider_retry"
+            ]
+            self.assertEqual(retry_events, [{
+                "attempt": 1,
+                "wait_s": 3,
+                "reason": "credential_pool_exhausted",
+                "upstream_status": 400,
+                "tool_count": 1,
+            }])
+            self.assertNotIn("unrecoverable worker fault", engine.stop_reason)
 
     async def test_forever_mode_retries_explicitly_safe_worker_errors_past_limit(self):
         with isolated_runtime():

@@ -841,6 +841,7 @@ class OpenCodeClient:
             or not self.native_shell.home.is_dir()
             or not self.native_shell.temporary.is_dir()
             or not (self.native_shell.native_bin / "curl").is_file()
+            or not (self.native_shell.native_bin / "httpx").is_file()
         ):
             try:
                 self.native_shell = prepare_native_shell(

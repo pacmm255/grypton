@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import stat
 import time
 import unicodedata
 from contextlib import contextmanager
@@ -559,6 +560,15 @@ class Workspace:
         )
         self.render_scope_document()
 
+    def worker_policy_block(self, c: Optional[Constraints] = None) -> str:
+        """Return the value-free worker projection, including transport facts."""
+        from . import request_policy
+
+        c = c or self.load_constraints()
+        lines = [c.to_worker_prompt_block()]
+        lines.extend(request_policy.worker_facts(self.slug))
+        return "\n".join(lines)
+
     def render_scope_document(self) -> None:
         """Refresh worker-readable policy and observation projections.
 
@@ -586,6 +596,36 @@ class Workspace:
             self._legacy_program_profile_path,
             json.dumps(public, indent=2, ensure_ascii=False) + "\n",
         )
+
+    def save_program_profile(self, profile: dict) -> None:
+        """Persist structured operator policy without changing the brief copy."""
+        if not isinstance(profile, dict):
+            raise ValueError("structured program policy must be an object")
+        self._migrate_operator_state()
+        public = {key: value for key, value in profile.items() if key != "brief_text"}
+        self._save_operator_text(
+            self.program_profile_path,
+            self._legacy_program_profile_path,
+            json.dumps(public, indent=2, ensure_ascii=False) + "\n",
+        )
+
+    def load_program_profile(self) -> dict:
+        """Load the private structured program policy, failing closed."""
+        self._migrate_operator_state()
+        try:
+            info = self.program_profile_path.stat(follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise ValueError("no structured program policy is recorded") from exc
+        if (not stat.S_ISREG(info.st_mode)
+                or stat.S_IMODE(info.st_mode) & 0o077):
+            raise ValueError("structured program policy is not a private regular file")
+        try:
+            value = json.loads(self.program_profile_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise ValueError("structured program policy is unreadable or malformed") from exc
+        if not isinstance(value, dict):
+            raise ValueError("structured program policy is malformed")
+        return value
 
     def add_standing_instruction(self, text: str) -> Constraints:
         """Persist a user instruction for the rest of the engagement (R27/I4)."""
@@ -1563,7 +1603,7 @@ class Workspace:
         c = c or self.load_constraints()
         out = [f"# Scope Rules — {self.slug}", "",
                "```",
-               c.to_worker_prompt_block(), "```", ""]
+               self.worker_policy_block(c), "```", ""]
         _atomic_write(self.root / "scope-rules.md", "\n".join(out) + "\n")
 
 

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import asyncio
 import json
 import os
 from pathlib import Path
 import shutil
+import socket
 import sys
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -37,6 +40,7 @@ from grypton.workspace import Workspace
 OPENCLAUDE_ROOT = Path("/root/openclaude")
 PRIMARY_KEY = "fixture-primary-key-000000000001"
 SPARE_KEY = "fixture-spare-key-000000000002"
+THIRD_KEY = "fixture-third-key-000000000003"
 
 
 @contextmanager
@@ -180,6 +184,13 @@ def generic_rate_limited_provider(*, spare_succeeds: bool):
         "spare_succeeds": spare_succeeds,
         "status": 429,
         "error_type": "rate_limit",
+        "error_message": "busy",
+        "retry_after": "30",
+        "disconnect_primary": False,
+        "truncate_primary": False,
+        "delay_primary_s": 0.0,
+        "slow_error_body_s": 0.0,
+        "error_headers_sent": threading.Event(),
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -188,6 +199,33 @@ def generic_rate_limited_provider(*, spare_succeeds: bool):
             self.rfile.read(length)
             authorization = self.headers.get("Authorization", "")
             calls.append(authorization)
+            if authorization == f"Bearer {PRIMARY_KEY}" and control["delay_primary_s"]:
+                time.sleep(control["delay_primary_s"])
+            if authorization == f"Bearer {PRIMARY_KEY}" and control["disconnect_primary"]:
+                try:
+                    self.connection.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                self.connection.close()
+                return
+            if authorization == f"Bearer {PRIMARY_KEY}" and control["truncate_primary"]:
+                body = json.dumps({
+                    "id": "chatcmpl_truncated",
+                    "object": "chat.completion",
+                    "model": "fixture-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "incomplete"},
+                        "finish_reason": "stop",
+                    }],
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body) + 100))
+                self.end_headers()
+                self.wfile.write(body[: max(1, len(body) // 2)])
+                self.connection.close()
+                return
             if control["spare_succeeds"] and authorization == f"Bearer {SPARE_KEY}":
                 status = 200
                 payload = {
@@ -204,15 +242,33 @@ def generic_rate_limited_provider(*, spare_succeeds: bool):
             else:
                 status = control["status"]
                 payload = {
-                    "error": {"type": control["error_type"], "message": "busy"}
+                    "error": {
+                        "type": control["error_type"],
+                        "message": control["error_message"],
+                    }
                 }
             body = json.dumps(payload).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Retry-After", "30")
+            if control["retry_after"] is not None:
+                self.send_header("Retry-After", control["retry_after"])
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            try:
+                if (
+                    authorization == f"Bearer {PRIMARY_KEY}"
+                    and status >= 400
+                    and control["slow_error_body_s"]
+                ):
+                    self.wfile.write(body[:1])
+                    self.wfile.flush()
+                    control["error_headers_sent"].set()
+                    time.sleep(control["slow_error_body_s"])
+                    self.wfile.write(body[1:])
+                else:
+                    self.wfile.write(body)
+            except OSError:
+                pass
 
         def log_message(self, *args):
             pass
@@ -740,11 +796,12 @@ class OpenClaudeRotationTests(unittest.IsolatedAsyncioTestCase):
         return config_path
 
     @staticmethod
-    def _post(gateway: OpenClaudeGateway) -> tuple[int, str]:
+    def _post(gateway: OpenClaudeGateway,
+              model: str = "fixture-chat") -> tuple[int, str]:
         request = Request(
             gateway.url + "/v1/messages",
             data=json.dumps({
-                "model": "fixture-chat",
+                "model": model,
                 "max_tokens": 40,
                 "messages": [{"role": "user", "content": "fixture"}],
                 "stream": False,
@@ -797,6 +854,453 @@ class OpenClaudeRotationTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn(PRIMARY_KEY, serialized)
                     self.assertNotIn(SPARE_KEY, serialized)
                     self.assertNotRegex(serialized, r"\bkey [a-f0-9]{8}\b")
+                finally:
+                    await gateway.close()
+
+    async def test_generic_400_rotates_to_spare_and_preserves_exact_route(self):
+        asyncio.get_running_loop().slow_callback_duration = 1.0
+        with generic_rate_limited_provider(spare_succeeds=True) as (port, calls, control), \
+                tempfile.TemporaryDirectory() as directory:
+            control.update(
+                status=400,
+                error_type="invalid_request",
+                retry_after=None,
+            )
+            root = Path(directory)
+            config_path = self._rotation_config(root, port, window_ms=0)
+            with patch.dict(os.environ, {"GRYPTON_TEST_ROTATION_KEY": PRIMARY_KEY}):
+                gateway = OpenClaudeGateway(
+                    "fixture-chat", "auto", "worker", root / "transport",
+                    openclaude_root=OPENCLAUDE_ROOT, config_path=config_path,
+                )
+                try:
+                    await gateway.start()
+                    status, body = await asyncio.to_thread(self._post, gateway)
+                    self.assertEqual(status, 200)
+                    self.assertIn("rotated", body)
+                    self.assertEqual(gateway.model.route_id, "fixture-chat")
+                    self.assertEqual(calls, [
+                        f"Bearer {PRIMARY_KEY}",
+                        f"Bearer {SPARE_KEY}",
+                    ])
+                    events = gateway.drain_events()
+                    self.assertFalse(any(
+                        event.get("type") == "openclaude_terminal"
+                        for event in events
+                    ))
+                    serialized = json.dumps(events)
+                    self.assertNotIn(PRIMARY_KEY, serialized)
+                    self.assertNotIn(SPARE_KEY, serialized)
+                finally:
+                    await gateway.close()
+
+    async def test_all_generic_400_keys_emit_retryable_terminal_with_original_status(self):
+        asyncio.get_running_loop().slow_callback_duration = 1.0
+        with generic_rate_limited_provider(spare_succeeds=False) as (port, calls, control), \
+                tempfile.TemporaryDirectory() as directory:
+            control.update(
+                status=400,
+                error_type="invalid_request",
+                retry_after=None,
+            )
+            root = Path(directory)
+            config_path = self._rotation_config(root, port, window_ms=0)
+            with patch.dict(os.environ, {"GRYPTON_TEST_ROTATION_KEY": PRIMARY_KEY}):
+                gateway = OpenClaudeGateway(
+                    "fixture-chat", "auto", "worker", root / "transport",
+                    openclaude_root=OPENCLAUDE_ROOT, config_path=config_path,
+                )
+                try:
+                    await gateway.start()
+                    status, _ = await asyncio.to_thread(self._post, gateway)
+                    self.assertEqual(status, 400)
+                    self.assertEqual(calls, [
+                        f"Bearer {PRIMARY_KEY}",
+                        f"Bearer {SPARE_KEY}",
+                    ])
+                    events = gateway.drain_events()
+                    terminal = [
+                        event for event in events
+                        if event.get("type") == "openclaude_terminal"
+                    ]
+                    self.assertEqual(terminal, [{
+                        "type": "openclaude_terminal",
+                        "route": "fixture-chat",
+                        "reason": "credential_pool_exhausted",
+                        "upstream_status": 400,
+                        "pool_size": 2,
+                        "retry_after_s": 60,
+                    }])
+                    serialized = json.dumps(events)
+                    self.assertNotIn(PRIMARY_KEY, serialized)
+                    self.assertNotIn(SPARE_KEY, serialized)
+                finally:
+                    await gateway.close()
+
+    async def test_generic_503_rotates_to_spare_once(self):
+        with generic_rate_limited_provider(spare_succeeds=True) as (port, calls, control), \
+                tempfile.TemporaryDirectory() as directory:
+            control.update(status=503, error_type="overloaded", retry_after=None)
+            root = Path(directory)
+            config_path = self._rotation_config(root, port, window_ms=240_000)
+            with patch.dict(os.environ, {"GRYPTON_TEST_ROTATION_KEY": PRIMARY_KEY}):
+                gateway = OpenClaudeGateway(
+                    "fixture-chat", "auto", "worker", root / "transport",
+                    openclaude_root=OPENCLAUDE_ROOT, config_path=config_path,
+                )
+                try:
+                    await gateway.start()
+                    status, body = await asyncio.to_thread(self._post, gateway)
+                    self.assertEqual(status, 200)
+                    self.assertIn("rotated", body)
+                    self.assertEqual(calls, [
+                        f"Bearer {PRIMARY_KEY}",
+                        f"Bearer {SPARE_KEY}",
+                    ])
+                finally:
+                    await gateway.close()
+
+    async def test_pre_response_connection_reset_rotates_to_spare(self):
+        with generic_rate_limited_provider(spare_succeeds=True) as (port, calls, control), \
+                tempfile.TemporaryDirectory() as directory:
+            control["disconnect_primary"] = True
+            root = Path(directory)
+            config_path = self._rotation_config(root, port, window_ms=0)
+            with patch.dict(os.environ, {"GRYPTON_TEST_ROTATION_KEY": PRIMARY_KEY}):
+                gateway = OpenClaudeGateway(
+                    "fixture-chat", "auto", "worker", root / "transport",
+                    openclaude_root=OPENCLAUDE_ROOT, config_path=config_path,
+                )
+                try:
+                    await gateway.start()
+                    status, body = await asyncio.to_thread(self._post, gateway)
+                    self.assertEqual(status, 200)
+                    self.assertIn("rotated", body)
+                    self.assertEqual(calls, [
+                        f"Bearer {PRIMARY_KEY}",
+                        f"Bearer {SPARE_KEY}",
+                    ])
+                    events = gateway.drain_events()
+                    self.assertFalse(any(
+                        event.get("type") == "openclaude_terminal"
+                        for event in events
+                    ))
+                finally:
+                    await gateway.close()
+
+    async def test_three_key_failure_attempts_each_credential_exactly_once(self):
+        with generic_rate_limited_provider(spare_succeeds=False) as (port, calls, control), \
+                tempfile.TemporaryDirectory() as directory:
+            control.update(status=500, error_type="provider_error", retry_after=None)
+            root = Path(directory)
+            config_path = self._rotation_config(root, port, window_ms=240_000)
+            key_file = root / "keys"
+            key_file.write_text(f"{SPARE_KEY}\n{THIRD_KEY}\n", encoding="utf-8")
+            key_file.chmod(0o600)
+            with patch.dict(os.environ, {"GRYPTON_TEST_ROTATION_KEY": PRIMARY_KEY}):
+                gateway = OpenClaudeGateway(
+                    "fixture-chat", "auto", "worker", root / "transport",
+                    openclaude_root=OPENCLAUDE_ROOT, config_path=config_path,
+                )
+                try:
+                    await gateway.start()
+                    status, _ = await asyncio.to_thread(self._post, gateway)
+                    self.assertEqual(status, 400)
+                    self.assertEqual(calls, [
+                        f"Bearer {PRIMARY_KEY}",
+                        f"Bearer {SPARE_KEY}",
+                        f"Bearer {THIRD_KEY}",
+                    ])
+                    terminal = [
+                        event for event in gateway.drain_events()
+                        if event.get("type") == "openclaude_terminal"
+                    ]
+                    self.assertEqual(len(terminal), 1)
+                    self.assertEqual(terminal[0]["pool_size"], 3)
+                    self.assertEqual(terminal[0]["upstream_status"], 500)
+                finally:
+                    await gateway.close()
+
+    async def test_concurrent_requests_keep_credential_attempts_isolated(self):
+        with generic_rate_limited_provider(spare_succeeds=True) as (port, calls, _), \
+                tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = self._rotation_config(root, port, window_ms=0)
+            with patch.dict(os.environ, {"GRYPTON_TEST_ROTATION_KEY": PRIMARY_KEY}):
+                gateway = OpenClaudeGateway(
+                    "fixture-chat", "auto", "worker", root / "transport",
+                    openclaude_root=OPENCLAUDE_ROOT, config_path=config_path,
+                )
+                try:
+                    await gateway.start()
+                    first, second = await asyncio.gather(
+                        asyncio.to_thread(self._post, gateway),
+                        asyncio.to_thread(self._post, gateway),
+                    )
+                    self.assertEqual((first[0], second[0]), (200, 200))
+                    self.assertEqual(calls.count(f"Bearer {SPARE_KEY}"), 2)
+                    self.assertIn(
+                        calls.count(f"Bearer {PRIMARY_KEY}"),
+                        {1, 2},
+                    )
+                    events = gateway.drain_events()
+                    self.assertFalse(any(
+                        event.get("type") == "openclaude_terminal"
+                        for event in events
+                    ))
+                finally:
+                    await gateway.close()
+
+    async def test_pool_traversal_preserves_prompt_overflow_recovery(self):
+        with generic_rate_limited_provider(spare_succeeds=False) as (port, calls, control), \
+                tempfile.TemporaryDirectory() as directory:
+            control.update(
+                status=400,
+                error_type="invalid_request",
+                error_message="maximum context length exceeded",
+                retry_after=None,
+            )
+            root = Path(directory)
+            config_path = self._rotation_config(root, port, window_ms=0)
+            with patch.dict(os.environ, {"GRYPTON_TEST_ROTATION_KEY": PRIMARY_KEY}):
+                gateway = OpenClaudeGateway(
+                    "fixture-chat", "auto", "worker", root / "transport",
+                    openclaude_root=OPENCLAUDE_ROOT, config_path=config_path,
+                )
+                try:
+                    await gateway.start()
+                    status, body = await asyncio.to_thread(self._post, gateway)
+                    self.assertEqual(status, 400)
+                    self.assertIn("capability_rejected: prompt_too_long", body)
+                    self.assertEqual(calls, [
+                        f"Bearer {PRIMARY_KEY}",
+                        f"Bearer {SPARE_KEY}",
+                    ])
+                    self.assertFalse(any(
+                        event.get("type") == "openclaude_terminal"
+                        for event in gateway.drain_events()
+                    ))
+                finally:
+                    await gateway.close()
+
+    async def test_pool_traversal_preserves_thinking_signature_recovery(self):
+        with generic_rate_limited_provider(spare_succeeds=False) as (port, calls, control), \
+                tempfile.TemporaryDirectory() as directory:
+            control.update(
+                status=400,
+                error_type="invalid_request",
+                error_message="invalid signature in thinking block",
+                retry_after=None,
+            )
+            root = Path(directory)
+            config_path = self._rotation_config(root, port, window_ms=0)
+            with patch.dict(os.environ, {"GRYPTON_TEST_ROTATION_KEY": PRIMARY_KEY}):
+                gateway = OpenClaudeGateway(
+                    "fixture-chat", "auto", "manager", root / "transport",
+                    openclaude_root=OPENCLAUDE_ROOT, config_path=config_path,
+                )
+                try:
+                    await gateway.start()
+                    status, body = await asyncio.to_thread(self._post, gateway)
+                    self.assertEqual(status, 400)
+                    self.assertIn("capability_rejected: thinking_signature", body)
+                    self.assertEqual(len(calls), 2)
+                    self.assertFalse(any(
+                        event.get("type") == "openclaude_terminal"
+                        for event in gateway.drain_events()
+                    ))
+                finally:
+                    await gateway.close()
+
+    async def test_successful_headers_never_replay_after_body_stream_failure(self):
+        with generic_rate_limited_provider(spare_succeeds=True) as (port, calls, control), \
+                tempfile.TemporaryDirectory() as directory:
+            control["truncate_primary"] = True
+            root = Path(directory)
+            config_path = self._rotation_config(root, port, window_ms=0)
+            with patch.dict(os.environ, {"GRYPTON_TEST_ROTATION_KEY": PRIMARY_KEY}):
+                gateway = OpenClaudeGateway(
+                    "fixture-chat", "auto", "worker", root / "transport",
+                    openclaude_root=OPENCLAUDE_ROOT, config_path=config_path,
+                )
+                try:
+                    await gateway.start()
+                    status, _ = await asyncio.to_thread(self._post, gateway)
+                    self.assertGreaterEqual(status, 400)
+                    self.assertEqual(calls, [f"Bearer {PRIMARY_KEY}"])
+                    self.assertFalse(any(
+                        event.get("type") == "openclaude_terminal"
+                        for event in gateway.drain_events()
+                    ))
+                finally:
+                    await gateway.close()
+
+    async def test_large_error_body_is_bounded_without_tee_hang(self):
+        with generic_rate_limited_provider(spare_succeeds=False) as (port, calls, control), \
+                tempfile.TemporaryDirectory() as directory:
+            control.update(
+                status=400,
+                error_type="invalid_request",
+                error_message="x" * 100_000,
+                retry_after=None,
+            )
+            root = Path(directory)
+            config_path = self._rotation_config(root, port, window_ms=0)
+            with patch.dict(os.environ, {"GRYPTON_TEST_ROTATION_KEY": PRIMARY_KEY}):
+                gateway = OpenClaudeGateway(
+                    "fixture-chat", "auto", "worker", root / "transport",
+                    openclaude_root=OPENCLAUDE_ROOT, config_path=config_path,
+                )
+                try:
+                    await gateway.start()
+                    status, _ = await asyncio.wait_for(
+                        asyncio.to_thread(self._post, gateway),
+                        timeout=3,
+                    )
+                    self.assertEqual(status, 400)
+                    self.assertEqual(len(calls), 2)
+                finally:
+                    await gateway.close()
+
+    async def test_gateway_rejects_every_route_except_selected_route(self):
+        with generic_rate_limited_provider(spare_succeeds=True) as (port, calls, _), \
+                tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = self._rotation_config(root, port, window_ms=0)
+            document = json.loads(config_path.read_text(encoding="utf-8"))
+            document["routes"]["other-route"] = {
+                **document["routes"]["fixture-chat"],
+                "model": "other-model",
+                "label": "Other route",
+            }
+            config_path.write_text(json.dumps(document), encoding="utf-8")
+            with patch.dict(os.environ, {"GRYPTON_TEST_ROTATION_KEY": PRIMARY_KEY}):
+                gateway = OpenClaudeGateway(
+                    "fixture-chat", "auto", "worker", root / "transport",
+                    openclaude_root=OPENCLAUDE_ROOT, config_path=config_path,
+                )
+                try:
+                    await gateway.start()
+                    status, _ = await asyncio.to_thread(
+                        self._post, gateway, "other-route",
+                    )
+                    self.assertEqual(status, 400)
+                    self.assertEqual(calls, [])
+                finally:
+                    await gateway.close()
+
+    async def test_credential_pool_cap_fails_before_provider_dispatch(self):
+        with generic_rate_limited_provider(spare_succeeds=True) as (port, calls, _), \
+                tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = self._rotation_config(root, port, window_ms=0)
+            key_file = root / "keys"
+            cap_keys = [f"fixture-cap-key-{index:03d}" for index in range(64)]
+            key_file.write_text("\n".join(cap_keys) + "\n", encoding="utf-8")
+            key_file.chmod(0o600)
+            with patch.dict(os.environ, {"GRYPTON_TEST_ROTATION_KEY": PRIMARY_KEY}):
+                gateway = OpenClaudeGateway(
+                    "fixture-chat", "auto", "worker", root / "transport",
+                    openclaude_root=OPENCLAUDE_ROOT, config_path=config_path,
+                )
+                try:
+                    await gateway.start()
+                    status, body = await asyncio.to_thread(self._post, gateway)
+                    self.assertEqual(status, 424)
+                    self.assertEqual(calls, [])
+                    serialized = body + json.dumps(gateway.drain_events())
+                    self.assertNotIn(PRIMARY_KEY, serialized)
+                    for key in cap_keys:
+                        self.assertNotIn(key, serialized)
+                finally:
+                    await gateway.close()
+
+    async def test_client_abort_does_not_rotate_or_emit_terminal(self):
+        with generic_rate_limited_provider(spare_succeeds=True) as (port, calls, control), \
+                tempfile.TemporaryDirectory() as directory:
+            control["delay_primary_s"] = 0.4
+            root = Path(directory)
+            config_path = self._rotation_config(root, port, window_ms=0)
+            with patch.dict(os.environ, {"GRYPTON_TEST_ROTATION_KEY": PRIMARY_KEY}):
+                gateway = OpenClaudeGateway(
+                    "fixture-chat", "auto", "worker", root / "transport",
+                    openclaude_root=OPENCLAUDE_ROOT, config_path=config_path,
+                )
+                try:
+                    await gateway.start()
+                    connection = HTTPConnection(
+                        "127.0.0.1",
+                        int(gateway.url.rsplit(":", 1)[1]),
+                        timeout=2,
+                    )
+                    payload = json.dumps({
+                        "model": "fixture-chat",
+                        "max_tokens": 40,
+                        "messages": [{"role": "user", "content": "fixture"}],
+                        "stream": False,
+                    }).encode()
+                    connection.request("POST", "/v1/messages", body=payload, headers={
+                        "content-type": "application/json",
+                        "content-length": str(len(payload)),
+                        "x-api-key": gateway.token,
+                    })
+                    for _ in range(100):
+                        if calls:
+                            break
+                        await asyncio.sleep(0.01)
+                    self.assertEqual(calls, [f"Bearer {PRIMARY_KEY}"])
+                    connection.close()
+                    await asyncio.sleep(0.6)
+                    self.assertEqual(calls, [f"Bearer {PRIMARY_KEY}"])
+                    self.assertFalse(any(
+                        event.get("type") == "openclaude_terminal"
+                        for event in gateway.drain_events()
+                    ))
+                finally:
+                    await gateway.close()
+
+    async def test_client_abort_while_reading_error_body_does_not_rotate_or_emit_terminal(self):
+        with generic_rate_limited_provider(spare_succeeds=True) as (port, calls, control), \
+                tempfile.TemporaryDirectory() as directory:
+            control["slow_error_body_s"] = 0.5
+            root = Path(directory)
+            config_path = self._rotation_config(root, port, window_ms=0)
+            with patch.dict(os.environ, {"GRYPTON_TEST_ROTATION_KEY": PRIMARY_KEY}):
+                gateway = OpenClaudeGateway(
+                    "fixture-chat", "auto", "worker", root / "transport",
+                    openclaude_root=OPENCLAUDE_ROOT, config_path=config_path,
+                )
+                try:
+                    await gateway.start()
+                    connection = HTTPConnection(
+                        "127.0.0.1",
+                        int(gateway.url.rsplit(":", 1)[1]),
+                        timeout=2,
+                    )
+                    payload = json.dumps({
+                        "model": "fixture-chat",
+                        "max_tokens": 40,
+                        "messages": [{"role": "user", "content": "fixture"}],
+                        "stream": False,
+                    }).encode()
+                    connection.request("POST", "/v1/messages", body=payload, headers={
+                        "content-type": "application/json",
+                        "content-length": str(len(payload)),
+                        "x-api-key": gateway.token,
+                    })
+                    sent = await asyncio.to_thread(
+                        control["error_headers_sent"].wait,
+                        2,
+                    )
+                    self.assertTrue(sent)
+                    self.assertEqual(calls, [f"Bearer {PRIMARY_KEY}"])
+                    connection.close()
+                    await asyncio.sleep(0.7)
+                    self.assertEqual(calls, [f"Bearer {PRIMARY_KEY}"])
+                    self.assertFalse(any(
+                        event.get("type") == "openclaude_terminal"
+                        for event in gateway.drain_events()
+                    ))
                 finally:
                     await gateway.close()
 
@@ -989,7 +1493,7 @@ class OpenClaudeRotationTests(unittest.IsolatedAsyncioTestCase):
                     }])
                     status, _ = await asyncio.wait_for(request_task, timeout=2)
                     request_task = None
-                    self.assertEqual(status, 429)
+                    self.assertEqual(status, 400)
                     self.assertEqual(calls, [
                         f"Bearer {PRIMARY_KEY}",
                         f"Bearer {SPARE_KEY}",
@@ -1167,10 +1671,10 @@ class OpenClaudeRotationTests(unittest.IsolatedAsyncioTestCase):
                             return exc.code, exc.read().decode()
 
                     status, _ = await asyncio.to_thread(post)
-                    # OpenClaude aggregates a fully exhausted multi-key pool
-                    # into one retryable response while the sidecar retains the
-                    # last private upstream status in its sanitized event.
-                    self.assertEqual(status, 429)
+                    # The sidecar terminates one bounded pool traversal with a
+                    # fixed local error while retaining the last private
+                    # upstream status in its sanitized event.
+                    self.assertEqual(status, 400)
                     self.assertEqual(calls, [
                         f"Bearer {PRIMARY_KEY}",
                         f"Bearer {SPARE_KEY}",

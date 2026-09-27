@@ -189,11 +189,44 @@ _AUTOMATION_DENY = re.compile(
 _CREDENTIAL_REQUIRED = re.compile(
     r"(?i)(?:test using only accounts? created with|must use (?:the )?(?:assigned )?credentials?|"
     r"ensure that you use your @bugcrowdninja\.com|"
-    r"when (?:registering|creating)[^.]{0,160}(?:use|with)[^.]{0,80}@bugcrowdninja\.com)"
+    r"when (?:registering|creating)[^.\n]{0,160}(?:use|using|with|provide)"
+    r"[^.\n]{0,80}@[A-Za-z0-9.-]+|"
+    r"must use[^.\n]{0,100}@[A-Za-z0-9.-]+|"
+    r"(?:use|provide)[^.\n]{0,60}(?:work|business|corporate|company)[ -]email)"
 )
 _ACCOUNT_SUPPORTED = re.compile(
     r"(?i)(?:when registering for an account|create an account|select [\"']sign up[\"']|"
     r"you may want to set up test accounts?)"
+)
+_SELF_CREATED_ACCOUNT_PERMIT = re.compile(
+    r"(?i)(?:"
+    r"\b(?:you|researchers?|testers?|participants?)\s+"
+    r"(?:may|can|are\s+(?:allowed|permitted)\s+to)\s+"
+    r"(?:create|register|set\s+up)\b[^.\n]{0,100}\baccounts?\b|"
+    r"\bwhen\s+(?:registering|creating)\s+(?:for\s+)?(?:an?\s+)?(?:test\s+)?account\b|"
+    r"\byou\s+may\s+want\s+to\s+set\s+up\s+test\s+accounts?\b|"
+    r"\bselect\s+[\"']sign\s+up[\"']|"
+    r"(?:^|[.!]\s+)\s*(?:create|set\s+up)\s+(?:a\s+|your\s+own\s+)"
+    r"(?:test\s+)?account\b"
+    r")"
+)
+_SELF_CREATED_ACCOUNT_DENY = re.compile(
+    r"(?i)(?:"
+    r"\b(?:do not|must not|may not|cannot|can't|"
+    r"(?:are|is)\s+not\s+(?:allowed|permitted)\s+to)\s+"
+    r"(?:create|register|set\s+up)\b[^.\n]{0,100}\baccounts?\b|"
+    r"\b(?:account\s+creation|creating\s+(?:for\s+)?(?:an?\s+)?(?:test\s+)?account|"
+    r"registering\s+(?:for\s+)?(?:an?\s+)?(?:test\s+)?account)\b"
+    r"[^.\n]{0,80}\b(?:prohibited|forbidden|not\s+(?:allowed|permitted))\b"
+    r")"
+)
+_DISPOSABLE_EMAIL_DENY = re.compile(
+    r"(?i)(?:\bno\s+(?:disposable|temporary|temp)[\s-]*(?:e-?mail|mail)(?:\s+address(?:es)?)?"
+    r"|(?:do not|must not|may not|cannot|can't)\s+(?:use\s+)?"
+    r"(?:a\s+)?(?:disposable|temporary|temp)[\s-]*(?:e-?mail|mail)(?:\s+address(?:es)?)?"
+    r"|(?:disposable|temporary|temp)[\s-]*(?:e-?mail|mail)(?:\s+address(?:es)?)?"
+    r"[^.\n]{0,100}(?:prohibited|forbidden|blocked|rejected|unsupported|"
+    r"not (?:allowed|permitted|accepted|supported)|(?:cannot|must not|may not)\s+be\s+used))"
 )
 
 _SEVERITY_LABELS = {
@@ -354,6 +387,9 @@ def analyze_snapshot(path: str | Path) -> dict:
     automation = _AUTOMATION_DENY.search(text)
     credential = _CREDENTIAL_REQUIRED.search(text)
     account = _ACCOUNT_SUPPORTED.search(text)
+    account_permit = _SELF_CREATED_ACCOUNT_PERMIT.search(text)
+    account_deny = _SELF_CREATED_ACCOUNT_DENY.search(text)
+    disposable_email = _DISPOSABLE_EMAIL_DENY.search(text)
     excluded_findings, conditional_exclusions = _structured_finding_policy(data)
     targets: list[dict] = []
     for group in data.get("scope") or []:
@@ -391,6 +427,24 @@ def analyze_snapshot(path: str | Path) -> dict:
         "credential_requirement": bool(credential),
         "credential_rule_excerpt": _snippet(text, credential) if credential else "",
         "account_workflows_supported": bool(account),
+        "self_created_account_permission": bool(account_permit and not account_deny),
+        "self_created_account_rule_excerpt": (
+            _snippet(text, account_permit) if account_permit else ""
+        ),
+        "self_created_account_prohibited": bool(account_deny),
+        "self_created_account_prohibition_excerpt": (
+            _snippet(text, account_deny) if account_deny else ""
+        ),
+        "disposable_email_prohibited": bool(disposable_email),
+        "disposable_email_rule_excerpt": (
+            _snippet(text, disposable_email) if disposable_email else ""
+        ),
+        # Mailbox tooling requires this exact structured grant. Old profiles
+        # and programs that mandate assigned credentials fail closed.
+        "temporary_mail_account_bootstrap_allowed": bool(
+            account_permit and not account_deny
+            and not credential and not disposable_email
+        ),
         "known_issues_enabled": bool(document.get("knownIssuesEnabled")),
         "logged_in_snapshot": bool(document.get("isLoggedIn")),
         "targets": targets,

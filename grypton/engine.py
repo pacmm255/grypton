@@ -284,7 +284,7 @@ class Engine:
         # compatibility handoff before OpenCode can see the workspace.
         self.ws.retire_legacy_operator_state()
         constraints = self.ws.load_constraints()
-        worker_cblock = constraints.to_worker_prompt_block()
+        worker_cblock = self.ws.worker_policy_block(constraints)
         # This document is visible to Kraude. Refresh it on every start so an
         # engagement created by an older release cannot retain manager-only or
         # free-form fields in the worker workspace.
@@ -1950,6 +1950,8 @@ class Engine:
             "http_request", "goja_request", "flow_replay", "httpx_probe",
             "browse", "dns_lookup", "tls_certificate", "port_scan",
             "subdomain_enum", "credential_login", "credential_browser_login",
+            "temporary_mailbox_create", "temporary_mailbox_poll",
+            "temporary_account_browser_signup", "temporary_account_browser_continue",
             "authenticated_http_request", "authenticated_browser_request",
             "artifact_download", "tcp_exchange", "research",
         }
@@ -2014,6 +2016,11 @@ class Engine:
             shape = f"flow:{args.get('flow_id') or ''}"
         elif name == "httpx_probe":
             shape = "targets:" + " ".join(sorted(str(args.get("targets") or "").split()))
+        elif name in {
+            "temporary_mailbox_create", "temporary_mailbox_poll",
+            "temporary_account_browser_continue",
+        }:
+            shape = "mailbox:" + str(args.get("alias") or "")
         else:
             host = str(args.get("host") or args.get("domain") or "").lower().rstrip(".")
             extra = ""

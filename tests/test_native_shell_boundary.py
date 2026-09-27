@@ -394,6 +394,7 @@ int main(void) {
             spec.temporary.mkdir()
             spec.native_bin.mkdir()
             (spec.native_bin / "curl").write_text("fixture", encoding="utf-8")
+            (spec.native_bin / "httpx").write_text("fixture", encoding="utf-8")
             spec.launcher.write_text("fixture", encoding="utf-8")
             with patch("grypton.providers.prepare_native_shell", return_value=spec) as prepare:
                 first, _ = client._environment()

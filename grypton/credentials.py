@@ -91,6 +91,16 @@ def _profile_dir(target: str) -> Path:
     return _private_dir(credential_dir(target) / ".profiles")
 
 
+def _mailbox_dir(target: str) -> Path:
+    """Return the private disposable-mail state directory."""
+    return _private_dir(credential_dir(target) / ".mailboxes")
+
+
+def mailbox_path(target: str, name: str) -> Path:
+    alias = _safe_name(name, label="mailbox alias")
+    return _mailbox_dir(target) / (alias + ".json")
+
+
 def auth_profile_path(target: str, name: str) -> Path:
     alias = _safe_name(name, label="credential name")
     return _profile_dir(target) / (alias + ".json")
@@ -169,6 +179,17 @@ def session_material_lock(target: str, name: str):
     lock_path = _session_dir(target) / f".{alias}.material.lock"
     with _private_interprocess_lock(
         lock_path, error="private session lock is unavailable"
+    ):
+        yield
+
+
+@contextmanager
+def mailbox_lock(target: str, name: str):
+    """Serialize creation and polling for one private mailbox alias."""
+    alias = _safe_name(name, label="mailbox alias")
+    lock_path = _mailbox_dir(target) / f".{alias}.lock"
+    with _private_interprocess_lock(
+        lock_path, error="private mailbox lock is unavailable"
     ):
         yield
 
@@ -285,6 +306,36 @@ def load_credential(target: str, name: str) -> dict[str, str]:
     if not isinstance(username, str) or not username or not isinstance(password, str) or not password:
         raise CredentialError("credential file does not contain a username and password")
     return {"username": username, "password": password}
+
+
+def save_mailbox(target: str, name: str, value: dict) -> str:
+    """Persist an opaque mailbox record outside the model-visible workspace."""
+    alias = _safe_name(name, label="mailbox alias")
+    if not isinstance(value, dict):
+        raise CredentialError("mailbox record must be an object")
+    _atomic_private_json(mailbox_path(target, alias), value)
+    return alias
+
+
+def load_mailbox(target: str, name: str) -> dict:
+    """Load one private mailbox record while enforcing its file mode."""
+    alias = _safe_name(name, label="mailbox alias")
+    try:
+        return _read_private_json(
+            mailbox_path(target, alias), label="mailbox record"
+        )
+    except CredentialError as exc:
+        if "named credential does not exist" in str(exc):
+            raise CredentialError("named mailbox does not exist") from exc
+        raise
+
+
+def list_mailboxes(target: str) -> list[str]:
+    directory = _mailbox_dir(target)
+    return sorted(
+        path.stem for path in directory.glob("*.json")
+        if _NAME.fullmatch(path.stem) and path.is_file() and not path.is_symlink()
+    )
 
 
 def normalize_login_username(username: str, transform: str = "stored") -> str:
@@ -449,6 +500,19 @@ def provider_redaction_values(target: str) -> tuple[str, ...]:
                     add(row[6], session_material=True)
         except (CredentialError, OSError):
             pass
+    try:
+        mailbox_aliases = list_mailboxes(target)[:256]
+    except (CredentialError, OSError):
+        mailbox_aliases = []
+    for alias in mailbox_aliases:
+        try:
+            mailbox = load_mailbox(target, alias)
+        except (CredentialError, OSError):
+            continue
+        # These values must never reach provider output. The public mailbox
+        # address is already covered by its paired named target credential.
+        for key in ("mailbox_password", "bearer_token", "target_password"):
+            add(mailbox.get(key))
     return tuple(sorted(values, key=len, reverse=True))
 
 
