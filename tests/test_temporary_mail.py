@@ -136,6 +136,73 @@ class TemporaryMailboxTests(unittest.TestCase):
             signup["properties"]["flow"]["enum"],
             ["one-page", "identifier-otp"],
         )
+        self.assertEqual(
+            signup["properties"]["submission_origins"]["maxItems"], 8
+        )
+        self.assertEqual(
+            signup["properties"]["submission_preflight_urls"]["maxItems"], 4
+        )
+        continuation = REGISTRY["temporary_account_browser_continue"][1]
+        self.assertIn("otp_submission_url", continuation["properties"])
+        stages = continuation["properties"]["post_otp_stages"]
+        self.assertEqual(stages["maxItems"], 6)
+        self.assertEqual(
+            stages["items"]["required"], ["submit_selector"]
+        )
+        self.assertEqual(
+            stages["items"]["properties"]["fields"]["maxProperties"], 20
+        )
+        self.assertEqual(
+            stages["items"]["properties"]["choice_selectors"]["maxItems"], 4
+        )
+        self.assertEqual(
+            stages["items"]["properties"]["action_only"]["type"], "boolean"
+        )
+
+    def test_invalid_onboarding_fields_never_enter_the_audit_ledger(self):
+        with isolated_runtime():
+            workspace = authorized_workspace()
+            record = mailbox_record()
+            credentials.save_mailbox(workspace.slug, "signup", record)
+            credentials.save_credential(
+                workspace.slug, "signup", record["address"],
+                record["target_password"],
+            )
+            seventh_private = "seventh-stage-private-never-log"
+            nested_private = "nested-private-never-log"
+            seven_stages = [
+                {
+                    "fields": {
+                        "#name": (
+                            seventh_private if index == 6 else f"stage-{index}"
+                        ),
+                    },
+                    "submit_selector": "#next",
+                }
+                for index in range(7)
+            ]
+            too_many = dispatch(
+                workspace, "temporary_account_browser_continue",
+                {"alias": "signup", "post_otp_stages": seven_stages},
+            )
+            malformed = dispatch(
+                workspace, "temporary_account_browser_continue",
+                {
+                    "alias": "signup",
+                    "post_otp_stages": [{
+                        "fields": {"#name": {"wrapped": nested_private}},
+                        "submit_selector": "#next",
+                    }],
+                },
+            )
+
+            self.assertFalse(too_many["ok"])
+            self.assertFalse(malformed["ok"])
+            audit = (workspace.root / ".ledger/tool-calls.jsonl").read_text()
+            self.assertNotIn(seventh_private, audit)
+            self.assertNotIn(nested_private, audit)
+            self.assertIn("[TRUNCATED_STAGES]", audit)
+            self.assertIn("[REDACTED]", audit)
 
     def test_signup_delegates_to_single_submission_private_browser_path(self):
         with isolated_runtime():
@@ -160,6 +227,11 @@ class TemporaryMailboxTests(unittest.TestCase):
                     "submit_selector": "#register",
                     "fields": {"#name": "Grypton Research", "#size": "small"},
                     "checkboxes": ["#terms"],
+                    "submission_origins": ["https://api.example.test"],
+                    "submission_url": "https://api.example.test/auth/signup",
+                    "submission_preflight_urls": [
+                        "https://api.example.test/auth/check-email"
+                    ],
                 })
             self.assertEqual(result, expected)
             _, called_url = browser.call_args.args
@@ -168,6 +240,25 @@ class TemporaryMailboxTests(unittest.TestCase):
             self.assertEqual(called["credential"], "signup")
             self.assertEqual(called["registration_fields"]["#name"], "Grypton Research")
             self.assertEqual(called["registration_checkboxes"], ["#terms"])
+            self.assertEqual(
+                called["_additional_submission_origins"],
+                ["https://api.example.test"],
+            )
+            self.assertEqual(
+                called["_submission_url"],
+                "https://api.example.test/auth/signup",
+            )
+            self.assertEqual(called["_submission_preflight_urls"], [
+                "https://api.example.test/auth/check-email",
+            ])
+            candidate = called["_profile_candidate"]
+            self.assertEqual(candidate["strategy"], "browser")
+            self.assertEqual(
+                candidate["login_url"], "https://app.example.test/signup"
+            )
+            self.assertIsNone(
+                credentials.load_auth_profile_optional(workspace.slug, "signup")
+            )
             rendered = repr(browser.call_args)
             self.assertNotIn(record["mailbox_password"], rendered)
             self.assertNotIn(record["bearer_token"], rendered)
@@ -196,6 +287,11 @@ class TemporaryMailboxTests(unittest.TestCase):
                     "submit_selector": "form button[type='submit']",
                     "fields": {"#name": "Grypton Research"},
                     "checkboxes": ["#terms", "#privacy"],
+                    "submission_origins": ["https://api.example.test"],
+                    "submission_url": "https://api.example.test/auth/signup",
+                    "submission_preflight_urls": [
+                        "https://api.example.test/auth/check-email"
+                    ],
                 })
             self.assertEqual(result, expected)
             called = browser.call_args.kwargs
@@ -205,6 +301,17 @@ class TemporaryMailboxTests(unittest.TestCase):
             })
             self.assertEqual(called["registration_checkboxes"], [
                 "#terms", "#privacy",
+            ])
+            self.assertEqual(
+                called["_additional_submission_origins"],
+                ["https://api.example.test"],
+            )
+            self.assertEqual(
+                called["_submission_url"],
+                "https://api.example.test/auth/signup",
+            )
+            self.assertEqual(called["_submission_preflight_urls"], [
+                "https://api.example.test/auth/check-email",
             ])
             profile = called["_profile_candidate"]
             self.assertEqual(profile["strategy"], "browser")
@@ -256,6 +363,9 @@ class TemporaryMailboxTests(unittest.TestCase):
                 workspace.slug, "signup", record["address"], record["target_password"]
             )
             otp = "739251"
+            private_workspace = "Private Workspace Never Log"
+            private_first_name = "Private Given Never Log"
+            private_sixth_value = "Private Sixth Stage Never Log"
             def continue_browser(*_args, **kwargs):
                 kwargs["_continuation_observation"]["reserved"] = True
                 return {"ok": True, "summary": "Session proved.",
@@ -280,17 +390,63 @@ class TemporaryMailboxTests(unittest.TestCase):
             ) as continuation:
                 result = dispatch(
                     workspace, "temporary_account_browser_continue",
-                    {"alias": "signup", "sender_domain": "example.test"},
+                    {
+                        "alias": "signup", "sender_domain": "example.test",
+                        "otp_submission_url": (
+                            "https://api.example.test/auth/verify-otp"
+                        ),
+                        "post_otp_stages": [{
+                            "fields": {
+                                "#workspace": private_workspace,
+                                "#first-name": private_first_name,
+                            },
+                            "checkboxes": ["#profile-consent"],
+                            "choice_selectors": [
+                                "#company-size-trigger", "#company-small",
+                            ],
+                            "submit_selector": "#profile-next",
+                        }, {
+                            "fields": {"#second": "Private Second"},
+                            "submit_selector": "#second-next",
+                        }, {
+                            "fields": {"#third": "Private Third"},
+                            "submit_selector": "#third-next",
+                        }, {
+                            "fields": {"#fourth": "Private Fourth"},
+                            "submit_selector": "#fourth-next",
+                        }, {
+                            "fields": {"#fifth": "Private Fifth"},
+                            "submit_selector": "#fifth-next",
+                        }, {
+                            "fields": {"#sixth": private_sixth_value},
+                            "submit_selector": "#sixth-next",
+                        }],
+                    },
                 )
             self.assertTrue(result["ok"])
             self.assertTrue(result["data"]["ready"])
             self.assertEqual(continuation.call_args.kwargs["otp"], otp)
+            self.assertEqual(
+                continuation.call_args.kwargs["otp_submission_url"],
+                "https://api.example.test/auth/verify-otp",
+            )
+            self.assertEqual(
+                continuation.call_args.kwargs["post_otp_stages"][0]["fields"],
+                {
+                    "#workspace": private_workspace,
+                    "#first-name": private_first_name,
+                },
+            )
             mark_delivered.assert_called_once_with(
                 workspace, "signup", "mail-otp", "otp"
             )
             self.assertNotIn(otp, json.dumps(result))
             audit = (workspace.root / ".ledger/tool-calls.jsonl").read_text()
             self.assertNotIn(otp, audit)
+            self.assertNotIn(private_workspace, audit)
+            self.assertNotIn(private_first_name, audit)
+            self.assertNotIn(private_sixth_value, audit)
+            self.assertIn("#workspace", audit)
 
     def test_private_otp_preflight_failure_leaves_mailbox_message_retryable(self):
         with isolated_runtime():
@@ -337,6 +493,58 @@ class TemporaryMailboxTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "printable strings"):
             tools._browser_auth_registration_controls({"#name": "bad\nvalue"}, [])
+
+        stages = tools._browser_post_otp_stages([{
+            "fields": {"#workspace": "Research", "#size": "small"},
+            "checkboxes": ["#terms"],
+            "choice_selector": "#small-company",
+            "submit_selector": "#next",
+        }])
+        self.assertEqual(len(stages), 1)
+        self.assertEqual(stages[0]["fields"]["#size"], "small")
+        self.assertEqual(stages[0]["choice_selectors"], ["#small-company"])
+        action_only = tools._browser_post_otp_stages([{
+            "action_only": True, "submit_selector": "#skip",
+        }])
+        self.assertTrue(action_only[0]["action_only"])
+        self.assertEqual(action_only[0]["fields"], {})
+        ordered_choices = tools._browser_post_otp_stages([{
+            "fields": {"#workspace": "Research"},
+            "choice_selectors": ["#open", "#small"],
+            "submit_selector": "#next",
+        }])
+        self.assertEqual(
+            ordered_choices[0]["choice_selectors"], ["#open", "#small"]
+        )
+        with self.assertRaisesRegex(ValueError, "at most 6"):
+            tools._browser_post_otp_stages([
+                {"fields": {"#name": "value"}, "submit_selector": "#next"}
+                for _index in range(7)
+            ])
+        with self.assertRaisesRegex(ValueError, "nonempty field"):
+            tools._browser_post_otp_stages([{
+                "fields": {}, "submit_selector": "#next",
+            }])
+        with self.assertRaisesRegex(ValueError, "at most 4 choice selectors"):
+            tools._browser_post_otp_stages([{
+                "fields": {"#name": "value"},
+                "choice_selector": "#first",
+                "choice_selectors": [
+                    "#second", "#third", "#fourth", "#fifth",
+                ],
+                "submit_selector": "#next",
+            }])
+        with self.assertRaisesRegex(ValueError, "action_only cannot include"):
+            tools._browser_post_otp_stages([{
+                "action_only": True,
+                "fields": {"#name": "value"},
+                "submit_selector": "#skip",
+            }])
+        with self.assertRaisesRegex(ValueError, "unsupported settings"):
+            tools._browser_post_otp_stages([{
+                "fields": {"#name": "value"}, "submit_selector": "#next",
+                "password": "not accepted",
+            }])
 
         class Locator:
             def __init__(self, tag, input_type=""):
@@ -691,6 +899,63 @@ class TemporaryMailboxTests(unittest.TestCase):
             allowed = analyze_snapshot(path)
             self.assertTrue(allowed["temporary_mail_account_bootstrap_allowed"])
 
+            for description in (
+                (
+                    "Researchers may create an account. API requests require "
+                    "an Authorization header."
+                ),
+                (
+                    "Researchers may create an account. Approval is required "
+                    "before submitting a vulnerability report."
+                ),
+                (
+                    "Researchers may create an account and test invitation "
+                    "acceptance."
+                ),
+                "Researchers may create an account. No credentials are provided.",
+                (
+                    "Provided credentials are optional. Researchers may create "
+                    "an account."
+                ),
+                (
+                    "Researchers may create an account using self-assigned "
+                    "credentials."
+                ),
+                (
+                    "Researchers may create an account. Automated testing is "
+                    "not forbidden."
+                ),
+                (
+                    "Researchers may create an account. Temporary email is not "
+                    "prohibited."
+                ),
+                (
+                    "Researchers may create an account. No temporary email "
+                    "restrictions apply."
+                ),
+            ):
+                with self.subTest(description=description):
+                    base["data"]["brief"]["description"] = description
+                    path.write_text(json.dumps(base), encoding="utf-8")
+                    unrelated = analyze_snapshot(path)
+                    self.assertTrue(unrelated["self_created_account_permission"])
+                    self.assertFalse(unrelated["credential_requirement"])
+                    self.assertFalse(unrelated["automation_prohibited"])
+                    self.assertFalse(unrelated["disposable_email_prohibited"])
+                    self.assertTrue(
+                        unrelated["temporary_mail_account_bootstrap_allowed"]
+                    )
+
+            base["data"]["brief"]["description"] = (
+                'For ordinary customers, select "Sign Up".'
+            )
+            path.write_text(json.dumps(base), encoding="utf-8")
+            ui_instruction = analyze_snapshot(path)
+            self.assertFalse(ui_instruction["self_created_account_permission"])
+            self.assertFalse(
+                ui_instruction["temporary_mail_account_bootstrap_allowed"]
+            )
+
             base["data"]["brief"]["description"] = (
                 "When registering for an account, obtain written authorization "
                 "from support first."
@@ -702,6 +967,106 @@ class TemporaryMailboxTests(unittest.TestCase):
                 conditional["temporary_mail_account_bootstrap_allowed"]
             )
 
+            for description in (
+                'Do not select "Sign Up".',
+                'You are not allowed to select "Sign Up".',
+                'You are not permitted to select "Sign Up".',
+                'It is not allowed to select "Sign Up".',
+                "Researchers may create an account. Do not sign up.",
+                "Only authorized researchers may create an account.",
+                "Invited researchers may create an account.",
+                "Researchers may create an account when approved.",
+                "By invitation only, researchers may create an account.",
+                (
+                    "Subject to prior approval, researchers may create an "
+                    "account."
+                ),
+                (
+                    "Prior approval required from support. Researchers may "
+                    "create an account."
+                ),
+                (
+                    "Researchers may create an account. Obtain written approval "
+                    "from support first."
+                ),
+                (
+                    "Researchers may create an account. Approval must be obtained "
+                    "from support."
+                ),
+                (
+                    "Researchers can create an account only with prior written "
+                    "permission from support."
+                ),
+                "Researchers may create an account if invited by the program.",
+                (
+                    "Researchers may create an account provided that support "
+                    "approves."
+                ),
+                (
+                    "Researchers may create an account. You must receive written "
+                    "approval from support first."
+                ),
+                (
+                    "Researchers may create an account. An invitation from support "
+                    "is required."
+                ),
+                (
+                    "Researchers may create an account. Registration requires an "
+                    "invitation from support."
+                ),
+                (
+                    "Researchers may create an account. You must be invited by "
+                    "support."
+                ),
+                (
+                    "Researchers may create an account. Never create an account "
+                    "without approval."
+                ),
+            ):
+                with self.subTest(description=description):
+                    base["data"]["brief"]["description"] = description
+                    path.write_text(json.dumps(base), encoding="utf-8")
+                    qualified = analyze_snapshot(path)
+                    self.assertFalse(
+                        qualified["self_created_account_permission"]
+                    )
+                    self.assertFalse(
+                        qualified["temporary_mail_account_bootstrap_allowed"]
+                    )
+
+            for description in (
+                "Researchers may create an account using the assigned credentials.",
+                (
+                    "Researchers may create an account. Credentials will be "
+                    "provided by support."
+                ),
+                (
+                    "Researchers may create an account. Credentials provided by "
+                    "support must be used."
+                ),
+                (
+                    "Researchers may create an account. Only program-provided "
+                    "accounts may be used."
+                ),
+                (
+                    "Researchers may create an account. Use only the test "
+                    "account issued by support."
+                ),
+                (
+                    "Researchers may create an account. Use the login supplied "
+                    "by support."
+                ),
+            ):
+                with self.subTest(description=description):
+                    base["data"]["brief"]["description"] = description
+                    path.write_text(json.dumps(base), encoding="utf-8")
+                    assigned = analyze_snapshot(path)
+                    self.assertTrue(assigned["credential_requirement"])
+                    self.assertFalse(assigned["self_created_account_permission"])
+                    self.assertFalse(
+                        assigned["temporary_mail_account_bootstrap_allowed"]
+                    )
+
             base["data"]["brief"]["description"] = (
                 "Researchers may create an account. "
                 "When registering for an account, use your email."
@@ -712,6 +1077,23 @@ class TemporaryMailboxTests(unittest.TestCase):
             denied = analyze_snapshot(path)
             self.assertTrue(denied["disposable_email_prohibited"])
             self.assertFalse(denied["temporary_mail_account_bootstrap_allowed"])
+
+            base["data"]["brief"]["description"] = (
+                "Researchers may create an account. Automated testing is forbidden."
+            )
+            path.write_text(json.dumps(base), encoding="utf-8")
+            automation_denied = analyze_snapshot(path)
+            self.assertTrue(automation_denied["automation_prohibited"])
+
+            base["data"]["brief"]["description"] = (
+                "Researchers may create an account. Never use temporary email."
+            )
+            path.write_text(json.dumps(base), encoding="utf-8")
+            never_temporary = analyze_snapshot(path)
+            self.assertTrue(never_temporary["disposable_email_prohibited"])
+            self.assertFalse(
+                never_temporary["temporary_mail_account_bootstrap_allowed"]
+            )
 
             base["data"]["brief"]["description"] = "Do not create an account."
             path.write_text(json.dumps(base), encoding="utf-8")
@@ -749,6 +1131,62 @@ class TemporaryMailboxTests(unittest.TestCase):
             self.assertFalse(
                 implicit_required_domain["temporary_mail_account_bootstrap_allowed"]
             )
+
+    def test_bugcrowd_profile_recognizes_uxcam_self_provisioning_clause(self):
+        snapshot = {
+            "id": "uxcam-mail-policy",
+            "data": {
+                "brief": {"description": ""},
+                "scope": [{
+                    "name": "web", "inScope": True, "maxSeverity": "P1",
+                    "targets": [{
+                        "name": "UXCam", "uri": "https://app.uxcam.com",
+                        "category": "website",
+                    }],
+                }],
+            },
+        }
+        affirmative = (
+            "Accounts can be self-provisioned for testing at "
+            "app.uxcam.com/signup, and you will get a free 14-day trial."
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "brief.json"
+            for description, expected in (
+                (affirmative, True),
+                (
+                    affirmative
+                    + " Accounts can be self-provisioned for testing only with "
+                    "prior approval.",
+                    False,
+                ),
+                (
+                    affirmative
+                    + " Credentials will be provided by the program.",
+                    False,
+                ),
+                ("Accounts cannot be self-provisioned for testing.", False),
+                ("No accounts can be self-provisioned for testing.", False),
+                (
+                    "Only approved accounts can be self-provisioned for testing.",
+                    False,
+                ),
+                (
+                    affirmative + " Self-provisioning accounts is prohibited.",
+                    False,
+                ),
+            ):
+                with self.subTest(description=description):
+                    snapshot["data"]["brief"]["description"] = description
+                    path.write_text(json.dumps(snapshot), encoding="utf-8")
+                    profile = analyze_snapshot(path)
+                    self.assertEqual(
+                        profile["temporary_mail_account_bootstrap_allowed"],
+                        expected,
+                    )
+                    self.assertEqual(
+                        profile["self_created_account_permission"], expected
+                    )
 
 
 if __name__ == "__main__":

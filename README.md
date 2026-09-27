@@ -896,6 +896,10 @@ available:
 - `temporary_account_browser_continue` privately polls a numeric email OTP and
   supplies it to one retained browser step-up. The OTP stays out of model
   output and tool arguments; the saved browser profile runs the normal proof.
+  When the OTP is sent to an additional API origin, set
+  `otp_submission_url` to that exact in-scope verification endpoint. Grypton
+  combines it with the origin retained from signup and rejects undeclared
+  cross-origin OTP traffic before the code can leave the browser.
 
 All four tools check the private structured program profile every time. A missing
 or older profile, a brief that only mentions assigned credentials, or a rule

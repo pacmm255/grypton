@@ -1562,6 +1562,21 @@ else:
             credentials.record_login_outcome(
                 target, alias, blocked_reason="MFA/OTP challenge was presented"
             )
+            with self.assertRaisesRegex(
+                credentials.CredentialError, "submission origins"
+            ):
+                credentials.save_pending_browser_step_up(
+                    target, alias, attempt=attempt, origin=origin,
+                    challenge_url="https://app.example.test/login",
+                    profile_revision="0123456789ab", cookies=[],
+                    local_storage={"anonymous_id": "private-anonymous-value"},
+                    session_storage={}, tokens={}, otp_selector="#otp",
+                    otp_fields=1,
+                    submission_origins=[
+                        origin,
+                        "https://api.example.test/auth?email=private",
+                    ],
+                )
             credentials.save_pending_browser_step_up(
                 target, alias, attempt=attempt, origin=origin,
                 challenge_url="https://app.example.test/login",
@@ -1575,6 +1590,9 @@ else:
                 session_storage={}, tokens={},
                 otp_selector="input.otp__digit", otp_fields=5,
                 submit_selector="",
+                submission_origins=[
+                    origin, "https://api.example.test:443",
+                ],
             )
 
             path = credentials.pending_browser_step_up_path(target, alias)
@@ -1587,7 +1605,21 @@ else:
             )
             pending = credentials.load_pending_browser_step_up(target, alias)
             self.assertTrue(pending["available"])
+            self.assertEqual(pending["submission_origins"], [
+                "https://app.example.test:443",
+                "https://api.example.test:443",
+            ])
             self.assertNotIn("839201", json.dumps(pending))
+
+            legacy_record = json.loads(path.read_text(encoding="utf-8"))
+            legacy_record.pop("submission_origins")
+            path.write_text(json.dumps(legacy_record), encoding="utf-8")
+            self.assertEqual(
+                credentials.load_pending_browser_step_up(
+                    target, alias
+                )["submission_origins"],
+                ["https://app.example.test:443"],
+            )
 
             reserved = credentials.reserve_pending_browser_step_up(target, alias)
             self.assertTrue(reserved["reserved"])

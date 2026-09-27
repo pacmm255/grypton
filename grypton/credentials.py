@@ -1481,11 +1481,65 @@ def _step_up_selector(value: object, *, label: str, optional: bool = False) -> s
     return selector
 
 
+def _canonical_step_up_submission_origins(
+    value: object, *, primary_origin: str,
+) -> list[str]:
+    """Canonicalize the bounded exact-origin contract for an MFA continuation."""
+    primary = normalize_origin(primary_origin)
+    if value is None:
+        return [primary]
+    if not isinstance(value, (list, tuple)) or not 1 <= len(value) <= 9:
+        raise CredentialError(
+            "pending browser step-up submission origins are invalid"
+        )
+    output: list[str] = []
+    seen: set[str] = set()
+    for raw_origin in value:
+        if (
+            not isinstance(raw_origin, str) or not raw_origin
+            or len(raw_origin) > 2048
+            or any(
+                ord(char) < 0x20 or ord(char) == 0x7f
+                for char in raw_origin
+            )
+        ):
+            raise CredentialError(
+                "pending browser step-up submission origins are invalid"
+            )
+        try:
+            parsed = urlsplit(raw_origin)
+            origin = normalize_origin(raw_origin)
+        except (ValueError, CredentialError) as exc:
+            raise CredentialError(
+                "pending browser step-up submission origins are invalid"
+            ) from exc
+        if (
+            parsed.path not in {"", "/"}
+            or parsed.query or parsed.fragment
+            or parsed.username is not None or parsed.password is not None
+        ):
+            raise CredentialError(
+                "pending browser step-up submission origins are invalid"
+            )
+        if origin in seen:
+            raise CredentialError(
+                "pending browser step-up submission origins are invalid"
+            )
+        seen.add(origin)
+        output.append(origin)
+    if output[0] != primary:
+        raise CredentialError(
+            "pending browser step-up submission origins must begin with its origin"
+        )
+    return output
+
+
 def save_pending_browser_step_up(
     target: str, name: str, *, attempt: int, origin: str,
     challenge_url: str, profile_revision: str, cookies: object,
     local_storage: object, session_storage: object, tokens: object,
     otp_selector: str, otp_fields: int, submit_selector: str = "",
+    submission_origins: object = None,
 ) -> None:
     """Retain one origin-bound MFA continuation without retaining its OTP."""
     alias = _safe_name(name, label="credential name")
@@ -1514,6 +1568,9 @@ def save_pending_browser_step_up(
     )
     action_control = _step_up_selector(
         submit_selector, label="OTP action selector", optional=True
+    )
+    allowed_submission_origins = _canonical_step_up_submission_origins(
+        submission_origins, primary_origin=str(canonical["origin"])
     )
     if isinstance(otp_fields, bool) or not isinstance(otp_fields, int) or not 0 <= otp_fields <= 12:
         raise CredentialError("pending browser step-up field count is invalid")
@@ -1546,6 +1603,7 @@ def save_pending_browser_step_up(
             "otp_selector": otp_control,
             "otp_fields": otp_fields,
             "submit_selector": action_control,
+            "submission_origins": allowed_submission_origins,
         }
         if len((json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")) > (
             _PENDING_BROWSER_SESSION_MAX_BYTES
@@ -1598,6 +1656,9 @@ def _load_pending_browser_step_up_unlocked(target: str, name: str) -> dict[str, 
     tokens = _canonical_pending_tokens(
         value.get("tokens"), label="pending browser step-up"
     )
+    submission_origins = _canonical_step_up_submission_origins(
+        value.get("submission_origins"), primary_origin=origin
+    )
     otp_selector = _step_up_selector(
         value.get("otp_selector"), label="OTP selector", optional=True
     )
@@ -1629,6 +1690,7 @@ def _load_pending_browser_step_up_unlocked(target: str, name: str) -> dict[str, 
         "otp_selector": otp_selector,
         "otp_fields": otp_fields,
         "submit_selector": submit_selector,
+        "submission_origins": submission_origins,
     }
 
 

@@ -182,50 +182,282 @@ def _snippet(text: str, match: re.Match, radius: int = 150) -> str:
 
 
 _AUTOMATION_DENY = re.compile(
-    r"(?i)(?:use of any automated tools?/?scanners? is strictly prohibited|"
-    r"automated (?:tools?|scanners?|testing)[^.]{0,100}(?:prohibited|not allowed)|"
-    r"do not use (?:any )?automated (?:tools?|scanners?))"
+    r"(?ix)\b(?:"
+    r"(?:use\s+of\s+)?(?:any\s+)?"
+    r"(?:automated\s+(?:tools?(?:/scanners?)?|scanners?|testing|scanning)|"
+    r"automation)(?:\s+(?:of|against|on|in)\s+[^.;!?\n]{1,60}?)?"
+    r"\s+(?:is|are)\s+(?:strictly\s+)?"
+    r"(?:prohibited|forbidden|disallowed|not\s+(?:allowed|permitted))|"
+    r"(?:do\s+not|must\s+not|may\s+not|never)\s+use\s+"
+    r"(?:any\s+)?automated\s+(?:tools?|scanners?)"
+    r")\b"
 )
-_CREDENTIAL_REQUIRED = re.compile(
-    r"(?i)(?:test using only accounts? created with|must use (?:the )?(?:assigned )?credentials?|"
-    r"ensure that you use your @bugcrowdninja\.com|"
-    r"when (?:registering|creating)[^.\n]{0,160}(?:use|using|with|provide)"
-    r"[^.\n]{0,80}@[A-Za-z0-9.-]+|"
-    r"must use[^.\n]{0,100}@[A-Za-z0-9.-]+|"
-    r"(?:use|provide)[^.\n]{0,60}(?:work|business|corporate|company)[ -]email)"
+
+_ACCOUNT_ACTOR = r"(?:you|researchers?|testers?|participants?)"
+_ACCOUNT_ACTION = (
+    r"(?:(?:create|set\s+up)\b[^;.!?\n]{0,48}\b(?:test\s+)?accounts?\b|"
+    r"register(?:ing)?(?:\s+for)?\b[^;.!?\n]{0,32}\baccounts?\b|"
+    r"sign[ -]?up\b)"
+)
+_SELF_PROVISIONED_ACCOUNT = (
+    r"^\s*(?:[-*\u2022]\s*)?accounts?\s+can\s+be\s+"
+    r"self[- ]provisioned\s+for\s+testing\b"
+)
+_ACCOUNT_CONTEXT = (
+    rf"(?:{_ACCOUNT_ACTION}|{_SELF_PROVISIONED_ACCOUNT}|"
+    r"\baccount\s+creation\b|\bregistration\b)"
+)
+_ACCOUNT_CREATION_CONTEXT = re.compile(rf"(?i){_ACCOUNT_CONTEXT}")
+_ACCOUNT_AUTHORIZATION = (
+    r"(?:approv(?:al|e[ds]?)|authori[sz](?:ation|e[ds]?)|"
+    r"permissions?|consent|invit(?:e[ds]?|ations?))"
 )
 _ACCOUNT_SUPPORTED = re.compile(
     r"(?i)(?:when registering for an account|create an account|select [\"']sign up[\"']|"
     r"you may want to set up test accounts?)"
 )
 _SELF_CREATED_ACCOUNT_PERMIT = re.compile(
-    r"(?i)(?:"
-    r"\b(?:you|researchers?|testers?|participants?)\s+"
-    r"(?:may|can|are\s+(?:allowed|permitted)\s+to)\s+"
-    r"(?:create|register|set\s+up)\b[^.\n]{0,100}\baccounts?\b|"
-    r"\byou\s+may\s+want\s+to\s+set\s+up\s+test\s+accounts?\b|"
-    r"\bselect\s+[\"']sign\s+up[\"']|"
-    r"(?:^|[.!]\s+)\s*(?:create|set\s+up)\s+(?:a\s+|your\s+own\s+)"
-    r"(?:test\s+)?account\b"
-    r")"
+    rf"(?i)(?:\b{_ACCOUNT_ACTOR}\s+"
+    r"(?:may(?:\s+want\s+to)?|can|are\s+(?:allowed|permitted)\s+to)\s+"
+    rf"{_ACCOUNT_ACTION}|{_SELF_PROVISIONED_ACCOUNT})"
 )
 _SELF_CREATED_ACCOUNT_DENY = re.compile(
-    r"(?i)(?:"
-    r"\b(?:do not|must not|may not|cannot|can't|"
+    rf"(?ix)(?:"
+    r"\bno\s+accounts?\s+(?:can|may)\s+be\s+self[- ]provisioned\s+"
+    r"for\s+testing\b|"
+    r"\baccounts?\s+(?:cannot|can't|can\s+not|may\s+not|must\s+not|never)\s+"
+    r"be\s+self[- ]provisioned\s+for\s+testing\b|"
+    r"\bself[- ]provision(?:ing|ed)\s+accounts?\s+(?:is|are)\s+"
+    r"(?:prohibited|forbidden|disallowed|not\s+(?:allowed|permitted))\b|"
+    rf"(?:\b{_ACCOUNT_ACTOR}\s+)?"
+    r"(?:do\s+not|must\s+not|may\s+not|cannot|can't|never|"
     r"(?:are|is)\s+not\s+(?:allowed|permitted)\s+to)\s+"
-    r"(?:create|register|set\s+up)\b[^.\n]{0,100}\baccounts?\b|"
-    r"\b(?:account\s+creation|creating\s+(?:for\s+)?(?:an?\s+)?(?:test\s+)?account|"
-    r"registering\s+(?:for\s+)?(?:an?\s+)?(?:test\s+)?account)\b"
-    r"[^.\n]{0,80}\b(?:prohibited|forbidden|not\s+(?:allowed|permitted))\b"
+    rf"{_ACCOUNT_ACTION}|"
+    r"\b(?:do\s+not|must\s+not|may\s+not|cannot|can't|never|"
+    r"not\s+(?:allowed|permitted)\s+to)\s+"
+    r"(?:click|choose|select|use)\s+(?:the\s+)?[\"']?sign[ -]?up[\"']?|"
+    r"\b(?:account\s+creation|registration|sign[ -]?up|"
+    r"(?:creat(?:ing)?|registering|set(?:ting)?\s+up)\b"
+    r"[^;.!?\n]{0,48}\baccounts?)\s+"
+    r"(?:is|are)\s+(?:strictly\s+)?"
+    r"(?:prohibited|forbidden|disallowed|not\s+(?:allowed|permitted))"
     r")"
 )
+
+_ACCOUNT_GATE_AFTER = re.compile(
+    rf"(?i){_ACCOUNT_CONTEXT}[^;.!?\n]{{0,100}}\b(?:"
+    r"only\s+(?:if|after|when|with|using)|if|after|when|once|unless|"
+    r"with|upon|pending|following|by|as\s+long\s+as|"
+    r"provided(?:\s+that)?|subject\s+to|contingent\s+(?:on|upon)|"
+    r"conditional(?:ly)?\s+(?:on|upon)|requires?|needs?)\b"
+    rf"[^;.!?\n]{{0,100}}\b{_ACCOUNT_AUTHORIZATION}\b"
+)
+_ACCOUNT_GATE_BEFORE = re.compile(
+    rf"(?ix)(?:"
+    rf"\b(?:only\s+)?(?:approv(?:ed)?|authori[sz]ed|invited)\s+"
+    rf"(?:researchers?|testers?|participants?|users?)[^;.!?\n]{{0,80}}"
+    rf"{_ACCOUNT_CONTEXT}|"
+    rf"\b(?:researchers?|testers?|participants?|users?)\s+"
+    rf"(?:who\s+are\s+|that\s+are\s+)?"
+    rf"(?:approv(?:ed)?|authori[sz]ed|invited)[^;.!?\n]{{0,80}}"
+    rf"{_ACCOUNT_CONTEXT}|"
+    r"\b(?:only\s+)?(?:with|after|upon|subject\s+to|pending|"
+    r"contingent\s+(?:on|upon)|conditional(?:ly)?\s+(?:on|upon)|"
+    r"if|when|once|unless|by|provided(?:\s+that)?)\b"
+    rf"[^;.!?\n]{{0,100}}\b{_ACCOUNT_AUTHORIZATION}\b"
+    rf"[^;.!?\n]{{0,100}}{_ACCOUNT_CONTEXT}|"
+    rf"\b{_ACCOUNT_AUTHORIZATION}\b[^;.!?\n]{{0,80}}"
+    r"\b(?:is|are)?\s*(?:required|necessary|needed)\b"
+    rf"[^;.!?\n]{{0,100}}{_ACCOUNT_CONTEXT}"
+    r")"
+)
+_ACCOUNT_GATE_REQUIREMENT = re.compile(
+    rf"(?i){_ACCOUNT_CONTEXT}[^;.!?\n]{{0,80}}"
+    r"\b(?:requires?|needs?)\b[^;.!?\n]{0,80}"
+    rf"\b{_ACCOUNT_AUTHORIZATION}\b"
+)
+_TECHNICAL_AUTHORIZATION = re.compile(
+    r"(?i)\bauthori[sz]ation\s+(?:headers?|tokens?|schemes?)\b|"
+    r"\bauthori[sz]ation\s*:\s*(?:bearer|basic)\b"
+)
+_STANDALONE_ACCOUNT_GATE = re.compile(
+    rf"(?ix)^(?:"
+    rf"(?:an?\s+)?(?:prior\s+|written\s+)*{_ACCOUNT_AUTHORIZATION}"
+    r"(?:\s+from\s+[\w -]{1,80}?)?\s+"
+    r"(?:(?:is|are)\s+)?(?:required|necessary|needed)"
+    r"(?:\s+from\s+[\w -]{1,80}?)?(?:\s+first)?|"
+    rf"{_ACCOUNT_ACTOR}\s+(?:must|need(?:s)?\s+to|required\s+to)\s+"
+    rf"(?:first\s+)?(?:(?:be\s+)?{_ACCOUNT_AUTHORIZATION}|"
+    rf"(?:obtain|receive|request|get|have)\s+(?:prior\s+|written\s+)*"
+    rf"{_ACCOUNT_AUTHORIZATION})"
+    r"(?:\s+(?:from|by)\s+[\w -]{1,80}?)?(?:\s+first)?|"
+    r"(?:obtain|receive|request|get)\s+(?:prior\s+|written\s+)*"
+    rf"{_ACCOUNT_AUTHORIZATION}"
+    r"(?:\s+from\s+[\w -]{1,80}?)?\s+first|"
+    rf"(?:prior\s+|written\s+)*{_ACCOUNT_AUTHORIZATION}\s+must\s+be\s+"
+    r"(?:obtained|received|granted)"
+    r"(?:\s+(?:from|by)\s+[\w -]{1,80}?)?|"
+    r"invit(?:e|ation)[ -]only"
+    r")$"
+)
+
+_ALLOCATED_ITEM = (
+    r"(?:credentials?|(?:test\s+)?accounts?|logins?|login\s+details?)"
+)
+_ALLOCATED_CREDENTIALS = re.compile(
+    rf"(?i)(?:"
+    rf"(?:assigned|provided|issued|supplied)\s+{_ALLOCATED_ITEM}\b|"
+    rf"{_ALLOCATED_ITEM}\s+(?:(?:are|were|will|shall|must|have)\s+"
+    r"(?:been\s+|be\s+)?)?(?:assigned|provided|issued|supplied)\b"
+    r")"
+)
+_ALLOCATED_CREDENTIAL_NEGATION = re.compile(
+    r"(?i)(?:"
+    r"\bno\s+(?:assigned\s+|provided\s+|issued\s+|supplied\s+)?"
+    r"(?:credentials?|(?:test\s+)?accounts?|logins?)\b|"
+    r"\bno\b[^.!?\n]{0,40}\b(?:assigned|provided|issued|supplied)[- ]+"
+    r"(?:credentials?|(?:test\s+)?accounts?|logins?)\b|"
+    r"\bself[- ](?:assigned|provided|issued|supplied)\s+"
+    r"(?:credentials?|accounts?|logins?)\b|"
+    r"\b(?:do\s+not|don't|must\s+not|never)\s+use\b|"
+    r"\b(?:credentials?|accounts?|logins?)\b[^.!?\n]{0,80}"
+    r"\b(?:optional|not\s+required)\b|"
+    r"\b(?:assigned|provided|issued|supplied)\s+"
+    r"(?:credentials?|accounts?|logins?)\b[^.!?\n]{0,80}"
+    r"\b(?:optional|must\s+not\s+be\s+used)\b"
+    r")"
+)
+_CREDENTIAL_REQUIRED = re.compile(
+    r"(?i)(?:test using only accounts? created with|"
+    r"must use (?:the )?(?:assigned )?credentials?|"
+    r"ensure that you use your @bugcrowdninja\.com|"
+    r"when (?:registering|creating)[^.\n]{0,160}(?:use|using|with|provide)"
+    r"[^.\n]{0,80}@[A-Za-z0-9.-]+|"
+    r"must use[^.\n]{0,100}@[A-Za-z0-9.-]+|"
+    r"(?:use|provide)[^.\n]{0,60}(?:work|business|corporate|company)[ -]email)"
+)
+
+_POLICY_CLAUSE_SPLIT = re.compile(r"[.!?]+(?=\s|$)\s*|\n+")
+_POLICY_LABEL = re.compile(
+    r"(?i)^(?:brief\s+(?:name|tagline|description|targetsOverview|"
+    r"additionalInformation)|target\s+description):\s*"
+)
+
+
+def _policy_clauses(text: str) -> list[str]:
+    return [
+        _POLICY_LABEL.sub("", clause.strip())
+        for clause in _POLICY_CLAUSE_SPLIT.split(text)
+        if clause.strip()
+    ]
+
+
+def _account_gate(clause: str) -> bool:
+    semantic = _TECHNICAL_AUTHORIZATION.sub("", clause)
+    return bool(
+        _ACCOUNT_CREATION_CONTEXT.search(semantic)
+        and (
+            _ACCOUNT_GATE_AFTER.search(semantic)
+            or _ACCOUNT_GATE_BEFORE.search(semantic)
+            or _ACCOUNT_GATE_REQUIREMENT.search(semantic)
+        )
+    )
+
+
+def _allocated_account_clause(
+    clauses: list[str], permit_indices: set[int]
+) -> str:
+    for index, clause in enumerate(clauses):
+        match = _ALLOCATED_CREDENTIALS.search(clause)
+        if not match or _ALLOCATED_CREDENTIAL_NEGATION.search(clause):
+            continue
+        technical = bool(re.search(
+            r"(?i)\b(?:api|sftp|ssh|http|header|token)\b", clause
+        ))
+        account_related = bool(
+            _ACCOUNT_CREATION_CONTEXT.search(clause)
+            or re.search(r"(?i)\b(?:accounts?|logins?|login\s+details?)\b", match.group(0))
+            or any(abs(index - permit_index) <= 1 for permit_index in permit_indices)
+            or re.search(r"(?i)\b(?:must|required\s+to|only)\s+use\b", clause)
+        )
+        if account_related and not (
+            technical and not _ACCOUNT_CREATION_CONTEXT.search(clause)
+        ):
+            return clause
+    return ""
+
+
+def _evaluate_account_policy(text: str) -> dict[str, object]:
+    clauses = _policy_clauses(text)
+    permits = [
+        (index, clause, _SELF_CREATED_ACCOUNT_PERMIT.search(clause))
+        for index, clause in enumerate(clauses)
+    ]
+    permits = [row for row in permits if row[2] is not None]
+    denials = [
+        (clause, _SELF_CREATED_ACCOUNT_DENY.search(clause))
+        for clause in clauses
+    ]
+    denials = [row for row in denials if row[1] is not None]
+    permit_indices = {index for index, _clause, _match in permits}
+    allocated_clause = _allocated_account_clause(clauses, permit_indices)
+    qualified = any(_account_gate(clause) for clause in clauses)
+    if not qualified:
+        for index in permit_indices:
+            for neighbor in (index - 1, index + 1):
+                if (
+                    0 <= neighbor < len(clauses)
+                    and _STANDALONE_ACCOUNT_GATE.fullmatch(clauses[neighbor])
+                ):
+                    qualified = True
+                    break
+            if qualified:
+                break
+    credential_rows = []
+    for clause in clauses:
+        match = _CREDENTIAL_REQUIRED.search(clause)
+        if not match:
+            continue
+        technical = bool(re.search(
+            r"(?i)\b(?:api|sftp|ssh|http|header|token)\b", clause
+        ))
+        if technical and not _ACCOUNT_CREATION_CONTEXT.search(clause):
+            continue
+        credential_rows.append((clause, match))
+    credential = credential_rows[0][1] if credential_rows else None
+    return {
+        "permit": permits[0][2] if permits else None,
+        "permit_clause": permits[0][1] if permits else "",
+        "deny": denials[0][1] if denials else None,
+        "deny_clause": denials[0][0] if denials else "",
+        "qualified": qualified,
+        "allocated_clause": allocated_clause,
+        "credential": credential,
+        "credential_clause": credential_rows[0][0] if credential_rows else "",
+        "credential_requirement": bool(credential or allocated_clause),
+        "permission": bool(
+            permits and not denials and not qualified and not allocated_clause
+        ),
+    }
+
+
+_MAIL_KIND = (
+    r"(?:disposable|temporary|temp|throwaway)[\s-]*(?:e-?mails?|mails?)"
+)
+_MAIL_SUBJECT = rf"{_MAIL_KIND}(?:\s+(?:addresses?|providers?|services?))?"
 _DISPOSABLE_EMAIL_DENY = re.compile(
-    r"(?i)(?:\bno\s+(?:disposable|temporary|temp)[\s-]*(?:e-?mail|mail)(?:\s+address(?:es)?)?"
-    r"|(?:do not|must not|may not|cannot|can't)\s+(?:use\s+)?"
-    r"(?:a\s+)?(?:disposable|temporary|temp)[\s-]*(?:e-?mail|mail)(?:\s+address(?:es)?)?"
-    r"|(?:disposable|temporary|temp)[\s-]*(?:e-?mail|mail)(?:\s+address(?:es)?)?"
-    r"[^.\n]{0,100}(?:prohibited|forbidden|blocked|rejected|unsupported|"
-    r"not (?:allowed|permitted|accepted|supported)|(?:cannot|must not|may not)\s+be\s+used))"
+    rf"(?ix)\b(?:"
+    rf"no\s+{_MAIL_SUBJECT}"
+    r"(?!\s+(?:restrictions?|prohibitions?|bans?)\b)|"
+    r"(?:do\s+not|must\s+not|may\s+not|cannot|can't|never)\s+"
+    rf"(?:use\s+)?(?:an?\s+)?{_MAIL_SUBJECT}|"
+    rf"{_MAIL_SUBJECT}(?:\s+(?:for|during|when)\b[^.;!?\n]{{0,60}})?"
+    r"\s+(?:is|are)\s+(?:strictly\s+)?"
+    r"(?:prohibited|forbidden|disallowed|blocked|rejected|unsupported|"
+    r"not\s+(?:allowed|permitted|accepted|supported))|"
+    rf"{_MAIL_SUBJECT}\s+"
+    r"(?:cannot|must\s+not|may\s+not|must\s+never)\s+be\s+used"
+    r")\b"
 )
 
 _SEVERITY_LABELS = {
@@ -384,11 +616,14 @@ def analyze_snapshot(path: str | Path) -> dict:
     data = document["data"]
     text = _brief_text(document)
     automation = _AUTOMATION_DENY.search(text)
-    credential = _CREDENTIAL_REQUIRED.search(text)
+    account_policy = _evaluate_account_policy(text)
+    credential = account_policy["credential"]
+    credential_requirement = bool(account_policy["credential_requirement"])
     account = _ACCOUNT_SUPPORTED.search(text)
-    account_permit = _SELF_CREATED_ACCOUNT_PERMIT.search(text)
-    account_deny = _SELF_CREATED_ACCOUNT_DENY.search(text)
+    account_permit = account_policy["permit"]
+    account_deny = account_policy["deny"]
     disposable_email = _DISPOSABLE_EMAIL_DENY.search(text)
+    account_permission = bool(account_policy["permission"])
     excluded_findings, conditional_exclusions = _structured_finding_policy(data)
     targets: list[dict] = []
     for group in data.get("scope") or []:
@@ -423,16 +658,17 @@ def analyze_snapshot(path: str | Path) -> dict:
         "vrt_version": document.get("vrtVersion") or "",
         "automation_prohibited": bool(automation),
         "automation_rule_excerpt": _snippet(text, automation) if automation else "",
-        "credential_requirement": bool(credential),
-        "credential_rule_excerpt": _snippet(text, credential) if credential else "",
-        "account_workflows_supported": bool(account),
-        "self_created_account_permission": bool(account_permit and not account_deny),
-        "self_created_account_rule_excerpt": (
-            _snippet(text, account_permit) if account_permit else ""
+        "credential_requirement": credential_requirement,
+        "credential_rule_excerpt": (
+            str(account_policy["credential_clause"]) if credential
+            else str(account_policy["allocated_clause"])
         ),
+        "account_workflows_supported": bool(account or account_permit or account_deny),
+        "self_created_account_permission": account_permission,
+        "self_created_account_rule_excerpt": str(account_policy["permit_clause"]),
         "self_created_account_prohibited": bool(account_deny),
-        "self_created_account_prohibition_excerpt": (
-            _snippet(text, account_deny) if account_deny else ""
+        "self_created_account_prohibition_excerpt": str(
+            account_policy["deny_clause"]
         ),
         "disposable_email_prohibited": bool(disposable_email),
         "disposable_email_rule_excerpt": (
@@ -441,8 +677,7 @@ def analyze_snapshot(path: str | Path) -> dict:
         # Mailbox tooling requires this exact structured grant. Old profiles
         # and programs that mandate assigned credentials fail closed.
         "temporary_mail_account_bootstrap_allowed": bool(
-            account_permit and not account_deny
-            and not credential and not disposable_email
+            account_permission and not credential_requirement and not disposable_email
         ),
         "known_issues_enabled": bool(document.get("knownIssuesEnabled")),
         "logged_in_snapshot": bool(document.get("isLoggedIn")),

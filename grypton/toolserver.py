@@ -247,6 +247,9 @@ def _temporary_account_browser_signup(ws, args):
             registration_checkboxes=args.get("checkboxes"),
             timeout=args.get("timeout", 45),
             _profile_candidate=profile,
+            _additional_submission_origins=args.get("submission_origins", []),
+            _submission_url=args.get("submission_url", ""),
+            _submission_preflight_urls=args.get("submission_preflight_urls", []),
         )
     return tools.credential_browser_login(
         ws, args.get("url", ""), credential=alias,
@@ -258,6 +261,10 @@ def _temporary_account_browser_signup(ws, args):
         registration_fields=args.get("fields"),
         registration_checkboxes=args.get("checkboxes"),
         timeout=args.get("timeout", 45),
+        _profile_candidate=profile,
+        _additional_submission_origins=args.get("submission_origins", []),
+        _submission_url=args.get("submission_url", ""),
+        _submission_preflight_urls=args.get("submission_preflight_urls", []),
     )
 
 
@@ -265,6 +272,9 @@ def _temporary_account_browser_continue(ws, args):
     alias = args.get("alias", "")
     try:
         temporary_mail.require_mailbox(ws, alias)
+        post_otp_stages = tools._browser_post_otp_stages(
+            args.get("post_otp_stages")
+        )
         profile = credentials.load_auth_profile_optional(ws.slug, alias)
         if not isinstance(profile, dict) or profile.get("strategy") != "browser":
             return {
@@ -284,7 +294,10 @@ def _temporary_account_browser_continue(ws, args):
             scope_check=lambda url: tools.check_url_scope(ws, url)[0],
             consume=False,
         )
-    except (temporary_mail.TemporaryMailboxError, credentials.CredentialError) as exc:
+    except (
+        ValueError, temporary_mail.TemporaryMailboxError,
+        credentials.CredentialError,
+    ) as exc:
         return {"ok": False, "summary": str(exc)}
     mailbox_data = (
         mailbox_result.get("data")
@@ -304,6 +317,8 @@ def _temporary_account_browser_continue(ws, args):
         otp_selector=args.get("otp_selector", ""),
         submit_selector=args.get("submit_selector", ""),
         password_submit_selector=args.get("password_submit_selector", ""),
+        otp_submission_url=args.get("otp_submission_url", ""),
+        post_otp_stages=post_otp_stages,
         timeout=args.get("browser_timeout", 45),
         _continuation_observation=continuation_observation,
     )
@@ -784,6 +799,25 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
                 "items": {"type": "string"},
                 "description": "Checkbox selectors to affirm for signup",
             },
+            "submission_origins": {
+                "type": "array", "maxItems": 8, "uniqueItems": True,
+                "items": {"type": "string", "minLength": 1, "maxLength": 2048},
+                "description": (
+                    "Additional exact in-scope API origins allowed to receive "
+                    "guarded signup requests; submission_url is required when set"
+                ),
+            },
+            "submission_url": _string(
+                "Exact in-scope URL for the final guarded signup request"
+            ),
+            "submission_preflight_urls": {
+                "type": "array", "maxItems": 4, "uniqueItems": True,
+                "items": {"type": "string", "minLength": 1, "maxLength": 8192},
+                "description": (
+                    "Exact in-scope availability-check URLs allowed once each "
+                    "before the final signup request"
+                ),
+            },
             "timeout": {"type": "integer", "minimum": 5, "maximum": 120},
         }, ("url", "alias", "verify_url", "success_marker")),
         _temporary_account_browser_signup),
@@ -795,6 +829,69 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
             "otp_selector": _string("Optional OTP input CSS selector"),
             "submit_selector": _string("Optional OTP submit CSS selector"),
             "password_submit_selector": _string("Optional password-stage submit selector"),
+            "otp_submission_url": _string(
+                "Exact in-scope OTP request URL; required when the retained "
+                "signup uses an additional API origin"
+            ),
+            "post_otp_stages": {
+                "type": "array", "maxItems": 6,
+                "description": (
+                    "Ordered same-origin onboarding forms and actions after OTP"
+                ),
+                "items": _object({
+                    "fields": {
+                        "type": "object", "minProperties": 1,
+                        "maxProperties": 20,
+                        "propertyNames": {
+                            "type": "string", "minLength": 1, "maxLength": 500,
+                        },
+                        "additionalProperties": {
+                            "type": "string", "maxLength": 500,
+                        },
+                        "description": (
+                            "CSS selectors mapped to private onboarding text "
+                            "or select values"
+                        ),
+                    },
+                    "checkboxes": {
+                        "type": "array", "maxItems": 10,
+                        "items": {
+                            "type": "string", "minLength": 1,
+                            "maxLength": 500,
+                        },
+                        "description": "Checkbox selectors to affirm in this stage",
+                    },
+                    "choice_selector": {
+                        "type": "string", "minLength": 1, "maxLength": 500,
+                        "description": (
+                            "Backward-compatible single radio or button selector"
+                        ),
+                    },
+                    "choice_selectors": {
+                        "type": "array", "maxItems": 4,
+                        "uniqueItems": True,
+                        "items": {
+                            "type": "string", "minLength": 1,
+                            "maxLength": 500,
+                        },
+                        "description": (
+                            "Ordered visible button, option, or radio selectors "
+                            "to choose before the action"
+                        ),
+                    },
+                    "action_only": {
+                        "type": "boolean",
+                        "description": (
+                            "Click the action without fields, choices, or a "
+                            "credential-bearing submission"
+                        ),
+                    },
+                    "submit_selector": {
+                        "type": "string", "minLength": 1, "maxLength": 500,
+                        "description": "Single action selector for this stage",
+                    },
+                }, ("submit_selector",)),
+            },
             "mail_timeout": {"type": "integer", "minimum": 1, "maximum": 120},
             "browser_timeout": {"type": "integer", "minimum": 5, "maximum": 120},
         }, ("alias",)), _temporary_account_browser_continue),
@@ -1093,19 +1190,79 @@ def _redacted(value, secret_values=()):
     return value
 
 
+def _audit_redacted_args(name: str, args: dict, secret_values=()) -> object:
+    """Redact and bound private onboarding values even for malformed calls."""
+    output = _redacted(args, secret_values)
+    if (
+        name != "temporary_account_browser_continue"
+        or not isinstance(output, dict)
+        or "post_otp_stages" not in args
+    ):
+        return output
+    raw_stages = args.get("post_otp_stages")
+    if not isinstance(raw_stages, list):
+        output["post_otp_stages"] = "[REDACTED INVALID VALUE]"
+        return output
+    safe_stages: list[object] = []
+    safe_keys = {
+        "action_only", "checkboxes", "choice_selector",
+        "choice_selectors", "submit_selector",
+    }
+    for raw_stage in raw_stages[:6]:
+        if not isinstance(raw_stage, dict):
+            safe_stages.append("[REDACTED INVALID STAGE]")
+            continue
+        safe_stage: dict[str, object] = {}
+        for raw_key, raw_value in list(raw_stage.items())[:32]:
+            key = str(raw_key)[:128]
+            if key == "fields":
+                if isinstance(raw_value, dict):
+                    safe_fields = {
+                        str(selector)[:500]: "[REDACTED]"
+                        for selector in list(raw_value)[:20]
+                    }
+                    if len(raw_value) > 20:
+                        safe_fields["[TRUNCATED]"] = "[REDACTED]"
+                    safe_stage[key] = safe_fields
+                else:
+                    safe_stage[key] = "[REDACTED INVALID FIELDS]"
+            elif key in safe_keys:
+                safe_stage[key] = _redacted(raw_value, secret_values)
+            else:
+                safe_stage[key] = "[REDACTED UNKNOWN FIELD]"
+        if len(raw_stage) > 32:
+            safe_stage["[TRUNCATED]"] = True
+        safe_stages.append(safe_stage)
+    if len(raw_stages) > 6:
+        safe_stages.append({"[TRUNCATED_STAGES]": len(raw_stages) - 6})
+    output["post_otp_stages"] = safe_stages
+    return output
+
+
 def _audit_secret_values(workspace: Workspace, name: str, args: dict) -> tuple[str, ...]:
     if name not in {
         "credential_login", "credential_browser_login",
         "temporary_account_browser_signup", "temporary_account_browser_continue",
     }:
         return ()
+    values: list[str] = []
+    if name == "temporary_account_browser_continue":
+        stages = args.get("post_otp_stages")
+        if isinstance(stages, list):
+            for stage in stages[:6]:
+                fields = stage.get("fields") if isinstance(stage, dict) else None
+                if isinstance(fields, dict):
+                    values.extend(
+                        value for value in fields.values()
+                        if isinstance(value, str) and value
+                    )
     try:
         secret = credentials.load_credential(
             workspace.slug, str(args.get("credential") or args.get("alias") or "")
         )
     except credentials.CredentialError:
-        return ()
-    values = [secret["password"]]
+        return tools._serialized_secret_variants(values)
+    values.append(secret["password"])
     values.extend(tools._login_username_redaction_values(
         secret["username"], str(args.get("username_transform") or "stored")
     ))
@@ -1168,8 +1325,11 @@ def dispatch(workspace: Workspace, name: str, args: dict) -> dict:
         audit_secrets = _audit_secret_values(workspace, name, args or {})
         audit_row = {
             "at": time.time(), "tool": name,
-            "args": _redacted(args or {}, audit_secrets),
-            "ok": bool(result.get("ok")), "summary": result.get("summary", "")[:1000],
+            "args": _audit_redacted_args(name, args or {}, audit_secrets),
+            "ok": bool(result.get("ok")),
+            "summary": tools.redact_sensitive_text(
+                str(result.get("summary", "")), audit_secrets
+            )[:1000],
             "duration_s": round(time.time() - started, 3),
         }
         auth_dispatch = _audit_auth_dispatch(name, result)

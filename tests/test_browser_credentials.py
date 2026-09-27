@@ -9,10 +9,10 @@ import tempfile
 import threading
 import time
 import unittest
-from urllib.parse import quote, quote_plus
+from urllib.parse import parse_qsl, quote, quote_plus
 from unittest.mock import patch
 
-from grypton import config, credentials, tools
+from grypton import config, credentials, request_policy, tools
 from grypton.toolserver import REGISTRY, _handle, dispatch
 from grypton.tools import (
     _browser_auth_blocker, _browser_auth_persisted_cookies,
@@ -56,6 +56,14 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
     identifier_console = "identifier-console-never-log"
     mode = "success"
     login_posts = 0
+    login_posts_before_reservation = 0
+    attempt_reserved = False
+    identifier_preflight_posts = 0
+    otp_posts = 0
+    partial_otp_posts = 0
+    onboarding_workspace_posts = 0
+    onboarding_name_posts = 0
+    onboarding_payloads = []
     verify_requests = 0
     verify_header_values = []
 
@@ -91,9 +99,14 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                 return
             if type(self).mode in {
                 "staged-otp", "staged-otp-dynamic-captcha",
-                "staged-otp-identifier-captcha",
+                "staged-otp-identifier-captcha", "staged-otp-split",
+                "staged-otp-oninput-header", "staged-otp-armed-timer",
+                "staged-otp-partial", "staged-otp-delayed",
+                "staged-otp-onboarding",
             }:
-                html = b"""<!doctype html><html><body data-captcha-trigger='DYNAMIC'>
+                html = b"""<!doctype html><html><body data-captcha-trigger='DYNAMIC'
+                  data-otp-transport='SPLIT' data-pre-submit-request='PRE_SUBMIT'
+                  data-post-otp='POST_OTP'>
                 <main id='app'></main>
                 <script>
                 const app = document.getElementById('app');
@@ -112,6 +125,25 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                         const captcha = document.createElement('div');
                         captcha.id = 'dynamic-captcha'; captcha.className = 'g-recaptcha';
                         document.body.appendChild(captcha);
+                        fetch('/api/identifier-preflight', {method:'POST',
+                          headers:{'Content-Type':'application/json'}, body:JSON.stringify({
+                            phone_number:document.getElementById('phone_number').value})
+                        }).catch(() => {});
+                      } else if (document.body.dataset.preSubmitRequest === 'header') {
+                        fetch('/api/identifier-preflight', {method:'POST',
+                          headers:{'Content-Type':'application/json',
+                            'X-Identifier':document.getElementById('phone_number').value},
+                          body:'{}'}).catch(() => {});
+                      } else if (
+                        document.body.dataset.preSubmitRequest === 'armed-timer'
+                      ) {
+                        const action = document.getElementById('submit-btn');
+                        action.style.pointerEvents = 'none';
+                        setTimeout(() => fetch('/api/identifier-preflight', {
+                          method:'POST', headers:{'Content-Type':'application/json',
+                            'X-Identifier':document.getElementById('phone_number').value},
+                          body:'{}'}).catch(() => {}), 200);
+                        setTimeout(() => { action.style.pointerEvents = 'auto'; }, 400);
                       }
                     };
                     document.getElementById('privacy').onchange = () => {
@@ -138,7 +170,8 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                   } else if (stage === 'otp') {
                     app.innerHTML = `<p>Enter verification code</p><form id="otp-form">
                       ${Array.from({length:6}, (_, i) => `<input class="otp__digit"
-                        data-index="${i}" inputmode="numeric" maxlength="1">`).join('')}
+                        data-index="${i}" name="d${i + 1}"
+                        inputmode="numeric" maxlength="1">`).join('')}
                       <input id="otp" type="hidden">
                       <input name="csrf" type="hidden" value="${challenge.csrf || ''}">
                       <input name="challenge_id" type="hidden"
@@ -149,19 +182,107 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                       </form>`;
                     for (const input of document.querySelectorAll('.otp__digit')) {
                       input.oninput = async () => {
-                        const otp = Array.from(document.querySelectorAll('.otp__digit'))
-                          .map(item => item.value).join('');
+                        const digits = Array.from(document.querySelectorAll('.otp__digit'));
+                        const otp = digits.map(item => item.value).join('');
                         document.getElementById('otp').value = otp;
+                        if (document.body.dataset.otpTransport === 'partial' && input.value) {
+                          const partial = new URLSearchParams();
+                          partial.append(`otp-input-${input.dataset.index}`, input.value);
+                          fetch('/api/otp-partial', {method:'POST', headers:{
+                            'Content-Type':'application/x-www-form-urlencoded'},
+                            body:partial.toString()}).catch(() => {});
+                        }
                         if (otp.length !== 6) return;
-                        const response = await fetch('/api/verify-otp', {method:'POST',
-                          headers:{'Content-Type':'application/json'}, body:JSON.stringify({
-                            phone_number:'09123456789', otp,
-                            anonymous_id:sessionStorage.getItem('anonymous_id')})});
+                        let request;
+                        if (document.body.dataset.otpTransport === 'split') {
+                          const payload = new URLSearchParams();
+                          payload.append('year', '2026'); payload.append('attempt', '1');
+                          digits.forEach((item, index) => payload.append(
+                            `d${index + 1}`, item.value));
+                          request = {method:'POST', headers:{
+                            'Content-Type':'application/x-www-form-urlencoded'},
+                            body:payload.toString()};
+                        } else {
+                          request = {method:'POST', headers:{
+                            'Content-Type':'application/json'}, body:JSON.stringify({
+                              phone_number:'09123456789', otp,
+                              anonymous_id:sessionStorage.getItem('anonymous_id')})};
+                        }
+                        const response = await fetch('/api/verify-otp', request);
                         if (response.ok) { const value = await response.json();
                           sessionStorage.setItem('verification_token', value.token);
-                          sessionStorage.setItem('stage','password'); render(); }
+                          sessionStorage.setItem('stage',
+                            document.body.dataset.postOtp === 'onboarding'
+                              ? 'workspace-intro' : 'password'); render();
+                          if (document.body.dataset.otpTransport === 'delayed') {
+                            setTimeout(() => fetch('/api/verify-otp', {method:'POST',
+                              headers:{'Content-Type':'application/json'},
+                              body:JSON.stringify({otp})}).catch(() => {}), 800);
+                          } }
                       };
                     }
+                  } else if (stage === 'workspace-intro') {
+                    app.innerHTML = `<button id="create-workspace" type="button">
+                      Create new workspace</button>`;
+                    document.getElementById('create-workspace').onclick = () => {
+                      sessionStorage.setItem('stage','workspace'); render();
+                    };
+                  } else if (stage === 'workspace') {
+                    app.innerHTML = `<form id="workspace-form">
+                      <input id="workspace-name" name="workspace_name">
+                      <button id="company-size-trigger" role="combobox" type="button"
+                        aria-controls="company-options">Choose size</button>
+                      <div id="company-options" hidden>
+                        <button id="company-small" role="option" type="button">
+                          Small</button>
+                      </div>
+                      <input id="company-size" name="company_size" type="hidden">
+                      <button id="workspace-next" type="submit">Next</button></form>`;
+                    document.getElementById('company-size-trigger').onclick = () => {
+                      document.getElementById('company-options').hidden = false;
+                    };
+                    document.getElementById('company-small').onclick = () => {
+                      document.getElementById('company-size').value = 'small';
+                      document.getElementById('company-options').hidden = true;
+                    };
+                    document.getElementById('workspace-form').onsubmit = async (event) => {
+                      event.preventDefault();
+                      const response = await fetch('/api/onboarding-workspace', {
+                        method:'POST', headers:{'Content-Type':'application/json'},
+                        body:JSON.stringify({
+                          workspace_name:document.getElementById('workspace-name').value,
+                          company_size:document.getElementById('company-size').value})});
+                      if (response.ok) { sessionStorage.setItem('stage','name'); render(); }
+                    };
+                  } else if (stage === 'name') {
+                    app.innerHTML = `<form id="name-form">
+                      <input id="first-name" name="first_name">
+                      <input id="last-name" name="last_name">
+                      <input id="profile-consent" name="profile_consent" type="checkbox">
+                      <button id="name-next" type="submit">Finish</button></form>`;
+                    document.getElementById('name-form').onsubmit = async (event) => {
+                      event.preventDefault();
+                      const response = await fetch('/api/onboarding-name', {
+                        method:'POST', headers:{'Content-Type':'application/json'},
+                        body:JSON.stringify({
+                          first_name:document.getElementById('first-name').value,
+                          last_name:document.getElementById('last-name').value,
+                          profile_consent:document.getElementById('profile-consent').checked})});
+                      if (response.ok) { sessionStorage.setItem('stage','invite'); render(); }
+                    };
+                  } else if (stage === 'invite') {
+                    app.innerHTML = `<button id="skip-invites" type="button">
+                      Skip invitations</button>`;
+                    document.getElementById('skip-invites').onclick = () => {
+                      sessionStorage.setItem('stage','support'); render();
+                    };
+                  } else if (stage === 'support') {
+                    app.innerHTML = `<button id="skip-support" type="button">
+                      Skip support setup</button>`;
+                    document.getElementById('skip-support').onclick = () => {
+                      sessionStorage.setItem('stage','dashboard');
+                      location.assign('/dashboard');
+                    };
                   } else {
                     app.innerHTML = `<form id="password-form"><input id="verification_token">
                       <input id="password" type="password"><button id="password-submit-btn"
@@ -185,6 +306,24 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                     b"registration" if type(self).mode == "staged-otp-dynamic-captcha"
                     else b"identifier" if type(self).mode == "staged-otp-identifier-captcha"
                     else b"none",
+                )
+                html = html.replace(
+                    b"SPLIT",
+                    b"split" if type(self).mode == "staged-otp-split"
+                    else b"partial" if type(self).mode == "staged-otp-partial"
+                    else b"delayed" if type(self).mode == "staged-otp-delayed"
+                    else b"joined",
+                )
+                html = html.replace(
+                    b"PRE_SUBMIT",
+                    b"header" if type(self).mode == "staged-otp-oninput-header"
+                    else b"armed-timer" if type(self).mode == "staged-otp-armed-timer"
+                    else b"none",
+                )
+                html = html.replace(
+                    b"POST_OTP",
+                    b"onboarding"
+                    if type(self).mode == "staged-otp-onboarding" else b"password",
                 )
                 self._send(
                     200, html, content_type="text/html; charset=utf-8",
@@ -229,6 +368,12 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                 "<script src='/block-dom.js'></script>"
                 if type(self).mode == "login-domcontentloaded-hang" else ""
             )
+            auto_submit_script = (
+                "document.querySelector('[data-testid=\"login-password\"]')"
+                ".addEventListener('input', () => "
+                "document.getElementById('login-form').requestSubmit());"
+                if type(self).mode == "login-input-autosubmit" else ""
+            )
             html = f"""<!doctype html><html><body>
             {challenge}
             <form id="login-form">
@@ -261,6 +406,7 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                 '{"/dashboard?unexpected=1" if type(self).mode == "status-wrong-terminal" else "/dashboard"}'
               );
             }});
+            {auto_submit_script}
             </script>{blocking_script}</body></html>""".encode()
             self._send(
                 200, html, content_type="text/html; charset=utf-8",
@@ -358,15 +504,31 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if type(self).mode in {
             "staged-otp", "staged-otp-dynamic-captcha",
-            "staged-otp-identifier-captcha",
+            "staged-otp-identifier-captcha", "staged-otp-split",
+            "staged-otp-oninput-header", "staged-otp-armed-timer",
+            "staged-otp-partial", "staged-otp-delayed",
+            "staged-otp-onboarding",
         } and self.path in {
             "/api/send-otp", "/api/verify-otp", "/api/login-stage",
+            "/api/identifier-preflight", "/api/otp-partial",
+            "/api/onboarding-workspace", "/api/onboarding-name",
         }:
             length = int(self.headers.get("Content-Length", "0"))
+            raw = self.rfile.read(length).decode()
+            if self.path == "/api/identifier-preflight":
+                type(self).identifier_preflight_posts += 1
+                self._json(200, {"received": True})
+                return
+            if self.path == "/api/otp-partial":
+                type(self).partial_otp_posts += 1
+                self._json(200, {"received": True})
+                return
             try:
-                value = json.loads(self.rfile.read(length).decode())
+                value = json.loads(raw)
             except ValueError:
-                value = {}
+                value = dict(parse_qsl(raw, keep_blank_values=True))
+            if type(self).mode == "staged-otp-split" and self.path == "/api/verify-otp":
+                value["otp"] = "".join(value.get(f"d{index}", "") for index in range(1, 7))
             if self.path == "/api/send-otp":
                 type(self).login_posts += 1
                 self._json(
@@ -387,11 +549,34 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                 )
                 return
             if self.path == "/api/verify-otp":
+                type(self).otp_posts += 1
                 self._json(
                     200 if value.get("otp") == type(self).otp else 401,
                     {"token": "stage-verification-token-never-log"}
                     if value.get("otp") == type(self).otp
                     else {"error": "invalid otp code"},
+                )
+                return
+            if self.path == "/api/onboarding-workspace":
+                type(self).onboarding_workspace_posts += 1
+                type(self).onboarding_payloads.append(value)
+                accepted = (
+                    value.get("workspace_name") == "Bounded Research"
+                    and value.get("company_size") == "small"
+                )
+                self._json(200 if accepted else 400, {"accepted": accepted})
+                return
+            if self.path == "/api/onboarding-name":
+                type(self).onboarding_name_posts += 1
+                type(self).onboarding_payloads.append(value)
+                accepted = (
+                    value.get("first_name") == "Ada"
+                    and value.get("last_name") == "Lovelace"
+                    and value.get("profile_consent") is True
+                )
+                self._json(
+                    200 if accepted else 400, {"authenticated": accepted},
+                    cookie=type(self).session if accepted else "",
                 )
                 return
             accepted = (
@@ -408,6 +593,8 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
             return
         type(self).login_posts += 1
+        if not type(self).attempt_reserved:
+            type(self).login_posts_before_reservation += 1
         length = int(self.headers.get("Content-Length", "0"))
         try:
             value = json.loads(self.rfile.read(length).decode())
@@ -461,6 +648,14 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
 def spa_auth_server(mode: str):
     _SpaAuthHandler.mode = mode
     _SpaAuthHandler.login_posts = 0
+    _SpaAuthHandler.login_posts_before_reservation = 0
+    _SpaAuthHandler.attempt_reserved = False
+    _SpaAuthHandler.identifier_preflight_posts = 0
+    _SpaAuthHandler.otp_posts = 0
+    _SpaAuthHandler.partial_otp_posts = 0
+    _SpaAuthHandler.onboarding_workspace_posts = 0
+    _SpaAuthHandler.onboarding_name_posts = 0
+    _SpaAuthHandler.onboarding_payloads = []
     _SpaAuthHandler.verify_requests = 0
     _SpaAuthHandler.verify_header_values = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _SpaAuthHandler)
@@ -742,6 +937,297 @@ def bootstrap_proof_server():
         thread.join(timeout=2)
 
 
+class _CrossOriginSignupHandler(BaseHTTPRequestHandler):
+    email = "researcher@temporary.example"
+    otp = "731904"
+    primary_port = 0
+    api_port = 0
+    api_posts = 0
+    otp_posts = 0
+    preflight_posts = 0
+    mandatory_header_values: list[str] = []
+    query_secret = False
+    redirect_final = False
+    redirect_followups = 0
+    json_requests = False
+    redirect_options = False
+    options_requests: list[str] = []
+    options_redirect_followups = 0
+    request_order: list[str] = []
+    post_content_types: list[str] = []
+
+    def _send(self, status: int, body: bytes, *, content_type: str,
+              cors: bool = False, location: str = "") -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        if cors:
+            self.send_header(
+                "Access-Control-Allow-Origin",
+                f"http://127.0.0.1:{type(self).primary_port}",
+            )
+        if location:
+            self.send_header("Location", location)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        port = int(self.server.server_address[1])
+        if port == type(self).primary_port and self.path == "/signup":
+            api_url = (
+                f"http://127.0.0.1:{type(self).api_port}/auth/signup"
+            )
+            check_url = (
+                f"http://127.0.0.1:{type(self).api_port}/auth/check-email"
+            )
+            otp_url = (
+                f"http://127.0.0.1:{type(self).api_port}/auth/verify-otp"
+            )
+            query_secret = "yes" if type(self).query_secret else "no"
+            json_requests = "yes" if type(self).json_requests else "no"
+            body = f"""<!doctype html><html><body data-query-secret='{query_secret}' data-json='{json_requests}'><main id='app'>
+              <p>Create your test account</p>
+              <form id='signup-form'>
+                <input id='email' name='email' type='email'>
+                <input id='password' name='password' type='password'>
+                <input id='privacy' type='checkbox'>
+                <button id='create-account' type='submit'>Create account</button>
+              </form></main><script>
+              sessionStorage.setItem('anonymous_id', 'uxcam-test-browser');
+              sessionStorage.setItem(
+                'policy_identity', '{type(self).email}'
+              );
+              const renderOtp = () => {{
+                document.getElementById('app').innerHTML = `
+                  <p>Enter verification code</p>
+                  <form id="otp-form"><input id="otp" name="otp"
+                    autocomplete="one-time-code">
+                  <button id="verify" type="submit">Verify</button></form>`;
+                document.getElementById('otp-form').onsubmit = async (event) => {{
+                  event.preventDefault();
+                  const response = await fetch('{otp_url}', {{
+                    method: 'POST',
+                    headers: {{'Content-Type': 'application/json'}},
+                    body: JSON.stringify({{
+                      otp: document.getElementById('otp').value,
+                    }}),
+                  }});
+                  if (response.ok) {{
+                    document.cookie = 'signup_session=verified; Path=/; SameSite=Lax';
+                    location.assign('/profile');
+                  }}
+                }};
+              }};
+              const signupForm = document.getElementById('signup-form');
+              if (sessionStorage.getItem('signup_stage') === 'otp') {{
+                renderOtp();
+              }} else signupForm.onsubmit = async (event) => {{
+                event.preventDefault();
+                try {{
+                  const asJson = document.body.dataset.json === 'yes';
+                  const requestBody = (values) => asJson
+                    ? JSON.stringify(values) : new URLSearchParams(values);
+                  const requestHeaders = {{'Content-Type': asJson
+                    ? 'application/json' : 'application/x-www-form-urlencoded'}};
+                  const checkResponse = await fetch('{check_url}', {{
+                    method: 'POST',
+                    headers: requestHeaders,
+                    body: requestBody({{
+                      email: document.getElementById('email').value,
+                    }}),
+                  }});
+                  if (!checkResponse.ok) return;
+                  const endpoint = '{api_url}' + (
+                    document.body.dataset.querySecret === 'yes'
+                      ? '?email=' + encodeURIComponent(
+                          document.getElementById('email').value)
+                      : '');
+                  const response = await fetch(endpoint, {{
+                    method: 'POST',
+                    headers: requestHeaders,
+                    body: requestBody({{
+                      email: document.getElementById('email').value,
+                      password: document.getElementById('password').value,
+                      privacy: document.getElementById('privacy').checked,
+                    }}),
+                  }});
+                  if (response.ok) {{
+                    sessionStorage.setItem('signup_stage', 'otp');
+                    renderOtp();
+                  }}
+                }} catch (_error) {{}}
+              }};
+              </script></body></html>""".encode()
+            self._send(200, body, content_type="text/html")
+            return
+        if port == type(self).primary_port and self.path == "/profile":
+            authenticated = (
+                "signup_session=verified" in self.headers.get("Cookie", "")
+            )
+            self._send(
+                200 if authenticated else 401,
+                (
+                    b'<html><body>Account profile</body></html>'
+                    if authenticated else b'{"authenticated":false}'
+                ),
+                content_type=(
+                    "text/html" if authenticated else "application/json"
+                ),
+            )
+            return
+        self._send(404, b"", content_type="text/plain")
+
+    def do_OPTIONS(self):
+        port = int(self.server.server_address[1])
+        request_path = self.path.split("?", 1)[0]
+        type(self).mandatory_header_values.append(
+            self.headers.get("X-UXCam-Researcher", "")
+        )
+        type(self).options_requests.append(self.path)
+        type(self).request_order.append("OPTIONS " + self.path)
+        if port != type(self).api_port:
+            self._send(404, b"", content_type="text/plain")
+            return
+        if request_path == "/auth/redirected":
+            type(self).options_redirect_followups += 1
+            self._send(204, b"", content_type="text/plain", cors=True)
+            return
+        if request_path not in {
+            "/auth/check-email", "/auth/signup", "/auth/verify-otp",
+        }:
+            self._send(404, b"", content_type="text/plain", cors=True)
+            return
+        if type(self).redirect_options:
+            self._send(
+                307, b"", content_type="text/plain", cors=True,
+                location=(
+                    f"http://127.0.0.1:{type(self).api_port}/auth/redirected"
+                ),
+            )
+            return
+        self.send_response(204)
+        self.send_header(
+            "Access-Control-Allow-Origin",
+            f"http://127.0.0.1:{type(self).primary_port}",
+        )
+        self.send_header("Access-Control-Allow-Methods", "POST")
+        requested_headers = self.headers.get(
+            "Access-Control-Request-Headers", "Content-Type"
+        )
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            requested_headers + ", X-UXCam-Researcher",
+        )
+        self.send_header("Access-Control-Max-Age", "0")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_POST(self):
+        port = int(self.server.server_address[1])
+        request_path = self.path.split("?", 1)[0]
+        if port != type(self).api_port or request_path not in {
+            "/auth/check-email", "/auth/signup", "/auth/verify-otp",
+            "/auth/redirected",
+        }:
+            self._send(404, b"", content_type="text/plain")
+            return
+        length = int(self.headers.get("Content-Length", "0"))
+        raw_body = self.rfile.read(length).decode()
+        if self.headers.get("Content-Type", "").split(";", 1)[0].strip() == (
+            "application/json"
+        ):
+            parsed_body = json.loads(raw_body)
+            values = parsed_body if isinstance(parsed_body, dict) else {}
+        else:
+            values = dict(parse_qsl(raw_body, keep_blank_values=True))
+        type(self).mandatory_header_values.append(
+            self.headers.get("X-UXCam-Researcher", "")
+        )
+        type(self).request_order.append("POST " + self.path)
+        type(self).post_content_types.append(
+            self.headers.get("Content-Type", "")
+        )
+        if request_path == "/auth/redirected":
+            type(self).redirect_followups += 1
+            self._send(200, b"{}", content_type="application/json", cors=True)
+            return
+        if request_path == "/auth/check-email":
+            type(self).preflight_posts += 1
+            status = 200 if values.get("email") == type(self).email else 400
+            self._send(
+                status, b'{"available":true}',
+                content_type="application/json", cors=True,
+            )
+            return
+        if request_path == "/auth/verify-otp":
+            type(self).otp_posts += 1
+            status = 200 if values.get("otp") == type(self).otp else 401
+            self._send(
+                status,
+                b'{"verified":true}' if status == 200 else b'{"verified":false}',
+                content_type="application/json", cors=True,
+            )
+            return
+        type(self).api_posts += 1
+        if type(self).redirect_final:
+            self._send(
+                307, b"", content_type="application/json", cors=True,
+                location=(
+                    f"http://127.0.0.1:{type(self).api_port}/auth/redirected"
+                ),
+            )
+            return
+        status = 202 if (
+            values.get("email") == type(self).email
+            and values.get("privacy") in {True, "true"}
+        ) else 400
+        self._send(
+            status, b'{"otp_required":true}',
+            content_type="application/json", cors=True,
+        )
+
+    def log_message(self, *_args):
+        pass
+
+
+@contextmanager
+def cross_origin_signup_servers(*, query_secret: bool = False,
+                                redirect_final: bool = False,
+                                json_requests: bool = False,
+                                redirect_options: bool = False):
+    primary = ThreadingHTTPServer(("127.0.0.1", 0), _CrossOriginSignupHandler)
+    api = ThreadingHTTPServer(("127.0.0.1", 0), _CrossOriginSignupHandler)
+    _CrossOriginSignupHandler.primary_port = primary.server_address[1]
+    _CrossOriginSignupHandler.api_port = api.server_address[1]
+    _CrossOriginSignupHandler.api_posts = 0
+    _CrossOriginSignupHandler.otp_posts = 0
+    _CrossOriginSignupHandler.preflight_posts = 0
+    _CrossOriginSignupHandler.mandatory_header_values = []
+    _CrossOriginSignupHandler.query_secret = query_secret
+    _CrossOriginSignupHandler.redirect_final = redirect_final
+    _CrossOriginSignupHandler.redirect_followups = 0
+    _CrossOriginSignupHandler.json_requests = json_requests
+    _CrossOriginSignupHandler.redirect_options = redirect_options
+    _CrossOriginSignupHandler.options_requests = []
+    _CrossOriginSignupHandler.options_redirect_followups = 0
+    _CrossOriginSignupHandler.request_order = []
+    _CrossOriginSignupHandler.post_content_types = []
+    threads = [
+        threading.Thread(target=server.serve_forever, daemon=True)
+        for server in (primary, api)
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        yield primary.server_address[1], api.server_address[1]
+    finally:
+        for server in (primary, api):
+            server.shutdown()
+            server.server_close()
+        for thread in threads:
+            thread.join(timeout=2)
+
+
 class BrowserCredentialTests(unittest.TestCase):
     def _workspace(self, port: int) -> Workspace:
         ws = Workspace("browser-credential-test")
@@ -749,6 +1235,37 @@ class BrowserCredentialTests(unittest.TestCase):
         ws.create(origin, "web")
         ws.save_constraints(Constraints(in_scope=[origin]))
         return ws
+
+    def _cross_origin_signup_workspace(
+        self, primary_port: int, api_port: int, *, api_in_scope: bool = True,
+    ) -> Workspace:
+        primary_origin = f"http://127.0.0.1:{primary_port}"
+        api_origin = f"http://127.0.0.1:{api_port}"
+        ws = Workspace("cross-origin-browser-signup")
+        ws.create(primary_origin, "web")
+        ws.save_constraints(Constraints(in_scope=[
+            primary_origin,
+            *([api_origin] if api_in_scope else []),
+        ]))
+        return ws
+
+    def _cross_origin_signup_profile(self, primary_port: int) -> dict:
+        origin = f"http://127.0.0.1:{primary_port}"
+        return {
+            "version": 1,
+            "strategy": "browser",
+            "login_url": origin + "/signup",
+            "verify_url": origin + "/profile",
+            "success_marker": "Account profile",
+            "username_transform": "stored",
+            "timeout": 10,
+            "browser": {
+                "username_selector": "#email",
+                "password_selector": "input[type='password']",
+                "submit_selector": "#create-account",
+                "verify_headers": {},
+            },
+        }
 
     def _request(self, port: int) -> dict:
         return {
@@ -1351,6 +1868,35 @@ class BrowserCredentialTests(unittest.TestCase):
             self.assertEqual(result["data"]["control_status"], 401)
             self.assertTrue(result["data"]["session"]["established"])
             self.assertEqual(_SpaAuthHandler.login_posts, 1)
+
+    def test_first_login_reserves_and_captures_before_input_autosubmit(self):
+        with isolated_runtime(), spa_auth_server("login-input-autosubmit") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            credentials.save_auth_profile(
+                ws.slug, "primary", self._status_profile(port)
+            )
+            original_begin = credentials.begin_login_attempt
+
+            def marked_begin(*args, **kwargs):
+                attempt = original_begin(*args, **kwargs)
+                _SpaAuthHandler.attempt_reserved = True
+                return attempt
+
+            with patch.object(
+                credentials, "begin_login_attempt", side_effect=marked_begin,
+            ):
+                result = dispatch(
+                    ws, "credential_browser_login", {"credential": "primary"}
+                )
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(_SpaAuthHandler.login_posts, 1)
+            self.assertEqual(_SpaAuthHandler.login_posts_before_reservation, 0)
+            self.assertEqual(result["data"]["credential_submission_requests"], 1)
+            self.assertEqual(result["data"]["matched_submission_count"], 1)
 
     def test_login_form_can_submit_before_domcontentloaded(self):
         with isolated_runtime(), spa_auth_server(
@@ -2481,6 +3027,88 @@ class BrowserCredentialTests(unittest.TestCase):
             )
             self.assertEqual(_SpaAuthHandler.login_posts, 1)
 
+    def test_profile_candidate_commits_only_with_successful_browser_proof(self):
+        for mode, succeeds in (
+            ("success", True), ("failed", False), ("captcha", False),
+        ):
+            with self.subTest(mode=mode), isolated_runtime(), spa_auth_server(mode) as port:
+                ws = self._workspace(port)
+                credentials.save_credential(
+                    ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+                )
+                request = self._request(port)
+                profile = {
+                    "version": 1,
+                    "strategy": "browser",
+                    "login_url": request["url"],
+                    "verify_url": request["verify_url"],
+                    "success_marker": request["success_marker"],
+                    "username_transform": request["username_transform"],
+                    "timeout": request["timeout"],
+                    "browser": {
+                        "username_selector": "[data-testid='login-username']",
+                        "password_selector": "[data-testid='login-password']",
+                        "submit_selector": "[data-testid='login-submit']",
+                        "verify_headers": {},
+                    },
+                }
+
+                result = tools.credential_browser_login(
+                    ws, **request, _profile_candidate=profile
+                )
+
+                self.assertEqual(result["ok"], succeeds, result)
+                saved = credentials.load_auth_profile_optional(
+                    ws.slug, "primary"
+                )
+                if succeeds:
+                    canonical = credentials.validate_auth_profile(profile)
+                    self.assertEqual(saved, canonical)
+                    self.assertEqual(
+                        credentials.load_attempt_state(ws.slug, "primary")[
+                            "proof_profile_revision"
+                        ],
+                        credentials.auth_profile_revision(canonical),
+                    )
+                else:
+                    self.assertIsNone(saved)
+
+    def test_profile_candidate_preflight_failure_does_not_persist(self):
+        with isolated_runtime(), spa_auth_server("success") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            request = self._request(port)
+            request["timeout"] = 5
+            profile = {
+                "version": 1,
+                "strategy": "browser",
+                "login_url": request["url"],
+                "verify_url": request["verify_url"],
+                "success_marker": request["success_marker"],
+                "username_transform": request["username_transform"],
+                "timeout": request["timeout"],
+                "browser": {
+                    "username_selector": "[data-testid='login-username']",
+                    "password_selector": "[data-testid='login-password']",
+                    "submit_selector": "[data-testid='login-submit']",
+                    "verify_headers": {},
+                },
+            }
+            result = tools.credential_browser_login(
+                ws, **request, registration_fields={"#name": 42},
+                _profile_candidate=profile,
+            )
+
+            self.assertFalse(result["ok"], result)
+            self.assertIsNone(
+                credentials.load_auth_profile_optional(ws.slug, "primary")
+            )
+            self.assertEqual(
+                credentials.session_status(ws.slug, "primary")["attempts"], 0
+            )
+
     def test_otp_and_captcha_are_factual_blockers(self):
         for mode, expected, attempts in (
             ("otp", "MFA/OTP", 1),
@@ -2501,6 +3129,374 @@ class BrowserCredentialTests(unittest.TestCase):
                     attempts,
                 )
                 self.assertEqual(_SpaAuthHandler.login_posts, attempts)
+
+    def test_identifier_signup_allows_one_declared_secondary_origin(self):
+        with isolated_runtime(), cross_origin_signup_servers() as ports:
+            primary_port, api_port = ports
+            ws = self._cross_origin_signup_workspace(primary_port, api_port)
+            api_origin = f"http://127.0.0.1:{api_port}"
+            credentials.save_credential(
+                ws.slug, "signup", _CrossOriginSignupHandler.email,
+                "target-password-never-log",
+            )
+            request_policy.set_origin_policy(
+                ws.slug, api_origin,
+                headers={
+                    "X-UXCam-Researcher": _CrossOriginSignupHandler.email,
+                },
+                max_requests_per_second=20,
+                rate_bucket="uxcam-signup",
+            )
+
+            result = tools.credential_browser_begin_step_up(
+                ws, credential="signup",
+                registration_checkboxes=["#privacy"], timeout=10,
+                _profile_candidate=self._cross_origin_signup_profile(
+                    primary_port
+                ),
+                _additional_submission_origins=[api_origin],
+                _submission_url=api_origin + "/auth/signup",
+                _submission_preflight_urls=[
+                    api_origin + "/auth/check-email"
+                ],
+            )
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["data"]["identifier_submission_requests"], 1)
+            self.assertEqual(_CrossOriginSignupHandler.preflight_posts, 1)
+            self.assertEqual(_CrossOriginSignupHandler.api_posts, 1)
+            self.assertEqual(
+                _CrossOriginSignupHandler.mandatory_header_values,
+                [
+                    _CrossOriginSignupHandler.email,
+                    _CrossOriginSignupHandler.email,
+                ],
+            )
+            pending = credentials.load_pending_browser_step_up(
+                ws.slug, "signup"
+            )
+            self.assertEqual(pending["submission_origins"], [
+                f"http://127.0.0.1:{primary_port}", api_origin,
+            ])
+            self.assertNotIn(
+                _CrossOriginSignupHandler.email, json.dumps(result)
+            )
+
+    def test_identifier_signup_allows_exact_json_cors_preflights(self):
+        with isolated_runtime(), cross_origin_signup_servers(
+            json_requests=True
+        ) as ports:
+            primary_port, api_port = ports
+            ws = self._cross_origin_signup_workspace(primary_port, api_port)
+            api_origin = f"http://127.0.0.1:{api_port}"
+            credentials.save_credential(
+                ws.slug, "signup", _CrossOriginSignupHandler.email,
+                "target-password-never-log",
+            )
+            request_policy.set_origin_policy(
+                ws.slug, api_origin,
+                headers={
+                    "X-UXCam-Researcher": _CrossOriginSignupHandler.email,
+                },
+                max_requests_per_second=20,
+                rate_bucket="uxcam-json-signup",
+            )
+
+            result = tools.credential_browser_begin_step_up(
+                ws, credential="signup",
+                registration_checkboxes=["#privacy"], timeout=10,
+                _profile_candidate=self._cross_origin_signup_profile(
+                    primary_port
+                ),
+                _additional_submission_origins=[api_origin],
+                _submission_url=api_origin + "/auth/signup",
+                _submission_preflight_urls=[
+                    api_origin + "/auth/check-email"
+                ],
+            )
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(_CrossOriginSignupHandler.preflight_posts, 1)
+            self.assertEqual(_CrossOriginSignupHandler.api_posts, 1)
+            routed_order = _CrossOriginSignupHandler.request_order
+            self.assertIn(routed_order, (
+                ["POST /auth/check-email", "POST /auth/signup"],
+                [
+                    "OPTIONS /auth/check-email", "POST /auth/check-email",
+                    "OPTIONS /auth/signup", "POST /auth/signup",
+                ],
+            ))
+            self.assertEqual(
+                _CrossOriginSignupHandler.mandatory_header_values,
+                [_CrossOriginSignupHandler.email] * len(routed_order),
+            )
+            self.assertNotIn(
+                _CrossOriginSignupHandler.email, json.dumps(result)
+            )
+
+    def test_real_chromium_emits_exact_json_cors_sequence(self):
+        from playwright.sync_api import sync_playwright
+
+        with cross_origin_signup_servers(json_requests=True) as ports:
+            primary_port, api_port = ports
+            primary_origin = f"http://127.0.0.1:{primary_port}"
+            api_origin = f"http://127.0.0.1:{api_port}"
+            check_endpoint = api_origin + "/auth/check-email"
+            final_endpoint = api_origin + "/auth/signup"
+            cors_state = {
+                "active": True,
+                "preflight_active": True,
+                "preflight_seen": {},
+                "cors_preflight_seen": {},
+                "seen": 0,
+            }
+            validation_errors = []
+
+            executable = tools._browser_executable()
+            self.assertTrue(executable)
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(
+                    headless=True, executable_path=executable,
+                    args=["--no-sandbox"],
+                )
+                try:
+                    page = browser.new_page()
+                    session = page.context.new_cdp_session(page)
+
+                    def observe_request(event):
+                        request = event.get("request") or {}
+                        method = str(request.get("method") or "").upper()
+                        url = str(request.get("url") or "")
+                        try:
+                            if method == "OPTIONS":
+                                _endpoint, counter_key = (
+                                    tools._browser_cors_preflight_contract(
+                                        url, method,
+                                        str(request.get("postData") or ""),
+                                        request.get("headers") or {},
+                                        primary_origin=primary_origin,
+                                        final_endpoint=final_endpoint,
+                                        preflight_endpoints=(check_endpoint,),
+                                        state=cors_state,
+                                    )
+                                )
+                                cors_state["cors_preflight_seen"][
+                                    counter_key
+                                ] = 1
+                        except Exception as exc:
+                            validation_errors.append(str(exc))
+
+                    session.on("Network.requestWillBeSent", observe_request)
+                    session.send("Network.enable")
+                    page.goto(primary_origin + "/signup")
+                    page.fill("#email", _CrossOriginSignupHandler.email)
+                    page.fill("#password", "target-password-never-log")
+                    page.check("#privacy")
+                    page.click("#create-account")
+                    page.locator("#otp").wait_for(timeout=5000)
+                finally:
+                    browser.close()
+
+            self.assertEqual(validation_errors, [])
+            self.assertEqual(_CrossOriginSignupHandler.request_order, [
+                "OPTIONS /auth/check-email", "POST /auth/check-email",
+                "OPTIONS /auth/signup", "POST /auth/signup",
+            ])
+            self.assertEqual(cors_state["cors_preflight_seen"], {
+                "preflight:" + check_endpoint: 1,
+                "final:" + final_endpoint: 1,
+            })
+
+    def test_one_page_signup_keeps_email_check_separate_from_final_match(self):
+        with isolated_runtime(), cross_origin_signup_servers() as ports:
+            primary_port, api_port = ports
+            ws = self._cross_origin_signup_workspace(primary_port, api_port)
+            primary_origin = f"http://127.0.0.1:{primary_port}"
+            api_origin = f"http://127.0.0.1:{api_port}"
+            credentials.save_credential(
+                ws.slug, "signup", _CrossOriginSignupHandler.email,
+                "target-password-never-log",
+            )
+
+            result = tools.credential_browser_login(
+                ws, primary_origin + "/signup", credential="signup",
+                username_selector="#email", password_selector="#password",
+                submit_selector="#create-account",
+                verify_url=primary_origin + "/profile",
+                success_marker="Account profile",
+                registration_checkboxes=["#privacy"], timeout=10,
+                _profile_candidate=self._cross_origin_signup_profile(
+                    primary_port
+                ),
+                _additional_submission_origins=[api_origin],
+                _submission_url=api_origin + "/auth/signup",
+                _submission_preflight_urls=[
+                    api_origin + "/auth/check-email"
+                ],
+            )
+
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(_CrossOriginSignupHandler.preflight_posts, 1)
+            self.assertEqual(_CrossOriginSignupHandler.api_posts, 1)
+            self.assertEqual(result["data"]["matched_submission_count"], 1)
+            self.assertEqual(
+                result["data"]["credential_submission_requests"], 1
+            )
+            self.assertTrue(result["data"]["step_up"]["pending"])
+
+    def test_identifier_signup_denies_undeclared_and_out_of_scope_origins(self):
+        cases = (
+            (True, None, "undeclared"),
+            (True, "declare", "missing-final-endpoint"),
+            (False, "declare", "out-of-scope"),
+        )
+        for api_in_scope, declaration, label in cases:
+            with self.subTest(case=label), isolated_runtime(), \
+                    cross_origin_signup_servers() as ports:
+                primary_port, api_port = ports
+                ws = self._cross_origin_signup_workspace(
+                    primary_port, api_port, api_in_scope=api_in_scope
+                )
+                api_origin = f"http://127.0.0.1:{api_port}"
+                credentials.save_credential(
+                    ws.slug, "signup", _CrossOriginSignupHandler.email,
+                    "target-password-never-log",
+                )
+                kwargs = {}
+                if declaration:
+                    kwargs["_additional_submission_origins"] = [api_origin]
+                result = tools.credential_browser_begin_step_up(
+                    ws, credential="signup",
+                    registration_checkboxes=["#privacy"], timeout=5,
+                    _profile_candidate=self._cross_origin_signup_profile(
+                        primary_port
+                    ),
+                    **kwargs,
+                )
+
+                self.assertFalse(result["ok"], result)
+                self.assertEqual(_CrossOriginSignupHandler.preflight_posts, 0)
+                self.assertEqual(_CrossOriginSignupHandler.api_posts, 0)
+                self.assertEqual(
+                    credentials.session_status(ws.slug, "signup")["attempts"],
+                    0,
+                )
+
+    def test_identifier_signup_blocks_credentials_in_secondary_query(self):
+        with isolated_runtime(), \
+                cross_origin_signup_servers(query_secret=True) as ports:
+            primary_port, api_port = ports
+            ws = self._cross_origin_signup_workspace(primary_port, api_port)
+            api_origin = f"http://127.0.0.1:{api_port}"
+            credentials.save_credential(
+                ws.slug, "signup", _CrossOriginSignupHandler.email,
+                "target-password-never-log",
+            )
+
+            result = tools.credential_browser_begin_step_up(
+                ws, credential="signup",
+                registration_checkboxes=["#privacy"], timeout=5,
+                _profile_candidate=self._cross_origin_signup_profile(
+                    primary_port
+                ),
+                _additional_submission_origins=[api_origin],
+                _submission_url=api_origin + "/auth/signup",
+                _submission_preflight_urls=[
+                    api_origin + "/auth/check-email"
+                ],
+            )
+
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(_CrossOriginSignupHandler.preflight_posts, 1)
+            self.assertEqual(_CrossOriginSignupHandler.api_posts, 0)
+            self.assertEqual(
+                credentials.session_status(ws.slug, "signup")["attempts"], 0
+            )
+            self.assertNotIn(
+                _CrossOriginSignupHandler.email, json.dumps(result)
+            )
+
+    def test_identifier_signup_does_not_follow_secondary_redirect(self):
+        with isolated_runtime(), cross_origin_signup_servers(
+            redirect_final=True
+        ) as ports:
+            primary_port, api_port = ports
+            ws = self._cross_origin_signup_workspace(primary_port, api_port)
+            api_origin = f"http://127.0.0.1:{api_port}"
+            credentials.save_credential(
+                ws.slug, "signup", _CrossOriginSignupHandler.email,
+                "target-password-never-log",
+            )
+
+            result = tools.credential_browser_begin_step_up(
+                ws, credential="signup",
+                registration_checkboxes=["#privacy"], timeout=5,
+                _profile_candidate=self._cross_origin_signup_profile(
+                    primary_port
+                ),
+                _additional_submission_origins=[api_origin],
+                _submission_url=api_origin + "/auth/signup",
+                _submission_preflight_urls=[
+                    api_origin + "/auth/check-email"
+                ],
+            )
+
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(_CrossOriginSignupHandler.preflight_posts, 1)
+            self.assertEqual(_CrossOriginSignupHandler.api_posts, 1)
+            self.assertEqual(_CrossOriginSignupHandler.redirect_followups, 0)
+
+    def test_identifier_signup_does_not_follow_cors_preflight_redirect(self):
+        from playwright.sync_api import sync_playwright
+
+        with isolated_runtime(), cross_origin_signup_servers(
+            json_requests=True, redirect_options=True
+        ) as ports:
+            primary_port, api_port = ports
+            ws = self._cross_origin_signup_workspace(primary_port, api_port)
+            primary_origin = f"http://127.0.0.1:{primary_port}"
+            api_origin = f"http://127.0.0.1:{api_port}"
+            executable = tools._browser_executable()
+            self.assertTrue(executable)
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(
+                    headless=True, executable_path=executable,
+                    args=["--no-sandbox"],
+                )
+                try:
+                    context = browser.new_context()
+                    page = context.new_page()
+                    capture, _responses = (
+                        tools._browser_auth_enable_response_capture(
+                            context, page, ws, [],
+                            (_CrossOriginSignupHandler.email,),
+                            ("target-password-never-log",),
+                            submission_url=api_origin + "/auth/signup",
+                            preflight_urls=(
+                                api_origin + "/auth/check-email",
+                            ),
+                            reject_submission_redirects=True,
+                        )
+                    )
+                    page.goto(primary_origin + "/signup")
+                    page.fill("#email", _CrossOriginSignupHandler.email)
+                    page.fill("#password", "target-password-never-log")
+                    page.check("#privacy")
+                    page.click("#create-account")
+                    page.wait_for_timeout(500)
+                    capture.send("Fetch.disable")
+                finally:
+                    browser.close()
+
+            self.assertEqual(
+                _CrossOriginSignupHandler.options_requests,
+                ["/auth/check-email"],
+            )
+            self.assertEqual(
+                _CrossOriginSignupHandler.options_redirect_followups, 0
+            )
+            self.assertEqual(_CrossOriginSignupHandler.preflight_posts, 0)
+            self.assertEqual(_CrossOriginSignupHandler.api_posts, 0)
 
     def test_private_cli_style_staged_otp_continuation_reuses_one_attempt(self):
         with isolated_runtime(), spa_auth_server("staged-otp") as port:
@@ -2550,6 +3546,12 @@ class BrowserCredentialTests(unittest.TestCase):
                 credentials.session_status(ws.slug, "primary")["state"],
                 "step-up-pending",
             )
+            pending = credentials.load_pending_browser_step_up(
+                ws.slug, "primary"
+            )
+            self.assertEqual(pending["attempt"], 1)
+            self.assertEqual(pending["profile_revision"],
+                             credentials.auth_profile_revision(profile))
 
             not_submitted = tools.credential_browser_step_up(
                 ws, credential="primary", otp=_SpaAuthHandler.otp,
@@ -2585,6 +3587,443 @@ class BrowserCredentialTests(unittest.TestCase):
                             path.read_text(encoding="utf-8", errors="ignore"),
                             path,
                         )
+
+    def test_step_up_combines_persisted_origin_with_declared_otp_endpoint(self):
+        with isolated_runtime(), cross_origin_signup_servers() as ports:
+            primary_port, api_port = ports
+            ws = self._cross_origin_signup_workspace(primary_port, api_port)
+            primary_origin = f"http://127.0.0.1:{primary_port}"
+            api_origin = f"http://127.0.0.1:{api_port}"
+            credentials.save_credential(
+                ws.slug, "signup", _CrossOriginSignupHandler.email,
+                "target-password-never-log",
+            )
+            started = tools.credential_browser_begin_step_up(
+                ws, credential="signup",
+                registration_checkboxes=["#privacy"], timeout=10,
+                _profile_candidate=self._cross_origin_signup_profile(
+                    primary_port
+                ),
+                _additional_submission_origins=[api_origin],
+                _submission_url=api_origin + "/auth/signup",
+                _submission_preflight_urls=[api_origin + "/auth/check-email"],
+            )
+            self.assertTrue(started["ok"], started)
+            pending = credentials.load_pending_browser_step_up(
+                ws.slug, "signup"
+            )
+            self.assertEqual(
+                pending["submission_origins"],
+                [primary_origin, api_origin],
+            )
+            request_policy.set_origin_policy(
+                ws.slug, api_origin,
+                headers={"X-Researcher": _CrossOriginSignupHandler.email},
+                max_requests_per_second=20,
+                rate_bucket="otp-matcher-separation",
+            )
+            expected = {"ok": True, "summary": "continued privately"}
+            with patch(
+                "grypton.tools._credential_browser_step_up_locked",
+                return_value=expected,
+            ) as locked:
+                continued = tools.credential_browser_step_up(
+                    ws, credential="signup", otp="123456", timeout=10,
+                    otp_submission_url=api_origin + "/auth/verify-otp",
+                )
+
+            self.assertEqual(continued, expected)
+            self.assertEqual(
+                locked.call_args.kwargs["submission_origins"],
+                (primary_origin, api_origin),
+            )
+            self.assertEqual(
+                locked.call_args.kwargs["otp_submission_url"],
+                api_origin + "/auth/verify-otp",
+            )
+            self.assertIn(
+                _CrossOriginSignupHandler.email,
+                locked.call_args.kwargs["code_secrets"],
+            )
+            self.assertNotIn(
+                _CrossOriginSignupHandler.email,
+                locked.call_args.kwargs["code_match_values"],
+            )
+
+    def test_step_up_sends_otp_to_distinct_declared_cross_origin_endpoint(self):
+        with isolated_runtime(), cross_origin_signup_servers(
+            json_requests=True
+        ) as ports:
+            primary_port, api_port = ports
+            ws = self._cross_origin_signup_workspace(primary_port, api_port)
+            api_origin = f"http://127.0.0.1:{api_port}"
+            credentials.save_credential(
+                ws.slug, "signup", _CrossOriginSignupHandler.email,
+                "target-password-never-log",
+            )
+            request_policy.set_origin_policy(
+                ws.slug, api_origin,
+                headers={
+                    "X-UXCam-Researcher": _CrossOriginSignupHandler.email,
+                },
+                max_requests_per_second=20,
+                rate_bucket="cross-origin-otp",
+            )
+            started = tools.credential_browser_begin_step_up(
+                ws, credential="signup",
+                registration_checkboxes=["#privacy"], timeout=10,
+                _profile_candidate=self._cross_origin_signup_profile(
+                    primary_port
+                ),
+                _additional_submission_origins=[api_origin],
+                _submission_url=api_origin + "/auth/signup",
+                _submission_preflight_urls=[
+                    api_origin + "/auth/check-email"
+                ],
+            )
+            self.assertTrue(started["ok"], started)
+
+            undeclared = tools.credential_browser_step_up(
+                ws, credential="signup", otp=_CrossOriginSignupHandler.otp,
+                otp_selector="#otp", submit_selector="#verify", timeout=10,
+            )
+            self.assertFalse(undeclared["ok"], undeclared)
+            self.assertEqual(_CrossOriginSignupHandler.otp_posts, 0)
+            self.assertTrue(
+                credentials.load_pending_browser_step_up(
+                    ws.slug, "signup"
+                )["available"]
+            )
+
+            completed = tools.credential_browser_step_up(
+                ws, credential="signup", otp=_CrossOriginSignupHandler.otp,
+                otp_selector="#otp", submit_selector="#verify",
+                otp_submission_url=api_origin + "/auth/verify-otp",
+                timeout=10,
+            )
+
+            self.assertTrue(completed["ok"], completed)
+            self.assertEqual(
+                completed["data"]["otp_submission_requests"], 1
+            )
+            self.assertTrue(completed["data"]["session"]["established"])
+            self.assertEqual(_CrossOriginSignupHandler.otp_posts, 1)
+            self.assertIn(
+                "POST /auth/verify-otp",
+                _CrossOriginSignupHandler.request_order,
+            )
+            self.assertEqual(
+                _CrossOriginSignupHandler.mandatory_header_values[-1],
+                _CrossOriginSignupHandler.email,
+            )
+            self.assertFalse(
+                credentials.pending_browser_step_up_path(
+                    ws.slug, "signup"
+                ).exists()
+            )
+
+    def test_unsubmitted_otp_reservation_is_released_for_retry(self):
+        with isolated_runtime(), spa_auth_server("staged-otp") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            profile = self._status_profile(port)
+            profile["username_transform"] = "stored"
+            profile["browser"].update({
+                "username_selector": "#phone_number",
+                "password_selector": "#password",
+                "submit_selector": "#submit-btn",
+            })
+            profile["browser"]["verification"]["login_status"] = 202
+            credentials.save_auth_profile(ws.slug, "primary", profile)
+
+            started = tools.credential_browser_begin_step_up(
+                ws, credential="primary",
+                registration_checkboxes=["#terms", "#privacy"],
+                timeout=10,
+            )
+            self.assertTrue(started["ok"], started)
+
+            real_step_up_input = tools._browser_step_up_input
+
+            def fail_reserved_fill(page, selector, code, timeout_ms, *, fill=True):
+                if fill:
+                    raise RuntimeError("synthetic pre-submit failure")
+                return real_step_up_input(
+                    page, selector, code, timeout_ms, fill=False
+                )
+
+            with patch(
+                "grypton.tools._browser_step_up_input",
+                side_effect=fail_reserved_fill,
+            ):
+                not_submitted = tools.credential_browser_step_up(
+                    ws, credential="primary", otp=_SpaAuthHandler.otp,
+                    timeout=10,
+                )
+
+            self.assertFalse(not_submitted["ok"], not_submitted)
+            self.assertEqual(
+                not_submitted["data"]["otp_submission_requests"], 0
+            )
+            pending = credentials.load_pending_browser_step_up(
+                ws.slug, "primary"
+            )
+            self.assertTrue(pending["available"])
+            self.assertFalse(pending["reserved"])
+
+            completed = tools.credential_browser_step_up(
+                ws, credential="primary", otp=_SpaAuthHandler.otp,
+                password_submit_selector="#password-submit-btn", timeout=10,
+            )
+            self.assertTrue(completed["ok"], completed)
+            self.assertEqual(completed["data"]["otp_submission_requests"], 1)
+
+    def test_temporary_mail_retry_keeps_same_otp_after_zero_transmission(self):
+        with isolated_runtime(), spa_auth_server("staged-otp") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            profile = self._status_profile(port)
+            profile["username_transform"] = "stored"
+            profile["browser"].update({
+                "username_selector": "#phone_number",
+                "password_selector": "#password",
+                "submit_selector": "#submit-btn",
+            })
+            profile["browser"]["verification"]["login_status"] = 202
+            credentials.save_auth_profile(ws.slug, "primary", profile)
+            started = tools.credential_browser_begin_step_up(
+                ws, credential="primary",
+                registration_checkboxes=["#terms", "#privacy"], timeout=10,
+            )
+            self.assertTrue(started["ok"], started)
+
+            mailbox = {"delivered": False, "polls": 0}
+
+            def poll(*_args, **_kwargs):
+                mailbox["polls"] += 1
+                if mailbox["delivered"]:
+                    return {"ok": True, "data": {"ready": False}}
+                return {
+                    "ok": True,
+                    "data": {
+                        "ready": True, "value": _SpaAuthHandler.otp,
+                        "_message_id": "same-mail-message",
+                    },
+                }
+
+            def mark_delivered(*_args):
+                mailbox["delivered"] = True
+
+            real_step_up_input = tools._browser_step_up_input
+
+            def fail_reserved_fill(page, selector, code, timeout_ms, *, fill=True):
+                if fill:
+                    raise RuntimeError("synthetic pre-submit failure")
+                return real_step_up_input(
+                    page, selector, code, timeout_ms, fill=False
+                )
+
+            with patch(
+                "grypton.toolserver.temporary_mail.require_mailbox"
+            ), patch(
+                "grypton.toolserver.temporary_mail.poll", side_effect=poll
+            ), patch(
+                "grypton.toolserver.temporary_mail.mark_delivered",
+                side_effect=mark_delivered,
+            ) as mark:
+                with patch(
+                    "grypton.tools._browser_step_up_input",
+                    side_effect=fail_reserved_fill,
+                ):
+                    first = dispatch(
+                        ws, "temporary_account_browser_continue",
+                        {"alias": "primary", "browser_timeout": 10},
+                    )
+                self.assertFalse(first["ok"], first)
+                self.assertFalse(mailbox["delivered"])
+                mark.assert_not_called()
+                self.assertTrue(
+                    credentials.load_pending_browser_step_up(
+                        ws.slug, "primary"
+                    )["available"]
+                )
+
+                second = dispatch(
+                    ws, "temporary_account_browser_continue", {
+                        "alias": "primary", "browser_timeout": 10,
+                        "password_submit_selector": "#password-submit-btn",
+                    },
+                )
+
+            self.assertTrue(second["ok"], second)
+            self.assertEqual(mailbox["polls"], 2)
+            self.assertTrue(mailbox["delivered"])
+            mark.assert_called_once_with(
+                ws, "primary", "same-mail-message", "otp"
+            )
+            self.assertEqual(_SpaAuthHandler.otp_posts, 1)
+
+    def test_temporary_mail_consumes_otp_after_post_send_exception(self):
+        with isolated_runtime(), spa_auth_server("staged-otp") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            profile = self._status_profile(port)
+            profile["username_transform"] = "stored"
+            profile["browser"].update({
+                "username_selector": "#phone_number",
+                "password_selector": "#password",
+                "submit_selector": "#submit-btn",
+            })
+            profile["browser"]["verification"]["login_status"] = 202
+            credentials.save_auth_profile(ws.slug, "primary", profile)
+            started = tools.credential_browser_begin_step_up(
+                ws, credential="primary",
+                registration_checkboxes=["#terms", "#privacy"], timeout=10,
+            )
+            self.assertTrue(started["ok"], started)
+
+            mailbox = {"delivered": False}
+
+            def poll(*_args, **_kwargs):
+                return {
+                    "ok": True,
+                    "data": {
+                        "ready": True, "value": _SpaAuthHandler.otp,
+                        "_message_id": "transmitted-mail-message",
+                    },
+                }
+
+            def mark_delivered(*_args):
+                mailbox["delivered"] = True
+
+            real_step_up_input = tools._browser_step_up_input
+
+            def fail_after_transmission(
+                page, selector, code, timeout_ms, *, fill=True,
+            ):
+                result = real_step_up_input(
+                    page, selector, code, timeout_ms, fill=fill
+                )
+                if fill:
+                    deadline = time.monotonic() + 5
+                    while (
+                        _SpaAuthHandler.otp_posts < 1
+                        and time.monotonic() < deadline
+                    ):
+                        page.wait_for_timeout(50)
+                    if _SpaAuthHandler.otp_posts != 1:
+                        raise AssertionError("OTP request did not cross the route")
+                    raise RuntimeError("synthetic post-transmission failure")
+                return result
+
+            with patch(
+                "grypton.toolserver.temporary_mail.require_mailbox"
+            ), patch(
+                "grypton.toolserver.temporary_mail.poll", side_effect=poll
+            ), patch(
+                "grypton.toolserver.temporary_mail.mark_delivered",
+                side_effect=mark_delivered,
+            ) as mark, patch(
+                "grypton.tools._browser_step_up_input",
+                side_effect=fail_after_transmission,
+            ):
+                failed = dispatch(
+                    ws, "temporary_account_browser_continue",
+                    {"alias": "primary", "browser_timeout": 10},
+                )
+
+            self.assertFalse(failed["ok"], failed)
+            self.assertEqual(failed["data"]["otp_submission_requests"], 1)
+            self.assertEqual(_SpaAuthHandler.otp_posts, 1)
+            self.assertTrue(mailbox["delivered"])
+            mark.assert_called_once_with(
+                ws, "primary", "transmitted-mail-message", "otp"
+            )
+            self.assertFalse(
+                credentials.pending_browser_step_up_path(
+                    ws.slug, "primary"
+                ).exists()
+            )
+            self.assertFalse(
+                credentials.load_pending_browser_step_up(
+                    ws.slug, "primary"
+                )["available"]
+            )
+
+    def test_ordered_post_otp_onboarding_completes_same_origin_signup(self):
+        with isolated_runtime(), spa_auth_server("staged-otp-onboarding") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            profile = self._status_profile(port)
+            profile["username_transform"] = "stored"
+            profile["browser"].update({
+                "username_selector": "#phone_number",
+                "password_selector": "#password",
+                "submit_selector": "#submit-btn",
+            })
+            profile["browser"]["verification"]["login_status"] = 202
+            credentials.save_auth_profile(ws.slug, "primary", profile)
+            started = tools.credential_browser_begin_step_up(
+                ws, credential="primary",
+                registration_checkboxes=["#terms", "#privacy"], timeout=10,
+            )
+            self.assertTrue(started["ok"], started)
+
+            stages = [{
+                "action_only": True,
+                "submit_selector": "#create-workspace",
+            }, {
+                "fields": {
+                    "#workspace-name": "Bounded Research",
+                },
+                "choice_selectors": [
+                    "#company-size-trigger", "#company-small",
+                ],
+                "submit_selector": "#workspace-next",
+            }, {
+                "fields": {
+                    "#first-name": "Ada",
+                    "#last-name": "Lovelace",
+                },
+                "checkboxes": ["#profile-consent"],
+                "submit_selector": "#name-next",
+            }, {
+                "action_only": True,
+                "submit_selector": "#skip-invites",
+            }, {
+                "action_only": True,
+                "submit_selector": "#skip-support",
+            }]
+            completed = tools.credential_browser_step_up(
+                ws, credential="primary", otp=_SpaAuthHandler.otp,
+                post_otp_stages=stages, timeout=10,
+            )
+
+            self.assertTrue(completed["ok"], completed)
+            self.assertEqual(completed["data"]["otp_submission_requests"], 1)
+            self.assertEqual(completed["data"]["password_submission_requests"], 0)
+            self.assertEqual(completed["data"]["post_otp_stages_completed"], 5)
+            self.assertEqual(
+                completed["data"]["post_otp_stage_submission_requests"],
+                [0, 1, 1, 0, 0],
+            )
+            self.assertEqual(_SpaAuthHandler.otp_posts, 1)
+            self.assertEqual(_SpaAuthHandler.onboarding_workspace_posts, 1)
+            self.assertEqual(_SpaAuthHandler.onboarding_name_posts, 1)
+            serialized = json.dumps(completed)
+            for private in (
+                _SpaAuthHandler.otp, "Bounded Research", "Ada", "Lovelace",
+            ):
+                self.assertNotIn(private, serialized)
+            self.assertTrue(completed["data"]["session"]["established"])
 
     def test_identifier_otp_preflight_defers_profile_and_allows_corrected_retry(self):
         with isolated_runtime(), spa_auth_server("staged-otp") as port:
@@ -2693,7 +4132,737 @@ class BrowserCredentialTests(unittest.TestCase):
             self.assertFalse(result["ok"], result)
             self.assertIn("CAPTCHA", result["summary"])
             self.assertEqual(result["data"]["identifier_submission_requests"], 0)
+            self.assertEqual(result["data"]["blocked_pre_submit_requests"], 1)
+            self.assertEqual(_SpaAuthHandler.identifier_preflight_posts, 0)
             self.assertEqual(_SpaAuthHandler.login_posts, 0)
+            self.assertIsNone(
+                credentials.load_auth_profile_optional(ws.slug, "primary")
+            )
+            self.assertEqual(
+                credentials.session_status(ws.slug, "primary")["attempts"], 0
+            )
+
+    def test_identifier_gate_blocks_all_requests_until_expected_submission(self):
+        for mode in ("staged-otp-oninput-header", "staged-otp-armed-timer"):
+            with self.subTest(mode=mode), isolated_runtime(), spa_auth_server(mode) as port:
+                ws = self._workspace(port)
+                credentials.save_credential(
+                    ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+                )
+                profile = self._status_profile(port)
+                profile["username_transform"] = "stored"
+                profile["browser"].update({
+                    "username_selector": "#phone_number",
+                    "password_selector": "#password",
+                    "submit_selector": "#submit-btn",
+                })
+                profile["browser"]["verification"]["login_status"] = 202
+
+                result = tools.credential_browser_begin_step_up(
+                    ws, credential="primary",
+                    registration_checkboxes=["#terms", "#privacy"],
+                    timeout=10, _profile_candidate=profile,
+                )
+
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(_SpaAuthHandler.identifier_preflight_posts, 0)
+                self.assertEqual(_SpaAuthHandler.login_posts, 1)
+                self.assertGreaterEqual(
+                    result["data"]["blocked_pre_submit_requests"], 1
+                )
+                self.assertEqual(
+                    result["data"]["identifier_submission_requests"], 1
+                )
+                self.assertEqual(
+                    credentials.session_status(ws.slug, "primary")["state"],
+                    "step-up-pending",
+                )
+
+    def test_split_otp_fields_are_counted_as_one_submission(self):
+        with isolated_runtime(), spa_auth_server("staged-otp-split") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            profile = self._status_profile(port)
+            profile["username_transform"] = "stored"
+            profile["browser"].update({
+                "username_selector": "#phone_number",
+                "password_selector": "#password",
+                "submit_selector": "#submit-btn",
+            })
+            profile["browser"]["verification"]["login_status"] = 202
+            credentials.save_auth_profile(ws.slug, "primary", profile)
+            started = tools.credential_browser_begin_step_up(
+                ws, credential="primary",
+                registration_checkboxes=["#terms", "#privacy"], timeout=10,
+            )
+            self.assertTrue(started["ok"], started)
+
+            completed = tools.credential_browser_step_up(
+                ws, credential="primary", otp=_SpaAuthHandler.otp,
+                password_submit_selector="#password-submit-btn", timeout=10,
+            )
+
+            self.assertTrue(completed["ok"], completed)
+            self.assertEqual(completed["data"]["otp_submission_requests"], 1)
+            self.assertEqual(_SpaAuthHandler.otp_posts, 1)
+
+    def test_split_otp_blocks_per_digit_input_requests(self):
+        with isolated_runtime(), spa_auth_server("staged-otp-partial") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            profile = self._status_profile(port)
+            profile["username_transform"] = "stored"
+            profile["browser"].update({
+                "username_selector": "#phone_number",
+                "password_selector": "#password",
+                "submit_selector": "#submit-btn",
+            })
+            profile["browser"]["verification"]["login_status"] = 202
+            credentials.save_auth_profile(ws.slug, "primary", profile)
+            started = tools.credential_browser_begin_step_up(
+                ws, credential="primary",
+                registration_checkboxes=["#terms", "#privacy"], timeout=10,
+            )
+            self.assertTrue(started["ok"], started)
+
+            completed = tools.credential_browser_step_up(
+                ws, credential="primary", otp=_SpaAuthHandler.otp,
+                password_submit_selector="#password-submit-btn", timeout=10,
+            )
+
+            self.assertTrue(completed["ok"], completed)
+            self.assertEqual(_SpaAuthHandler.partial_otp_posts, 0)
+            self.assertEqual(_SpaAuthHandler.otp_posts, 1)
+            self.assertEqual(completed["data"]["otp_submission_requests"], 1)
+
+    def test_password_stage_blocks_delayed_old_otp_submission(self):
+        with isolated_runtime(), spa_auth_server("staged-otp-delayed") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            profile = self._status_profile(port)
+            profile["username_transform"] = "stored"
+            profile["browser"].update({
+                "username_selector": "#phone_number",
+                "password_selector": "#password",
+                "submit_selector": "#submit-btn",
+            })
+            profile["browser"]["verification"]["login_status"] = 202
+            credentials.save_auth_profile(ws.slug, "primary", profile)
+            started = tools.credential_browser_begin_step_up(
+                ws, credential="primary",
+                registration_checkboxes=["#terms", "#privacy"], timeout=10,
+            )
+            self.assertTrue(started["ok"], started)
+
+            completed = tools.credential_browser_step_up(
+                ws, credential="primary", otp=_SpaAuthHandler.otp,
+                password_submit_selector="#password-submit-btn", timeout=10,
+            )
+
+            self.assertTrue(completed["ok"], completed)
+            self.assertEqual(_SpaAuthHandler.otp_posts, 1)
+            self.assertEqual(completed["data"]["password_submission_requests"], 1)
+
+    def test_split_otp_matcher_rejects_unrelated_numeric_fields(self):
+        state = {
+            "username_values": (_SpaAuthHandler.otp,),
+            "password_values": (_SpaAuthHandler.otp,),
+            "ordered_digit_values": tuple(_SpaAuthHandler.otp),
+        }
+        self.assertTrue(tools._browser_submission_matches(
+            "https://example.test/verify",
+            "year=2026&attempt=1&d1=8&d2=3&d3=9&d4=2&d5=0&d6=1",
+            state,
+        ))
+        self.assertFalse(tools._browser_submission_matches(
+            "https://example.test/verify",
+            "year=8&month=3&day=9&hour=2&minute=0&attempt=1",
+            state,
+        ))
+
+    def test_submission_matcher_requires_exact_body_scalars_and_rejects_query(self):
+        state = {
+            "username_values": ("app",),
+            "password_values": ("secret",),
+        }
+        self.assertFalse(tools._browser_submission_matches(
+            "https://app.example.test/app/login", "", state,
+        ))
+        self.assertFalse(tools._browser_submission_matches(
+            "https://app.example.test/login?identifier=app&password=secret",
+            "", state, method="GET",
+        ))
+        self.assertFalse(tools._browser_submission_matches(
+            "https://app.example.test/login",
+            '{"username":"happy-app-user","password":"mysecretvalue"}',
+            state, content_type="application/json",
+        ))
+        self.assertTrue(tools._browser_submission_matches(
+            "https://app.example.test/login",
+            '{"username":"app","password":"secret"}', state,
+            content_type="application/json",
+        ))
+        self.assertFalse(tools._browser_submission_matches(
+            "https://app.example.test/login",
+            '--x\r\nContent-Disposition: form-data; name="username"\r\n\r\n'
+            'app\r\n--x\r\nContent-Disposition: form-data; name="password"'
+            '\r\n\r\nsecret\r\n--x--\r\n', state,
+            content_type="multipart/form-data; boundary=x",
+        ))
+
+    def test_identifier_gate_stays_armed_when_request_policy_blocks_submit(self):
+        class Context:
+            callback = None
+
+            def route(self, _pattern, callback):
+                self.callback = callback
+
+        class Chromium:
+            def __init__(self, context):
+                self.context = context
+
+            def launch_persistent_context(self, **_kwargs):
+                return self.context
+
+        class Playwright:
+            def __init__(self, context):
+                self.chromium = Chromium(context)
+
+        class Request:
+            url = "https://example.test/submit"
+            post_data = '{"identifier":"app"}'
+            headers = {"Content-Type": "application/json"}
+
+        class Route:
+            request = Request()
+            aborted = False
+            continued = False
+
+            def abort(self, _reason):
+                self.aborted = True
+
+            def continue_(self, **_kwargs):
+                self.continued = True
+
+        context = Context()
+        workspace = type(
+            "WorkspaceStub", (), {"slug": "browser-gate-policy-test"}
+        )()
+        state = {
+            "active": True,
+            "username_values": ("app",),
+            "password_values": ("app",),
+            "seen": 0,
+            "blocked": 0,
+            "block_all_until_submission": True,
+            "blocked_before_active": 0,
+        }
+        with (
+            patch("grypton.tools._private_browser_proxy", return_value=""),
+            patch("grypton.tools.check_url_scope", return_value=(True, "")),
+            patch(
+                "grypton.tools.request_policy.policy_for_url",
+                side_effect=tools.request_policy.RequestPolicyError(
+                    "synthetic policy failure"
+                ),
+            ),
+        ):
+            tools._launch_scoped_browser_context(
+                Playwright(context), {
+                    "profile": "/tmp/profile-fixture",
+                    "executable": "/bin/true",
+                    "environment": {},
+                }, workspace, [],
+                credential_submission_state=state,
+            )
+            route = Route()
+            context.callback(route)
+
+        self.assertTrue(route.aborted)
+        self.assertFalse(route.continued)
+        self.assertEqual(state["seen"], 0)
+        self.assertTrue(state["block_all_until_submission"])
+
+    def test_cors_preflight_route_is_exact_bounded_and_one_shot(self):
+        class Context:
+            callback = None
+
+            def route(self, _pattern, callback):
+                self.callback = callback
+
+        class Chromium:
+            def __init__(self, context):
+                self.context = context
+
+            def launch_persistent_context(self, **_kwargs):
+                return self.context
+
+        class Playwright:
+            def __init__(self, context):
+                self.chromium = Chromium(context)
+
+        class Request:
+            def __init__(self, url, *, headers=None, body="",
+                         method="OPTIONS", public_headers=None):
+                self.url = url
+                self.post_data = body
+                self.method = method
+                self.headers = dict(
+                    public_headers
+                    if public_headers is not None else {"Accept": "*/*"}
+                )
+                self._complete_headers = dict(headers or {})
+                self.redirected_from = None
+
+            def all_headers(self):
+                return dict(self._complete_headers)
+
+        class Route:
+            def __init__(self, url, *, headers=None, body="",
+                         method="OPTIONS", public_headers=None):
+                self.request = Request(
+                    url, headers=headers, body=body, method=method,
+                    public_headers=public_headers,
+                )
+                self.aborted = False
+                self.continued = False
+                self.continue_headers = None
+
+            def abort(self, _reason):
+                self.aborted = True
+
+            def continue_(self, **kwargs):
+                self.continued = True
+                self.continue_headers = kwargs.get("headers")
+
+        primary_origin = "https://primary.example:443"
+        api_origin = "https://api.example:443"
+        check_endpoint = api_origin + "/auth/check-email"
+        final_endpoint = api_origin + "/auth/signup"
+        valid_headers = {
+            "Origin": primary_origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+            "Sec-Fetch-Mode": "cors",
+        }
+        state = {
+            "active": True,
+            "preflight_active": True,
+            "preflight_seen": {},
+            "cors_preflight_seen": {},
+            "username_values": ("researcher@example.test",),
+            "password_values": ("researcher@example.test",),
+            "preflight_matcher": {
+                "username_values": ("researcher@example.test",),
+                "password_values": ("researcher@example.test",),
+            },
+            "preflight_forbidden_values": ("private-password",),
+            "seen": 0,
+            "blocked": 0,
+            "block_all_until_submission": True,
+            "block_before_active": True,
+            "blocked_before_active": 0,
+            "blocked_retired": 0,
+            "retired_matchers": [],
+            "reject_unsupported": True,
+        }
+        context = Context()
+        workspace = type("WorkspaceStub", (), {"slug": "cors-route-test"})()
+        with (
+            patch("grypton.tools._private_browser_proxy", return_value=""),
+            patch("grypton.tools.check_url_scope", return_value=(True, "")),
+            patch(
+                "grypton.tools.request_policy.policy_for_url",
+                return_value=(api_origin, {}),
+            ),
+            patch(
+                "grypton.tools.request_policy.resolved_headers",
+                return_value={"X-UXCam-Researcher": "private-policy-value"},
+            ),
+            patch(
+                "grypton.tools.request_policy.enforce_rate_limit"
+            ) as enforce_rate_limit,
+        ):
+            tools._launch_scoped_browser_context(
+                Playwright(context), {
+                    "profile": "/tmp/profile-fixture",
+                    "executable": "/bin/true",
+                    "environment": {},
+                }, workspace, [], credential_submission_state=state,
+                credential_submission_origins=(primary_origin, api_origin),
+                credential_submission_url=final_endpoint,
+                credential_preflight_urls=(check_endpoint,),
+                exact_origin=primary_origin,
+            )
+
+            allowed = Route(check_endpoint, headers=valid_headers)
+            context.callback(allowed)
+            repeated = Route(check_endpoint, headers=valid_headers)
+            context.callback(repeated)
+            undeclared_endpoint = Route(
+                api_origin + "/auth/other", headers=valid_headers
+            )
+            context.callback(undeclared_endpoint)
+            undeclared_origin = Route(
+                "https://other.example/auth/check-email", headers=valid_headers
+            )
+            context.callback(undeclared_origin)
+            malformed_headers = Route(check_endpoint, headers={
+                **valid_headers,
+                "Access-Control-Request-Headers": (
+                    "content-type, Content-Type"
+                ),
+            })
+            context.callback(malformed_headers)
+            query = Route(check_endpoint + "?probe=1", headers=valid_headers)
+            context.callback(query)
+            body = Route(check_endpoint, headers=valid_headers, body="probe=1")
+            context.callback(body)
+            credential_header = Route(check_endpoint, headers={
+                **valid_headers, "Cookie": "renderer-session=secret",
+            })
+            context.callback(credential_header)
+            secret_header = Route(
+                check_endpoint,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Leak": "prefix-private-password-suffix",
+                },
+                public_headers={
+                    "Content-Type": "application/json",
+                    "X-Leak": "prefix-private-password-suffix",
+                },
+                body=json.dumps({"email": "researcher@example.test"}),
+                method="POST",
+            )
+            context.callback(secret_header)
+            self.assertEqual(state["seen"], 0)
+            self.assertTrue(state["block_all_until_submission"])
+
+            state.update({
+                "active": True,
+                "preflight_active": False,
+                "username_values": ("later-stage-private-value",),
+                "password_values": ("later-stage-private-value",),
+                "seen": 0,
+                "blocked": 0,
+                "block_all_until_submission": True,
+                "blocked_before_active": 0,
+                "blocked_retired": 0,
+                "retired_matchers": [],
+                "submission_url": "",
+                "primary_origin_only": True,
+            })
+            retired_secondary = Route(
+                api_origin + "/arbitrary/exfil",
+                headers={"Content-Type": "application/json"},
+                public_headers={"Content-Type": "application/json"},
+                body=json.dumps({
+                    "password": "later-stage-private-value",
+                }),
+                method="POST",
+            )
+            context.callback(retired_secondary)
+            allowed_primary = Route(
+                primary_origin + "/onboarding/profile",
+                headers={"Content-Type": "application/json"},
+                public_headers={"Content-Type": "application/json"},
+                body=json.dumps({
+                    "password": "later-stage-private-value",
+                }),
+                method="POST",
+            )
+            context.callback(allowed_primary)
+
+        self.assertTrue(allowed.continued)
+        self.assertFalse(allowed.aborted)
+        self.assertEqual(
+            allowed.continue_headers["X-UXCam-Researcher"],
+            "private-policy-value",
+        )
+        self.assertEqual(
+            allowed.continue_headers["Origin"], primary_origin
+        )
+        self.assertEqual(
+            allowed.continue_headers["Access-Control-Request-Method"],
+            "POST",
+        )
+        self.assertEqual(
+            allowed.continue_headers["Access-Control-Request-Headers"],
+            "content-type",
+        )
+        self.assertEqual(state["preflight_seen"], {})
+        self.assertEqual(
+            state["cors_preflight_seen"],
+            {"preflight:" + check_endpoint: 1},
+        )
+        self.assertTrue(all(route.aborted for route in (
+            repeated, undeclared_endpoint, undeclared_origin,
+            malformed_headers, query, body, credential_header, secret_header,
+            retired_secondary,
+        )))
+        self.assertTrue(allowed_primary.continued)
+        self.assertFalse(allowed_primary.aborted)
+        self.assertEqual(state["seen"], 1)
+        self.assertEqual(enforce_rate_limit.call_count, 2)
+
+    def test_one_shot_route_gate_rejects_partial_unsupported_and_retired_stages(self):
+        class Context:
+            callback = None
+
+            def route(self, _pattern, callback):
+                self.callback = callback
+
+        class Chromium:
+            def __init__(self, context):
+                self.context = context
+
+            def launch_persistent_context(self, **_kwargs):
+                return self.context
+
+        class Playwright:
+            def __init__(self, context):
+                self.chromium = Chromium(context)
+
+        class Request:
+            def __init__(self, url, body, *, method="POST", content_type=""):
+                self.url = url
+                self.post_data = body
+                self.method = method
+                self.headers = {
+                    "User-Agent": "Chromium/149.2",
+                    "Referer": "https://example.test:8392/form",
+                }
+                if content_type:
+                    self.headers["Content-Type"] = content_type
+
+        class Route:
+            def __init__(self, *args, **kwargs):
+                self.request = Request(*args, **kwargs)
+                self.aborted = False
+                self.continued = False
+
+            def abort(self, _reason):
+                self.aborted = True
+
+            def continue_(self, **_kwargs):
+                self.continued = True
+
+        context = Context()
+        workspace = type("WorkspaceStub", (), {"slug": "one-shot-gate-test"})()
+        state = {
+            "active": True,
+            "username_values": (_SpaAuthHandler.otp,),
+            "password_values": (_SpaAuthHandler.otp,),
+            "ordered_digit_values": tuple(_SpaAuthHandler.otp),
+            "seen": 0,
+            "blocked": 0,
+            "block_all_until_submission": True,
+            "block_before_active": True,
+            "blocked_before_active": 0,
+            "blocked_retired": 0,
+            "retired_matchers": [],
+            "reject_unsupported": True,
+        }
+        with (
+            patch("grypton.tools._private_browser_proxy", return_value=""),
+            patch("grypton.tools.check_url_scope", return_value=(True, "")),
+            patch(
+                "grypton.tools.request_policy.policy_for_url",
+                return_value=("https://example.test:443", {}),
+            ),
+            patch("grypton.tools.request_policy.resolved_headers", return_value={}),
+            patch("grypton.tools.request_policy.enforce_rate_limit"),
+        ):
+            tools._launch_scoped_browser_context(
+                Playwright(context), {
+                    "profile": "/tmp/profile-fixture",
+                    "executable": "/bin/true",
+                    "environment": {},
+                }, workspace, [], credential_submission_state=state,
+                exact_origin="https://example.test:443",
+            )
+
+            partials = []
+            for index, character in enumerate(_SpaAuthHandler.otp):
+                route = Route(
+                    "https://example.test/otp",
+                    f"otp-input-{index}={character}",
+                    content_type="application/x-www-form-urlencoded",
+                )
+                context.callback(route)
+                partials.append(route)
+            query = Route(
+                "https://example.test/otp?otp=" + _SpaAuthHandler.otp,
+                "", method="GET",
+            )
+            context.callback(query)
+            multipart = Route(
+                "https://example.test/otp",
+                "--x\r\nContent-Disposition: form-data; name=\"otp\"\r\n\r\n"
+                + _SpaAuthHandler.otp + "\r\n--x--\r\n",
+                content_type="multipart/form-data; boundary=x",
+            )
+            context.callback(multipart)
+            expected = Route(
+                "https://example.test/otp",
+                '{"otp":["8","3","9","2","0","1"]}',
+                content_type="application/json",
+            )
+            context.callback(expected)
+            multipart_after_submission = Route(
+                "https://example.test/otp",
+                "--x\r\nContent-Disposition: form-data; name=\"otp\"\r\n\r\n"
+                + _SpaAuthHandler.otp + "\r\n--x--\r\n",
+                content_type="multipart/form-data; boundary=x",
+            )
+            context.callback(multipart_after_submission)
+            duplicate = Route(
+                "https://example.test/otp", "otp=" + _SpaAuthHandler.otp,
+                content_type="application/x-www-form-urlencoded",
+            )
+            context.callback(duplicate)
+
+            tools._browser_retarget_submission_state(
+                state, (_SpaAuthHandler.password,)
+            )
+            state["active"] = True
+            delayed_otp = Route(
+                "https://example.test/otp", "otp=" + _SpaAuthHandler.otp,
+                content_type="application/x-www-form-urlencoded",
+            )
+            context.callback(delayed_otp)
+            substring = Route(
+                "https://example.test/password",
+                '{"telemetry":"prefix-browser-password-never-log-suffix"}',
+                content_type="application/json",
+            )
+            context.callback(substring)
+            password = Route(
+                "https://example.test/password",
+                json.dumps({"password": _SpaAuthHandler.password}),
+                content_type="application/json",
+            )
+            context.callback(password)
+
+        self.assertTrue(all(route.aborted for route in partials))
+        self.assertEqual(state["seen"], 1)
+        self.assertTrue(query.aborted)
+        self.assertTrue(multipart.aborted)
+        self.assertTrue(expected.continued)
+        self.assertTrue(multipart_after_submission.aborted)
+        self.assertTrue(duplicate.aborted)
+        self.assertTrue(delayed_otp.aborted)
+        self.assertTrue(substring.aborted)
+        self.assertTrue(password.continued)
+
+    def test_identifier_otp_candidate_rolls_back_when_pending_save_fails(self):
+        with isolated_runtime(), spa_auth_server("staged-otp") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            profile = self._status_profile(port)
+            profile["username_transform"] = "stored"
+            profile["browser"].update({
+                "username_selector": "#phone_number",
+                "password_selector": "#password",
+                "submit_selector": "#submit-btn",
+            })
+            profile["browser"]["verification"]["login_status"] = 202
+
+            with patch.object(
+                credentials, "save_pending_browser_step_up",
+                side_effect=credentials.CredentialError(
+                    "synthetic pending failure"
+                ),
+            ):
+                result = tools.credential_browser_begin_step_up(
+                    ws, credential="primary",
+                    registration_checkboxes=["#terms", "#privacy"],
+                    timeout=10, _profile_candidate=profile,
+                )
+
+            self.assertFalse(result["ok"], result)
+            self.assertIsNone(
+                credentials.load_auth_profile_optional(ws.slug, "primary")
+            )
+            self.assertFalse(
+                credentials.pending_browser_step_up_path(
+                    ws.slug, "primary"
+                ).exists()
+            )
+            state = credentials.load_attempt_state(ws.slug, "primary")
+            self.assertEqual(state["attempts"], 1)
+            self.assertIn("MFA/OTP", state["blocked_reason"])
+
+    def test_split_otp_matcher_orders_indices_and_accepts_alphanumeric_codes(self):
+        self.assertEqual(
+            tools._browser_split_code_values("AB12", 4), tuple("AB12")
+        )
+        with self.assertRaisesRegex(ValueError, "ASCII letters or digits"):
+            tools._browser_split_code_values("A-12", 4)
+        state = {
+            "username_values": ("AB12",),
+            "password_values": ("AB12",),
+            "ordered_digit_values": tuple("AB12"),
+        }
+        self.assertTrue(tools._browser_submission_matches(
+            "https://example.test/verify",
+            "code4=2&code2=B&code1=A&code3=1",
+            state,
+        ))
+        for post_data, content_type in (
+            (
+                "otp-input-0=A&otp-input-1=B&otp-input-2=1&otp-input-3=2",
+                "application/x-www-form-urlencoded",
+            ),
+            (
+                "otp-input-3=A&otp-input-2=B&otp-input-1=1&otp-input-0=2",
+                "application/x-www-form-urlencoded",
+            ),
+            ('{"otp":["A","B","1","2"]}', "application/json"),
+        ):
+            with self.subTest(post_data=post_data):
+                self.assertTrue(tools._browser_submission_matches(
+                    "https://example.test/verify", post_data, state,
+                    content_type=content_type,
+                ))
+        for post_data in (
+            "code1=A&code1=B&code3=1&code4=2",
+            "code1=A&code2=B&code4=1&code5=2",
+            "code0=2&code1=1&code2=B&code3=A",
+            '{"code":["2","1","B","A"]}',
+        ):
+            with self.subTest(post_data=post_data):
+                self.assertFalse(tools._browser_submission_matches(
+                    "https://example.test/verify", post_data, state,
+                ))
+
+    def test_password_submission_state_does_not_reuse_split_otp_matcher(self):
+        state = {
+            "active": False,
+            "username_values": ("AB12",),
+            "password_values": ("AB12",),
+            "ordered_digit_values": tuple("AB12"),
+            "seen": 1,
+            "blocked": 0,
+        }
+        tools._browser_retarget_submission_state(
+            state, (_SpaAuthHandler.password,)
+        )
+
+        self.assertFalse(tools._browser_submission_matches(
+            "https://example.test/password",
+            "code1=A&code2=B&code3=1&code4=2",
+            state,
+        ))
 
     def test_browser_login_retains_discovered_step_up_for_private_cli(self):
         with isolated_runtime(), spa_auth_server("otp") as port:
@@ -2703,14 +4872,23 @@ class BrowserCredentialTests(unittest.TestCase):
             )
             profile = self._status_profile(port)
             profile["browser"]["verification"]["login_status"] = 202
-            credentials.save_auth_profile(ws.slug, "primary", profile)
+            browser = profile["browser"]
 
-            result = dispatch(
-                ws, "credential_browser_login", {"credential": "primary"}
+            result = tools.credential_browser_login(
+                ws, profile["login_url"], credential="primary",
+                username_transform=profile["username_transform"],
+                username_selector=browser["username_selector"],
+                password_selector=browser["password_selector"],
+                submit_selector=browser["submit_selector"],
+                verify_url=profile["verify_url"],
+                verification=browser["verification"], timeout=profile["timeout"],
+                _profile_candidate=profile,
             )
 
             self.assertFalse(result["ok"], result)
             self.assertTrue(result["data"]["step_up"]["pending"])
+            saved = credentials.load_auth_profile_optional(ws.slug, "primary")
+            self.assertEqual(saved, credentials.validate_auth_profile(profile))
             self.assertTrue(
                 result["data"]["step_up"]["otp_control_discovered"]
             )
@@ -2719,12 +4897,41 @@ class BrowserCredentialTests(unittest.TestCase):
                 credentials.session_status(ws.slug, "primary")["state"],
                 "step-up-pending",
             )
-            pending = credentials.load_pending_browser_step_up(
-                ws.slug, "primary"
+
+    def test_profile_candidate_rolls_back_when_pending_step_up_save_fails(self):
+        with isolated_runtime(), spa_auth_server("otp") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
             )
-            self.assertEqual(pending["attempt"], 1)
-            self.assertEqual(pending["profile_revision"],
-                             credentials.auth_profile_revision(profile))
+            profile = self._status_profile(port)
+            profile["browser"]["verification"]["login_status"] = 202
+            browser = profile["browser"]
+            with patch.object(
+                credentials, "save_pending_browser_step_up",
+                side_effect=credentials.CredentialError("synthetic pending failure"),
+            ):
+                result = tools.credential_browser_login(
+                    ws, profile["login_url"], credential="primary",
+                    username_transform=profile["username_transform"],
+                    username_selector=browser["username_selector"],
+                    password_selector=browser["password_selector"],
+                    submit_selector=browser["submit_selector"],
+                    verify_url=profile["verify_url"],
+                    verification=browser["verification"],
+                    timeout=profile["timeout"], _profile_candidate=profile,
+                )
+
+            self.assertFalse(result["ok"], result)
+            self.assertFalse(result["data"]["step_up"]["pending"])
+            self.assertIsNone(
+                credentials.load_auth_profile_optional(ws.slug, "primary")
+            )
+            self.assertFalse(
+                credentials.pending_browser_step_up_path(
+                    ws.slug, "primary"
+                ).exists()
+            )
 
     def test_false_challenge_fields_and_negative_text_are_not_blockers(self):
         for observation in (

@@ -2949,6 +2949,506 @@ def _isolated_browser_profile(executable: str):
         shutil.rmtree(data_root, ignore_errors=True)
 
 
+_BROWSER_SPLIT_CODE_STEMS = frozenset({
+    "d", "digit", "otp", "otpinput", "code", "codeinput", "pin",
+    "pininput", "verificationcode", "verificationcodeinput",
+    "onetimecode", "onetimecodeinput",
+})
+
+
+def _browser_json_submission_fields(value: object) -> tuple[
+    list[tuple[str, str]], list[tuple[str, list[str]]], bool
+]:
+    """Return bounded JSON scalar fields and scalar arrays without coercing containers."""
+    if not isinstance(value, dict):
+        return [], [], False
+    pairs: list[tuple[str, str]] = []
+    sequences: list[tuple[str, list[str]]] = []
+    count = 0
+
+    def scalar(item: object) -> Optional[str]:
+        if isinstance(item, bool) or not isinstance(item, (str, int, float)):
+            return None
+        return str(item)
+
+    def walk(mapping: dict, depth: int) -> bool:
+        nonlocal count
+        if depth > 4 or len(mapping) > 64:
+            return False
+        for raw_key, child in mapping.items():
+            key = str(raw_key)
+            if isinstance(child, bool) or child is None:
+                count += 1
+                if count > 64:
+                    return False
+                continue
+            rendered = scalar(child)
+            if rendered is not None:
+                count += 1
+                pairs.append((key, rendered))
+            elif isinstance(child, dict):
+                if not walk(child, depth + 1):
+                    return False
+            elif isinstance(child, list):
+                if not 2 <= len(child) <= 12:
+                    return False
+                values: list[str] = []
+                for item in child:
+                    rendered = scalar(item)
+                    if rendered is None:
+                        return False
+                    values.append(rendered)
+                    pairs.append((key, rendered))
+                    count += 1
+                sequences.append((key, values))
+            else:
+                return False
+            if count > 64:
+                return False
+        return True
+
+    if not walk(value, 0):
+        return [], [], False
+    return pairs, sequences, True
+
+
+def _browser_submission_body_fields(
+    post_data: str, content_type: str = ""
+) -> tuple[list[tuple[str, str]], list[tuple[str, list[str]]], bool]:
+    """Parse only exact, bounded JSON or URL-encoded request bodies."""
+    body = str(post_data or "")
+    media_type = str(content_type or "").split(";", 1)[0].strip().lower()
+    if media_type == "multipart/form-data":
+        return [], [], False
+    if media_type in {"application/json", "text/json"} or (
+        not media_type and body.lstrip().startswith(("{", "["))
+    ):
+        try:
+            parsed = json.loads(body)
+        except (TypeError, ValueError):
+            return [], [], False
+        return _browser_json_submission_fields(parsed)
+    if media_type not in {"", "application/x-www-form-urlencoded"}:
+        return [], [], False
+    try:
+        pairs = [
+            (str(key), str(value))
+            for key, value in parse_qsl(
+                body, keep_blank_values=True, max_num_fields=64,
+            )
+        ]
+    except (TypeError, ValueError):
+        return [], [], False
+    return pairs, [], bool(pairs)
+
+
+def _browser_split_fields_match(
+    pairs: Iterable[tuple[str, str]],
+    sequences: Iterable[tuple[str, list[str]]],
+    expected: object,
+) -> bool:
+    """Match a bounded split code in indexed, repeated, or JSON-array fields."""
+    if (
+        not isinstance(expected, (tuple, list))
+        or not 2 <= len(expected) <= 12
+        or any(
+            not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9]", value)
+            for value in expected
+        )
+    ):
+        return False
+    wanted = list(expected)
+
+    def values_match(values: list[str]) -> bool:
+        return len(values) == len(wanted) and values == wanted
+
+    for raw_key, values in sequences:
+        normalized = re.sub(r"[^a-z0-9]", "", raw_key.lower())
+        if normalized in _BROWSER_SPLIT_CODE_STEMS and values_match(values):
+            return True
+
+    indexed: dict[str, list[tuple[int, str]]] = {}
+    repeated: dict[str, list[str]] = {}
+    for raw_key, value in pairs:
+        normalized = re.sub(r"[^a-z0-9]", "", raw_key.lower())
+        match = re.fullmatch(r"([a-z][a-z0-9]*?)([0-9]{1,2})", normalized)
+        if match and match.group(1) in _BROWSER_SPLIT_CODE_STEMS:
+            indexed.setdefault(match.group(1), []).append(
+                (int(match.group(2)), value)
+            )
+        if normalized in _BROWSER_SPLIT_CODE_STEMS - {"d"}:
+            repeated.setdefault(normalized, []).append(value)
+
+    if any(values_match(values) for values in repeated.values()):
+        return True
+    for values in indexed.values():
+        if len(values) != len(wanted):
+            continue
+        original_indices = [index for index, _value in values]
+        original_values = [value for _index, value in values]
+        ordered = sorted(values, key=lambda item: item[0])
+        indices = [index for index, _value in ordered]
+        if len(set(indices)) != len(wanted):
+            continue
+        if indices not in (
+            list(range(len(wanted))), list(range(1, len(wanted) + 1)),
+        ):
+            continue
+        if values_match([value for _index, value in ordered]):
+            return True
+        # Some split-code widgets name their controls in descending order
+        # while serializing them in visible DOM order. Accept that concrete
+        # layout without treating an arbitrary reversed code as equivalent.
+        if (
+            original_indices == list(reversed(indices))
+            and values_match(original_values)
+        ):
+            return True
+    return False
+
+
+def _browser_ordered_digit_fields_match(post_data: str,
+                                        expected: object) -> bool:
+    """Recognize one bounded alphanumeric code across coherent split fields."""
+    pairs, sequences, supported = _browser_submission_body_fields(post_data)
+    return bool(
+        supported and _browser_split_fields_match(pairs, sequences, expected)
+    )
+
+
+def _browser_submission_query_has_secret(request_url: str, state: dict) -> bool:
+    """Return whether decoded query values carry current submission material."""
+    try:
+        pairs = [
+            (str(key), str(value))
+            for key, value in parse_qsl(
+                urlsplit(str(request_url or "")).query,
+                keep_blank_values=True, max_num_fields=64,
+            )
+        ]
+    except (TypeError, ValueError):
+        return False
+    values = [value for _key, value in pairs]
+    secrets = {
+        str(value) for value in (
+            *(state.get("username_values") or ()),
+            *(state.get("password_values") or ()),
+        ) if str(value)
+    }
+    return bool(
+        any(value in secrets for value in values)
+        or _browser_split_fields_match(
+            pairs, (), state.get("ordered_digit_values")
+        )
+    )
+
+
+def _browser_submission_matches(
+    request_url: str, post_data: str, state: dict, *, method: str = "POST",
+    content_type: str = "",
+) -> bool:
+    """Match exact structured body values for one complete guarded submission."""
+    if str(method or "").upper() in {"GET", "HEAD"}:
+        return False
+    if _browser_submission_query_has_secret(request_url, state):
+        return False
+    pairs, sequences, supported = _browser_submission_body_fields(
+        post_data, content_type
+    )
+    if not supported:
+        return False
+    scalars = [value for _key, value in pairs]
+    username_values = {
+        str(value) for value in state.get("username_values") or () if str(value)
+    }
+    password_values = {
+        str(value) for value in state.get("password_values") or () if str(value)
+    }
+    if (
+        any(value in username_values for value in scalars)
+        and any(value in password_values for value in scalars)
+    ):
+        return True
+    return _browser_split_fields_match(
+        pairs, sequences, state.get("ordered_digit_values")
+    )
+
+
+def _browser_retarget_submission_state(state: dict,
+                                       secret_values: Iterable[str]) -> None:
+    """Start a guarded stage while retaining the prior matcher as denied."""
+    retired = list(state.get("retired_matchers") or ())
+    if state.get("username_values") or state.get("password_values"):
+        retired.append({
+            "username_values": tuple(state.get("username_values") or ()),
+            "password_values": tuple(state.get("password_values") or ()),
+            "ordered_digit_values": tuple(
+                state.get("ordered_digit_values") or ()
+            ),
+        })
+    values = tuple(secret_values)
+    state.update({
+        "active": False,
+        "username_values": values,
+        "password_values": values,
+        "ordered_digit_values": (),
+        "seen": 0,
+        "blocked": 0,
+        "block_all_until_submission": True,
+        "block_before_active": True,
+        "retired_matchers": retired[-4:],
+    })
+
+
+def _browser_submission_origin_allowlist(
+    workspace: Workspace, primary_origin: str, value: object,
+) -> tuple[str, ...]:
+    """Validate exact in-scope origins allowed to receive one credential body."""
+    if value is None:
+        return ()
+    if (
+        not isinstance(value, (list, tuple))
+        or isinstance(value, (str, bytes))
+        or len(value) > 8
+    ):
+        raise ValueError(
+            "Additional browser submission origins must be a list of at most 8 origins."
+        )
+    origins = [primary_origin]
+    seen = {primary_origin}
+    for raw_origin in value:
+        if (
+            not isinstance(raw_origin, str) or not raw_origin.strip()
+            or len(raw_origin) > 2048
+            or any(
+                ord(char) < 0x20 or ord(char) == 0x7f
+                for char in raw_origin
+            )
+        ):
+            raise ValueError(
+                "Additional browser submission origins must be non-empty strings."
+            )
+        try:
+            origin = request_policy.canonical_origin(raw_origin)
+        except request_policy.RequestPolicyError as exc:
+            raise ValueError(str(exc)) from exc
+        allowed, _reason = check_url_scope(workspace, origin)
+        if not allowed:
+            raise ValueError(
+                "Every additional browser submission origin must be in scope."
+            )
+        if origin in seen:
+            raise ValueError(
+                "Additional browser submission origins must be canonically unique."
+            )
+        seen.add(origin)
+        origins.append(origin)
+    return tuple(origins)
+
+
+def _browser_canonical_submission_endpoint(value: object) -> str:
+    """Return one exact HTTP(S) endpoint without query, fragment, or userinfo."""
+    if (
+        not isinstance(value, str) or not value.strip()
+        or len(value) > 8192
+        or any(ord(char) < 0x20 or ord(char) == 0x7f for char in value)
+    ):
+        raise ValueError("Browser submission endpoints must be non-empty URLs.")
+    raw_url = value.strip()
+    try:
+        parsed = urlsplit(raw_url)
+        origin = credentials.normalize_origin(raw_url)
+    except (ValueError, credentials.CredentialError) as exc:
+        raise ValueError("Browser submission endpoint is not a valid HTTP(S) URL.") from exc
+    if (
+        "?" in raw_url or "#" in raw_url
+        or parsed.query or parsed.fragment
+        or parsed.username is not None or parsed.password is not None
+    ):
+        raise ValueError(
+            "Browser submission endpoints cannot contain query, fragment, or URL credentials."
+        )
+    return origin + (parsed.path or "/")
+
+
+def _browser_submission_endpoint_contract(
+    workspace: Workspace, submission_origins: tuple[str, ...],
+    final_value: object, preflight_value: object,
+) -> tuple[str, tuple[str, ...]]:
+    """Validate one final endpoint and bounded credential-safe preflights."""
+    final_raw = str(final_value or "").strip()
+    if preflight_value is None:
+        raw_preflights: list[object] = []
+    elif (
+        isinstance(preflight_value, list)
+        and len(preflight_value) <= 4
+    ):
+        raw_preflights = list(preflight_value)
+    else:
+        raise ValueError(
+            "Browser submission preflight URLs must be a list of at most 4 URLs."
+        )
+    if raw_preflights and not final_raw:
+        raise ValueError(
+            "A final browser submission URL is required when preflight URLs are declared."
+        )
+    if len(submission_origins) > 1 and not final_raw:
+        raise ValueError(
+            "A final browser submission URL is required for an additional submission origin."
+        )
+    if (final_raw or raw_preflights) and not submission_origins:
+        raise ValueError(
+            "Browser submission endpoints require an exact submission-origin allowlist."
+        )
+
+    final_endpoint = (
+        _browser_canonical_submission_endpoint(final_raw) if final_raw else ""
+    )
+    preflight_endpoints = tuple(
+        _browser_canonical_submission_endpoint(value)
+        for value in raw_preflights
+    )
+    endpoints = tuple(
+        endpoint for endpoint in (final_endpoint, *preflight_endpoints)
+        if endpoint
+    )
+    if len(set(endpoints)) != len(endpoints):
+        raise ValueError("Browser submission endpoints must be unique.")
+    allowed_origins = frozenset(submission_origins)
+    for endpoint in endpoints:
+        endpoint_origin = credentials.normalize_origin(endpoint)
+        allowed, _reason = check_url_scope(workspace, endpoint)
+        if not allowed or endpoint_origin not in allowed_origins:
+            raise ValueError(
+                "Every browser submission endpoint must use a declared in-scope origin."
+            )
+    return final_endpoint, preflight_endpoints
+
+
+def _browser_cors_preflight_contract(
+    request_url: str, method: str, post_data: str, headers: object, *,
+    primary_origin: str, final_endpoint: str,
+    preflight_endpoints: Iterable[str], state: dict,
+) -> tuple[str, str]:
+    """Validate one bodyless browser CORS preflight for an armed endpoint."""
+    if str(method or "").upper() != "OPTIONS" or str(post_data or ""):
+        raise ValueError("Browser CORS preflight request is invalid.")
+    try:
+        parsed = urlsplit(str(request_url or ""))
+        endpoint = credentials.normalize_origin(request_url) + (parsed.path or "/")
+    except (ValueError, credentials.CredentialError) as exc:
+        raise ValueError("Browser CORS preflight endpoint is invalid.") from exc
+    if (
+        "?" in str(request_url) or "#" in str(request_url)
+        or parsed.query or parsed.fragment
+        or parsed.username is not None or parsed.password is not None
+    ):
+        raise ValueError("Browser CORS preflight endpoint is invalid.")
+    preflight_set = frozenset(preflight_endpoints)
+    if endpoint == final_endpoint:
+        stage = "final"
+        armed = bool(
+            state.get("active")
+            and int(state.get("seen") or 0) == 0
+        )
+    elif endpoint in preflight_set:
+        stage = "preflight"
+        preflight_seen = state.get("preflight_seen")
+        if not isinstance(preflight_seen, dict):
+            preflight_seen = {}
+        armed = bool(
+            (state.get("preflight_active") or state.get("active"))
+            and int(state.get("seen") or 0) == 0
+            and int(preflight_seen.get(endpoint) or 0) == 0
+        )
+    else:
+        raise ValueError("Browser CORS preflight endpoint is not declared.")
+
+    if not isinstance(headers, dict) or not 1 <= len(headers) <= 64:
+        raise ValueError("Browser CORS preflight headers are invalid.")
+    normalized_headers: dict[str, str] = {}
+    total_header_chars = 0
+    for raw_name, raw_value in headers.items():
+        if not isinstance(raw_name, str) or not isinstance(raw_value, str):
+            raise ValueError("Browser CORS preflight headers are invalid.")
+        name = raw_name.strip().lower()
+        value = raw_value.strip()
+        if (
+            not re.fullmatch(r"[!#$%&'*+.^_`|~0-9a-z-]{1,128}", name)
+            or name in normalized_headers
+            or len(value) > 8192
+            or "\r" in value or "\n" in value
+            or any(ord(char) < 0x20 and char != "\t" for char in value)
+            or "\x7f" in value
+        ):
+            raise ValueError("Browser CORS preflight headers are invalid.")
+        total_header_chars += len(name) + len(value)
+        if total_header_chars > 32_768:
+            raise ValueError("Browser CORS preflight headers are invalid.")
+        normalized_headers[name] = value
+
+    if any(name in normalized_headers for name in (
+        *_SENSITIVE_HEADERS,
+        "content-length", "transfer-encoding",
+    )):
+        content_length = normalized_headers.get("content-length")
+        unsafe_names = set(normalized_headers).intersection(_SENSITIVE_HEADERS)
+        if unsafe_names or content_length not in {None, "0"} or (
+            "transfer-encoding" in normalized_headers
+        ):
+            raise ValueError("Browser CORS preflight carried credentials or a body.")
+
+    origin_value = normalized_headers.get("origin", "")
+    try:
+        origin_parts = urlsplit(origin_value)
+        request_page_origin = credentials.normalize_origin(origin_value)
+    except (ValueError, credentials.CredentialError) as exc:
+        raise ValueError("Browser CORS preflight Origin header is invalid.") from exc
+    if (
+        request_page_origin != primary_origin
+        or origin_parts.path or origin_parts.query or origin_parts.fragment
+        or origin_parts.username is not None or origin_parts.password is not None
+    ):
+        raise ValueError("Browser CORS preflight Origin header is invalid.")
+    if normalized_headers.get("access-control-request-method", "").upper() != "POST":
+        raise ValueError("Browser CORS preflight method header must be POST.")
+
+    raw_requested_headers = normalized_headers.get(
+        "access-control-request-headers", ""
+    )
+    if not raw_requested_headers or len(raw_requested_headers) > 2048:
+        raise ValueError("Browser CORS requested-header list is invalid.")
+    requested_headers = [
+        name.strip().lower() for name in raw_requested_headers.split(",")
+    ]
+    forbidden_requested = {
+        *_SENSITIVE_HEADERS,
+        "access-control-request-headers", "access-control-request-method",
+        "connection", "content-length", "cookie", "host", "origin",
+        "proxy-connection", "set-cookie", "transfer-encoding", "upgrade",
+    }
+    if (
+        not 1 <= len(requested_headers) <= 16
+        or len(set(requested_headers)) != len(requested_headers)
+        or "content-type" not in requested_headers
+        or any(
+            not re.fullmatch(r"[!#$%&'*+.^_`|~0-9a-z-]{1,128}", name)
+            or name in forbidden_requested
+            or name.startswith(("proxy-", "sec-"))
+            for name in requested_headers
+        )
+    ):
+        raise ValueError("Browser CORS requested-header list is invalid.")
+
+    counter_key = f"{stage}:{endpoint}"
+    cors_seen = state.get("cors_preflight_seen")
+    if not isinstance(cors_seen, dict):
+        cors_seen = {}
+    if not armed or int(cors_seen.get(counter_key) or 0) != 0:
+        raise ValueError("Browser CORS preflight stage is not armed.")
+    return endpoint, counter_key
+
+
 def _launch_scoped_browser_context(playwright, launch_profile: dict,
                                    workspace: Workspace,
                                    denied_requests: list[str],
@@ -2956,6 +3456,9 @@ def _launch_scoped_browser_context(playwright, launch_profile: dict,
                                    bound_headers: Optional[dict] = None,
                                    bound_header_state: Optional[dict] = None,
                                    credential_submission_state: Optional[dict] = None,
+                                   credential_submission_origins: tuple[str, ...] = (),
+                                   credential_submission_url: str = "",
+                                   credential_preflight_urls: tuple[str, ...] = (),
                                    exact_origin: str = "",
                                    network_state: Optional[dict] = None,
                                    launch_timeout_ms: Optional[int] = None):
@@ -2994,6 +3497,12 @@ def _launch_scoped_browser_context(playwright, launch_profile: dict,
         # capture can audit, so keep them closed in scoped mode.
         context.route_web_socket("**/*", lambda web_socket: web_socket.close())
 
+    submission_origins = frozenset(credential_submission_origins)
+    additional_submission_origins = frozenset(
+        credential_submission_origins[1:]
+    )
+    preflight_endpoints = frozenset(credential_preflight_urls)
+
     def scope_route(route) -> None:
         request_url = route.request.url
         scheme = urlsplit(request_url).scheme.lower()
@@ -3012,40 +3521,346 @@ def _launch_scoped_browser_context(playwright, launch_profile: dict,
                 route.abort("blockedbyclient")
                 return
         allowed, _ = check_url_scope(workspace, request_url)
-        if allowed and exact_origin:
+        request_origin = ""
+        if allowed and (exact_origin or submission_origins):
             try:
-                allowed = credentials.normalize_origin(request_url) == exact_origin
+                request_origin = credentials.normalize_origin(request_url)
             except credentials.CredentialError:
                 allowed = False
-        if allowed:
-            if (
+        additional_submission_request = bool(
+            allowed
+            and exact_origin
+            and request_origin != exact_origin
+            and request_origin in additional_submission_origins
+            and not (
                 credential_submission_state
-                and credential_submission_state.get("active")
-            ):
+                and credential_submission_state.get("primary_origin_only")
+            )
+        )
+        if allowed and exact_origin:
+            allowed = bool(
+                request_origin == exact_origin or additional_submission_request
+            )
+        if allowed:
+            matches_submission = False
+            matches_preflight_body = False
+            matches_final_submission = False
+            matches_preflight_submission = False
+            first_expected_submission = False
+            first_expected_preflight = False
+            first_expected_cors_preflight = False
+            cors_preflight_key = ""
+            if credential_submission_state:
+                active_submission_url = (
+                    str(credential_submission_state.get("submission_url") or "")
+                    if "submission_url" in credential_submission_state
+                    else credential_submission_url
+                )
                 post_data = str(route.request.post_data or "")
-                username_values = tuple(
-                    credential_submission_state.get("username_values") or ()
+                request_method = str(
+                    getattr(
+                        route.request, "method",
+                        "POST" if post_data else "GET",
+                    ) or ""
+                ).upper()
+                raw_headers = getattr(route.request, "headers", {})
+                route_headers = (
+                    raw_headers if isinstance(raw_headers, dict) else {}
                 )
-                password_values = tuple(
-                    credential_submission_state.get("password_values") or ()
-                )
-                matches_submission = bool(
-                    post_data
-                    and any(value and value in post_data
-                            for value in username_values)
-                    and any(value and value in post_data
-                            for value in password_values)
-                )
-                if matches_submission:
-                    credential_submission_state["seen"] = int(
-                        credential_submission_state.get("seen") or 0
+                complete_headers = route_headers
+                complete_headers_loaded = False
+                all_headers = getattr(route.request, "all_headers", None)
+                if callable(all_headers):
+                    try:
+                        candidate_headers = all_headers()
+                    except Exception:
+                        candidate_headers = None
+                    if isinstance(candidate_headers, dict):
+                        complete_headers = candidate_headers
+                        complete_headers_loaded = True
+                elif request_method == "OPTIONS":
+                    credential_submission_state[
+                        "blocked_before_active"
+                    ] = int(
+                        credential_submission_state.get(
+                            "blocked_before_active"
+                        ) or 0
                     ) + 1
-                    if credential_submission_state["seen"] > 1:
+                    route.abort("blockedbyclient")
+                    return
+                if request_method == "OPTIONS" and not complete_headers_loaded:
+                    credential_submission_state[
+                        "blocked_before_active"
+                    ] = int(
+                        credential_submission_state.get(
+                            "blocked_before_active"
+                        ) or 0
+                    ) + 1
+                    route.abort("blockedbyclient")
+                    return
+                content_type = next((
+                    str(value) for key, value in complete_headers.items()
+                    if str(key).lower() == "content-type"
+                ), "")
+                if (
+                    request_method == "OPTIONS"
+                    and (active_submission_url or preflight_endpoints)
+                ):
+                    primary_origin = (
+                        credential_submission_origins[0]
+                        if credential_submission_origins else exact_origin
+                    )
+                    try:
+                        _cors_endpoint, cors_preflight_key = (
+                            _browser_cors_preflight_contract(
+                                request_url, request_method, post_data,
+                                complete_headers,
+                                primary_origin=primary_origin,
+                                final_endpoint=active_submission_url,
+                                preflight_endpoints=preflight_endpoints,
+                                state=credential_submission_state,
+                            )
+                        )
+                    except ValueError:
+                        credential_submission_state[
+                            "blocked_before_active"
+                        ] = int(
+                            credential_submission_state.get(
+                                "blocked_before_active"
+                            ) or 0
+                        ) + 1
+                        route.abort("blockedbyclient")
+                        return
+                    first_expected_cors_preflight = True
+                _body_pairs, _body_sequences, body_supported = (
+                    _browser_submission_body_fields(post_data, content_type)
+                )
+                if (
+                    post_data
+                    and request_method not in {"GET", "HEAD"}
+                    and credential_submission_state.get("reject_unsupported")
+                    and not body_supported
+                ):
+                    credential_submission_state["blocked_retired"] = int(
+                        credential_submission_state.get("blocked_retired") or 0
+                    ) + 1
+                    route.abort("blockedbyclient")
+                    return
+                matches_submission = _browser_submission_matches(
+                    request_url, post_data, credential_submission_state,
+                    method=request_method, content_type=content_type,
+                )
+                preflight_matcher = credential_submission_state.get(
+                    "preflight_matcher"
+                )
+                if preflight_endpoints and isinstance(preflight_matcher, dict):
+                    matches_preflight_body = _browser_submission_matches(
+                        request_url, post_data, preflight_matcher,
+                        method=request_method, content_type=content_type,
+                    )
+                    forbidden_preflight_values = {
+                        str(value) for value in credential_submission_state.get(
+                            "preflight_forbidden_values"
+                        ) or () if str(value)
+                    }
+                    if forbidden_preflight_values:
+                        matches_preflight_body = bool(
+                            matches_preflight_body
+                            and not any(
+                                value in forbidden_preflight_values
+                                for _key, value in _body_pairs
+                            )
+                        )
+                request_endpoint = ""
+                if (matches_submission or matches_preflight_body) and (
+                    active_submission_url or preflight_endpoints
+                ):
+                    try:
+                        request_endpoint = _browser_canonical_submission_endpoint(
+                            request_url
+                        )
+                    except ValueError:
+                        request_endpoint = ""
+                matches_preflight_submission = bool(
+                    matches_preflight_body
+                    and request_endpoint in preflight_endpoints
+                )
+                matches_final_submission = bool(
+                    matches_submission
+                    and (
+                        not active_submission_url
+                        or request_endpoint == active_submission_url
+                    )
+                )
+                retired_matchers = credential_submission_state.get(
+                    "retired_matchers"
+                ) or ()
+                protected_header_values = {
+                    str(value)
+                    for matcher in (
+                        credential_submission_state,
+                        *(retired_matchers or ()),
+                    )
+                    if isinstance(matcher, dict)
+                    for value in (
+                        *(matcher.get("username_values") or ()),
+                        *(matcher.get("password_values") or ()),
+                    )
+                    if str(value)
+                }
+                protected_header_values.update(
+                    str(value) for value in credential_submission_state.get(
+                        "preflight_forbidden_values"
+                    ) or () if str(value)
+                )
+                renderer_header_secret = any(
+                    secret in str(value)
+                    for value in route_headers.values()
+                    for secret in protected_header_values
+                )
+                forbidden_query = _browser_submission_query_has_secret(
+                    request_url, credential_submission_state
+                ) or any(
+                    _browser_submission_query_has_secret(request_url, matcher)
+                    for matcher in retired_matchers
+                )
+                retired_submission = any(
+                    _browser_submission_matches(
+                        request_url, post_data, matcher,
+                        method=request_method, content_type=content_type,
+                    )
+                    for matcher in retired_matchers
+                )
+                if forbidden_query or retired_submission or renderer_header_secret:
+                    credential_submission_state["blocked_retired"] = int(
+                        credential_submission_state.get("blocked_retired") or 0
+                    ) + 1
+                    if renderer_header_secret:
+                        credential_submission_state["blocked_before_active"] = int(
+                            credential_submission_state.get(
+                                "blocked_before_active"
+                            ) or 0
+                        ) + 1
+                    route.abort("blockedbyclient")
+                    return
+                if (
+                    (matches_submission or matches_preflight_body)
+                    and submission_origins
+                    and request_origin not in submission_origins
+                ):
+                    credential_submission_state["blocked_retired"] = int(
+                        credential_submission_state.get("blocked_retired") or 0
+                    ) + 1
+                    route.abort("blockedbyclient")
+                    return
+                if (
+                    (matches_submission or matches_preflight_body)
+                    and (active_submission_url or preflight_endpoints)
+                    and not (
+                        matches_final_submission
+                        or matches_preflight_submission
+                    )
+                ):
+                    credential_submission_state["blocked_retired"] = int(
+                        credential_submission_state.get("blocked_retired") or 0
+                    ) + 1
+                    route.abort("blockedbyclient")
+                    return
+                if credential_submission_state.get(
+                    "block_all_until_submission"
+                ):
+                    preflight_seen = credential_submission_state.get(
+                        "preflight_seen"
+                    )
+                    if not isinstance(preflight_seen, dict):
+                        preflight_seen = {}
+                    first_expected_preflight = bool(
+                        matches_preflight_submission
+                        and (
+                            credential_submission_state.get("preflight_active")
+                            or credential_submission_state.get("active")
+                        )
+                        and int(credential_submission_state.get("seen") or 0) == 0
+                        and int(preflight_seen.get(request_endpoint) or 0) == 0
+                    )
+                    first_expected_submission = bool(
+                        credential_submission_state.get("active")
+                        and matches_final_submission
+                        and int(
+                            credential_submission_state.get("seen") or 0
+                        ) == 0
+                    )
+                    if not (
+                        first_expected_submission or first_expected_preflight
+                        or first_expected_cors_preflight
+                    ):
+                        credential_submission_state[
+                            "blocked_before_active"
+                        ] = int(
+                            credential_submission_state.get(
+                                "blocked_before_active"
+                            ) or 0
+                        ) + 1
+                        route.abort("blockedbyclient")
+                        return
+                if (
+                    matches_final_submission
+                    and credential_submission_state.get("block_before_active")
+                    and not credential_submission_state.get("active")
+                ):
+                    credential_submission_state["blocked_before_active"] = int(
+                        credential_submission_state.get("blocked_before_active") or 0
+                    ) + 1
+                    route.abort("blockedbyclient")
+                    return
+                if (
+                    matches_final_submission
+                    and credential_submission_state.get("active")
+                ):
+                    if int(
+                        credential_submission_state.get("seen") or 0
+                    ) >= 1:
                         credential_submission_state["blocked"] = int(
                             credential_submission_state.get("blocked") or 0
                         ) + 1
                         route.abort("blockedbyclient")
                         return
+                if (
+                    matches_preflight_submission
+                    and not first_expected_preflight
+                ):
+                    credential_submission_state["blocked_retired"] = int(
+                        credential_submission_state.get("blocked_retired") or 0
+                    ) + 1
+                    route.abort("blockedbyclient")
+                    return
+            if additional_submission_request and not (
+                first_expected_submission or first_expected_preflight
+                or first_expected_cors_preflight
+            ):
+                if credential_submission_state is not None:
+                    credential_submission_state["blocked_before_active"] = int(
+                        credential_submission_state.get(
+                            "blocked_before_active"
+                        ) or 0
+                    ) + 1
+                route.abort("blockedbyclient")
+                return
+            redirected_from = getattr(route.request, "redirected_from", None)
+            if redirected_from is not None and additional_submission_origins:
+                try:
+                    redirect_origin = credentials.normalize_origin(
+                        redirected_from.url
+                    )
+                except (AttributeError, credentials.CredentialError):
+                    redirect_origin = ""
+                if redirect_origin in additional_submission_origins:
+                    if credential_submission_state is not None:
+                        credential_submission_state["blocked"] = int(
+                            credential_submission_state.get("blocked") or 0
+                        ) + 1
+                    route.abort("blockedbyclient")
+                    return
             request_headers = None
             active_origin = bound_header_origin
             active_headers = bound_headers
@@ -3071,6 +3886,18 @@ def _launch_scoped_browser_context(playwright, launch_profile: dict,
                 mandatory_headers = request_policy.resolved_headers(
                     workspace.slug, transport_policy
                 )
+                if first_expected_cors_preflight and any(
+                    str(name).lower() in {
+                        "access-control-request-headers",
+                        "access-control-request-method",
+                        "content-length", "content-type", "origin",
+                        "transfer-encoding",
+                    }
+                    for name in mandatory_headers
+                ):
+                    raise request_policy.RequestPolicyError(
+                        "mandatory headers cannot replace CORS preflight controls"
+                    )
                 request_policy.enforce_rate_limit(
                     workspace.slug, policy_origin, transport_policy
                 )
@@ -3087,10 +3914,48 @@ def _launch_scoped_browser_context(playwright, launch_profile: dict,
                 route.abort("blockedbyclient")
                 return
             if mandatory_headers:
+                merge_base_headers = (
+                    complete_headers
+                    if first_expected_cors_preflight
+                    else request_headers or dict(route.request.headers)
+                )
                 request_headers = request_policy.merge_mandatory_headers(
-                    request_headers or dict(route.request.headers),
+                    merge_base_headers,
                     mandatory_headers,
                 )
+            if (
+                credential_submission_state
+                and first_expected_cors_preflight
+            ):
+                cors_preflight_seen = credential_submission_state.setdefault(
+                    "cors_preflight_seen", {}
+                )
+                cors_preflight_seen[cors_preflight_key] = 1
+            elif (
+                credential_submission_state
+                and first_expected_preflight
+            ):
+                preflight_seen = credential_submission_state.setdefault(
+                    "preflight_seen", {}
+                )
+                preflight_seen[request_endpoint] = int(
+                    preflight_seen.get(request_endpoint) or 0
+                ) + 1
+            elif (
+                credential_submission_state
+                and matches_final_submission
+                and credential_submission_state.get("active")
+            ):
+                # Commit the one permitted submission only after every request
+                # policy check has passed and immediately before transport.
+                credential_submission_state["seen"] = int(
+                    credential_submission_state.get("seen") or 0
+                ) + 1
+                credential_submission_state["preflight_active"] = False
+                if first_expected_submission:
+                    credential_submission_state[
+                        "block_all_until_submission"
+                    ] = False
             if request_headers is None:
                 route.continue_()
             else:
@@ -3595,10 +4460,29 @@ def _browser_auth_response_url(url: str) -> bool:
 def _browser_auth_enable_response_capture(context, page, workspace: Workspace,
                                           denied_requests: list[str],
                                           username_values: Iterable[str],
-                                          password_values: Iterable[str]):
+                                          password_values: Iterable[str],
+                                          ordered_digit_values: Iterable[str] = (),
+                                          submission_url: str = "",
+                                          preflight_urls: Iterable[str] = (),
+                                          reject_submission_redirects: bool = False):
     """Capture bounded non-GET responses at CDP response stage."""
     session = context.new_cdp_session(page)
     responses: list[dict] = []
+    submission_matcher = {
+        "username_values": tuple(username_values),
+        "password_values": tuple(password_values),
+        "ordered_digit_values": tuple(ordered_digit_values),
+    }
+    preflight_matcher = {
+        "username_values": tuple(username_values),
+        "password_values": tuple(username_values),
+        "ordered_digit_values": (),
+    }
+    preflight_endpoints = frozenset(preflight_urls)
+    submission_endpoints = frozenset(
+        endpoint for endpoint in (submission_url, *preflight_endpoints)
+        if endpoint
+    )
 
     def paused(event: dict) -> None:
         request_id = str(event.get("requestId") or "")
@@ -3607,24 +4491,87 @@ def _browser_auth_enable_response_capture(context, page, workspace: Workspace,
         method = str(request.get("method") or "").upper()
         resource_type = str(event.get("resourceType") or "").lower()
         post_data = str(request.get("postData") or "")
-        matches_submission = bool(
-            post_data
-            and any(value and value in post_data for value in username_values)
-            and any(value and value in post_data for value in password_values)
+        request_headers = (
+            request.get("headers")
+            if isinstance(request.get("headers"), dict) else {}
         )
+        content_type = next((
+            str(value) for key, value in request_headers.items()
+            if str(key).lower() == "content-type"
+        ), "")
+        matches_body = _browser_submission_matches(
+            request_url, post_data, submission_matcher,
+            method=method, content_type=content_type,
+        )
+        matches_preflight_body = bool(
+            preflight_endpoints
+            and _browser_submission_matches(
+                request_url, post_data, preflight_matcher,
+                method=method, content_type=content_type,
+            )
+        )
+        request_endpoint = ""
+        if (matches_body or matches_preflight_body or method == "OPTIONS") and (
+            submission_url or preflight_endpoints
+        ):
+            try:
+                request_endpoint = _browser_canonical_submission_endpoint(
+                    request_url
+                )
+            except ValueError:
+                request_endpoint = ""
+        matches_preflight = bool(
+            matches_preflight_body and request_endpoint in preflight_endpoints
+        )
+        matches_submission = bool(
+            matches_body
+            and (not submission_url or request_endpoint == submission_url)
+        )
+        matches_cors_preflight = bool(
+            method == "OPTIONS"
+            and request_endpoint in submission_endpoints
+        )
+        response_status = int(event.get("responseStatusCode") or 0)
         resumed = False
         try:
             allowed, _ = check_url_scope(workspace, request_url)
             if not allowed:
                 if len(denied_requests) < 100:
                     denied_requests.append(request_url)
+                resumed = True
                 session.send("Fetch.failRequest", {
                     "requestId": request_id,
                     "errorReason": "BlockedByClient",
                 })
-                resumed = True
                 return
-            if method == "GET" or len(responses) >= 8:
+            if (
+                reject_submission_redirects
+                and (
+                    matches_submission or matches_preflight
+                    or matches_cors_preflight
+                )
+                and 300 <= response_status < 400
+            ):
+                if len(responses) < 8:
+                    responses.append({
+                        "phase": "login",
+                        "method": method,
+                        "resource_type": resource_type,
+                        "url": request_url,
+                        "status": response_status,
+                        "body": "",
+                        "body_truncated": False,
+                        "matches_submission": matches_submission,
+                        "matches_preflight": matches_preflight,
+                        "matches_cors_preflight": matches_cors_preflight,
+                    })
+                resumed = True
+                session.send("Fetch.failRequest", {
+                    "requestId": request_id,
+                    "errorReason": "BlockedByClient",
+                })
+                return
+            if method in {"GET", "OPTIONS"} or len(responses) >= 8:
                 return
             headers = event.get("responseHeaders")
             content_length = 0
@@ -3665,10 +4612,11 @@ def _browser_auth_enable_response_capture(context, page, workspace: Workspace,
                 "method": method,
                 "resource_type": resource_type,
                 "url": request_url,
-                "status": int(event.get("responseStatusCode") or 0),
+                "status": response_status,
                 "body": body,
                 "body_truncated": truncated,
                 "matches_submission": matches_submission,
+                "matches_preflight": matches_preflight,
             })
         except Exception as exc:
             responses.append({
@@ -5098,13 +6046,31 @@ def credential_browser_login(
     registration_fields: Optional[dict] = None,
     registration_checkboxes: Optional[list] = None,
     timeout: int = 45,
+    _profile_candidate: Optional[dict] = None,
+    _additional_submission_origins: object = None,
+    _submission_url: object = "",
+    _submission_preflight_urls: object = None,
 ) -> dict:
     """Serialize one complete browser login proof with other session writers."""
     try:
         with credentials.auth_profile_lock(workspace.slug, credential):
-            profile = credentials.load_auth_profile_optional(
+            existing = credentials.load_auth_profile_optional(
                 workspace.slug, credential
             )
+            candidate = (
+                credentials.validate_auth_profile(_profile_candidate)
+                if _profile_candidate is not None else None
+            )
+            if candidate is not None and candidate.get("strategy") != "browser":
+                return _err(
+                    "Browser login requires a browser authentication profile."
+                )
+            if existing is not None and candidate is not None and existing != candidate:
+                return _err(
+                    "The paired credential already has a different browser "
+                    "authentication profile; replace or clear it explicitly."
+                )
+            profile = existing if existing is not None else candidate
             profile_revision = (
                 credentials.auth_profile_revision(profile)
                 if isinstance(profile, dict)
@@ -5122,6 +6088,12 @@ def credential_browser_login(
                     registration_fields=registration_fields,
                     registration_checkboxes=registration_checkboxes,
                     timeout=timeout, _profile_revision=profile_revision,
+                    _profile_to_persist=(profile if existing is None else None),
+                    _additional_submission_origins=(
+                        _additional_submission_origins
+                    ),
+                    _submission_url=_submission_url,
+                    _submission_preflight_urls=_submission_preflight_urls,
                 )
     except credentials.CredentialError as exc:
         return _err(str(exc))
@@ -5146,6 +6118,10 @@ def _credential_browser_login_locked(
     _refresh_generation: Optional[int] = None,
     _upgrade_generation: Optional[int] = None,
     _profile_revision: str = "",
+    _profile_to_persist: Optional[dict] = None,
+    _additional_submission_origins: object = None,
+    _submission_url: object = "",
+    _submission_preflight_urls: object = None,
 ) -> dict:
     """Submit one private credential through a scoped rendered login form."""
     verify_url = str(verify_url or "").strip()
@@ -5157,6 +6133,15 @@ def _credential_browser_login_locked(
             return blocked
     try:
         login_origin = credentials.normalize_origin(url)
+        submission_origins = _browser_submission_origin_allowlist(
+            workspace, login_origin, _additional_submission_origins
+        )
+        final_submission_url, submission_preflight_urls = (
+            _browser_submission_endpoint_contract(
+                workspace, submission_origins, _submission_url,
+                _submission_preflight_urls,
+            )
+        )
         status_verification = None
         if verification is None:
             if not verify_url or not success_marker:
@@ -5315,6 +6300,8 @@ def _credential_browser_login_locked(
     matched_submission_status = 0
     browser_identity = ""
     attempt = 0
+    attempt_snapshot: Optional[tuple[bool, bytes, int]] = None
+    attempt_reservation_released = False
     blocker = ""
     failure = ""
     phase = {"name": "initial"}
@@ -5327,10 +6314,27 @@ def _credential_browser_login_locked(
     }
     credential_submission_state = {
         "active": False,
+        "preflight_active": False,
+        "preflight_seen": {},
+        "cors_preflight_seen": {},
         "username_values": _serialized_secret_variants(username_redactions),
         "password_values": _serialized_secret_variants((secret["password"],)),
+        "preflight_matcher": {
+            "username_values": _serialized_secret_variants(username_redactions),
+            "password_values": _serialized_secret_variants(username_redactions),
+            "ordered_digit_values": (),
+        },
+        "preflight_forbidden_values": _serialized_secret_variants((
+            secret["password"],
+        )),
         "seen": 0,
         "blocked": 0,
+        "block_all_until_submission": False,
+        "block_before_active": True,
+        "blocked_before_active": 0,
+        "blocked_retired": 0,
+        "retired_matchers": [],
+        "reject_unsupported": True,
     }
 
     def remember_console(message) -> None:
@@ -5391,6 +6395,9 @@ def _credential_browser_login_locked(
                     playwright, launch_profile, workspace, denied_requests,
                     bound_header_state=verify_header_state,
                     credential_submission_state=credential_submission_state,
+                    credential_submission_origins=submission_origins,
+                    credential_submission_url=final_submission_url,
+                    credential_preflight_urls=submission_preflight_urls,
                 )
                 page = context.new_page()
                 page.on("console", remember_console)
@@ -5453,17 +6460,28 @@ def _credential_browser_login_locked(
                             page, registration_fields, registration_checkboxes,
                             timeout_ms=timeout_ms,
                         )
-                        if maintenance_generation is not None:
-                            # Renewal persists its one-submission reservation and
-                            # starts capture before secrets enter the form.  Input
-                            # handlers can submit without a click.
-                            capture_session, pending_responses = (
-                                _browser_auth_enable_response_capture(
-                                    context, page, workspace, denied_requests,
-                                    _serialized_secret_variants(username_redactions),
-                                    _serialized_secret_variants((secret["password"],)),
+                        capture_session, pending_responses = (
+                            _browser_auth_enable_response_capture(
+                                context, page, workspace, denied_requests,
+                                _serialized_secret_variants(username_redactions),
+                                _serialized_secret_variants((secret["password"],)),
+                                submission_url=final_submission_url,
+                                preflight_urls=submission_preflight_urls,
+                                reject_submission_redirects=bool(
+                                    final_submission_url
+                                ),
+                            )
+                        )
+                        if (
+                            maintenance_generation is None
+                            or _upgrade_generation is not None
+                        ):
+                            attempt_snapshot = _snapshot_private_material(
+                                credentials.attempt_path(
+                                    workspace.slug, credential
                                 )
                             )
+                        if maintenance_generation is not None:
                             if _upgrade_generation is not None:
                                 attempt = credentials.begin_browser_state_upgrade(
                                     workspace.slug, credential,
@@ -5474,36 +6492,31 @@ def _credential_browser_login_locked(
                                     workspace.slug, credential,
                                     generation=_refresh_generation,
                                 )
-                            credential_submission_state["active"] = True
+                        else:
+                            attempt = credentials.begin_login_attempt(
+                                workspace.slug, credential
+                            )
+                        # From the first secret-bearing fill until one complete
+                        # structured request passes policy, every browser request
+                        # is denied.  Keeping the stage active supports a form that
+                        # auto-submits only after both complete values are present.
+                        credential_submission_state[
+                            "block_all_until_submission"
+                        ] = True
+                        credential_submission_state["active"] = True
                         username.fill(login_username, timeout=timeout_ms)
                         password.fill(secret["password"], timeout=timeout_ms)
-                        submission_seen = False
-                        if maintenance_generation is not None:
-                            # Let Playwright dispatch any request synchronously
-                            # triggered by the input/change handler.  The route
-                            # guard observes the request before its response,
-                            # so a slow login endpoint cannot make us click and
-                            # send the credentials a second time.
-                            page.wait_for_timeout(100)
-                            submission_seen = bool(
-                                credential_submission_state["seen"]
-                            )
+                        # Let Playwright dispatch a synchronous input/change
+                        # submission before deciding whether an explicit click is
+                        # needed.  The route guard counts it before its response.
+                        page.wait_for_timeout(100)
+                        submission_seen = bool(
+                            credential_submission_state["seen"]
+                        )
                         if not submission_seen:
                             _browser_auth_wait_for_submit(
                                 page, submit, timeout_ms
                             )
-                            if maintenance_generation is None:
-                                capture_session, pending_responses = (
-                                    _browser_auth_enable_response_capture(
-                                        context, page, workspace, denied_requests,
-                                        _serialized_secret_variants(username_redactions),
-                                        _serialized_secret_variants((secret["password"],)),
-                                    )
-                                )
-                                attempt = credentials.begin_login_attempt(
-                                    workspace.slug, credential
-                                )
-                                credential_submission_state["active"] = True
                             submit.click(timeout=timeout_ms)
                         deadline = time.monotonic() + timeout_seconds
                         while time.monotonic() < deadline:
@@ -5912,6 +6925,25 @@ def _credential_browser_login_locked(
                 pass
 
     if (
+        attempt
+        and _refresh_generation is None
+        and credential_submission_state["seen"] == 0
+        and attempt_snapshot is not None
+    ):
+        try:
+            _restore_private_material(
+                credentials.attempt_path(workspace.slug, credential),
+                attempt_snapshot,
+            )
+            attempt = 0
+            attempt_reservation_released = True
+        except (OSError, credentials.CredentialError) as exc:
+            failure = failure or (
+                "Unsubmitted credential reservation could not be released: "
+                + _browser_safe_error(exc, secret_values)
+            )
+
+    if (
         status_mode
         and replay_probe_attempts
         and _browser_auth_probe_result_is_transient(
@@ -6026,43 +7058,88 @@ def _credential_browser_login_locked(
             )
 
     established = False
-    if refresh_reservation_released:
+    if refresh_reservation_released or attempt_reservation_released:
         pass
     elif attempt and blocker:
         if maintenance_generation is None:
-            credentials.record_login_outcome(
-                workspace.slug, credential, blocked_reason=blocker
+            pending_ready = bool(
+                blocker.startswith("MFA/OTP")
+                and _profile_revision
+                and not failure
+                and credential_submission_state["seen"] == 1
+                and credential_submission_state["blocked"] == 0
+                and matched_submission_count == 1
             )
-            if blocker.startswith("MFA/OTP"):
-                if not _profile_revision:
+            if pending_ready:
+                pending_snapshots: list[
+                    tuple[Path, tuple[bool, bytes, int]]
+                ] = []
+                try:
+                    pending_paths = [
+                        credentials.attempt_path(workspace.slug, credential),
+                        credentials.pending_browser_step_up_path(
+                            workspace.slug, credential
+                        ),
+                    ]
+                    if _profile_to_persist is not None:
+                        pending_paths.append(
+                            credentials.auth_profile_path(
+                                workspace.slug, credential
+                            )
+                        )
+                    pending_snapshots = [
+                        (path, _snapshot_private_material(path))
+                        for path in pending_paths
+                    ]
+                    if _profile_to_persist is not None:
+                        credentials.save_auth_profile(
+                            workspace.slug, credential, _profile_to_persist
+                        )
+                    credentials.record_login_outcome(
+                        workspace.slug, credential, blocked_reason=blocker
+                    )
+                    credentials.save_pending_browser_step_up(
+                        workspace.slug, credential, attempt=attempt,
+                        origin=login_origin, challenge_url=final_url,
+                        profile_revision=_profile_revision, cookies=cookies,
+                        local_storage=local_storage,
+                        session_storage=session_storage, tokens=tokens,
+                        otp_selector=str(
+                            step_up_controls.get("otp_selector") or ""
+                        ),
+                        otp_fields=int(step_up_controls.get("otp_fields") or 0),
+                        submit_selector=str(
+                            step_up_controls.get("submit_selector") or ""
+                        ),
+                        submission_origins=(
+                            submission_origins or (login_origin,)
+                        ),
+                    )
+                    pending_step_up_saved = True
+                except Exception:
+                    for path, snapshot in reversed(pending_snapshots):
+                        try:
+                            _restore_private_material(path, snapshot)
+                        except (OSError, credentials.CredentialError):
+                            pass
+                    try:
+                        credentials.record_login_outcome(
+                            workspace.slug, credential, blocked_reason=blocker
+                        )
+                    except credentials.CredentialError:
+                        pass
+                    pending_step_up_failure = (
+                        "the private MFA continuation could not be saved"
+                    )
+            else:
+                credentials.record_login_outcome(
+                    workspace.slug, credential, blocked_reason=blocker
+                )
+                if blocker.startswith("MFA/OTP") and not _profile_revision:
                     pending_step_up_failure = (
                         "a saved browser authentication profile is required for "
                         "human MFA continuation"
                     )
-                elif (
-                    not failure
-                    and credential_submission_state["seen"] == 1
-                    and credential_submission_state["blocked"] == 0
-                    and matched_submission_count == 1
-                ):
-                    try:
-                        credentials.save_pending_browser_step_up(
-                            workspace.slug, credential, attempt=attempt,
-                            origin=login_origin, challenge_url=final_url,
-                            profile_revision=_profile_revision, cookies=cookies,
-                            local_storage=local_storage,
-                            session_storage=session_storage, tokens=tokens,
-                            otp_selector=str(
-                                step_up_controls.get("otp_selector") or ""
-                            ),
-                            otp_fields=int(step_up_controls.get("otp_fields") or 0),
-                            submit_selector=str(
-                                step_up_controls.get("submit_selector") or ""
-                            ),
-                        )
-                        pending_step_up_saved = True
-                    except credentials.CredentialError as exc:
-                        pending_step_up_failure = str(exc)
         elif _upgrade_generation is not None:
             credentials.record_browser_state_upgrade_outcome(
                 workspace.slug, credential,
@@ -6083,12 +7160,16 @@ def _credential_browser_login_locked(
                 local_storage=local_storage,
                 session_storage=session_storage,
             )
-            commit_paths = (
+            commit_paths = [
                 credentials.cookie_jar_storage_path(workspace.slug, credential),
                 credentials.token_path(workspace.slug, credential),
                 credentials.browser_storage_path(workspace.slug, credential),
                 credentials.attempt_path(workspace.slug, credential),
-            )
+            ]
+            if _profile_to_persist is not None:
+                commit_paths.append(
+                    credentials.auth_profile_path(workspace.slug, credential)
+                )
             commit_snapshots = [
                 (path, _snapshot_private_material(path))
                 for path in commit_paths
@@ -6106,6 +7187,10 @@ def _credential_browser_login_locked(
             if tokens:
                 credentials.save_tokens(
                     workspace.slug, credential, tokens, origin=login_origin
+                )
+            if _profile_to_persist is not None:
+                credentials.save_auth_profile(
+                    workspace.slug, credential, _profile_to_persist
                 )
             if maintenance_generation is None:
                 credentials.record_login_outcome(
@@ -6490,6 +7575,17 @@ def _browser_step_up_input(page, selector: str, code: str, timeout_ms: int,
     return visible[-1], len(visible)
 
 
+def _browser_split_code_values(code: str, fields_used: int) -> tuple[str, ...]:
+    """Return a matchable split code or reject it before its one-shot reserve."""
+    if fields_used <= 1:
+        return ()
+    if not re.fullmatch(r"[A-Za-z0-9]{2,12}", code):
+        raise ValueError(
+            "Split-field one-time codes must contain 2-12 ASCII letters or digits."
+        )
+    return tuple(code)
+
+
 def credential_browser_begin_step_up(
     workspace: Workspace,
     *,
@@ -6498,6 +7594,9 @@ def credential_browser_begin_step_up(
     registration_checkboxes: Optional[list] = None,
     timeout: int = 45,
     _profile_candidate: Optional[dict] = None,
+    _additional_submission_origins: object = None,
+    _submission_url: object = "",
+    _submission_preflight_urls: object = None,
 ) -> dict:
     """Send one profile-bound identifier request and retain its MFA page privately."""
     try:
@@ -6531,6 +7630,11 @@ def credential_browser_begin_step_up(
                     registration_checkboxes=registration_checkboxes,
                     timeout=timeout,
                     profile_to_persist=(profile if existing is None else None),
+                    additional_submission_origins=(
+                        _additional_submission_origins
+                    ),
+                    submission_url=_submission_url,
+                    submission_preflight_urls=_submission_preflight_urls,
                 )
     except (ValueError, credentials.CredentialError) as exc:
         return _err(str(exc))
@@ -6543,6 +7647,9 @@ def _credential_browser_begin_step_up_locked(
     registration_checkboxes: Optional[list] = None,
     timeout: int = 45,
     profile_to_persist: Optional[dict] = None,
+    additional_submission_origins: object = None,
+    submission_url: object = "",
+    submission_preflight_urls: object = None,
 ) -> dict:
     login_url = str(profile["login_url"])
     verify_url = str(profile["verify_url"])
@@ -6552,6 +7659,15 @@ def _credential_browser_begin_step_up_locked(
             return blocked
     try:
         origin = credentials.normalize_origin(login_url)
+        submission_origins = _browser_submission_origin_allowlist(
+            workspace, origin, additional_submission_origins
+        )
+        final_submission_url, preflight_submission_urls = (
+            _browser_submission_endpoint_contract(
+                workspace, submission_origins, submission_url,
+                submission_preflight_urls,
+            )
+        )
         secret = credentials.load_credential(workspace.slug, credential)
         username = credentials.normalize_login_username(
             secret["username"], profile["username_transform"]
@@ -6585,11 +7701,13 @@ def _credential_browser_begin_step_up_locked(
         policy_values = request_policy.all_resolved_secret_values(workspace.slug)
     except request_policy.RequestPolicyError as exc:
         return _err(f"Request policy blocked browser authentication: {exc}.")
-    username_secrets = _serialized_secret_variants((
-        *_login_username_redaction_values(
+    username_match_values = _serialized_secret_variants(
+        _login_username_redaction_values(
             secret["username"], profile["username_transform"]
-        ),
-        *policy_values,
+        )
+    )
+    username_secrets = _serialized_secret_variants((
+        *username_match_values, *policy_values,
     ))
     denied_requests: list[str] = []
     pending_responses: list[dict] = []
@@ -6607,15 +7725,31 @@ def _credential_browser_begin_step_up_locked(
     statuses: list[int] = []
     console: list[dict] = []
     attempt = 0
+    attempt_snapshot: Optional[tuple[bool, bytes, int]] = None
     failure = ""
     blocker = ""
     context = None
     submission_state = {
         "active": False,
-        "username_values": username_secrets,
-        "password_values": username_secrets,
+        "preflight_active": False,
+        "preflight_seen": {},
+        "cors_preflight_seen": {},
+        "username_values": username_match_values,
+        "password_values": username_match_values,
+        "preflight_matcher": {
+            "username_values": username_match_values,
+            "password_values": username_match_values,
+            "ordered_digit_values": (),
+        },
+        "preflight_forbidden_values": (),
         "seen": 0,
         "blocked": 0,
+        "block_all_until_submission": False,
+        "block_before_active": True,
+        "blocked_before_active": 0,
+        "blocked_retired": 0,
+        "retired_matchers": [],
+        "reject_unsupported": True,
     }
     try:
         with _isolated_browser_profile(executable) as launch_profile:
@@ -6623,6 +7757,9 @@ def _credential_browser_begin_step_up_locked(
                 context = _launch_scoped_browser_context(
                     playwright, launch_profile, workspace, denied_requests,
                     credential_submission_state=submission_state,
+                    credential_submission_origins=submission_origins,
+                    credential_submission_url=final_submission_url,
+                    credential_preflight_urls=preflight_submission_urls,
                     exact_origin=origin,
                 )
                 page = context.new_page()
@@ -6662,7 +7799,12 @@ def _credential_browser_begin_step_up_locked(
                 capture_session, pending_responses = (
                     _browser_auth_enable_response_capture(
                         context, page, workspace, denied_requests,
-                        username_secrets, username_secrets,
+                        username_match_values, username_match_values,
+                        submission_url=final_submission_url,
+                        preflight_urls=preflight_submission_urls,
+                        reject_submission_redirects=bool(
+                            final_submission_url
+                        ),
                     )
                 )
                 try:
@@ -6700,14 +7842,19 @@ def _credential_browser_begin_step_up_locked(
                         page, submit_selector, role="submit",
                         timeout_ms=timeout_ms,
                     )
-                    if profile_to_persist is not None:
-                        credentials.save_auth_profile(
-                            workspace.slug, credential, profile_to_persist
-                        )
+                    attempt_snapshot = _snapshot_private_material(
+                        credentials.attempt_path(workspace.slug, credential)
+                    )
                     attempt = credentials.begin_login_attempt(
                         workspace.slug, credential
                     )
-                    submission_state["active"] = True
+                    # Initial navigation and preflight resources are complete.
+                    # From this point until the expected submit request, no
+                    # same-origin network activity may leave the renderer.
+                    submission_state["block_all_until_submission"] = True
+                    submission_state["preflight_active"] = bool(
+                        preflight_submission_urls
+                    )
                     username_control.fill(username, timeout=timeout_ms)
                     page.wait_for_timeout(100)
                     current_url, current_dom, current_visible = (
@@ -6729,6 +7876,10 @@ def _credential_browser_begin_step_up_locked(
                         _browser_auth_wait_for_submit(
                             page, submit_control, timeout_ms
                         )
+                        # Fill/change handlers remain unable to transmit the
+                        # identifier through the final CAPTCHA snapshot. Open
+                        # the one-request gate only for this explicit action.
+                        submission_state["active"] = True
                         submit_control.click(timeout=timeout_ms)
                     deadline = time.monotonic() + timeout_seconds
                     while time.monotonic() < deadline:
@@ -6739,6 +7890,7 @@ def _credential_browser_begin_step_up_locked(
                         page.wait_for_timeout(100)
                 finally:
                     submission_state["active"] = False
+                    submission_state["preflight_active"] = False
                     try:
                         capture_session.send("Fetch.disable")
                     except Exception:
@@ -6791,6 +7943,23 @@ def _credential_browser_begin_step_up_locked(
                 context.close()
             except Exception:
                 pass
+
+    if (
+        attempt
+        and int(submission_state["seen"] or 0) == 0
+        and attempt_snapshot is not None
+    ):
+        try:
+            _restore_private_material(
+                credentials.attempt_path(workspace.slug, credential),
+                attempt_snapshot,
+            )
+            attempt = 0
+        except (OSError, credentials.CredentialError) as exc:
+            failure = failure or (
+                "Unsubmitted identifier attempt could not be released: "
+                + _browser_safe_error(exc, username_secrets)
+            )
 
     observed_private_values: list[str] = []
     identity_sources: list[str] = [rendered_dom]
@@ -6865,7 +8034,30 @@ def _credential_browser_begin_step_up_locked(
 
     pending_saved = False
     if attempt and not failure and blocker.startswith("MFA/OTP"):
+        pending_snapshots: list[
+            tuple[Path, tuple[bool, bytes, int]]
+        ] = []
         try:
+            pending_paths = [
+                credentials.attempt_path(workspace.slug, credential),
+                credentials.pending_browser_step_up_path(
+                    workspace.slug, credential
+                ),
+            ]
+            if profile_to_persist is not None:
+                pending_paths.append(
+                    credentials.auth_profile_path(
+                        workspace.slug, credential
+                    )
+                )
+            pending_snapshots = [
+                (path, _snapshot_private_material(path))
+                for path in pending_paths
+            ]
+            if profile_to_persist is not None:
+                credentials.save_auth_profile(
+                    workspace.slug, credential, profile_to_persist
+                )
             credentials.record_login_outcome(
                 workspace.slug, credential, blocked_reason=blocker
             )
@@ -6877,10 +8069,22 @@ def _credential_browser_begin_step_up_locked(
                 otp_selector=str(controls.get("otp_selector") or ""),
                 otp_fields=int(controls.get("otp_fields") or 0),
                 submit_selector=str(controls.get("submit_selector") or ""),
+                submission_origins=submission_origins or (origin,),
             )
             pending_saved = True
-        except credentials.CredentialError as exc:
-            failure = str(exc)
+        except Exception:
+            for path, snapshot in reversed(pending_snapshots):
+                try:
+                    _restore_private_material(path, snapshot)
+                except (OSError, credentials.CredentialError):
+                    pass
+            try:
+                credentials.record_login_outcome(
+                    workspace.slug, credential, blocked_reason=blocker
+                )
+            except credentials.CredentialError:
+                pass
+            failure = "the private MFA continuation could not be saved"
     elif attempt and blocker:
         credentials.record_login_outcome(
             workspace.slug, credential, blocked_reason=blocker
@@ -6892,6 +8096,9 @@ def _credential_browser_begin_step_up_locked(
         "credential": credential,
         "attempt": attempt,
         "identifier_submission_requests": int(submission_state["seen"] or 0),
+        "blocked_pre_submit_requests": int(
+            submission_state["blocked_before_active"] or 0
+        ),
         "blocked_duplicate_submissions": int(submission_state["blocked"] or 0),
         "otp_control_discovered": bool(controls.get("otp_selector")),
         "otp_fields": int(controls.get("otp_fields") or 0),
@@ -6909,6 +8116,156 @@ def _credential_browser_begin_step_up_locked(
     return _err(failure or "The MFA challenge was not retained.", data)
 
 
+def _browser_post_otp_stages(value: object) -> list[dict[str, object]]:
+    """Validate bounded post-OTP forms and action-only onboarding stages."""
+    if value is None:
+        return []
+    if not isinstance(value, list) or len(value) > 6:
+        raise ValueError("Post-OTP stages must be a list with at most 6 entries.")
+    stages: list[dict[str, object]] = []
+    for index, raw_stage in enumerate(value, 1):
+        if not isinstance(raw_stage, dict):
+            raise ValueError(f"Post-OTP stage {index} must be an object.")
+        unknown = set(raw_stage) - {
+            "fields", "checkboxes", "choice_selector", "choice_selectors",
+            "submit_selector", "action_only",
+        }
+        if unknown:
+            raise ValueError(
+                f"Post-OTP stage {index} contains unsupported settings."
+            )
+        raw_fields = raw_stage.get("fields")
+        raw_checkboxes = raw_stage.get("checkboxes")
+        if isinstance(raw_fields, dict) and any(
+            not isinstance(selector, str) for selector in raw_fields
+        ):
+            raise ValueError(
+                f"Post-OTP stage {index} field selectors must be strings."
+            )
+        if isinstance(raw_checkboxes, list) and any(
+            not isinstance(selector, str) for selector in raw_checkboxes
+        ):
+            raise ValueError(
+                f"Post-OTP stage {index} checkbox selectors must be strings."
+            )
+        fields, checkboxes = _browser_auth_registration_controls(
+            raw_fields, raw_checkboxes
+        )
+        raw_action_only = raw_stage.get("action_only", False)
+        if not isinstance(raw_action_only, bool):
+            raise ValueError(
+                f"Post-OTP stage {index} action_only must be a boolean."
+            )
+        action_only = raw_action_only
+        choice_selectors: list[str] = []
+        raw_choice_selector = raw_stage.get("choice_selector")
+        if raw_choice_selector is not None and not isinstance(
+            raw_choice_selector, str
+        ):
+            raise ValueError(
+                f"Post-OTP stage {index} choice selector must be a string."
+            )
+        if str(raw_choice_selector or "").strip():
+            choice_selectors.append(_browser_auth_selector(
+                raw_choice_selector,
+                label=f"Post-OTP stage {index} choice", default="",
+            ))
+        raw_choice_selectors = raw_stage.get("choice_selectors")
+        if raw_choice_selectors is None:
+            raw_choice_selectors = []
+        if (
+            not isinstance(raw_choice_selectors, list)
+            or len(raw_choice_selectors) > 4
+            or any(
+                not isinstance(selector, str)
+                for selector in raw_choice_selectors
+            )
+        ):
+            raise ValueError(
+                f"Post-OTP stage {index} choice selectors must be a list "
+                "of at most 4 strings."
+            )
+        choice_selectors.extend(
+            _browser_auth_selector(
+                selector, label=f"Post-OTP stage {index} choice", default=""
+            )
+            for selector in raw_choice_selectors
+        )
+        if len(choice_selectors) > 4:
+            raise ValueError(
+                f"Post-OTP stage {index} accepts at most 4 choice selectors."
+            )
+        if len(set(choice_selectors)) != len(choice_selectors):
+            raise ValueError(
+                f"Post-OTP stage {index} choice selectors must be unique."
+            )
+        if action_only:
+            if fields or checkboxes or choice_selectors:
+                raise ValueError(
+                    f"Post-OTP stage {index} action_only cannot include fields, "
+                    "checkboxes, or choices."
+                )
+        elif not fields or not any(fields.values()):
+            raise ValueError(
+                f"Post-OTP stage {index} requires at least one nonempty field "
+                "so its single submission can be matched."
+            )
+        if not isinstance(raw_stage.get("submit_selector"), str):
+            raise ValueError(
+                f"Post-OTP stage {index} action selector must be a string."
+            )
+        submit_selector = _browser_auth_selector(
+            raw_stage.get("submit_selector"),
+            label=f"Post-OTP stage {index} action", default="",
+        )
+        stages.append({
+            "fields": fields,
+            "checkboxes": checkboxes,
+            "choice_selectors": choice_selectors,
+            "submit_selector": submit_selector,
+            "action_only": action_only,
+        })
+    return stages
+
+
+def _browser_post_otp_choice(page, selector: str, timeout_ms: int,
+                             *, click: bool = True) -> None:
+    """Validate and optionally select one bounded radio/button choice."""
+    if not selector:
+        return
+    locator = page.locator(selector).first
+    locator.wait_for(state="visible", timeout=timeout_ms)
+    details = locator.evaluate(
+        """el => ({tag: el.tagName.toLowerCase(),
+                    type: (el.getAttribute('type') || '').toLowerCase(),
+                    role: (el.getAttribute('role') || '').toLowerCase(),
+                    disabled: !!el.disabled,
+                    ariaDisabled: el.getAttribute('aria-disabled') === 'true'})"""
+    )
+    tag = str((details or {}).get("tag") or "")
+    input_type = str((details or {}).get("type") or "")
+    aria_role = str((details or {}).get("role") or "")
+    if bool((details or {}).get("disabled")) or bool(
+        (details or {}).get("ariaDisabled")
+    ):
+        raise ValueError("Post-OTP choice control is disabled")
+    accepted = (
+        (tag == "input" and input_type == "radio")
+        or tag == "button"
+        or aria_role in {"button", "option", "radio"}
+    )
+    if not accepted:
+        raise ValueError(
+            "Post-OTP choice selector did not resolve to a radio, option, or "
+            "button control"
+        )
+    if click:
+        if tag == "input" and input_type == "radio":
+            locator.check(timeout=timeout_ms)
+        else:
+            locator.click(timeout=timeout_ms)
+
+
 def credential_browser_step_up(
     workspace: Workspace,
     *,
@@ -6917,6 +8274,8 @@ def credential_browser_step_up(
     otp_selector: str = "",
     submit_selector: str = "",
     password_submit_selector: str = "",
+    otp_submission_url: object = "",
+    post_otp_stages: Optional[list] = None,
     timeout: int = 45,
     _continuation_observation: Optional[dict] = None,
 ) -> dict:
@@ -6943,6 +8302,8 @@ def credential_browser_step_up(
             )
             if str(password_submit_selector or "").strip() else ""
         )
+        onboarding_stages = _browser_post_otp_stages(post_otp_stages)
+        code_match_values = _serialized_secret_variants((code,))
         with credentials.auth_profile_lock(workspace.slug, credential):
             profile = credentials.load_auth_profile_optional(
                 workspace.slug, credential
@@ -6960,6 +8321,7 @@ def credential_browser_step_up(
             password_secrets = _serialized_secret_variants((
                 password, *policy_values,
             ))
+            password_match_values = _serialized_secret_variants((password,))
             revision = credentials.auth_profile_revision(profile)
             with credentials.session_material_lock(workspace.slug, credential):
                 pending = credentials.load_pending_browser_step_up(
@@ -6996,6 +8358,33 @@ def credential_browser_step_up(
                     return _err(
                         "The pending MFA continuation no longer matches the profile origin."
                     )
+                raw_submission_origins = pending.get(
+                    "submission_origins", [origin]
+                )
+                if (
+                    not isinstance(raw_submission_origins, list)
+                    or not raw_submission_origins
+                    or len(raw_submission_origins) > 9
+                    or raw_submission_origins[0] != origin
+                ):
+                    return _err(
+                        "The pending MFA continuation has an invalid submission-origin contract."
+                    )
+                submission_origins = _browser_submission_origin_allowlist(
+                    workspace, origin, raw_submission_origins[1:]
+                )
+                if tuple(raw_submission_origins) != submission_origins:
+                    return _err(
+                        "The pending MFA continuation has an invalid submission-origin contract."
+                    )
+                final_otp_submission_url, _unused_preflight_urls = (
+                    _browser_submission_endpoint_contract(
+                        workspace,
+                        submission_origins,
+                        otp_submission_url,
+                        [],
+                    )
+                )
                 selected_otp = override_otp or str(
                     pending.get("otp_selector") or ""
                 )
@@ -7008,11 +8397,18 @@ def credential_browser_step_up(
                 )
                 return _credential_browser_step_up_locked(
                     workspace, credential=credential, code=code,
-                    code_secrets=code_secrets, password=password,
-                    password_secrets=password_secrets, pending=pending, profile=profile,
+                    code_secrets=code_secrets,
+                    code_match_values=code_match_values,
+                    password=password,
+                    password_secrets=password_secrets,
+                    password_match_values=password_match_values,
+                    pending=pending, profile=profile,
                     profile_revision=revision, otp_selector=selected_otp,
                     submit_selector=selected_submit,
                     password_submit_selector=override_password_submit,
+                    post_otp_stages=onboarding_stages,
+                    submission_origins=submission_origins,
+                    otp_submission_url=final_otp_submission_url,
                     timeout=timeout,
                     continuation_observation=_continuation_observation,
                 )
@@ -7026,14 +8422,19 @@ def _credential_browser_step_up_locked(
     credential: str,
     code: str,
     code_secrets: tuple[str, ...],
+    code_match_values: tuple[str, ...],
     password: str,
     password_secrets: tuple[str, ...],
+    password_match_values: tuple[str, ...],
     pending: dict,
     profile: dict,
     profile_revision: str,
     otp_selector: str,
     submit_selector: str,
     password_submit_selector: str,
+    post_otp_stages: list[dict[str, object]],
+    submission_origins: tuple[str, ...],
+    otp_submission_url: str,
     timeout: int,
     continuation_observation: Optional[dict] = None,
 ) -> dict:
@@ -7074,24 +8475,72 @@ def _credential_browser_step_up_locked(
     failure = ""
     submitted = 0
     password_submitted = 0
+    onboarding_submissions: list[int] = []
+    onboarding_blocked_duplicates: list[int] = []
+    onboarding_completed = 0
     blocked_duplicates = 0
     password_blocked_duplicates = 0
     password_stage = False
     continuation_reserved = False
+    continuation_snapshot: Optional[tuple[bool, bytes, int]] = None
     fields_used = 0
     context = None
     submission_state = {
         "active": False,
-        "username_values": code_secrets,
-        "password_values": code_secrets,
+        "username_values": code_match_values,
+        "password_values": code_match_values,
         "seen": 0,
         "blocked": 0,
+        "block_all_until_submission": False,
+        "block_before_active": True,
+        "blocked_before_active": 0,
+        "blocked_retired": 0,
+        "retired_matchers": [],
+        "reject_unsupported": True,
+        "submission_url": otp_submission_url,
+        "primary_origin_only": False,
     }
+    protected_auth_matchers: list[dict[str, tuple[str, ...]]] = []
+
+    def retain_auth_matchers() -> None:
+        """Keep OTP/password matchers denied through every onboarding stage."""
+        combined = [
+            *protected_auth_matchers,
+            *(submission_state.get("retired_matchers") or ()),
+        ]
+        unique: list[dict[str, tuple[str, ...]]] = []
+        seen: set[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = set()
+        for matcher in combined:
+            key = (
+                tuple(matcher.get("username_values") or ()),
+                tuple(matcher.get("password_values") or ()),
+                tuple(matcher.get("ordered_digit_values") or ()),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append({
+                "username_values": key[0],
+                "password_values": key[1],
+                "ordered_digit_values": key[2],
+            })
+        submission_state["retired_matchers"] = unique
+
     verify_header_state = {
         "active": False, "origin": origin, "headers": verify_headers,
     }
+    onboarding_values = tuple(
+        value
+        for stage in post_otp_stages
+        for value in (stage.get("fields") or {}).values()
+        if isinstance(value, str) and value
+    )
     runtime_secrets = tuple(sorted(
-        {*code_secrets, *password_secrets}, key=len, reverse=True
+        {
+            *code_secrets, *password_secrets,
+            *_serialized_secret_variants(onboarding_values),
+        },
+        key=len, reverse=True,
     ))
 
     try:
@@ -7101,6 +8550,8 @@ def _credential_browser_step_up_locked(
                     playwright, launch_profile, workspace, denied_requests,
                     bound_header_state=verify_header_state,
                     credential_submission_state=submission_state,
+                    credential_submission_origins=submission_origins,
+                    credential_submission_url=otp_submission_url,
                     exact_origin=origin,
                 )
                 if pending.get("cookies"):
@@ -7122,6 +8573,16 @@ def _credential_browser_step_up_locked(
                 input_control, fields_used = _browser_step_up_input(
                     page, otp_selector, code, timeout_ms, fill=False
                 )
+                submission_state["ordered_digit_values"] = (
+                    _browser_split_code_values(code, fields_used)
+                )
+                protected_auth_matchers.append({
+                    "username_values": tuple(code_match_values),
+                    "password_values": tuple(code_match_values),
+                    "ordered_digit_values": tuple(
+                        submission_state.get("ordered_digit_values") or ()
+                    ),
+                })
                 action = None
                 if submit_selector:
                     action = _browser_auth_locator(
@@ -7131,6 +8592,11 @@ def _credential_browser_step_up_locked(
                 # The reservation is persisted only after the restored page and
                 # controls are known to be usable, immediately before the OTP can
                 # leave this process. A crash after this point must not replay it.
+                continuation_snapshot = _snapshot_private_material(
+                    credentials.pending_browser_step_up_path(
+                        workspace.slug, credential
+                    )
+                )
                 credentials.reserve_pending_browser_step_up(
                     workspace.slug, credential
                 )
@@ -7140,13 +8606,20 @@ def _credential_browser_step_up_locked(
                 capture_session, pending_responses = (
                     _browser_auth_enable_response_capture(
                         context, page, workspace, denied_requests,
-                        code_secrets, code_secrets,
+                        code_match_values, code_match_values,
+                        submission_state.get("ordered_digit_values") or (),
+                        submission_url=otp_submission_url,
+                        reject_submission_redirects=(
+                            len(submission_origins) > 1
+                        ),
                     )
                 )
                 try:
+                    submission_state["block_all_until_submission"] = True
                     submission_state["active"] = True
                     # Re-fill after reservation so an input handler cannot send
-                    # the code before the durable one-shot boundary exists.
+                    # the code before the durable one-shot boundary exists. The
+                    # all-request gate rejects partial per-field transmissions.
                     input_control, fields_used = _browser_step_up_input(
                         page, otp_selector, code, timeout_ms
                     )
@@ -7167,12 +8640,18 @@ def _credential_browser_step_up_locked(
                         page.wait_for_timeout(100)
                 finally:
                     submission_state["active"] = False
+                    # The route commits `seen` immediately before transport.
+                    # Snapshot it even when Playwright raises after that point,
+                    # so a transmitted one-time code can never be restored for
+                    # retry by the outer rollback path.
+                    submitted = int(submission_state["seen"] or 0)
+                    blocked_duplicates = int(
+                        submission_state["blocked"] or 0
+                    )
                     try:
                         capture_session.send("Fetch.disable")
                     except Exception:
                         pass
-                submitted = int(submission_state["seen"] or 0)
-                blocked_duplicates = int(submission_state["blocked"] or 0)
                 if submitted != 1 or blocked_duplicates:
                     failure = "Exactly one OTP submission request was not observed."
                 _, raw_bodies, response_statuses = _browser_auth_collect_responses(
@@ -7186,6 +8665,12 @@ def _credential_browser_step_up_locked(
                     otp_observation,
                 ):
                     failure = "The supplied MFA code was rejected or expired."
+
+                # The declared OTP endpoint is single-stage. Later same-origin
+                # password or onboarding forms must be matched independently,
+                # while any later additional-origin request remains denied.
+                submission_state["submission_url"] = ""
+                submission_state["primary_origin_only"] = True
 
                 # Some staged logins exchange the OTP for a short-lived token,
                 # then reveal the saved-password form in the same browser
@@ -7204,6 +8689,19 @@ def _credential_browser_step_up_locked(
                             break
                     except Exception:
                         pass
+                    first_onboarding_selector = ""
+                    if post_otp_stages:
+                        first_onboarding_selector = next(iter(
+                            post_otp_stages[0].get("fields") or {}
+                        ), "") or str(
+                            post_otp_stages[0].get("submit_selector") or ""
+                        )
+                    if first_onboarding_selector:
+                        try:
+                            if page.locator(first_onboarding_selector).first.is_visible():
+                                break
+                        except Exception:
+                            pass
                     expected = (
                         str(verification.get("expected_post_login_url") or "")
                         if isinstance(verification, dict) else ""
@@ -7226,17 +8724,17 @@ def _credential_browser_step_up_locked(
                             page, password_action_selector, role="submit",
                             timeout_ms=timeout_ms,
                         )
-                    submission_state.update({
-                        "active": False,
-                        "username_values": password_secrets,
-                        "password_values": password_secrets,
-                        "seen": 0,
-                        "blocked": 0,
-                    })
+                    _browser_retarget_submission_state(
+                        submission_state, password_match_values
+                    )
+                    retain_auth_matchers()
                     password_capture, password_responses = (
                         _browser_auth_enable_response_capture(
                             context, page, workspace, denied_requests,
-                            password_secrets, password_secrets,
+                            password_match_values, password_match_values,
+                            reject_submission_redirects=(
+                                len(submission_origins) > 1
+                            ),
                         )
                     )
                     try:
@@ -7278,6 +8776,151 @@ def _credential_browser_step_up_locked(
                     )
                     raw_bodies.extend(password_bodies)
                     response_statuses.extend(password_statuses)
+                    protected_auth_matchers.append({
+                        "username_values": tuple(password_match_values),
+                        "password_values": tuple(password_match_values),
+                        "ordered_digit_values": (),
+                    })
+
+                for stage_index, stage in enumerate(post_otp_stages, 1):
+                    if failure:
+                        break
+                    current_url = str(page.url or "")
+                    allowed, reason = check_url_scope(workspace, current_url)
+                    if (
+                        not allowed
+                        or credentials.normalize_origin(current_url) != origin
+                    ):
+                        raise RuntimeError(
+                            f"Post-OTP stage {stage_index} started outside its "
+                            "exact origin" + (f": {reason}" if reason else "")
+                        )
+                    stage_fields = dict(stage.get("fields") or {})
+                    stage_checkboxes = list(stage.get("checkboxes") or [])
+                    choice_selectors = list(stage.get("choice_selectors") or [])
+                    stage_submit_selector = str(stage["submit_selector"])
+                    action_only = bool(stage.get("action_only"))
+                    if action_only:
+                        _browser_retarget_submission_state(
+                            submission_state, ()
+                        )
+                        retain_auth_matchers()
+                        submission_state["block_all_until_submission"] = False
+                        submission_state["active"] = False
+                        stage_action = _browser_auth_locator(
+                            page, stage_submit_selector, role="submit",
+                            timeout_ms=timeout_ms,
+                        )
+                        _browser_auth_wait_for_submit(
+                            page, stage_action, timeout_ms
+                        )
+                        stage_action.click(timeout=timeout_ms)
+                        page.wait_for_timeout(500)
+                        onboarding_submissions.append(0)
+                        onboarding_blocked_duplicates.append(0)
+                        stage_bodies: list[str] = []
+                        stage_statuses: list[int] = []
+                    else:
+                        _browser_auth_fill_registration_controls(
+                            page, stage_fields, stage_checkboxes,
+                            timeout_ms=timeout_ms, fill=False,
+                        )
+                    stage_values = tuple(dict.fromkeys(
+                        value for value in stage_fields.values() if value
+                    ))
+                    if not action_only:
+                        _browser_retarget_submission_state(
+                            submission_state, stage_values
+                        )
+                        if len(stage_values) > 1:
+                            # Requiring values from both sets prevents a per-field
+                            # input handler from being mistaken for the full form.
+                            submission_state["username_values"] = (
+                                stage_values[0],
+                            )
+                            submission_state["password_values"] = stage_values[1:]
+                        retain_auth_matchers()
+                        stage_capture, stage_responses = (
+                            _browser_auth_enable_response_capture(
+                                context, page, workspace, denied_requests,
+                                submission_state["username_values"],
+                                submission_state["password_values"],
+                                reject_submission_redirects=(
+                                    len(submission_origins) > 1
+                                ),
+                            )
+                        )
+                        try:
+                            _browser_auth_fill_registration_controls(
+                                page, stage_fields, stage_checkboxes,
+                                timeout_ms=timeout_ms,
+                            )
+                            for choice_selector in choice_selectors:
+                                _browser_post_otp_choice(
+                                    page, choice_selector, timeout_ms
+                                )
+                            stage_action = _browser_auth_locator(
+                                page, stage_submit_selector, role="submit",
+                                timeout_ms=timeout_ms,
+                            )
+                            page.wait_for_timeout(100)
+                            _browser_auth_wait_for_submit(
+                                page, stage_action, timeout_ms
+                            )
+                            submission_state["active"] = True
+                            stage_action.click(timeout=timeout_ms)
+                            deadline = time.monotonic() + timeout_seconds
+                            while time.monotonic() < deadline:
+                                if submission_state["seen"]:
+                                    page.wait_for_timeout(500)
+                                    break
+                                page.wait_for_timeout(100)
+                        finally:
+                            submission_state["active"] = False
+                            try:
+                                stage_capture.send("Fetch.disable")
+                            except Exception:
+                                pass
+                        stage_submitted = int(submission_state["seen"] or 0)
+                        stage_blocked = int(submission_state["blocked"] or 0)
+                        onboarding_submissions.append(stage_submitted)
+                        onboarding_blocked_duplicates.append(stage_blocked)
+                        if stage_submitted != 1 or stage_blocked:
+                            failure = (
+                                f"Exactly one post-OTP stage {stage_index} "
+                                "submission request was not observed."
+                            )
+                        _, stage_bodies, stage_statuses = (
+                            _browser_auth_collect_responses(
+                                stage_responses, workspace, runtime_secrets
+                            )
+                        )
+                    raw_bodies.extend(stage_bodies)
+                    response_statuses.extend(stage_statuses)
+                    current_url, stage_dom, stage_visible = (
+                        _browser_auth_snapshot(page)
+                    )
+                    allowed, reason = check_url_scope(workspace, current_url)
+                    if (
+                        not allowed
+                        or credentials.normalize_origin(current_url) != origin
+                    ):
+                        raise RuntimeError(
+                            f"Post-OTP stage {stage_index} ended outside its exact "
+                            "origin" + (f": {reason}" if reason else "")
+                        )
+                    stage_blocker = _browser_auth_blocker(
+                        "\n".join(stage_bodies), stage_statuses
+                    ) or _browser_auth_blocker(stage_visible)
+                    if _browser_auth_captcha_markup(stage_dom):
+                        stage_blocker = "CAPTCHA challenge was presented"
+                    if stage_blocker:
+                        failure = (
+                            f"Post-OTP stage {stage_index} was blocked: "
+                            + stage_blocker + "."
+                        )
+                    if not failure:
+                        onboarding_completed += 1
 
                 post_submit_url, _, visible = _browser_auth_snapshot(page)
                 allowed, reason = check_url_scope(workspace, post_submit_url)
@@ -7333,7 +8976,7 @@ def _credential_browser_step_up_locked(
                 ]
                 if any(
                     secret and secret in value
-                    for secret in code_secrets for value in private_values
+                    for secret in code_match_values for value in private_values
                 ):
                     failure = "The application retained the OTP in browser session material."
                 if not failure and reusable:
@@ -7390,13 +9033,34 @@ def _credential_browser_step_up_locked(
             except Exception:
                 pass
 
+    if (
+        continuation_reserved
+        and submitted == 0
+        and continuation_snapshot is not None
+    ):
+        try:
+            _restore_private_material(
+                credentials.pending_browser_step_up_path(
+                    workspace.slug, credential
+                ),
+                continuation_snapshot,
+            )
+            continuation_reserved = False
+            if isinstance(continuation_observation, dict):
+                continuation_observation["reserved"] = False
+        except (OSError, credentials.CredentialError) as exc:
+            failure = failure or (
+                "Unsubmitted MFA continuation reservation could not be released: "
+                + _browser_safe_error(exc, runtime_secrets)
+            )
+
     final_private_values = [
         *(str(cookie.get("value") or "") for cookie in cookies),
         *local_storage.values(), *session_storage.values(), *tokens.values(),
     ]
     if any(
         secret and secret in value
-        for secret in code_secrets for value in final_private_values
+        for secret in code_match_values for value in final_private_values
     ):
         failure = "The application retained the OTP in browser session material."
 
@@ -7505,6 +9169,12 @@ def _credential_browser_step_up_locked(
         "password_stage": password_stage,
         "password_submission_requests": password_submitted,
         "blocked_duplicate_password_submissions": password_blocked_duplicates,
+        "post_otp_stages_requested": len(post_otp_stages),
+        "post_otp_stages_completed": onboarding_completed,
+        "post_otp_stage_submission_requests": onboarding_submissions,
+        "blocked_duplicate_post_otp_submissions": (
+            onboarding_blocked_duplicates
+        ),
         "verify_status": verify_status,
         "replay_status": replay_status,
         "control_status": control_status,
