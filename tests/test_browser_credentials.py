@@ -93,12 +93,17 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                   const stage = sessionStorage.getItem('stage') || 'phone';
                   if (stage === 'phone') {
                     app.innerHTML = `<form id="phone-form"><input id="phone_number">
+                      <input id="terms" type="checkbox"><input id="privacy" type="checkbox">
+                      <input id="updates" type="checkbox">
                       <button id="submit-btn" type="submit">Send code</button></form>`;
                     document.getElementById('phone-form').onsubmit = async (event) => {
                       event.preventDefault();
                       const response = await fetch('/api/send-otp', {method:'POST',
                         headers:{'Content-Type':'application/json'}, body:JSON.stringify({
                           phone_number:document.getElementById('phone_number').value,
+                          terms:document.getElementById('terms').checked,
+                          privacy:document.getElementById('privacy').checked,
+                          updates:document.getElementById('updates').checked,
                           anonymous_id:sessionStorage.getItem('anonymous_id')})});
                       if (response.ok) { sessionStorage.setItem('stage','otp'); render(); }
                     };
@@ -321,7 +326,11 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
             if self.path == "/api/send-otp":
                 type(self).login_posts += 1
                 self._json(
-                    202 if value.get("phone_number") == "09123456789" else 400,
+                    202 if (
+                        value.get("phone_number") == "09123456789"
+                        and value.get("terms") is True
+                        and value.get("privacy") is True
+                    ) else 400,
                     {"otp_required": True},
                 )
                 return
@@ -2458,7 +2467,9 @@ class BrowserCredentialTests(unittest.TestCase):
             credentials.save_auth_profile(ws.slug, "primary", profile)
 
             started = tools.credential_browser_begin_step_up(
-                ws, credential="primary", timeout=10
+                ws, credential="primary",
+                registration_checkboxes=["#terms", "#privacy"],
+                timeout=10,
             )
             self.assertTrue(started["ok"], started)
             self.assertTrue(started["data"]["otp_control_discovered"])
@@ -2502,6 +2513,34 @@ class BrowserCredentialTests(unittest.TestCase):
                             path.read_text(encoding="utf-8", errors="ignore"),
                             path,
                         )
+
+    def test_identifier_otp_registration_preflight_does_not_spend_attempt(self):
+        with isolated_runtime(), spa_auth_server("staged-otp") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            profile = self._status_profile(port)
+            profile["username_transform"] = "stored"
+            profile["browser"].update({
+                "username_selector": "#phone_number",
+                "password_selector": "#password",
+                "submit_selector": "#submit-btn",
+            })
+            profile["browser"]["verification"]["login_status"] = 202
+            credentials.save_auth_profile(ws.slug, "primary", profile)
+
+            result = tools.credential_browser_begin_step_up(
+                ws, credential="primary",
+                registration_fields={"#missing-registration-field": "research"},
+                timeout=5,
+            )
+
+            self.assertFalse(result["ok"], result)
+            self.assertEqual(
+                credentials.session_status(ws.slug, "primary")["attempts"], 0
+            )
+            self.assertEqual(_SpaAuthHandler.login_posts, 0)
 
     def test_browser_login_retains_discovered_step_up_for_private_cli(self):
         with isolated_runtime(), spa_auth_server("otp") as port:

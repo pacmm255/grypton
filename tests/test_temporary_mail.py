@@ -132,6 +132,10 @@ class TemporaryMailboxTests(unittest.TestCase):
             ["url", "alias", "verify_url", "success_marker"],
         )
         self.assertNotIn("captcha", json.dumps(signup).lower())
+        self.assertEqual(
+            signup["properties"]["flow"]["enum"],
+            ["one-page", "identifier-otp"],
+        )
 
     def test_signup_delegates_to_single_submission_private_browser_path(self):
         with isolated_runtime():
@@ -168,6 +172,53 @@ class TemporaryMailboxTests(unittest.TestCase):
             self.assertNotIn(record["mailbox_password"], rendered)
             self.assertNotIn(record["bearer_token"], rendered)
             self.assertNotIn(record["target_password"], rendered)
+
+    def test_identifier_otp_signup_saves_profile_and_uses_private_begin_path(self):
+        with isolated_runtime():
+            workspace = authorized_workspace()
+            record = mailbox_record()
+            credentials.save_mailbox(workspace.slug, "signup", record)
+            credentials.save_credential(
+                workspace.slug, "signup", record["address"], record["target_password"]
+            )
+            expected = {"ok": True, "summary": "OTP challenge retained."}
+            with patch(
+                "grypton.toolserver.tools.credential_browser_begin_step_up",
+                return_value=expected,
+            ) as browser:
+                result = dispatch(workspace, "temporary_account_browser_signup", {
+                    "url": "https://app.example.test/signup",
+                    "alias": "signup",
+                    "verify_url": "https://app.example.test/profile",
+                    "success_marker": "Account profile",
+                    "flow": "identifier-otp",
+                    "email_selector": "input[name='email']",
+                    "submit_selector": "form button[type='submit']",
+                    "fields": {"#name": "Grypton Research"},
+                    "checkboxes": ["#terms", "#privacy"],
+                })
+            self.assertEqual(result, expected)
+            called = browser.call_args.kwargs
+            self.assertEqual(called["credential"], "signup")
+            self.assertEqual(called["registration_fields"], {
+                "#name": "Grypton Research",
+            })
+            self.assertEqual(called["registration_checkboxes"], [
+                "#terms", "#privacy",
+            ])
+            profile = credentials.load_auth_profile_optional(
+                workspace.slug, "signup"
+            )
+            self.assertEqual(profile["strategy"], "browser")
+            self.assertEqual(
+                profile["browser"]["username_selector"], "input[name='email']"
+            )
+            rendered = repr(browser.call_args)
+            for private in (
+                record["address"], record["mailbox_password"],
+                record["bearer_token"], record["target_password"],
+            ):
+                self.assertNotIn(private, rendered)
 
     def test_private_otp_continuation_does_not_put_code_in_tool_arguments_or_result(self):
         with isolated_runtime():
@@ -292,6 +343,13 @@ class TemporaryMailboxTests(unittest.TestCase):
                 return controls[selector]
 
         tools._browser_auth_fill_registration_controls(
+            Page(), fields, checkboxes, timeout_ms=5000, fill=False
+        )
+        self.assertFalse(any(
+            action[0] in {"fill", "select", "check"}
+            for control in controls.values() for action in control.actions
+        ))
+        tools._browser_auth_fill_registration_controls(
             Page(), fields, checkboxes, timeout_ms=5000
         )
         self.assertEqual(controls["#name"].actions[-1][0:2], ("fill", "Researcher"))
@@ -300,6 +358,12 @@ class TemporaryMailboxTests(unittest.TestCase):
             ("select", {"value": "free", "timeout": 5000}),
         )
         self.assertEqual(controls["#terms"].actions[-1][0], "check")
+        self.assertTrue(tools._browser_auth_captcha_markup(
+            '<script src="https://www.google.com/recaptcha/api.js"></script>'
+        ))
+        self.assertFalse(tools._browser_auth_captcha_markup(
+            '<p>Our privacy policy discusses CAPTCHA protection.</p>'
+        ))
 
     def test_policy_denial_happens_before_any_provider_request(self):
         with isolated_runtime():
@@ -434,6 +498,7 @@ class TemporaryMailboxTests(unittest.TestCase):
             self.assertFalse(first["data"]["reused"])
             self.assertEqual(first["data"]["credential"], "signup")
             serialized = json.dumps(first)
+            self.assertNotIn(calls[1][2]["address"], serialized)
             self.assertNotIn("provider-token-never-log", serialized)
             self.assertNotIn(calls[1][2]["password"], serialized)
 
@@ -450,7 +515,7 @@ class TemporaryMailboxTests(unittest.TestCase):
                           credentials.provider_redaction_values(workspace.slug))
             self.assertEqual(
                 temporary_mail.resolve_address(workspace.slug, "signup"),
-                first["data"]["address"],
+                record["address"],
             )
 
             with patch("grypton.temporary_mail._request_json") as request:
@@ -459,12 +524,12 @@ class TemporaryMailboxTests(unittest.TestCase):
                 )
             self.assertTrue(second["ok"])
             self.assertTrue(second["data"]["reused"])
-            self.assertEqual(second["data"]["address"], first["data"]["address"])
+            self.assertNotIn("address", second["data"])
             request.assert_not_called()
 
             audit = (workspace.root / ".ledger/tool-calls.jsonl").read_text()
             for private in (
-                record["mailbox_password"], record["bearer_token"],
+                record["address"], record["mailbox_password"], record["bearer_token"],
                 record["target_password"],
             ):
                 self.assertNotIn(private, audit)

@@ -211,8 +211,53 @@ def _temporary_account_browser_signup(ws, args):
     alias = args.get("alias", "")
     try:
         temporary_mail.require_mailbox(ws, alias)
+        flow = str(args.get("flow") or "one-page")
+        if flow not in {"one-page", "identifier-otp"}:
+            return {
+                "ok": False,
+                "summary": "Temporary account signup flow must be one-page or identifier-otp.",
+            }
+        profile = credentials.validate_auth_profile({
+            "version": 1,
+            "strategy": "browser",
+            "login_url": args.get("url", ""),
+            "verify_url": args.get("verify_url", ""),
+            "success_marker": args.get("success_marker", ""),
+            "username_transform": "stored",
+            "timeout": args.get("timeout", 45),
+            "browser": {
+                "username_selector": args.get(
+                    "email_selector", "input[type='email']"
+                ),
+                "password_selector": args.get(
+                    "password_selector", "input[type='password']"
+                ),
+                "submit_selector": args.get(
+                    "submit_selector", "button[type='submit']"
+                ),
+                "verify_headers": {},
+            },
+        })
+        existing = credentials.load_auth_profile_optional(ws.slug, alias)
+        if existing is None:
+            credentials.save_auth_profile(ws.slug, alias, profile)
+        elif existing != profile:
+            return {
+                "ok": False,
+                "summary": (
+                    "The paired credential already has a different browser "
+                    "authentication profile; replace or clear it explicitly."
+                ),
+            }
     except (temporary_mail.TemporaryMailboxError, credentials.CredentialError) as exc:
         return {"ok": False, "summary": str(exc)}
+    if flow == "identifier-otp":
+        return tools.credential_browser_begin_step_up(
+            ws, credential=alias,
+            registration_fields=args.get("fields"),
+            registration_checkboxes=args.get("checkboxes"),
+            timeout=args.get("timeout", 45),
+        )
     return tools.credential_browser_login(
         ws, args.get("url", ""), credential=alias,
         username_selector=args.get("email_selector", "input[type='email']"),
@@ -726,12 +771,16 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
             "timeout": {"type": "integer", "minimum": 1, "maximum": 120},
         }, ("alias", "kind")), _temporary_mailbox_poll),
     "temporary_account_browser_signup": (
-        "Submit one policy-permitted browser signup with a paired private mailbox credential.",
+        "Submit one policy-permitted browser signup with a paired private mailbox credential; identifier-otp retains the email-code challenge privately.",
         _object({
             "url": _string("In-scope signup page"),
             "alias": _string("Paired mailbox and target credential alias"),
             "verify_url": _string("Scoped same-origin page that proves the session"),
             "success_marker": _string("Exact non-secret authenticated marker"),
+            "flow": {
+                "type": "string", "enum": ["one-page", "identifier-otp"],
+                "description": "One-page email/password form or email-first OTP flow",
+            },
             "email_selector": _string("Email input CSS selector"),
             "password_selector": _string("Password input CSS selector"),
             "submit_selector": _string("Signup submit CSS selector"),

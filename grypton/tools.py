@@ -3314,6 +3314,19 @@ def _browser_auth_blocker(text: str, statuses: Iterable[int] = ()) -> str:
     return ""
 
 
+def _browser_auth_captcha_markup(rendered_dom: str) -> bool:
+    """Recognize an actually rendered CAPTCHA integration before secrets leave."""
+    source = str(rendered_dom or "")[:MAX_RESPONSE_BYTES]
+    return bool(re.search(
+        r'''(?isx)<(?:script|iframe|div|input|button)\b[^>]{0,2000}(?:
+            g-recaptcha|g-recaptcha-response|recaptcha/api(?:2)?\.js|
+            h-captcha|hcaptcha\.com/1/api\.js|cf-turnstile|
+            challenges\.cloudflare\.com/turnstile
+        )''',
+        source,
+    ))
+
+
 def _browser_auth_locator(page, selector: str, *, role: str, timeout_ms: int):
     locator = page.locator(selector).first
     locator.wait_for(state="visible", timeout=timeout_ms)
@@ -3381,8 +3394,9 @@ def _browser_auth_registration_controls(
 
 def _browser_auth_fill_registration_controls(
     page, fields: dict[str, str], checkbox_selectors: list[str], *, timeout_ms: int,
+    fill: bool = True,
 ) -> None:
-    """Fill ordinary text/select controls and affirm listed checkboxes only."""
+    """Validate, then optionally fill ordinary signup controls."""
     for selector, value in fields.items():
         locator = page.locator(selector).first
         locator.wait_for(state="visible", timeout=timeout_ms)
@@ -3396,14 +3410,16 @@ def _browser_auth_fill_registration_controls(
         if bool((details or {}).get("disabled")):
             raise ValueError("signup field control is disabled")
         if tag == "select":
-            locator.select_option(value=value, timeout=timeout_ms)
+            if fill:
+                locator.select_option(value=value, timeout=timeout_ms)
         elif tag == "textarea" or (
             tag == "input" and input_type in {
                 "", "text", "email", "tel", "number", "search", "url",
                 "date", "datetime-local", "month", "time", "week",
             }
         ):
-            locator.fill(value, timeout=timeout_ms)
+            if fill:
+                locator.fill(value, timeout=timeout_ms)
         else:
             raise ValueError(
                 "signup field selector did not resolve to a text or select control"
@@ -3424,7 +3440,8 @@ def _browser_auth_fill_registration_controls(
             raise ValueError(
                 "signup checkbox selector did not resolve to an enabled checkbox"
             )
-        locator.check(timeout=timeout_ms)
+        if fill:
+            locator.check(timeout=timeout_ms)
 
 
 def _browser_auth_wait_for_submit(page, locator, timeout_ms: int) -> None:
@@ -6475,6 +6492,8 @@ def credential_browser_begin_step_up(
     workspace: Workspace,
     *,
     credential: str,
+    registration_fields: Optional[dict] = None,
+    registration_checkboxes: Optional[list] = None,
     timeout: int = 45,
 ) -> dict:
     """Send one saved-profile identifier request and retain its MFA page privately."""
@@ -6494,7 +6513,10 @@ def credential_browser_begin_step_up(
                 )
                 return _credential_browser_begin_step_up_locked(
                     workspace, credential=credential, profile=profile,
-                    profile_revision=revision, timeout=timeout,
+                    profile_revision=revision,
+                    registration_fields=registration_fields,
+                    registration_checkboxes=registration_checkboxes,
+                    timeout=timeout,
                 )
     except (ValueError, credentials.CredentialError) as exc:
         return _err(str(exc))
@@ -6502,7 +6524,10 @@ def credential_browser_begin_step_up(
 
 def _credential_browser_begin_step_up_locked(
     workspace: Workspace, *, credential: str, profile: dict,
-    profile_revision: str, timeout: int,
+    profile_revision: str,
+    registration_fields: Optional[dict] = None,
+    registration_checkboxes: Optional[list] = None,
+    timeout: int = 45,
 ) -> dict:
     login_url = str(profile["login_url"])
     blocked = _scope_error(workspace, login_url)
@@ -6521,6 +6546,11 @@ def _credential_browser_begin_step_up_locked(
         submit_selector = _browser_auth_selector(
             profile["browser"].get("submit_selector"),
             label="Submit", default=_BROWSER_SUBMIT_SELECTOR,
+        )
+        registration_fields, registration_checkboxes = (
+            _browser_auth_registration_controls(
+                registration_fields, registration_checkboxes
+            )
         )
     except (ValueError, credentials.CredentialError) as exc:
         return _err(str(exc))
@@ -6554,6 +6584,11 @@ def _credential_browser_begin_step_up_locked(
         "otp_selector": "", "otp_fields": 0, "submit_selector": "",
     }
     final_url = login_url
+    rendered_dom = ""
+    response_rows: list[dict] = []
+    raw_bodies: list[str] = []
+    statuses: list[int] = []
+    console: list[dict] = []
     attempt = 0
     failure = ""
     blocker = ""
@@ -6574,13 +6609,34 @@ def _credential_browser_begin_step_up_locked(
                     exact_origin=origin,
                 )
                 page = context.new_page()
+                page.on("console", lambda message: console.append({
+                    "type": str(message.type), "text": str(message.text)[:4000],
+                }) if len(console) < 100 else None)
                 page.goto(login_url, wait_until="commit", timeout=timeout_ms)
                 page.wait_for_timeout(250)
+                final_url, rendered_dom, visible = _browser_auth_snapshot(page)
+                if credentials.normalize_origin(final_url) != origin:
+                    raise RuntimeError("signup page ended outside the login origin")
+                initial_blocker = _browser_auth_blocker(visible)
+                if initial_blocker.startswith(("MFA/OTP", "CAPTCHA")):
+                    blocker = initial_blocker
+                    raise ValueError(blocker)
+                if _browser_auth_captcha_markup(rendered_dom):
+                    blocker = "CAPTCHA challenge was presented"
+                    raise ValueError(blocker)
                 username_control = _browser_auth_locator(
                     page, username_selector, role="username", timeout_ms=timeout_ms
                 )
                 submit_control = _browser_auth_locator(
                     page, submit_selector, role="submit", timeout_ms=timeout_ms
+                )
+                # Validate every operator-supplied control while no account
+                # attempt is reserved and before the private identifier can
+                # enter the renderer. This keeps selector/form mistakes
+                # retryable without spending the durable one-shot boundary.
+                _browser_auth_fill_registration_controls(
+                    page, registration_fields, registration_checkboxes,
+                    timeout_ms=timeout_ms, fill=False,
                 )
                 capture_session, pending_responses = (
                     _browser_auth_enable_response_capture(
@@ -6589,6 +6645,10 @@ def _credential_browser_begin_step_up_locked(
                     )
                 )
                 try:
+                    _browser_auth_fill_registration_controls(
+                        page, registration_fields, registration_checkboxes,
+                        timeout_ms=timeout_ms,
+                    )
                     attempt = credentials.begin_login_attempt(
                         workspace.slug, credential
                     )
@@ -6613,10 +6673,10 @@ def _credential_browser_begin_step_up_locked(
                         capture_session.send("Fetch.disable")
                     except Exception:
                         pass
-                final_url, _, visible = _browser_auth_snapshot(page)
+                final_url, rendered_dom, visible = _browser_auth_snapshot(page)
                 if credentials.normalize_origin(final_url) != origin:
                     raise RuntimeError("MFA challenge ended outside the login origin")
-                _, raw_bodies, statuses = _browser_auth_collect_responses(
+                response_rows, raw_bodies, statuses = _browser_auth_collect_responses(
                     pending_responses, workspace, username_secrets
                 )
                 blocker = _browser_auth_blocker(
@@ -6653,6 +6713,39 @@ def _credential_browser_begin_step_up_locked(
             except Exception:
                 pass
 
+    runtime_secrets = [*username_secrets, *tokens.values()]
+    runtime_secrets.extend(
+        str(cookie.get("value") or "") for cookie in cookies
+        if str(cookie.get("value") or "")
+    )
+    runtime_secrets.extend(
+        str(value) for area in (local_storage, session_storage)
+        for value in area.values() if isinstance(value, str) and value
+    )
+    capture_secrets = _serialized_secret_variants(runtime_secrets)
+    safe_responses = _browser_redacted_capture_value(
+        response_rows, capture_secrets
+    )
+    html_path = None
+    flow = None
+    try:
+        html_path, flow = _browser_auth_save_capture(
+            workspace, login_url, {
+                "phase": "identifier-otp",
+                "final_url": final_url,
+                "responses": safe_responses,
+                "console": console,
+                "blocked_requests": denied_requests,
+                "auth_blocker": blocker,
+                "failure": failure,
+            }, rendered_dom, capture_secrets,
+        )
+    except OSError as exc:
+        failure = failure or (
+            "Browser signup capture could not be saved: "
+            + _browser_safe_error(exc, capture_secrets)
+        )
+
     pending_saved = False
     if attempt and not failure and blocker.startswith("MFA/OTP"):
         try:
@@ -6686,6 +6779,9 @@ def _credential_browser_begin_step_up_locked(
         "otp_control_discovered": bool(controls.get("otp_selector")),
         "otp_fields": int(controls.get("otp_fields") or 0),
         "action_control_discovered": bool(controls.get("submit_selector")),
+        "login_api_responses": safe_responses,
+        "flow": str(flow) if flow is not None else "",
+        "html_path": str(html_path) if html_path is not None else "",
         "session": credentials.session_status(workspace.slug, credential),
     }
     if pending_saved:

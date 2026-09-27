@@ -236,8 +236,8 @@ def create(workspace: Workspace, alias: str) -> dict:
             return {
                 "ok": True,
                 "summary": f"Temporary mailbox {alias!r} is ready.",
-                "data": {"alias": alias, "address": existing["address"],
-                         "credential": alias, "provider": "mail.tm", "reused": True},
+                "data": {"alias": alias, "credential": alias,
+                         "provider": "mail.tm", "reused": True},
             }
 
         with credentials.session_material_lock(workspace.slug, alias):
@@ -288,7 +288,7 @@ def create(workspace: Workspace, alias: str) -> dict:
         return {
             "ok": True,
             "summary": f"Temporary mailbox {alias!r} was created.",
-            "data": {"alias": alias, "address": address, "credential": alias,
+            "data": {"alias": alias, "credential": alias,
                      "provider": "mail.tm", "reused": False},
         }
 

@@ -880,16 +880,19 @@ not prohibit temporary mail, Grypton makes four additional worker tools
 available:
 
 - `temporary_mailbox_create` creates one [Mail.tm](https://docs.mail.tm/) address and
-  a private target-account credential under the same alias. It returns the
-  address and alias. The generated Mail.tm password, Mail.tm bearer token, and
-  target password never enter the prompt or tool result.
+  a private target-account credential under the same alias. It returns only
+  the alias and provider status. The address, Mail.tm password, Mail.tm bearer
+  token, and target password never enter the prompt or tool result.
 - `temporary_mailbox_poll` returns one requested numeric OTP or one confirmation
   URL. Confirmation URLs must pass the engagement's normal URL-scope check.
   It never returns a message body or attachment.
 - `temporary_account_browser_signup` fills one in-scope signup form with the
   paired private email/password, bounded non-secret text/select fields, and
   explicitly listed checkboxes. It uses the existing single-submission session
-  proof and reports an observed CAPTCHA as a blocker.
+  proof and reports an observed CAPTCHA as a blocker. Set `flow` to
+  `identifier-otp` for an email-first form: Grypton validates the declared
+  fields and checkboxes before reserving an attempt, submits the private email
+  once, and retains the same-origin OTP page for private continuation.
 - `temporary_account_browser_continue` privately polls a numeric email OTP and
   supplies it to one retained browser step-up. The OTP stays out of model
   output and tool arguments; the saved browser profile runs the normal proof.
