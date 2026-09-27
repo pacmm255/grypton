@@ -3753,6 +3753,26 @@ class BrowserCredentialTests(unittest.TestCase):
             finally:
                 browser.close()
 
+    def test_identifier_replay_canonicalizes_implicit_default_https_port(self):
+        body = '{"email":"researcher@example.test"}'
+        fingerprint = tools._browser_identifier_replay_fingerprint(
+            "https://app.example.test/api/send-otp",
+            "POST", body, "application/json; charset=utf-8",
+        )
+
+        self.assertEqual(
+            fingerprint["url"],
+            "https://app.example.test:443/api/send-otp",
+        )
+        self.assertEqual(fingerprint["body_bytes"], len(body.encode()))
+        self.assertEqual(
+            tools._browser_equivalent_endpoint_urls(fingerprint["url"]),
+            (
+                "https://app.example.test:443/api/send-otp",
+                "https://app.example.test/api/send-otp",
+            ),
+        )
+
     def test_step_up_combines_persisted_origin_with_declared_otp_endpoint(self):
         with isolated_runtime(), cross_origin_signup_servers() as ports:
             primary_port, api_port = ports

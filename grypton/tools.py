@@ -3290,8 +3290,6 @@ def _browser_identifier_replay_fingerprint(
         canonical_url = _browser_canonical_submission_endpoint(request_url)
     except ValueError:
         return {}
-    if canonical_url != str(request_url or ""):
-        return {}
     return {
         "url": canonical_url,
         "method": "POST",
@@ -3299,6 +3297,21 @@ def _browser_identifier_replay_fingerprint(
         "body_bytes": len(raw_body),
         "body_sha256": hashlib.sha256(raw_body).hexdigest(),
     }
+
+
+def _browser_equivalent_endpoint_urls(endpoint: str) -> tuple[str, ...]:
+    """Return exact URL spellings a browser may use for one canonical endpoint."""
+    canonical = _browser_canonical_submission_endpoint(endpoint)
+    parsed = urlsplit(canonical)
+    default_port = 443 if parsed.scheme == "https" else 80
+    if parsed.port != default_port:
+        return (canonical,)
+    host = parsed.hostname or ""
+    rendered_host = f"[{host}]" if ":" in host else host
+    implicit_port = urlunsplit((
+        parsed.scheme, rendered_host, parsed.path or "/", "", "",
+    ))
+    return tuple(dict.fromkeys((canonical, implicit_port)))
 
 
 def _browser_submission_endpoint_contract(
@@ -8382,7 +8395,7 @@ def _browser_post_otp_choice(page, selector: str, timeout_ms: int,
 def _browser_reconstruct_identifier_challenge(
     page, context, *, profile: dict, pending: dict, username: str,
     username_match_values: tuple[str, ...], otp_selector: str,
-    timeout_ms: int,
+    timeout_ms: int, submission_state: dict,
 ) -> bool:
     """Rebuild one memory-only OTP screen without resending its identifier."""
     replay = pending.get("identifier_replay")
@@ -8456,9 +8469,14 @@ def _browser_reconstruct_identifier_challenge(
         replay_state["blocked"] += 1
         route.abort("blockedbyclient")
 
-    context.route(replay_url, replay_route)
+    for equivalent_url in _browser_equivalent_endpoint_urls(replay_url):
+        context.route(equivalent_url, replay_route)
+    # Let the ordinary scoped loader finish rendering before closing the
+    # all-request gate. Some SPAs fetch their UI bundle after navigation
+    # commits; arming the gate before these controls exist would deadlock the
+    # page. No private value has entered the renderer at this point.
     _browser_auth_fill_registration_controls(
-        page, {}, checkboxes, timeout_ms=timeout_ms,
+        page, {}, checkboxes, timeout_ms=timeout_ms, fill=False,
     )
     username_control = _browser_auth_locator(
         page, username_selector, role="username", timeout_ms=timeout_ms,
@@ -8466,33 +8484,48 @@ def _browser_reconstruct_identifier_challenge(
     action = _browser_auth_locator(
         page, action_selector, role="submit", timeout_ms=timeout_ms,
     )
-    username_control.fill(username, timeout=timeout_ms)
-    page.wait_for_timeout(100)
-    _browser_auth_wait_for_submit(page, action, timeout_ms)
-    action.click(timeout=timeout_ms)
-    deadline = time.monotonic() + (timeout_ms / 1000)
-    visible_fields = 0
-    while time.monotonic() < deadline:
-        try:
-            locator = page.locator(otp_selector)
-            count = min(int(locator.count()), 13)
-            visible_fields = sum(
-                1 for index in range(count) if locator.nth(index).is_visible()
-            )
-            if visible_fields == expected_fields:
-                break
-        except Exception:
-            visible_fields = 0
+    prior_gate = bool(submission_state.get("block_all_until_submission"))
+    prior_active = bool(submission_state.get("active"))
+    succeeded = False
+    submission_state["block_all_until_submission"] = True
+    submission_state["active"] = False
+    try:
+        _browser_auth_fill_registration_controls(
+            page, {}, checkboxes, timeout_ms=timeout_ms,
+        )
+        username_control.fill(username, timeout=timeout_ms)
         page.wait_for_timeout(100)
-    if replay_state["fulfilled"] != 1 or replay_state["blocked"]:
-        raise ValueError(
-            "The memory-only OTP screen did not consume exactly one local identifier replay."
-        )
-    if visible_fields != expected_fields:
-        raise ValueError(
-            "The restored memory-only OTP controls did not match the saved challenge."
-        )
-    return True
+        _browser_auth_wait_for_submit(page, action, timeout_ms)
+        action.click(timeout=timeout_ms)
+        deadline = time.monotonic() + (timeout_ms / 1000)
+        visible_fields = 0
+        while time.monotonic() < deadline:
+            try:
+                locator = page.locator(otp_selector)
+                count = min(int(locator.count()), 13)
+                visible_fields = sum(
+                    1 for index in range(count)
+                    if locator.nth(index).is_visible()
+                )
+                if visible_fields == expected_fields:
+                    break
+            except Exception:
+                visible_fields = 0
+            page.wait_for_timeout(100)
+        if replay_state["fulfilled"] != 1 or replay_state["blocked"]:
+            raise ValueError(
+                "The memory-only OTP screen did not consume exactly one local identifier replay."
+            )
+        if visible_fields != expected_fields:
+            raise ValueError(
+                "The restored memory-only OTP controls did not match the saved challenge."
+            )
+        succeeded = True
+        return True
+    finally:
+        submission_state["active"] = prior_active
+        if not succeeded:
+            submission_state["block_all_until_submission"] = prior_gate
 
 
 def credential_browser_step_up(
@@ -8814,28 +8847,16 @@ def _credential_browser_step_up_locked(
                         page, otp_selector, code, timeout_ms, fill=False
                     )
                 except Exception:
-                    prior_gate = bool(
-                        submission_state.get("block_all_until_submission")
-                    )
-                    prior_active = bool(submission_state.get("active"))
-                    submission_state["block_all_until_submission"] = True
-                    submission_state["active"] = False
-                    try:
-                        identifier_replay_used = (
-                            _browser_reconstruct_identifier_challenge(
-                                page, context, profile=profile,
-                                pending=pending, username=username,
-                                username_match_values=username_match_values,
-                                otp_selector=otp_selector,
-                                timeout_ms=timeout_ms,
-                            )
+                    identifier_replay_used = (
+                        _browser_reconstruct_identifier_challenge(
+                            page, context, profile=profile,
+                            pending=pending, username=username,
+                            username_match_values=username_match_values,
+                            otp_selector=otp_selector,
+                            timeout_ms=timeout_ms,
+                            submission_state=submission_state,
                         )
-                    finally:
-                        submission_state["active"] = prior_active
-                        if not identifier_replay_used:
-                            submission_state[
-                                "block_all_until_submission"
-                            ] = prior_gate
+                    )
                     if not identifier_replay_used:
                         raise
                     input_control, fields_used = _browser_step_up_input(
