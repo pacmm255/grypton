@@ -3271,6 +3271,36 @@ def _browser_canonical_submission_endpoint(value: object) -> str:
     return origin + (parsed.path or "/")
 
 
+def _browser_identifier_replay_fingerprint(
+    request_url: object, method: object, post_data: object,
+    content_type: object,
+) -> dict[str, object]:
+    """Fingerprint one bounded structured POST without retaining its body."""
+    if str(method or "").upper() != "POST" or not isinstance(post_data, str):
+        return {}
+    media_type = str(content_type or "").split(";", 1)[0].strip().lower()
+    if media_type not in {
+        "application/json", "text/json", "application/x-www-form-urlencoded",
+    }:
+        return {}
+    raw_body = post_data.encode("utf-8")
+    if not 1 <= len(raw_body) <= 65_536:
+        return {}
+    try:
+        canonical_url = _browser_canonical_submission_endpoint(request_url)
+    except ValueError:
+        return {}
+    if canonical_url != str(request_url or ""):
+        return {}
+    return {
+        "url": canonical_url,
+        "method": "POST",
+        "media_type": media_type,
+        "body_bytes": len(raw_body),
+        "body_sha256": hashlib.sha256(raw_body).hexdigest(),
+    }
+
+
 def _browser_submission_endpoint_contract(
     workspace: Workspace, submission_origins: tuple[str, ...],
     final_value: object, preflight_value: object,
@@ -3948,6 +3978,12 @@ def _launch_scoped_browser_context(playwright, launch_profile: dict,
             ):
                 # Commit the one permitted submission only after every request
                 # policy check has passed and immediately before transport.
+                if int(credential_submission_state.get("seen") or 0) == 0:
+                    credential_submission_state["transported_request"] = (
+                        _browser_identifier_replay_fingerprint(
+                            request_url, request_method, post_data, content_type,
+                        )
+                    )
                 credential_submission_state["seen"] = int(
                     credential_submission_state.get("seen") or 0
                 ) + 1
@@ -4402,7 +4438,7 @@ def _browser_auth_discover_step_up_controls(page) -> dict[str, object]:
                       return 0;
                     }
                     const text = (form.innerText || '').toLowerCase();
-                    const challenge = /(?:verification|confirmation|one[- ]?time|otp)\s+(?:code|password|pin)|(?:enter|sent|email)\s+(?:the\s+)?code|код.{0,50}(?:подтверж|письм|почт|вход)|(?:подтверж|письм|почт|вход).{0,50}код/i;
+                    const challenge = /(?:verification|confirmation|one[- ]?time|otp)\s+(?:code|password|pin)|(?:enter|sent|email|inbox|check).{0,50}(?:code|pin)|(?:code|pin).{0,50}(?:sent|email|inbox)|код.{0,50}(?:подтверж|письм|почт|вход)|(?:подтверж|письм|почт|вход).{0,50}код/i;
                     return challenge.test(text) ? fields.length : 0;
                 }""",
                 selector,
@@ -8108,6 +8144,35 @@ def _credential_browser_begin_step_up_locked(
             credentials.record_login_outcome(
                 workspace.slug, credential, blocked_reason=blocker
             )
+            identifier_replay = None
+            if (
+                final_submission_url
+                and int(submission_state["seen"] or 0) == 1
+                and not registration_fields
+                and credentials.normalize_origin(final_submission_url) == origin
+            ):
+                fingerprint = submission_state.get("transported_request")
+                replay_responses = [
+                    row for row in pending_responses
+                    if isinstance(row, dict)
+                    and row.get("matches_submission") is True
+                    and not row.get("error")
+                    and str(row.get("method") or "").upper() == "POST"
+                    and str(row.get("url") or "") == final_submission_url
+                    and int(row.get("status") or 0) == 204
+                    and not str(row.get("body") or "")
+                    and not bool(row.get("body_truncated"))
+                ]
+                if (
+                    isinstance(fingerprint, dict)
+                    and fingerprint
+                    and len(replay_responses) == 1
+                ):
+                    identifier_replay = {
+                        **fingerprint,
+                        "status": 204,
+                        "checkboxes": registration_checkboxes,
+                    }
             credentials.save_pending_browser_step_up(
                 workspace.slug, credential, attempt=attempt, origin=origin,
                 challenge_url=final_url, profile_revision=profile_revision,
@@ -8117,6 +8182,7 @@ def _credential_browser_begin_step_up_locked(
                 otp_fields=int(controls.get("otp_fields") or 0),
                 submit_selector=str(controls.get("submit_selector") or ""),
                 submission_origins=submission_origins or (origin,),
+                identifier_replay=identifier_replay,
             )
             pending_saved = True
         except Exception:
@@ -8313,6 +8379,122 @@ def _browser_post_otp_choice(page, selector: str, timeout_ms: int,
             locator.click(timeout=timeout_ms)
 
 
+def _browser_reconstruct_identifier_challenge(
+    page, context, *, profile: dict, pending: dict, username: str,
+    username_match_values: tuple[str, ...], otp_selector: str,
+    timeout_ms: int,
+) -> bool:
+    """Rebuild one memory-only OTP screen without resending its identifier."""
+    replay = pending.get("identifier_replay")
+    if not isinstance(replay, dict) or not replay:
+        return False
+    replay_url = str(replay.get("url") or "")
+    expected_fingerprint = {
+        key: replay.get(key)
+        for key in (
+            "url", "method", "media_type", "body_bytes", "body_sha256",
+        )
+    }
+    expected_fields = pending.get("otp_fields")
+    if (
+        not replay_url or replay.get("status") != 204
+        or isinstance(expected_fields, bool)
+        or not isinstance(expected_fields, int)
+        or not 1 <= expected_fields <= 12
+    ):
+        raise ValueError("The pending identifier replay contract is invalid.")
+    browser = profile.get("browser") if isinstance(profile.get("browser"), dict) else {}
+    username_selector = _browser_auth_selector(
+        browser.get("username_selector"),
+        label="Username", default=_BROWSER_USERNAME_SELECTOR,
+    )
+    action_selector = _browser_auth_selector(
+        browser.get("submit_selector"),
+        label="Submit", default=_BROWSER_SUBMIT_SELECTOR,
+    )
+    checkboxes = replay.get("checkboxes")
+    if not isinstance(checkboxes, list):
+        raise ValueError("The pending identifier replay contract is invalid.")
+    replay_state = {"fulfilled": 0, "blocked": 0}
+    matcher = {
+        "username_values": tuple(username_match_values),
+        "password_values": tuple(username_match_values),
+        "ordered_digit_values": (),
+    }
+
+    def replay_route(route) -> None:
+        request = route.request
+        method = str(request.method or "").upper()
+        try:
+            headers = dict(request.all_headers() or {})
+        except Exception:
+            headers = dict(request.headers or {})
+        content_type = next((
+            str(value) for key, value in headers.items()
+            if str(key).lower() == "content-type"
+        ), "")
+        actual_fingerprint = _browser_identifier_replay_fingerprint(
+            str(request.url or ""), method, str(request.post_data or ""),
+            content_type,
+        )
+        matches = bool(
+            actual_fingerprint == expected_fingerprint
+            and replay_state["fulfilled"] == 0
+            and _browser_submission_matches(
+                str(request.url or ""), str(request.post_data or ""), matcher,
+                method=method, content_type=content_type,
+            )
+        )
+        if matches:
+            replay_state["fulfilled"] = 1
+            route.fulfill(
+                status=204,
+                headers={"Cache-Control": "no-store"},
+                body="",
+            )
+            return
+        replay_state["blocked"] += 1
+        route.abort("blockedbyclient")
+
+    context.route(replay_url, replay_route)
+    _browser_auth_fill_registration_controls(
+        page, {}, checkboxes, timeout_ms=timeout_ms,
+    )
+    username_control = _browser_auth_locator(
+        page, username_selector, role="username", timeout_ms=timeout_ms,
+    )
+    action = _browser_auth_locator(
+        page, action_selector, role="submit", timeout_ms=timeout_ms,
+    )
+    username_control.fill(username, timeout=timeout_ms)
+    page.wait_for_timeout(100)
+    _browser_auth_wait_for_submit(page, action, timeout_ms)
+    action.click(timeout=timeout_ms)
+    deadline = time.monotonic() + (timeout_ms / 1000)
+    visible_fields = 0
+    while time.monotonic() < deadline:
+        try:
+            locator = page.locator(otp_selector)
+            count = min(int(locator.count()), 13)
+            visible_fields = sum(
+                1 for index in range(count) if locator.nth(index).is_visible()
+            )
+            if visible_fields == expected_fields:
+                break
+        except Exception:
+            visible_fields = 0
+        page.wait_for_timeout(100)
+    if replay_state["fulfilled"] != 1 or replay_state["blocked"]:
+        raise ValueError(
+            "The memory-only OTP screen did not consume exactly one local identifier replay."
+        )
+    if visible_fields != expected_fields:
+        raise ValueError(
+            "The restored memory-only OTP controls did not match the saved challenge."
+        )
+    return True
+
+
 def credential_browser_step_up(
     workspace: Workspace,
     *,
@@ -8360,6 +8542,9 @@ def credential_browser_step_up(
                     "Human MFA continuation requires the saved browser authentication profile."
                 )
             secret = credentials.load_credential(workspace.slug, credential)
+            username = credentials.normalize_login_username(
+                secret["username"], profile["username_transform"]
+            )
             password = secret["password"]
             policy_values = request_policy.all_resolved_secret_values(
                 workspace.slug
@@ -8369,6 +8554,7 @@ def credential_browser_step_up(
                 password, *policy_values,
             ))
             password_match_values = _serialized_secret_variants((password,))
+            username_match_values = _serialized_secret_variants((username,))
             revision = credentials.auth_profile_revision(profile)
             with credentials.session_material_lock(workspace.slug, credential):
                 pending = credentials.load_pending_browser_step_up(
@@ -8449,6 +8635,8 @@ def credential_browser_step_up(
                     password=password,
                     password_secrets=password_secrets,
                     password_match_values=password_match_values,
+                    username=username,
+                    username_match_values=username_match_values,
                     pending=pending, profile=profile,
                     profile_revision=revision, otp_selector=selected_otp,
                     submit_selector=selected_submit,
@@ -8473,6 +8661,8 @@ def _credential_browser_step_up_locked(
     password: str,
     password_secrets: tuple[str, ...],
     password_match_values: tuple[str, ...],
+    username: str,
+    username_match_values: tuple[str, ...],
     pending: dict,
     profile: dict,
     profile_revision: str,
@@ -8529,6 +8719,7 @@ def _credential_browser_step_up_locked(
     password_blocked_duplicates = 0
     password_stage = False
     continuation_reserved = False
+    identifier_replay_used = False
     continuation_snapshot: Optional[tuple[bool, bytes, int]] = None
     fields_used = 0
     context = None
@@ -8585,6 +8776,7 @@ def _credential_browser_step_up_locked(
     runtime_secrets = tuple(sorted(
         {
             *code_secrets, *password_secrets,
+            *username_match_values,
             *_serialized_secret_variants(onboarding_values),
         },
         key=len, reverse=True,
@@ -8617,9 +8809,38 @@ def _credential_browser_step_up_locked(
                         "restored MFA page ended outside its exact origin"
                         + (f": {reason}" if reason else "")
                     )
-                input_control, fields_used = _browser_step_up_input(
-                    page, otp_selector, code, timeout_ms, fill=False
-                )
+                try:
+                    input_control, fields_used = _browser_step_up_input(
+                        page, otp_selector, code, timeout_ms, fill=False
+                    )
+                except Exception:
+                    prior_gate = bool(
+                        submission_state.get("block_all_until_submission")
+                    )
+                    prior_active = bool(submission_state.get("active"))
+                    submission_state["block_all_until_submission"] = True
+                    submission_state["active"] = False
+                    try:
+                        identifier_replay_used = (
+                            _browser_reconstruct_identifier_challenge(
+                                page, context, profile=profile,
+                                pending=pending, username=username,
+                                username_match_values=username_match_values,
+                                otp_selector=otp_selector,
+                                timeout_ms=timeout_ms,
+                            )
+                        )
+                    finally:
+                        submission_state["active"] = prior_active
+                        if not identifier_replay_used:
+                            submission_state[
+                                "block_all_until_submission"
+                            ] = prior_gate
+                    if not identifier_replay_used:
+                        raise
+                    input_control, fields_used = _browser_step_up_input(
+                        page, otp_selector, code, timeout_ms, fill=False
+                    )
                 submission_state["ordered_digit_values"] = (
                     _browser_split_code_values(code, fields_used)
                 )
@@ -9213,6 +9434,7 @@ def _credential_browser_step_up_locked(
         "otp_submission_requests": submitted,
         "blocked_duplicate_submissions": blocked_duplicates,
         "otp_fields": fields_used,
+        "identifier_replay_used": identifier_replay_used,
         "password_stage": password_stage,
         "password_submission_requests": password_submitted,
         "blocked_duplicate_password_submissions": password_blocked_duplicates,

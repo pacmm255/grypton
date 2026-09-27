@@ -102,18 +102,25 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                 "staged-otp-identifier-captcha", "staged-otp-split",
                 "staged-otp-oninput-header", "staged-otp-armed-timer",
                 "staged-otp-partial", "staged-otp-delayed",
-                "staged-otp-onboarding",
+                "staged-otp-onboarding", "staged-otp-memory",
             }:
                 html = b"""<!doctype html><html><body data-captcha-trigger='DYNAMIC'
                   data-otp-transport='SPLIT' data-pre-submit-request='PRE_SUBMIT'
-                  data-post-otp='POST_OTP'>
+                  data-post-otp='POST_OTP' data-stage-storage='STAGE_STORAGE'>
                 <main id='app'></main>
                 <script>
                 const app = document.getElementById('app');
+                let memoryStage = 'phone';
+                const currentStage = () => document.body.dataset.stageStorage === 'memory'
+                  ? memoryStage : (sessionStorage.getItem('stage') || 'phone');
+                const setStage = (value) => {
+                  if (document.body.dataset.stageStorage === 'memory') memoryStage = value;
+                  else sessionStorage.setItem('stage', value);
+                };
                 sessionStorage.setItem('anonymous_id',
                   sessionStorage.getItem('anonymous_id') || 'browser-anonymous-id');
                 function render(challenge = {}) {
-                  const stage = sessionStorage.getItem('stage') || 'phone';
+                  const stage = currentStage();
                   if (stage === 'phone') {
                     app.innerHTML = `<p>Enter your email and we will send a verification code.</p>
                       <form id="phone-form"><input id="phone_number">
@@ -162,10 +169,11 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                           privacy:document.getElementById('privacy').checked,
                           updates:document.getElementById('updates').checked,
                           anonymous_id:sessionStorage.getItem('anonymous_id')})});
-                      if (response.ok) { const value = await response.json();
+                      if (response.ok) { const value = response.status === 204
+                          ? {} : await response.json();
                         console.log(JSON.stringify(value));
                         console.log(value.console_value);
-                        sessionStorage.setItem('stage','otp'); render(value); }
+                        setStage('otp'); render(value); }
                     };
                   } else if (stage === 'otp') {
                     app.innerHTML = `<p>Enter verification code</p><form id="otp-form">
@@ -211,7 +219,7 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                         const response = await fetch('/api/verify-otp', request);
                         if (response.ok) { const value = await response.json();
                           sessionStorage.setItem('verification_token', value.token);
-                          sessionStorage.setItem('stage',
+                          setStage(
                             document.body.dataset.postOtp === 'onboarding'
                               ? 'workspace-intro' : 'password'); render();
                           if (document.body.dataset.otpTransport === 'delayed') {
@@ -225,7 +233,7 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                     app.innerHTML = `<button id="create-workspace" type="button">
                       Create new workspace</button>`;
                     document.getElementById('create-workspace').onclick = () => {
-                      sessionStorage.setItem('stage','workspace'); render();
+                      setStage('workspace'); render();
                     };
                   } else if (stage === 'workspace') {
                     app.innerHTML = `<form id="workspace-form">
@@ -252,7 +260,7 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                         body:JSON.stringify({
                           workspace_name:document.getElementById('workspace-name').value,
                           company_size:document.getElementById('company-size').value})});
-                      if (response.ok) { sessionStorage.setItem('stage','name'); render(); }
+                      if (response.ok) { setStage('name'); render(); }
                     };
                   } else if (stage === 'name') {
                     app.innerHTML = `<form id="name-form">
@@ -268,19 +276,19 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                           first_name:document.getElementById('first-name').value,
                           last_name:document.getElementById('last-name').value,
                           profile_consent:document.getElementById('profile-consent').checked})});
-                      if (response.ok) { sessionStorage.setItem('stage','invite'); render(); }
+                      if (response.ok) { setStage('invite'); render(); }
                     };
                   } else if (stage === 'invite') {
                     app.innerHTML = `<button id="skip-invites" type="button">
                       Skip invitations</button>`;
                     document.getElementById('skip-invites').onclick = () => {
-                      sessionStorage.setItem('stage','support'); render();
+                      setStage('support'); render();
                     };
                   } else if (stage === 'support') {
                     app.innerHTML = `<button id="skip-support" type="button">
                       Skip support setup</button>`;
                     document.getElementById('skip-support').onclick = () => {
-                      sessionStorage.setItem('stage','dashboard');
+                      setStage('dashboard');
                       location.assign('/dashboard');
                     };
                   } else {
@@ -316,7 +324,9 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                 )
                 html = html.replace(
                     b"PRE_SUBMIT",
-                    b"header" if type(self).mode == "staged-otp-oninput-header"
+                    b"header" if type(self).mode in {
+                        "staged-otp-oninput-header", "staged-otp-memory",
+                    }
                     else b"armed-timer" if type(self).mode == "staged-otp-armed-timer"
                     else b"none",
                 )
@@ -324,6 +334,11 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                     b"POST_OTP",
                     b"onboarding"
                     if type(self).mode == "staged-otp-onboarding" else b"password",
+                )
+                html = html.replace(
+                    b"STAGE_STORAGE",
+                    b"memory" if type(self).mode == "staged-otp-memory"
+                    else b"session",
                 )
                 self._send(
                     200, html, content_type="text/html; charset=utf-8",
@@ -507,7 +522,7 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
             "staged-otp-identifier-captcha", "staged-otp-split",
             "staged-otp-oninput-header", "staged-otp-armed-timer",
             "staged-otp-partial", "staged-otp-delayed",
-            "staged-otp-onboarding",
+            "staged-otp-onboarding", "staged-otp-memory",
         } and self.path in {
             "/api/send-otp", "/api/verify-otp", "/api/login-stage",
             "/api/identifier-preflight", "/api/otp-partial",
@@ -531,12 +546,16 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                 value["otp"] = "".join(value.get(f"d{index}", "") for index in range(1, 7))
             if self.path == "/api/send-otp":
                 type(self).login_posts += 1
+                accepted = (
+                    value.get("phone_number") == "09123456789"
+                    and value.get("terms") is True
+                    and value.get("privacy") is True
+                )
+                if type(self).mode == "staged-otp-memory" and accepted:
+                    self._send(204, b"", content_type="application/json")
+                    return
                 self._json(
-                    202 if (
-                        value.get("phone_number") == "09123456789"
-                        and value.get("terms") is True
-                        and value.get("privacy") is True
-                    ) else 400,
+                    202 if accepted else 400,
                     {
                         "otp_required": True,
                         "csrf": type(self).identifier_csrf,
@@ -3589,6 +3608,102 @@ class BrowserCredentialTests(unittest.TestCase):
                             path,
                         )
 
+    def test_memory_only_otp_challenge_is_rebuilt_without_second_identifier_post(self):
+        with isolated_runtime(), spa_auth_server("staged-otp-memory") as port:
+            ws = self._workspace(port)
+            origin = f"http://127.0.0.1:{port}"
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            profile = self._status_profile(port)
+            profile["username_transform"] = "stored"
+            profile["browser"].update({
+                "username_selector": "#phone_number",
+                "password_selector": "#password",
+                "submit_selector": "#submit-btn",
+            })
+            profile["browser"]["verification"]["login_status"] = 204
+            credentials.save_auth_profile(ws.slug, "primary", profile)
+
+            started = tools.credential_browser_begin_step_up(
+                ws, credential="primary",
+                registration_checkboxes=["#terms", "#privacy"],
+                timeout=10,
+                _additional_submission_origins=[],
+                _submission_url=origin + "/api/send-otp",
+            )
+
+            self.assertTrue(started["ok"], started)
+            self.assertEqual(_SpaAuthHandler.login_posts, 1)
+            self.assertEqual(_SpaAuthHandler.identifier_preflight_posts, 0)
+            pending = credentials.load_pending_browser_step_up(
+                ws.slug, "primary"
+            )
+            self.assertEqual(pending["identifier_replay"]["status"], 204)
+            self.assertEqual(
+                pending["identifier_replay"]["url"],
+                origin + "/api/send-otp",
+            )
+            completed = tools.credential_browser_step_up(
+                ws, credential="primary", otp=_SpaAuthHandler.otp,
+                password_submit_selector="#password-submit-btn",
+                otp_submission_url=origin + "/api/verify-otp",
+                timeout=10,
+            )
+
+            self.assertTrue(completed["ok"], completed)
+            self.assertTrue(completed["data"]["identifier_replay_used"])
+            self.assertEqual(_SpaAuthHandler.login_posts, 1)
+            self.assertEqual(_SpaAuthHandler.identifier_preflight_posts, 0)
+            self.assertEqual(_SpaAuthHandler.otp_posts, 1)
+            self.assertEqual(completed["data"]["session"]["attempts"], 1)
+            self.assertTrue(completed["data"]["session"]["established"])
+
+    def test_memory_only_replay_fingerprint_mismatch_never_reposts_identifier(self):
+        with isolated_runtime(), spa_auth_server("staged-otp-memory") as port:
+            ws = self._workspace(port)
+            origin = f"http://127.0.0.1:{port}"
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            profile = self._status_profile(port)
+            profile["username_transform"] = "stored"
+            profile["browser"].update({
+                "username_selector": "#phone_number",
+                "password_selector": "#password",
+                "submit_selector": "#submit-btn",
+            })
+            profile["browser"]["verification"]["login_status"] = 204
+            credentials.save_auth_profile(ws.slug, "primary", profile)
+            started = tools.credential_browser_begin_step_up(
+                ws, credential="primary",
+                registration_checkboxes=["#terms", "#privacy"], timeout=10,
+                _additional_submission_origins=[],
+                _submission_url=origin + "/api/send-otp",
+            )
+            self.assertTrue(started["ok"], started)
+            path = credentials.pending_browser_step_up_path(
+                ws.slug, "primary"
+            )
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record["identifier_replay"]["body_sha256"] = "0" * 64
+            path.write_text(json.dumps(record), encoding="utf-8")
+
+            failed = tools.credential_browser_step_up(
+                ws, credential="primary", otp=_SpaAuthHandler.otp,
+                password_submit_selector="#password-submit-btn",
+                otp_submission_url=origin + "/api/verify-otp", timeout=5,
+            )
+
+            self.assertFalse(failed["ok"], failed)
+            self.assertEqual(_SpaAuthHandler.login_posts, 1)
+            self.assertEqual(_SpaAuthHandler.otp_posts, 0)
+            pending = credentials.load_pending_browser_step_up(
+                ws.slug, "primary"
+            )
+            self.assertTrue(pending["available"])
+            self.assertFalse(pending["reserved"])
+
     def test_discovers_grouped_numeric_otp_without_maxlength(self):
         from playwright.sync_api import sync_playwright
 
@@ -3601,17 +3716,21 @@ class BrowserCredentialTests(unittest.TestCase):
             )
             try:
                 page = browser.new_page()
-                page.set_content(
-                    "<form><p>Enter the verification code</p>" + (
-                        '<input type="text" inputmode="numeric">' * 6
-                    ) + "</form>"
-                )
-                controls = tools._browser_auth_discover_step_up_controls(page)
-                self.assertEqual(
-                    controls["otp_selector"],
-                    "input[type='text'][inputmode='numeric']",
-                )
-                self.assertEqual(controls["otp_fields"], 6)
+                for challenge_text in (
+                    "Enter the verification code",
+                    "We sent a code to your email",
+                ):
+                    page.set_content(
+                        f"<form><p>{challenge_text}</p>" + (
+                            '<input type="text" inputmode="numeric">' * 6
+                        ) + "</form>"
+                    )
+                    controls = tools._browser_auth_discover_step_up_controls(page)
+                    self.assertEqual(
+                        controls["otp_selector"],
+                        "input[type='text'][inputmode='numeric']",
+                    )
+                    self.assertEqual(controls["otp_fields"], 6)
 
                 page.set_content(
                     '<input type="text" inputmode="numeric" name="company_size">'

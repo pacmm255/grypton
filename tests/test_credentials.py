@@ -1634,6 +1634,93 @@ else:
                 credentials.session_status(target, alias)["attempts"], 1
             )
 
+    def test_pending_browser_step_up_accepts_only_bound_request_fingerprint(self):
+        with isolated_runtime():
+            target, alias = "replay-target", "primary"
+            origin = "https://app.example.test:443"
+            credentials.save_credential(target, alias, "user", "password")
+            attempt = credentials.begin_login_attempt(target, alias)
+            credentials.record_login_outcome(
+                target, alias,
+                blocked_reason="MFA/OTP challenge was presented",
+            )
+            replay = {
+                "url": origin + "/api/send-otp",
+                "status": 204,
+                "method": "POST",
+                "media_type": "application/json",
+                "body_bytes": 48,
+                "body_sha256": "a" * 64,
+                "checkboxes": ["#terms", "#privacy"],
+            }
+            credentials.save_pending_browser_step_up(
+                target, alias, attempt=attempt, origin=origin,
+                challenge_url=origin + "/signup",
+                profile_revision="0123456789ab", cookies=[],
+                local_storage={}, session_storage={}, tokens={},
+                otp_selector="input[inputmode='numeric']", otp_fields=6,
+                submission_origins=[origin], identifier_replay=replay,
+            )
+
+            path = credentials.pending_browser_step_up_path(target, alias)
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            pending = credentials.load_pending_browser_step_up(target, alias)
+            self.assertEqual(pending["identifier_replay"], replay)
+
+            invalid_values = [
+                {**replay, "url": origin + "/api/send-otp?retry=1"},
+                {**replay, "url": "https://other.example.test:443/api/send-otp"},
+                {**replay, "status": True},
+                {**replay, "status": 204.0},
+                {**replay, "method": "GET"},
+                {**replay, "media_type": "text/plain"},
+                {**replay, "body_bytes": True},
+                {**replay, "body_sha256": "A" * 64},
+                {**replay, "extra": "field"},
+            ]
+            for invalid in invalid_values:
+                with self.subTest(invalid=invalid):
+                    with self.assertRaisesRegex(
+                        credentials.CredentialError, "identifier replay"
+                    ):
+                        credentials.save_pending_browser_step_up(
+                            target, alias, attempt=attempt, origin=origin,
+                            challenge_url=origin + "/signup",
+                            profile_revision="0123456789ab", cookies=[],
+                            local_storage={}, session_storage={}, tokens={},
+                            otp_selector="input[inputmode='numeric']",
+                            otp_fields=6, submission_origins=[origin],
+                            identifier_replay=invalid,
+                        )
+
+            other_origin = "https://other.example.test:443"
+            with self.assertRaisesRegex(
+                credentials.CredentialError, "identifier replay"
+            ):
+                credentials.save_pending_browser_step_up(
+                    target, alias, attempt=attempt, origin=origin,
+                    challenge_url=origin + "/signup",
+                    profile_revision="0123456789ab", cookies=[],
+                    local_storage={}, session_storage={}, tokens={},
+                    otp_selector="input[inputmode='numeric']", otp_fields=6,
+                    submission_origins=[origin, other_origin],
+                    identifier_replay={
+                        **replay,
+                        "url": other_origin + "/api/send-otp",
+                    },
+                )
+
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record.pop("identifier_replay")
+            record["local_storage"] = {"anonymous_id": "legacy-state"}
+            path.write_text(json.dumps(record), encoding="utf-8")
+            self.assertEqual(
+                credentials.load_pending_browser_step_up(
+                    target, alias
+                )["identifier_replay"],
+                {},
+            )
+
     def test_cookie_jar_symlink_is_rejected(self):
         with isolated_runtime() as root:
             credentials.save_credential("target", "primary", "u", "p")

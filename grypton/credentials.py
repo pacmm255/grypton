@@ -52,6 +52,9 @@ _BROWSER_STORAGE_MAX_TOTAL_CHARS = 1_000_000
 _BROWSER_STORAGE_MAX_COOKIES = 200
 # Promotion snapshots use the same one-megabyte private-material bound.
 _PENDING_BROWSER_SESSION_MAX_BYTES = 1_000_000
+_PENDING_IDENTIFIER_REPLAY_MEDIA_TYPES = frozenset({
+    "application/json", "text/json", "application/x-www-form-urlencoded",
+})
 
 
 class CredentialError(ValueError):
@@ -1534,12 +1537,91 @@ def _canonical_step_up_submission_origins(
     return output
 
 
+def _canonical_pending_identifier_replay(
+    value: object, *, submission_origins: list[str], optional: bool,
+) -> dict[str, object]:
+    """Validate one private, response-free replay contract."""
+    if value is None or (optional and isinstance(value, dict) and not value):
+        return {}
+    expected = {
+        "url", "status", "method", "media_type", "body_bytes",
+        "body_sha256", "checkboxes",
+    }
+    if not isinstance(value, dict) or set(value) != expected:
+        raise CredentialError(
+            "pending browser step-up identifier replay is invalid"
+        )
+    replay_url = value.get("url")
+    if not isinstance(replay_url, str):
+        raise CredentialError(
+            "pending browser step-up identifier replay is invalid"
+        )
+    try:
+        parsed = urlsplit(replay_url)
+        replay_origin = normalize_origin(replay_url)
+    except (ValueError, CredentialError) as exc:
+        raise CredentialError(
+            "pending browser step-up identifier replay is invalid"
+        ) from exc
+    canonical_url = replay_origin + (parsed.path or "/")
+    status = value.get("status")
+    body_bytes = value.get("body_bytes")
+    media_type = value.get("media_type")
+    body_sha256 = value.get("body_sha256")
+    if (
+        len(replay_url) > 8192
+        or replay_url != canonical_url
+        or not submission_origins or replay_origin != submission_origins[0]
+        or parsed.username is not None or parsed.password is not None
+        or parsed.query or parsed.fragment or parsed.path in {"", "/"}
+        or not isinstance(status, int) or isinstance(status, bool)
+        or status != 204
+        or value.get("method") != "POST"
+        or media_type not in _PENDING_IDENTIFIER_REPLAY_MEDIA_TYPES
+        or isinstance(body_bytes, bool) or not isinstance(body_bytes, int)
+        or not 1 <= body_bytes <= 65_536
+        or not isinstance(body_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", body_sha256) is None
+    ):
+        raise CredentialError(
+            "pending browser step-up identifier replay is invalid"
+        )
+    raw_checkboxes = value.get("checkboxes")
+    if (
+        not isinstance(raw_checkboxes, list)
+        or len(raw_checkboxes) > 10
+        or any(not isinstance(item, str) for item in raw_checkboxes)
+    ):
+        raise CredentialError(
+            "pending browser step-up identifier replay is invalid"
+        )
+    checkboxes = [
+        _step_up_selector(
+            item, label="identifier replay checkbox", optional=False
+        )
+        for item in raw_checkboxes
+    ]
+    if len(set(checkboxes)) != len(checkboxes):
+        raise CredentialError(
+            "pending browser step-up identifier replay is invalid"
+        )
+    return {
+        "url": canonical_url,
+        "status": 204,
+        "method": "POST",
+        "media_type": media_type,
+        "body_bytes": body_bytes,
+        "body_sha256": body_sha256,
+        "checkboxes": checkboxes,
+    }
+
+
 def save_pending_browser_step_up(
     target: str, name: str, *, attempt: int, origin: str,
     challenge_url: str, profile_revision: str, cookies: object,
     local_storage: object, session_storage: object, tokens: object,
     otp_selector: str, otp_fields: int, submit_selector: str = "",
-    submission_origins: object = None,
+    submission_origins: object = None, identifier_replay: object = None,
 ) -> None:
     """Retain one origin-bound MFA continuation without retaining its OTP."""
     alias = _safe_name(name, label="credential name")
@@ -1572,12 +1654,17 @@ def save_pending_browser_step_up(
     allowed_submission_origins = _canonical_step_up_submission_origins(
         submission_origins, primary_origin=str(canonical["origin"])
     )
+    replay = _canonical_pending_identifier_replay(
+        identifier_replay,
+        submission_origins=allowed_submission_origins,
+        optional=True,
+    )
     if isinstance(otp_fields, bool) or not isinstance(otp_fields, int) or not 0 <= otp_fields <= 12:
         raise CredentialError("pending browser step-up field count is invalid")
     safe_tokens = _canonical_pending_tokens(tokens, label="pending browser step-up")
     reusable = bool(
         canonical["cookies"] or canonical["local_storage"]
-        or canonical["session_storage"] or safe_tokens
+        or canonical["session_storage"] or safe_tokens or replay
     )
     if not reusable:
         raise CredentialError("MFA challenge did not expose resumable private browser state")
@@ -1604,6 +1691,7 @@ def save_pending_browser_step_up(
             "otp_fields": otp_fields,
             "submit_selector": action_control,
             "submission_origins": allowed_submission_origins,
+            "identifier_replay": replay,
         }
         if len((json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")) > (
             _PENDING_BROWSER_SESSION_MAX_BYTES
@@ -1659,6 +1747,11 @@ def _load_pending_browser_step_up_unlocked(target: str, name: str) -> dict[str, 
     submission_origins = _canonical_step_up_submission_origins(
         value.get("submission_origins"), primary_origin=origin
     )
+    identifier_replay = _canonical_pending_identifier_replay(
+        value.get("identifier_replay"),
+        submission_origins=submission_origins,
+        optional=True,
+    )
     otp_selector = _step_up_selector(
         value.get("otp_selector"), label="OTP selector", optional=True
     )
@@ -1691,6 +1784,7 @@ def _load_pending_browser_step_up_unlocked(target: str, name: str) -> dict[str, 
         "otp_fields": otp_fields,
         "submit_selector": submit_selector,
         "submission_origins": submission_origins,
+        "identifier_replay": identifier_replay,
     }
 
 
