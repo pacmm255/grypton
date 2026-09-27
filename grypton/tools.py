@@ -752,7 +752,9 @@ def _browser_private_response_values(body: str, headers: dict) -> tuple[str, ...
         "csrf", "csrftoken", "xsrf", "xsrftoken", "session", "sessionid",
         "sessiontoken", "authorization", "authorizationcode", "cookie",
         "cookies", "setcookie", "apikey", "credential", "credentials", "password",
-        "passwd", "oauth", "oauthcode", "code",
+        "passwd", "oauth", "oauthcode", "code", "otp", "otpcode",
+        "verificationcode", "onetimecode", "challenge", "challengeid",
+        "challengeidentifier", "state", "nonce", "transactionid", "flowid",
     }
 
     def key_is_sensitive(key: object) -> bool:
@@ -6495,13 +6497,24 @@ def credential_browser_begin_step_up(
     registration_fields: Optional[dict] = None,
     registration_checkboxes: Optional[list] = None,
     timeout: int = 45,
+    _profile_candidate: Optional[dict] = None,
 ) -> dict:
-    """Send one saved-profile identifier request and retain its MFA page privately."""
+    """Send one profile-bound identifier request and retain its MFA page privately."""
     try:
         with credentials.auth_profile_lock(workspace.slug, credential):
-            profile = credentials.load_auth_profile_optional(
+            existing = credentials.load_auth_profile_optional(
                 workspace.slug, credential
             )
+            candidate = (
+                credentials.validate_auth_profile(_profile_candidate)
+                if _profile_candidate is not None else None
+            )
+            if existing is not None and candidate is not None and existing != candidate:
+                return _err(
+                    "The paired credential already has a different browser "
+                    "authentication profile; replace or clear it explicitly."
+                )
+            profile = existing if existing is not None else candidate
             if not isinstance(profile, dict) or profile.get("strategy") != "browser":
                 return _err(
                     "Starting a browser MFA challenge requires a saved browser authentication profile."
@@ -6517,6 +6530,7 @@ def credential_browser_begin_step_up(
                     registration_fields=registration_fields,
                     registration_checkboxes=registration_checkboxes,
                     timeout=timeout,
+                    profile_to_persist=(profile if existing is None else None),
                 )
     except (ValueError, credentials.CredentialError) as exc:
         return _err(str(exc))
@@ -6528,11 +6542,14 @@ def _credential_browser_begin_step_up_locked(
     registration_fields: Optional[dict] = None,
     registration_checkboxes: Optional[list] = None,
     timeout: int = 45,
+    profile_to_persist: Optional[dict] = None,
 ) -> dict:
     login_url = str(profile["login_url"])
-    blocked = _scope_error(workspace, login_url)
-    if blocked:
-        return blocked
+    verify_url = str(profile["verify_url"])
+    for candidate_url in (login_url, verify_url):
+        blocked = _scope_error(workspace, candidate_url)
+        if blocked:
+            return blocked
     try:
         origin = credentials.normalize_origin(login_url)
         secret = credentials.load_credential(workspace.slug, credential)
@@ -6618,11 +6635,15 @@ def _credential_browser_begin_step_up_locked(
                 if credentials.normalize_origin(final_url) != origin:
                     raise RuntimeError("signup page ended outside the login origin")
                 initial_blocker = _browser_auth_blocker(visible)
-                if initial_blocker.startswith(("MFA/OTP", "CAPTCHA")):
+                if initial_blocker.startswith("CAPTCHA"):
                     blocker = initial_blocker
                     raise ValueError(blocker)
                 if _browser_auth_captcha_markup(rendered_dom):
                     blocker = "CAPTCHA challenge was presented"
+                    raise ValueError(blocker)
+                initial_controls = _browser_auth_discover_step_up_controls(page)
+                if initial_controls["otp_selector"]:
+                    blocker = "MFA/OTP challenge was presented"
                     raise ValueError(blocker)
                 username_control = _browser_auth_locator(
                     page, username_selector, role="username", timeout_ms=timeout_ms
@@ -6649,12 +6670,61 @@ def _credential_browser_begin_step_up_locked(
                         page, registration_fields, registration_checkboxes,
                         timeout_ms=timeout_ms,
                     )
+                    # Input and change handlers can inject a CAPTCHA after the
+                    # initial page snapshot. Give those handlers one event turn,
+                    # then recheck before the private identifier or reservation.
+                    page.wait_for_timeout(250)
+                    final_url, rendered_dom, visible = _browser_auth_snapshot(page)
+                    if credentials.normalize_origin(final_url) != origin:
+                        raise RuntimeError(
+                            "signup page ended outside the login origin during preflight"
+                        )
+                    pre_submit_blocker = _browser_auth_blocker(visible)
+                    if (
+                        pre_submit_blocker.startswith("CAPTCHA")
+                        or _browser_auth_captcha_markup(rendered_dom)
+                    ):
+                        blocker = "CAPTCHA challenge was presented"
+                        raise ValueError(blocker)
+                    pre_submit_controls = _browser_auth_discover_step_up_controls(page)
+                    if pre_submit_controls["otp_selector"]:
+                        blocker = "MFA/OTP challenge was presented"
+                        raise ValueError(blocker)
+                    # Registration handlers may replace form nodes. Re-resolve
+                    # both private-path controls before the profile is durable.
+                    username_control = _browser_auth_locator(
+                        page, username_selector, role="username",
+                        timeout_ms=timeout_ms,
+                    )
+                    submit_control = _browser_auth_locator(
+                        page, submit_selector, role="submit",
+                        timeout_ms=timeout_ms,
+                    )
+                    if profile_to_persist is not None:
+                        credentials.save_auth_profile(
+                            workspace.slug, credential, profile_to_persist
+                        )
                     attempt = credentials.begin_login_attempt(
                         workspace.slug, credential
                     )
                     submission_state["active"] = True
                     username_control.fill(username, timeout=timeout_ms)
                     page.wait_for_timeout(100)
+                    current_url, current_dom, current_visible = (
+                        _browser_auth_snapshot(page)
+                    )
+                    if credentials.normalize_origin(current_url) != origin:
+                        raise RuntimeError(
+                            "signup page ended outside the login origin after "
+                            "identifier entry"
+                        )
+                    identifier_blocker = _browser_auth_blocker(current_visible)
+                    if (
+                        identifier_blocker.startswith("CAPTCHA")
+                        or _browser_auth_captcha_markup(current_dom)
+                    ):
+                        blocker = "CAPTCHA challenge was presented"
+                        raise ValueError(blocker)
                     if not submission_state["seen"]:
                         _browser_auth_wait_for_submit(
                             page, submit_control, timeout_ms
@@ -6702,10 +6772,19 @@ def _credential_browser_begin_step_up_locked(
                 context.close()
                 context = None
     except Exception as exc:
-        failure = failure or (
-            "Browser MFA challenge start failed: "
-            + _browser_safe_error(exc, username_secrets)
-        )
+        if not failure:
+            if blocker:
+                failure = blocker
+            elif attempt:
+                failure = (
+                    "Browser MFA challenge start failed after the identifier "
+                    "entered the protected browser flow."
+                )
+            else:
+                failure = (
+                    "Browser MFA challenge start failed: "
+                    + _browser_safe_error(exc, username_secrets)
+                )
     finally:
         if context is not None:
             try:
@@ -6713,7 +6792,37 @@ def _credential_browser_begin_step_up_locked(
             except Exception:
                 pass
 
-    runtime_secrets = [*username_secrets, *tokens.values()]
+    observed_private_values: list[str] = []
+    identity_sources: list[str] = [rendered_dom]
+    for observed in pending_responses:
+        body = str(observed.get("body") or "")
+        response_url = str(observed.get("url") or "")
+        identity_sources.append(body)
+        observed_private_values.extend(
+            _browser_private_response_values(body, {"Location": response_url})
+        )
+    observed_private_values.extend(
+        _browser_private_response_values(rendered_dom, {"Location": final_url})
+    )
+    for row in console:
+        console_text = str(row.get("text") or "")
+        identity_sources.append(console_text)
+        observed_private_values.extend(
+            _browser_private_response_values(console_text, {})
+        )
+    for denied_url in denied_requests:
+        observed_private_values.extend(
+            _browser_private_response_values("", {"Location": denied_url})
+        )
+
+    raw_identity_values = _browser_identity_values(identity_sources)
+    identity_values = tuple(sorted({
+        *raw_identity_values,
+        *_serialized_secret_variants(raw_identity_values),
+    }, key=len, reverse=True))
+    runtime_secrets = [
+        *username_secrets, *tokens.values(), *observed_private_values,
+    ]
     runtime_secrets.extend(
         str(cookie.get("value") or "") for cookie in cookies
         if str(cookie.get("value") or "")
@@ -6723,22 +6832,30 @@ def _credential_browser_begin_step_up_locked(
         for value in area.values() if isinstance(value, str) and value
     )
     capture_secrets = _serialized_secret_variants(runtime_secrets)
-    safe_responses = _browser_redacted_capture_value(
-        response_rows, capture_secrets
-    )
+    safe_responses = []
+    for row in response_rows:
+        # Identifier responses are observable as routing/status metadata only.
+        # Bodies and response URLs can carry one-use codes or challenge state.
+        safe_responses.append({
+            key: _browser_redacted_capture_value(
+                value, capture_secrets, identity_values
+            )
+            for key, value in row.items()
+            if key in {"phase", "method", "resource_type", "status", "body_truncated"}
+        })
     html_path = None
     flow = None
     try:
         html_path, flow = _browser_auth_save_capture(
             workspace, login_url, {
                 "phase": "identifier-otp",
-                "final_url": final_url,
+                "final_origin": origin,
                 "responses": safe_responses,
-                "console": console,
-                "blocked_requests": denied_requests,
+                "console_event_count": len(console),
+                "blocked_request_count": len(denied_requests),
                 "auth_blocker": blocker,
                 "failure": failure,
-            }, rendered_dom, capture_secrets,
+            }, "", capture_secrets, identity_values,
         )
     except OSError as exc:
         failure = failure or (

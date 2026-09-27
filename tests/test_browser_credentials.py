@@ -48,6 +48,12 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
     token = "browser-token-never-log"
     otp = "839201"
     challenge_session = "browser-challenge-session-never-log"
+    identifier_csrf = "identifier-csrf-never-log"
+    identifier_code = "417263"
+    identifier_challenge = "identifier-challenge-never-log"
+    identifier_opaque = "identifier-opaque-never-log"
+    identifier_dom = "identifier-dom-never-log"
+    identifier_console = "identifier-console-never-log"
     mode = "success"
     login_posts = 0
     verify_requests = 0
@@ -83,19 +89,38 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
             if type(self).mode == "page-denied":
                 self._json(401, {"error": "login page unavailable"})
                 return
-            if type(self).mode == "staged-otp":
-                html = b"""<!doctype html><html><body><main id='app'></main>
+            if type(self).mode in {
+                "staged-otp", "staged-otp-dynamic-captcha",
+                "staged-otp-identifier-captcha",
+            }:
+                html = b"""<!doctype html><html><body data-captcha-trigger='DYNAMIC'>
+                <main id='app'></main>
                 <script>
                 const app = document.getElementById('app');
                 sessionStorage.setItem('anonymous_id',
                   sessionStorage.getItem('anonymous_id') || 'browser-anonymous-id');
-                function render() {
+                function render(challenge = {}) {
                   const stage = sessionStorage.getItem('stage') || 'phone';
                   if (stage === 'phone') {
-                    app.innerHTML = `<form id="phone-form"><input id="phone_number">
+                    app.innerHTML = `<p>Enter your email and we will send a verification code.</p>
+                      <form id="phone-form"><input id="phone_number">
                       <input id="terms" type="checkbox"><input id="privacy" type="checkbox">
                       <input id="updates" type="checkbox">
                       <button id="submit-btn" type="submit">Send code</button></form>`;
+                    document.getElementById('phone_number').oninput = () => {
+                      if (document.body.dataset.captchaTrigger === 'identifier') {
+                        const captcha = document.createElement('div');
+                        captcha.id = 'dynamic-captcha'; captcha.className = 'g-recaptcha';
+                        document.body.appendChild(captcha);
+                      }
+                    };
+                    document.getElementById('privacy').onchange = () => {
+                      if (document.body.dataset.captchaTrigger === 'registration') {
+                        const captcha = document.createElement('div');
+                        captcha.id = 'dynamic-captcha'; captcha.className = 'g-recaptcha';
+                        document.body.appendChild(captcha);
+                      }
+                    };
                     document.getElementById('phone-form').onsubmit = async (event) => {
                       event.preventDefault();
                       const response = await fetch('/api/send-otp', {method:'POST',
@@ -105,13 +130,23 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                           privacy:document.getElementById('privacy').checked,
                           updates:document.getElementById('updates').checked,
                           anonymous_id:sessionStorage.getItem('anonymous_id')})});
-                      if (response.ok) { sessionStorage.setItem('stage','otp'); render(); }
+                      if (response.ok) { const value = await response.json();
+                        console.log(JSON.stringify(value));
+                        console.log(value.console_value);
+                        sessionStorage.setItem('stage','otp'); render(value); }
                     };
                   } else if (stage === 'otp') {
                     app.innerHTML = `<p>Enter verification code</p><form id="otp-form">
                       ${Array.from({length:6}, (_, i) => `<input class="otp__digit"
                         data-index="${i}" inputmode="numeric" maxlength="1">`).join('')}
-                      <input id="otp" type="hidden"></form>`;
+                      <input id="otp" type="hidden">
+                      <input name="csrf" type="hidden" value="${challenge.csrf || ''}">
+                      <input name="challenge_id" type="hidden"
+                        value="${challenge.challenge_id || ''}">
+                      <input name="code" type="hidden" value="${challenge.code || ''}">
+                      <input name="server_context" type="hidden"
+                        value="${challenge.dom_value || ''}">
+                      </form>`;
                     for (const input of document.querySelectorAll('.otp__digit')) {
                       input.oninput = async () => {
                         const otp = Array.from(document.querySelectorAll('.otp__digit'))
@@ -145,6 +180,12 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                 }
                 render();
                 </script></body></html>"""
+                html = html.replace(
+                    b"DYNAMIC",
+                    b"registration" if type(self).mode == "staged-otp-dynamic-captcha"
+                    else b"identifier" if type(self).mode == "staged-otp-identifier-captcha"
+                    else b"none",
+                )
                 self._send(
                     200, html, content_type="text/html; charset=utf-8",
                     cookie=type(self).challenge_session,
@@ -315,7 +356,10 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
         self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        if type(self).mode == "staged-otp" and self.path in {
+        if type(self).mode in {
+            "staged-otp", "staged-otp-dynamic-captcha",
+            "staged-otp-identifier-captcha",
+        } and self.path in {
             "/api/send-otp", "/api/verify-otp", "/api/login-stage",
         }:
             length = int(self.headers.get("Content-Length", "0"))
@@ -331,7 +375,15 @@ class _SpaAuthHandler(BaseHTTPRequestHandler):
                         and value.get("terms") is True
                         and value.get("privacy") is True
                     ) else 400,
-                    {"otp_required": True},
+                    {
+                        "otp_required": True,
+                        "csrf": type(self).identifier_csrf,
+                        "code": type(self).identifier_code,
+                        "challenge_id": type(self).identifier_challenge,
+                        "opaque": type(self).identifier_opaque,
+                        "dom_value": type(self).identifier_dom,
+                        "console_value": type(self).identifier_console,
+                    },
                 )
                 return
             if self.path == "/api/verify-otp":
@@ -2474,6 +2526,26 @@ class BrowserCredentialTests(unittest.TestCase):
             self.assertTrue(started["ok"], started)
             self.assertTrue(started["data"]["otp_control_discovered"])
             self.assertEqual(started["data"]["otp_fields"], 6)
+            for row in started["data"]["login_api_responses"]:
+                self.assertNotIn("body", row)
+                self.assertNotIn("url", row)
+            serialized_started = json.dumps(started)
+            for private in (
+                _SpaAuthHandler.identifier_csrf,
+                _SpaAuthHandler.identifier_code,
+                _SpaAuthHandler.identifier_challenge,
+                _SpaAuthHandler.identifier_opaque,
+                _SpaAuthHandler.identifier_dom,
+                _SpaAuthHandler.identifier_console,
+            ):
+                self.assertNotIn(private, serialized_started)
+                for path in ws.root.rglob("*"):
+                    if path.is_file():
+                        self.assertNotIn(
+                            private,
+                            path.read_text(encoding="utf-8", errors="ignore"),
+                            path,
+                        )
             self.assertEqual(
                 credentials.session_status(ws.slug, "primary")["state"],
                 "step-up-pending",
@@ -2514,7 +2586,7 @@ class BrowserCredentialTests(unittest.TestCase):
                             path,
                         )
 
-    def test_identifier_otp_registration_preflight_does_not_spend_attempt(self):
+    def test_identifier_otp_preflight_defers_profile_and_allows_corrected_retry(self):
         with isolated_runtime(), spa_auth_server("staged-otp") as port:
             ws = self._workspace(port)
             credentials.save_credential(
@@ -2528,18 +2600,99 @@ class BrowserCredentialTests(unittest.TestCase):
                 "submit_selector": "#submit-btn",
             })
             profile["browser"]["verification"]["login_status"] = 202
-            credentials.save_auth_profile(ws.slug, "primary", profile)
-
             result = tools.credential_browser_begin_step_up(
                 ws, credential="primary",
                 registration_fields={"#missing-registration-field": "research"},
                 timeout=5,
+                _profile_candidate=profile,
             )
 
             self.assertFalse(result["ok"], result)
+            self.assertIsNone(
+                credentials.load_auth_profile_optional(ws.slug, "primary")
+            )
             self.assertEqual(
                 credentials.session_status(ws.slug, "primary")["attempts"], 0
             )
+            self.assertEqual(_SpaAuthHandler.login_posts, 0)
+
+            corrected = tools.credential_browser_begin_step_up(
+                ws, credential="primary",
+                registration_checkboxes=["#terms", "#privacy"],
+                timeout=10,
+                _profile_candidate=profile,
+            )
+            self.assertTrue(corrected["ok"], corrected)
+            saved = credentials.load_auth_profile_optional(ws.slug, "primary")
+            self.assertEqual(saved, credentials.validate_auth_profile(profile))
+            pending = credentials.load_pending_browser_step_up(
+                ws.slug, "primary"
+            )
+            self.assertEqual(
+                pending["profile_revision"], credentials.auth_profile_revision(saved)
+            )
+            self.assertEqual(
+                credentials.session_status(ws.slug, "primary")["attempts"], 1
+            )
+            self.assertEqual(_SpaAuthHandler.login_posts, 1)
+
+    def test_identifier_otp_rechecks_dynamic_captcha_before_profile_or_attempt(self):
+        with isolated_runtime(), spa_auth_server("staged-otp-dynamic-captcha") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            profile = self._status_profile(port)
+            profile["username_transform"] = "stored"
+            profile["browser"].update({
+                "username_selector": "#phone_number",
+                "password_selector": "#password",
+                "submit_selector": "#submit-btn",
+            })
+            profile["browser"]["verification"]["login_status"] = 202
+
+            result = tools.credential_browser_begin_step_up(
+                ws, credential="primary",
+                registration_checkboxes=["#terms", "#privacy"],
+                timeout=5,
+                _profile_candidate=profile,
+            )
+
+            self.assertFalse(result["ok"], result)
+            self.assertIn("CAPTCHA", result["summary"])
+            self.assertIsNone(
+                credentials.load_auth_profile_optional(ws.slug, "primary")
+            )
+            self.assertEqual(
+                credentials.session_status(ws.slug, "primary")["attempts"], 0
+            )
+            self.assertEqual(_SpaAuthHandler.login_posts, 0)
+
+    def test_identifier_otp_rechecks_captcha_after_identifier_fill_before_click(self):
+        with isolated_runtime(), spa_auth_server("staged-otp-identifier-captcha") as port:
+            ws = self._workspace(port)
+            credentials.save_credential(
+                ws.slug, "primary", "09123456789", _SpaAuthHandler.password
+            )
+            profile = self._status_profile(port)
+            profile["username_transform"] = "stored"
+            profile["browser"].update({
+                "username_selector": "#phone_number",
+                "password_selector": "#password",
+                "submit_selector": "#submit-btn",
+            })
+            profile["browser"]["verification"]["login_status"] = 202
+
+            result = tools.credential_browser_begin_step_up(
+                ws, credential="primary",
+                registration_checkboxes=["#terms", "#privacy"],
+                timeout=5,
+                _profile_candidate=profile,
+            )
+
+            self.assertFalse(result["ok"], result)
+            self.assertIn("CAPTCHA", result["summary"])
+            self.assertEqual(result["data"]["identifier_submission_requests"], 0)
             self.assertEqual(_SpaAuthHandler.login_posts, 0)
 
     def test_browser_login_retains_discovered_step_up_for_private_cli(self):

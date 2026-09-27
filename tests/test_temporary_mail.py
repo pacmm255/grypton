@@ -173,7 +173,7 @@ class TemporaryMailboxTests(unittest.TestCase):
             self.assertNotIn(record["bearer_token"], rendered)
             self.assertNotIn(record["target_password"], rendered)
 
-    def test_identifier_otp_signup_saves_profile_and_uses_private_begin_path(self):
+    def test_identifier_otp_signup_passes_private_profile_candidate(self):
         with isolated_runtime():
             workspace = authorized_workspace()
             record = mailbox_record()
@@ -206,12 +206,13 @@ class TemporaryMailboxTests(unittest.TestCase):
             self.assertEqual(called["registration_checkboxes"], [
                 "#terms", "#privacy",
             ])
-            profile = credentials.load_auth_profile_optional(
-                workspace.slug, "signup"
-            )
+            profile = called["_profile_candidate"]
             self.assertEqual(profile["strategy"], "browser")
             self.assertEqual(
                 profile["browser"]["username_selector"], "input[name='email']"
+            )
+            self.assertIsNone(
+                credentials.load_auth_profile_optional(workspace.slug, "signup")
             )
             rendered = repr(browser.call_args)
             for private in (
@@ -219,6 +220,32 @@ class TemporaryMailboxTests(unittest.TestCase):
                 record["bearer_token"], record["target_password"],
             ):
                 self.assertNotIn(private, rendered)
+
+    def test_identifier_otp_scope_failure_does_not_persist_profile(self):
+        with isolated_runtime():
+            workspace = authorized_workspace()
+            record = mailbox_record()
+            credentials.save_mailbox(workspace.slug, "signup", record)
+            credentials.save_credential(
+                workspace.slug, "signup", record["address"], record["target_password"]
+            )
+
+            result = dispatch(workspace, "temporary_account_browser_signup", {
+                "url": "https://outside.example/signup",
+                "alias": "signup",
+                "verify_url": "https://outside.example/profile",
+                "success_marker": "Account profile",
+                "flow": "identifier-otp",
+            })
+
+            self.assertFalse(result["ok"], result)
+            self.assertIn("Scope blocked", result["summary"])
+            self.assertIsNone(
+                credentials.load_auth_profile_optional(workspace.slug, "signup")
+            )
+            self.assertEqual(
+                credentials.session_status(workspace.slug, "signup")["attempts"], 0
+            )
 
     def test_private_otp_continuation_does_not_put_code_in_tool_arguments_or_result(self):
         with isolated_runtime():
@@ -647,7 +674,10 @@ class TemporaryMailboxTests(unittest.TestCase):
         base = {
             "id": "mail-policy",
             "data": {
-                "brief": {"description": "When registering for an account, use your email."},
+                "brief": {"description": (
+                    "Researchers may create an account. "
+                    "When registering for an account, use your email."
+                )},
                 "scope": [{
                     "name": "web", "inScope": True, "maxSeverity": "P1",
                     "targets": [{"name": "app", "uri": "https://app.example.test",
@@ -660,6 +690,22 @@ class TemporaryMailboxTests(unittest.TestCase):
             path.write_text(json.dumps(base), encoding="utf-8")
             allowed = analyze_snapshot(path)
             self.assertTrue(allowed["temporary_mail_account_bootstrap_allowed"])
+
+            base["data"]["brief"]["description"] = (
+                "When registering for an account, obtain written authorization "
+                "from support first."
+            )
+            path.write_text(json.dumps(base), encoding="utf-8")
+            conditional = analyze_snapshot(path)
+            self.assertFalse(conditional["self_created_account_permission"])
+            self.assertFalse(
+                conditional["temporary_mail_account_bootstrap_allowed"]
+            )
+
+            base["data"]["brief"]["description"] = (
+                "Researchers may create an account. "
+                "When registering for an account, use your email."
+            )
 
             base["data"]["brief"]["description"] += " Temporary email is not allowed."
             path.write_text(json.dumps(base), encoding="utf-8")

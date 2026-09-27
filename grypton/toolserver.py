@@ -238,17 +238,6 @@ def _temporary_account_browser_signup(ws, args):
                 "verify_headers": {},
             },
         })
-        existing = credentials.load_auth_profile_optional(ws.slug, alias)
-        if existing is None:
-            credentials.save_auth_profile(ws.slug, alias, profile)
-        elif existing != profile:
-            return {
-                "ok": False,
-                "summary": (
-                    "The paired credential already has a different browser "
-                    "authentication profile; replace or clear it explicitly."
-                ),
-            }
     except (temporary_mail.TemporaryMailboxError, credentials.CredentialError) as exc:
         return {"ok": False, "summary": str(exc)}
     if flow == "identifier-otp":
@@ -257,6 +246,7 @@ def _temporary_account_browser_signup(ws, args):
             registration_fields=args.get("fields"),
             registration_checkboxes=args.get("checkboxes"),
             timeout=args.get("timeout", 45),
+            _profile_candidate=profile,
         )
     return tools.credential_browser_login(
         ws, args.get("url", ""), credential=alias,

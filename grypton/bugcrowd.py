@@ -203,7 +203,6 @@ _SELF_CREATED_ACCOUNT_PERMIT = re.compile(
     r"\b(?:you|researchers?|testers?|participants?)\s+"
     r"(?:may|can|are\s+(?:allowed|permitted)\s+to)\s+"
     r"(?:create|register|set\s+up)\b[^.\n]{0,100}\baccounts?\b|"
-    r"\bwhen\s+(?:registering|creating)\s+(?:for\s+)?(?:an?\s+)?(?:test\s+)?account\b|"
     r"\byou\s+may\s+want\s+to\s+set\s+up\s+test\s+accounts?\b|"
     r"\bselect\s+[\"']sign\s+up[\"']|"
     r"(?:^|[.!]\s+)\s*(?:create|set\s+up)\s+(?:a\s+|your\s+own\s+)"
