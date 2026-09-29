@@ -22,7 +22,7 @@ operator / CLI / loopback dashboard
                  |
         +--------+---------+
         |                  |
- zai-coding-plan/...     go/...
+ go/longcat-...          go/muse-spark-...
  or another selected    or another selected
  OpenClaude route       OpenClaude route
 
@@ -51,7 +51,7 @@ The sidecar imports the supported modules from the local checkout at
 its `openclaude.config.json` must be present. `GRYPTON_OPENCLAUDE_HOME` and
 `GRYPTON_OPENCLAUDE_CONFIG` can select different paths.
 
-The default public routes are `zai-coding-plan/glm-5.3` at `max` for Kraude and
+The default public routes are `go/longcat-2.5-preview-free` with reasoning `on` for Kraude and
 `go/muse-spark-1.3-contributor` at `xhigh` for Kryptex. OpenClaude's local
 catalog is the source of truth. Grypton validates availability, effort support,
 and Kraude's tool capability before a real run. Legacy `opencode-go/...` input
@@ -73,11 +73,10 @@ OpenClaude classifies an upstream failure before deciding what can help:
 
 | Upstream result | Action |
 | --- | --- |
-| 401 or 402 | Bench the key and use the next usable key. |
-| 403 identified as data policy, blocked account, credits, quota, or billing | Bench the key and use the next usable key. |
-| Any provider HTTP 429 | Bench the key and use the next usable key once; end the OpenCode process promptly when the pool is exhausted and retry a tool-disabled manager request after the advertised cooldown. |
-| Connection failure, 408, 425, or 5xx | Retry with bounded backoff when the configured retry window permits it. |
-| Invalid request, unknown model, unsupported effort, ordinary permission denial, tool error, or scope denial | Return the error without spending another key. |
+| Any provider HTTP error before successful headers | Advance through the currently usable pool at most once per key. Bench non-recovery failures for a bounded cooldown; preserve prompt-overflow and reasoning-signature recovery responses without marking a key spent. |
+| Connection failure before response headers | Bench that credential briefly and advance to the next usable key. |
+| Successful response headers followed by a body-stream failure | Return the failure without replaying the request on another key. |
+| Local route, effort, tool, scope, or cancellation error | Return the error without starting provider-pool traversal. |
 
 The role gateway keeps its spent-key cooldown state across turns. OpenClaude
 never replays a request after response streaming has begun. This prevents one

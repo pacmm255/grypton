@@ -38,7 +38,7 @@ flowchart LR
 
 | Role | What it does | Model route |
 | --- | --- | --- |
-| **Kraude** | Maps the target, uses the available native and Grypton MCP tools, records evidence, and writes finding candidates. | `zai-coding-plan/glm-5.3` at `max` |
+| **Kraude** | Maps the target, uses the available native and Grypton MCP tools, records evidence, and writes finding candidates. | `go/longcat-2.5-preview-free` with reasoning `on` |
 | **Kryptex** | Manages Kraude, chooses the next useful step, corrects weak work, and handles ordinary blockers. | `go/muse-spark-1.3-contributor` at `xhigh` |
 | **Astra** | Independently reviews serious finding evidence. | `gpt-6-astra` at `max` |
 
@@ -62,9 +62,8 @@ Before a real run, Grypton expects:
   and `/root/open` as its `keyFile`;
 - at least two unique API keys in `/root/open`, one per non-empty line, with
   private file permissions;
-- the `zai-coding-plan` provider configured with its own primary credential
-  and private spare-key file (the bundled config uses
-  `/root/.config/openclaude/zai-coding-plan.keys`);
+- any optional provider selected instead of the defaults configured with its own
+  primary credential and private spare-key file;
 - Codex configured for the independent Astra validator.
 
 Never put a literal API key in Grypton configuration, a command, a report, or
@@ -75,7 +74,7 @@ gateway address and sanitized status events.
 The default role selections are:
 
 ```text
-Kraude   zai-coding-plan/glm-5.3         max
+Kraude   go/longcat-2.5-preview-free      on
 Kryptex  go/muse-spark-1.3-contributor   xhigh
 Astra    gpt-6-astra                      max
 ```
@@ -345,7 +344,7 @@ part of this selection: it stays on direct Codex with `gpt-6-astra` at `max`.
 ./bin/grypton models
 
 # Search route IDs, providers, labels, and models
-./bin/grypton models glm
+./bin/grypton models longcat
 ./bin/grypton models muse
 
 # Include disconnected or unsupported catalog entries when diagnosing
@@ -365,8 +364,8 @@ These commands save private global defaults in `/root/grypton/grypton.json`:
 
 ```bash
 ./bin/grypton models \
-  --set-kraude zai-coding-plan/glm-5.3 \
-  --kraude-effort max
+  --set-kraude go/longcat-2.5-preview-free \
+  --kraude-effort on
 
 ./bin/grypton models \
   --set-kryptex go/muse-spark-1.3-contributor \
@@ -383,8 +382,8 @@ Use role flags with `plan`, `init`, a direct start, or `resume`:
 ```bash
 ./bin/grypton init \
   --target "https://app.example.test" \
-  --kraude-model zai-coding-plan/glm-5.3 \
-  --kraude-effort max \
+  --kraude-model go/longcat-2.5-preview-free \
+  --kraude-effort on \
   --kryptex-model go/muse-spark-1.3-contributor \
   --kryptex-effort xhigh \
   -m "Map the authorized web surface"
@@ -399,8 +398,8 @@ In the interactive console:
 
 ```text
 ❯ /model
-❯ /models glm
-❯ /model kraude zai-coding-plan/glm-5.3 max
+❯ /models longcat
+❯ /model kraude go/longcat-2.5-preview-free on
 ❯ /model kryptex go/muse-spark-1.3-contributor xhigh
 ```
 
@@ -417,20 +416,17 @@ OpenClaude builds each provider's key pool from the configured primary
 credential followed by the lines in its `keyFile`. For the Go plan, that key
 file is `/root/open`. Duplicate keys are removed without printing their values.
 
-OpenClaude automatically moves to the next usable key when the provider answer
-shows a key-specific condition:
+OpenClaude can move to the next currently usable key after any provider HTTP
+error, including 4xx, 429, and 5xx responses. It attempts each usable credential
+at most once for one request. A non-recovery error benches that credential for a
+bounded cooldown; prompt-overflow and reasoning-signature recovery responses are
+preserved without marking the credential as spent. A connection failure before
+response headers can also advance to the next key.
 
-- HTTP 401 or 402;
-- a 403 identified as data-policy, blocked-account, credit, quota, or billing;
-- any HTTP 429 returned by the configured provider.
-
-The failed key enters a cooldown, so later requests do not immediately reuse
-it. Grypton tries each currently usable key at most once for a 429. If every
-key is limited, the current OpenCode process ends promptly with a sanitized
-retry delay. A tool-disabled Kryptex request waits for that delay and retries
-automatically; Kraude follows the detached-run recovery policy below. Temporary
-connection failures and HTTP 408, 425, or 5xx responses are
-retried with bounded delay when the configured retry window permits it.
+If every usable key has a non-recovery failure, the current OpenCode process
+ends promptly with a sanitized retry delay. A tool-disabled Kryptex request
+waits for that delay and retries automatically; Kraude follows the detached-run
+recovery policy below.
 
 When every Kryptex key is cooling down, autonomous direction and operator chat
 wait interruptibly until the earliest key is eligible, then retry the same
@@ -438,10 +434,11 @@ self-contained, tool-disabled request. Repeated exhaustion waits again instead
 of degrading that manager turn. Other provider failures still use the existing
 deterministic direction fallback.
 
-Grypton does not rotate keys for a malformed request, an unknown model, an
-unsupported effort, a tool error, or a scope denial because a different key
-cannot fix those conditions. OpenClaude never replays a request after a
-response has begun. This avoids duplicate tool activity and duplicate probes.
+Errors raised locally before a provider request, such as an unknown model,
+unsupported effort, tool error, scope denial, or client cancellation, do not
+traverse the key pool. After successful response headers arrive, OpenClaude
+never replays the request even if the body stream later fails. This avoids
+duplicate tool activity and duplicate probes.
 Sanitized gateway, request, effort, and rotation notices are written under the
 engagement's `transcripts/` directory; API keys are never written there.
 
@@ -1330,7 +1327,7 @@ Grypton. If you use a different config, export `GRYPTON_OPENCLAUDE_CONFIG`.
 Search the live local catalog instead of guessing a route name:
 
 ```bash
-./bin/grypton models glm
+./bin/grypton models longcat
 ./bin/grypton models muse
 ```
 

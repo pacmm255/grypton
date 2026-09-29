@@ -2282,7 +2282,7 @@ def _supervised_run_options(parser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="grypton",
-        description="Grypton Code: scoped testing with GLM Kraude, Spark Kryptex, and Astra validation.",
+        description="Grypton Code: scoped testing with LongCat Kraude, Spark Kryptex, and Astra validation.",
         epilog=("Claude Code-style shortcuts: `grypton --target HOST \"mission\"`, "
                 "`grypton -p --target HOST \"mission\"`, `grypton -c`, and `grypton -r ENGAGEMENT`."),
     )

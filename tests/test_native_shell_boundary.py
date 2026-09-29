@@ -360,7 +360,8 @@ int main(void) {
             root = Path(raw)
             workspace, transport, runtime = make_workspace(root)
             client = OpenCodeClient(
-                role="worker", route=config.WORKER_MODEL, effort="max",
+                role="worker", route=config.WORKER_MODEL,
+                effort=config.WORKER_EFFORT,
                 workspace=workspace, target_slug="native-config",
                 allow_tools=True, agent_prompt="fixture",
             )
@@ -377,7 +378,11 @@ int main(void) {
                             "baseURL": "http://127.0.0.1:32123/v1",
                             "apiKey": "{env:" + TOKEN_ENV + "}",
                         },
-                        "models": {config.WORKER_MODEL: {"variants": {"max": {}}}},
+                        "models": {
+                            config.WORKER_MODEL: {
+                                "variants": {config.WORKER_EFFORT: {}},
+                            },
+                        },
                     }
                 },
                 environment=lambda: {TOKEN_ENV: "fixture-gateway-token"},

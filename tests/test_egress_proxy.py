@@ -326,7 +326,8 @@ class EgressProxyTests(unittest.TestCase):
         with isolated_runtime():
             workspace = self._workspace("provider-egress")
             client = OpenCodeClient(
-                role="worker", route=config.WORKER_MODEL, effort="max",
+                role="worker", route=config.WORKER_MODEL,
+                effort=config.WORKER_EFFORT,
                 workspace=workspace.root, target_slug=workspace.slug,
                 allow_tools=True, agent_prompt="test",
             )
@@ -359,7 +360,8 @@ class EgressProxyTests(unittest.TestCase):
             with isolated_runtime():
                 workspace = self._workspace("p")
                 client = OpenCodeClient(
-                    role="worker", route=config.WORKER_MODEL, effort="max",
+                    role="worker", route=config.WORKER_MODEL,
+                    effort=config.WORKER_EFFORT,
                     workspace=workspace.root, target_slug=workspace.slug,
                     allow_tools=True, agent_prompt="test",
                 )
@@ -443,7 +445,8 @@ class EgressProxyTests(unittest.TestCase):
             with isolated_runtime():
                 workspace = self._workspace("q")
                 client = OpenCodeClient(
-                    role="worker", route=config.WORKER_MODEL, effort="max",
+                    role="worker", route=config.WORKER_MODEL,
+                    effort=config.WORKER_EFFORT,
                     workspace=workspace.root, target_slug=workspace.slug,
                     allow_tools=True, agent_prompt="test",
                 )

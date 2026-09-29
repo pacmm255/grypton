@@ -1,9 +1,9 @@
 {
   "worker": {
     "runner": "opencode",
-    "provider": "zai-coding-plan",
-    "model": "glm-5.3",
-    "effort": "max",
+    "provider": "go",
+    "model": "longcat-2.5-preview-free",
+    "effort": "on",
     "name": "Kraude"
   },
   "manager": {

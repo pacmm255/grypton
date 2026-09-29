@@ -135,12 +135,12 @@ These commands read the sanitized local catalog and do not start provider
 inference:
 
 ```bash
-./bin/grypton models glm
+./bin/grypton models longcat
 ./bin/grypton models muse
 ./bin/grypton plan \
   --target http://127.0.0.1:18767 \
-  --kraude-model zai-coding-plan/glm-5.3 \
-  --kraude-effort max \
+  --kraude-model go/longcat-2.5-preview-free \
+  --kraude-effort on \
   --kryptex-model go/muse-spark-1.3-contributor \
   --kryptex-effort xhigh \
   -m "Verify model selection only"
@@ -183,15 +183,18 @@ The acceptance conditions are:
   events, provider-call records, or reports;
 - the request is not replayed after any response stream begins.
 
-Repeat classification checks for 401/402, qualifying quota or billing 403,
-and generic 429 results. Verify single-key and multi-key 429 exhaustion ends
-promptly, and that a later request does not revisit a key still in cooldown.
+Repeat traversal checks for representative 400, 401, 402, 403, 429, and 5xx
+provider responses. Verify single-key and multi-key exhaustion ends promptly,
+each currently usable key is attempted at most once, and a later request does
+not revisit a key still in cooldown. Verify prompt-overflow and
+reasoning-signature recovery responses remain intact without benching the key.
 Verify Kryptex skips autonomous provider calls until the sanitized retry delay
 expires, permits exactly one half-open probe, clears the circuit on success or
 model change, and still permits operator chat while the direction circuit is open.
-Separately verify that connection failures and HTTP 408, 425, and 5xx obey the configured retry window. Invalid
-requests, unknown routes, unsupported effort, ordinary permission denials,
-tool errors, and scope denials must not rotate keys.
+Separately verify that a connection failure before response headers can advance
+to another usable key, while a client abort or a body failure after successful
+headers never replays the request. Unknown routes, unsupported effort, tool
+errors, and scope denials occur locally and must not start pool traversal.
 
 ## Optional live provider check
 
@@ -204,8 +207,8 @@ Start the bundled lab, choose the exact routes under review, and limit the run:
 ./bin/grypton init \
   --target http://127.0.0.1:18767 \
   --in-scope 127.0.0.1 \
-  --kraude-model zai-coding-plan/glm-5.3 \
-  --kraude-effort max \
+  --kraude-model go/longcat-2.5-preview-free \
+  --kraude-effort on \
   --kryptex-model go/muse-spark-1.3-contributor \
   --kryptex-effort xhigh \
   --max-turns 1 \
@@ -224,8 +227,8 @@ During a local interactive run:
 
 ```text
 ❯ /model
-❯ /models glm
-❯ /model kraude zai-coding-plan/glm-5.3 max
+❯ /models longcat
+❯ /model kraude go/longcat-2.5-preview-free on
 ❯ /model kryptex go/muse-spark-1.3-contributor xhigh
 ```
 

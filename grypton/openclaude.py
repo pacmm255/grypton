@@ -32,6 +32,7 @@ _ROUTE_ALIASES = {
     "opencode-go/": "go/",
     "opencode/": "zen/",
 }
+_LONGCAT_GO_BASE_URL = "https://opencode.ai/zen/go/v1"
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _ENV_REFERENCE = re.compile(r"^\{env:([A-Za-z_][A-Za-z0-9_]*)\}$")
@@ -257,6 +258,18 @@ def resolve_openclaude_route(route: str) -> str:
 def _effort_levels(value: Mapping[str, Any]) -> tuple[str, ...]:
     effort = value.get("effort") if isinstance(value.get("effort"), Mapping) else {}
     levels = [str(item) for item in (effort.get("levels") or []) if isinstance(item, str)]
+    toggle = effort.get("toggle") if isinstance(effort.get("toggle"), Mapping) else {}
+    parameter = toggle.get("parameter")
+    if (
+        (parameter == "thinking.type" and toggle.get("on") in {"enabled", "adaptive"})
+        or (parameter == "enable_thinking" and toggle.get("on") is True)
+    ):
+        levels.append("on")
+    if (
+        (parameter == "thinking.type" and toggle.get("off") == "disabled")
+        or (parameter == "enable_thinking" and toggle.get("off") is False)
+    ):
+        levels.append("off")
     for option in (value.get("reasoningOptions") or []):
         if not isinstance(option, Mapping):
             continue
@@ -265,6 +278,48 @@ def _effort_levels(value: Mapping[str, Any]) -> tuple[str, ...]:
     levels.extend(str(item) for item in aliases)
     levels.extend(str(item) for item in aliases.values() if isinstance(item, str))
     return tuple(dict.fromkeys(item for item in levels if item))
+
+
+def _with_verified_effort_profile(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Attach exact documented controls missing from a raw catalog snapshot."""
+    payload = dict(value)
+    route_id = str(value.get("routeId") or value.get("id") or "")
+    reasoning_options = value.get("reasoningOptions")
+    longcat_toggle = (
+        route_id == "go/longcat-2.5-preview-free"
+        and value.get("provider") == "go"
+        and str(value.get("baseUrl") or "").rstrip("/") == _LONGCAT_GO_BASE_URL
+        and value.get("model") == "longcat-2.5-preview-free"
+        and value.get("protocol") == "chat"
+        and isinstance(reasoning_options, list)
+        and any(
+            isinstance(option, Mapping) and option.get("type") == "toggle"
+            for option in reasoning_options
+        )
+    )
+    if not longcat_toggle:
+        return payload
+    # Replace, rather than merge with, the unverified catalog profile.  In
+    # particular, a stale graded ``parameter`` must not survive beside the
+    # documented LongCat thinking toggle.
+    effort = {
+        "version": 1,
+        "provider": "opencode-go",
+        "model": "longcat-2.5-preview-free",
+        "protocol": "chat",
+        "levels": [],
+        "aliases": {},
+        "default": "auto",
+        "providerDefault": "on",
+        "toggle": {
+            "parameter": "thinking.type",
+            "on": "enabled",
+            "off": "disabled",
+        },
+        "sources": ["https://longcat.chat/platform/docs/OpenCode.html"],
+    }
+    payload["effort"] = effort
+    return payload
 
 
 @dataclass(frozen=True)
@@ -293,6 +348,7 @@ class OpenClaudeModel:
 
     @classmethod
     def from_payload(cls, value: Mapping[str, Any]) -> "OpenClaudeModel":
+        value = _with_verified_effort_profile(value)
         capabilities = value.get("capabilities") \
             if isinstance(value.get("capabilities"), Mapping) else {}
         limits = value.get("limits") if isinstance(value.get("limits"), Mapping) else {}
@@ -471,9 +527,8 @@ def resolve_model(
             f"OpenClaude route {model.route_id!r} does not support tool calls."
         )
     selected_effort = str(effort or "auto").strip() or "auto"
-    if (selected_effort != "auto" and model.efforts
-            and selected_effort not in model.efforts):
-        supported = ", ".join(model.efforts)
+    if selected_effort != "auto" and selected_effort not in model.efforts:
+        supported = ", ".join(("auto", *model.efforts))
         raise OpenClaudeError(
             f"Effort {selected_effort!r} is unsupported by {model.route_id}; "
             f"choose {supported}."
@@ -650,9 +705,9 @@ class OpenClaudeGateway:
                 raise OpenClaudeError(
                     f"OpenClaude route {self.route!r} is not available{detail}"
                 )
-            if (self.effort not in {"", "auto"} and self._model.efforts
+            if (self.effort not in {"", "auto"}
                     and self.effort not in self._model.efforts):
-                supported = ", ".join(self._model.efforts)
+                supported = ", ".join(("auto", *self._model.efforts))
                 raise OpenClaudeError(
                     f"Effort {self.effort!r} is unsupported by {self.route}; choose {supported}."
                 )

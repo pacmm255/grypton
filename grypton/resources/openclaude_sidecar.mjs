@@ -47,6 +47,8 @@ function publicModel(model) {
     ? model.capabilities : {};
   const limits = model?.limits && typeof model.limits === 'object' ? model.limits : {};
   const effort = model?.effort && typeof model.effort === 'object' ? model.effort : {};
+  const toggle = effort?.toggle && typeof effort.toggle === 'object'
+    && !Array.isArray(effort.toggle) ? effort.toggle : null;
   return {
     routeId: cleanText(model?.routeId || model?.id, 300),
     id: cleanText(model?.id, 300),
@@ -79,6 +81,13 @@ function publicModel(model) {
       parameter: typeof effort.parameter === 'string' ? cleanText(effort.parameter, 80) : null,
       providerDefault: typeof effort.providerDefault === 'string'
         ? cleanText(effort.providerDefault, 40) : null,
+      toggle: toggle ? {
+        parameter: cleanText(toggle.parameter, 80),
+        on: typeof toggle.on === 'boolean' ? toggle.on : cleanText(toggle.on, 40),
+        ...(toggle.off === undefined ? {} : {
+          off: typeof toggle.off === 'boolean' ? toggle.off : cleanText(toggle.off, 40),
+        }),
+      } : null,
     },
     source: cleanText(model?.source, 120),
   };
@@ -286,6 +295,7 @@ async function refreshCatalog(refresh = false) {
   activeConfig = catalog.config;
   patchMuseEffort(activeConfig, catalog);
   patchDeepSeekGoEffort(activeConfig, catalog);
+  patchLongCatGoThinking(activeConfig, catalog);
   return publicCatalog(catalog);
 }
 
@@ -704,4 +714,46 @@ function patchDeepSeekGoEffort(config, discovered) {
   };
   route.effort = profile;
   if (model) model.effort = profile;
+}
+
+function patchLongCatGoThinking(config, discovered) {
+  const routeId = 'go/longcat-2.5-preview-free';
+  const officialBaseUrl = 'https://opencode.ai/zen/go/v1';
+  const route = config?.routes?.[routeId];
+  const model = (Array.isArray(discovered?.models) ? discovered.models : [])
+    .find(candidate => candidate?.routeId === routeId);
+  const baseUrl = typeof model?.baseUrl === 'string'
+    ? model.baseUrl.replace(/\/+$/, '') : '';
+  const existingToggle = route?.effort?.toggle;
+  const exactExistingToggle = existingToggle?.parameter === 'thinking.type'
+    && existingToggle?.on === 'enabled' && existingToggle?.off === 'disabled';
+  if (!route || model?.provider !== 'go'
+      || baseUrl !== officialBaseUrl
+      || route?.model !== 'longcat-2.5-preview-free'
+      || route?.protocol !== 'chat') return;
+  if (exactExistingToggle) {
+    model.effort = route.effort;
+    return;
+  }
+  const hasToggle = (Array.isArray(model?.reasoningOptions)
+    ? model.reasoningOptions : []).some(option => option?.type === 'toggle');
+  if (!hasToggle) return;
+  const profile = {
+    version: 1,
+    provider: 'opencode-go',
+    model: route.model,
+    protocol: 'chat',
+    levels: [],
+    aliases: {},
+    default: 'auto',
+    providerDefault: 'on',
+    toggle: {
+      parameter: 'thinking.type',
+      on: 'enabled',
+      off: 'disabled',
+    },
+    sources: ['https://longcat.chat/platform/docs/OpenCode.html'],
+  };
+  route.effort = profile;
+  model.effort = profile;
 }

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -26,6 +27,7 @@ from grypton.engine import Engine
 from grypton.manager import KryptexManager
 from grypton.reporting import audit_workspace
 from grypton.openclaude import (
+    OpenClaudeError,
     OpenClaudeGateway,
     OpenClaudeModel,
     TOKEN_ENV,
@@ -41,6 +43,7 @@ OPENCLAUDE_ROOT = Path("/root/openclaude")
 PRIMARY_KEY = "fixture-primary-key-000000000001"
 SPARE_KEY = "fixture-spare-key-000000000002"
 THIRD_KEY = "fixture-third-key-000000000003"
+LONGCAT_ROUTE = "go/longcat-2.5-preview-free"
 
 
 @contextmanager
@@ -83,6 +86,37 @@ def catalog_model(*, route: str = "go/muse-spark-1.3-contributor",
         "effort": {
             "levels": ["minimal", "low", "medium", "high", "xhigh"],
             "default": "auto",
+        },
+    })
+
+
+def toggle_catalog_model() -> OpenClaudeModel:
+    return OpenClaudeModel.from_payload({
+        "routeId": LONGCAT_ROUTE,
+        "provider": "go",
+        "baseUrl": "https://opencode.ai/zen/go/v1/",
+        "model": "longcat-2.5-preview-free",
+        "label": "LongCat 2.5 Preview Free",
+        "protocol": "chat",
+        "status": "available",
+        "capabilities": {
+            "tools": True,
+            "reasoning": True,
+            "temperature": True,
+            "input": {"text": True, "image": True},
+            "output": {"text": True},
+        },
+        "limits": {"context": 1_000_000, "output": 131_072},
+        "reasoningOptions": [{"type": "toggle"}],
+        "effort": {
+            "levels": [],
+            "default": "auto",
+            "providerDefault": "on",
+            "toggle": {
+                "parameter": "thinking.type",
+                "on": "enabled",
+                "off": "disabled",
+            },
         },
     })
 
@@ -318,6 +352,153 @@ class OpenClaudeAdapterTests(unittest.TestCase):
                 resolve_model(selected.route_id, effort="xhigh", require_tools=True)
         self.assertEqual(models.call_count, 2)
         pause.assert_called_once()
+
+    def test_toggle_metadata_exposes_on_off_and_empty_profiles_are_strict(self):
+        direct_catalog_payload = dict(toggle_catalog_model().raw)
+        direct_catalog_payload["effort"] = {
+            "version": 9,
+            "parameter": "reasoning_effort",
+            "levels": ["max"],
+            "aliases": {"xhigh": "max"},
+            "default": "max",
+            "unknown": "No verified effort field mapping",
+            "untrusted": "must not survive",
+        }
+        model = OpenClaudeModel.from_payload(direct_catalog_payload)
+        self.assertEqual(model.efforts, ("on", "off"))
+        self.assertEqual(model.raw["effort"], {
+            "version": 1,
+            "provider": "opencode-go",
+            "model": "longcat-2.5-preview-free",
+            "protocol": "chat",
+            "levels": [],
+            "aliases": {},
+            "default": "auto",
+            "providerDefault": "on",
+            "toggle": {
+                "parameter": "thinking.type",
+                "on": "enabled",
+                "off": "disabled",
+            },
+            "sources": ["https://longcat.chat/platform/docs/OpenCode.html"],
+        })
+
+        spoofed_payload = dict(direct_catalog_payload)
+        spoofed_payload["baseUrl"] = "http://127.0.0.1:9999/v1"
+        spoofed_payload["effort"] = {
+            "levels": [],
+            "default": "auto",
+            "unknown": "No verified effort field mapping",
+        }
+        spoofed = OpenClaudeModel.from_payload(spoofed_payload)
+        self.assertEqual(spoofed.efforts, ())
+        self.assertIn("unknown", spoofed.raw["effort"])
+        with patch("grypton.openclaude.list_models", return_value=[spoofed]):
+            with self.assertRaisesRegex(OpenClaudeError, "choose auto"):
+                resolve_model(LONGCAT_ROUTE, effort="on", require_tools=True)
+        with patch("grypton.openclaude.list_models", return_value=[model]):
+            selected = resolve_model(
+                "opencode-go/longcat-2.5-preview-free",
+                effort="on",
+                require_tools=True,
+            )
+            self.assertEqual(selected.route_id, LONGCAT_ROUTE)
+            self.assertEqual(selected.effort, "on")
+            with self.assertRaisesRegex(OpenClaudeError, "unsupported"):
+                resolve_model(LONGCAT_ROUTE, effort="max", require_tools=True)
+
+        unknown = OpenClaudeModel.from_payload({
+            "routeId": "fixture/unknown-effort",
+            "provider": "fixture",
+            "model": "unknown-effort",
+            "status": "available",
+            "capabilities": {"tools": True},
+            "effort": {"levels": [], "default": "auto"},
+        })
+        with patch("grypton.openclaude.list_models", return_value=[unknown]):
+            with self.assertRaisesRegex(OpenClaudeError, "choose auto"):
+                resolve_model(unknown.route_id, effort="on", require_tools=True)
+
+    @unittest.skipUnless(
+        shutil.which("node")
+        and (OPENCLAUDE_ROOT / "bin/openclaude.mjs").is_file(),
+        "local OpenClaude catalog is required",
+    )
+    def test_real_catalog_preflight_accepts_longcat_on(self):
+        from grypton.openclaude import _discover_models
+
+        _discover_models.cache_clear()
+        try:
+            selected = resolve_model(LONGCAT_ROUTE, effort="on", require_tools=True)
+        finally:
+            _discover_models.cache_clear()
+        self.assertEqual(selected.route_id, LONGCAT_ROUTE)
+        self.assertEqual(selected.effort, "on")
+        self.assertEqual(selected.efforts, ("on", "off"))
+
+    @unittest.skipUnless(
+        shutil.which("node")
+        and (OPENCLAUDE_ROOT / "src/effort.mjs").is_file(),
+        "local OpenClaude effort engine is required",
+    )
+    def test_longcat_toggle_uses_openclaude_wire_mapping(self):
+        source = """
+import { readFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+const effortModule = process.argv[1];
+const { resolveEffort, applyEffort } = await import(pathToFileURL(effortModule).href);
+const input = JSON.parse(readFileSync(0, 'utf8'));
+try {
+  const resolution = resolveEffort(input.route, input.selected);
+  const body = applyEffort(input.body, resolution);
+  process.stdout.write(JSON.stringify({ ok: true, body, resolution }));
+} catch (error) {
+  process.stdout.write(JSON.stringify({
+    ok: false,
+    status: Number(error?.status || 0),
+    message: String(error?.message || error),
+  }));
+}
+"""
+        effort_module = OPENCLAUDE_ROOT / "src/effort.mjs"
+        profile = toggle_catalog_model().raw["effort"]
+        route = {"protocol": "chat", "effort": profile}
+        body = {
+            "model": "longcat-2.5-preview-free",
+            "messages": [{"role": "user", "content": "fixture"}],
+            "reasoning_effort": "max",
+            "thinking": {"type": "adaptive"},
+        }
+
+        def apply(selected: str) -> dict:
+            result = subprocess.run(
+                [shutil.which("node") or "node", "--input-type=module", "-e",
+                 source, str(effort_module)],
+                input=json.dumps({
+                    "route": route,
+                    "selected": selected,
+                    "body": body,
+                }),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=10,
+                check=True,
+            )
+            return json.loads(result.stdout)
+
+        for selected, expected in (("on", "enabled"), ("off", "disabled")):
+            with self.subTest(selected=selected):
+                applied = apply(selected)
+                self.assertTrue(applied["ok"], applied)
+                self.assertEqual(
+                    applied["body"].get("thinking"), {"type": expected}
+                )
+                self.assertNotIn("reasoning_effort", applied["body"])
+        rejected = apply("max")
+        self.assertFalse(rejected["ok"], rejected)
+        self.assertEqual(rejected["status"], 400)
+        self.assertIn("not supported", rejected["message"])
 
     def test_exact_route_miss_retry_is_bounded_and_never_selects_another_route(self):
         other = catalog_model(route="fixture/other")

@@ -132,8 +132,9 @@ class CliTests(unittest.TestCase):
         self.assertEqual(positional.target, "example.test")
 
     def test_exact_routes_are_pinned(self):
-        self.assertEqual(config.WORKER_MODEL, "zai-coding-plan/glm-5.3")
-        self.assertEqual(config.WORKER_EFFORT, "max")
+        self.assertEqual(config.WORKER_PROVIDER, "go")
+        self.assertEqual(config.WORKER_MODEL, "go/longcat-2.5-preview-free")
+        self.assertEqual(config.WORKER_EFFORT, "on")
         self.assertEqual(config.MANAGER_MODEL, "go/muse-spark-1.3-contributor")
         self.assertEqual(config.MANAGER_EFFORT, "xhigh")
         self.assertEqual(config.VALIDATOR_MODEL, "gpt-6-astra")
@@ -144,6 +145,14 @@ class CliTests(unittest.TestCase):
         self.assertFalse(config.astra_auto_validation_required("P3"))
         self.assertEqual(config.PROMPTS_DIR, config.PACKAGE_DIR / "resources" / "prompts")
         self.assertTrue((config.PROMPTS_DIR / "worker_system.md").is_file())
+        packaged = json.loads((config.RESOURCES_DIR / "models.json").read_text())
+        self.assertEqual(packaged["worker"]["provider"], "go")
+        self.assertEqual(packaged["worker"]["model"], "longcat-2.5-preview-free")
+        self.assertEqual(packaged["worker"]["effort"], "on")
+        self.assertEqual(packaged["manager"]["model"], "muse-spark-1.3-contributor")
+        self.assertEqual(packaged["manager"]["effort"], "xhigh")
+        self.assertEqual(packaged["validator"]["model"], "gpt-6-astra")
+        self.assertEqual(packaged["validator"]["effort"], "max")
 
     def test_astra_route_ignores_environment_and_saved_config_overrides(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2059,7 +2068,8 @@ class WorkerEventTests(unittest.TestCase):
             workspace_state.create("example.test", "web")
             workspace = workspace_state.root
             client = OpenCodeClient(
-                role="worker", route=config.WORKER_MODEL, effort="max",
+                role="worker", route=config.WORKER_MODEL,
+                effort=config.WORKER_EFFORT,
                 workspace=workspace, target_slug="mcp-import", allow_tools=True,
                 agent_prompt="test",
             )
@@ -2075,7 +2085,11 @@ class WorkerEventTests(unittest.TestCase):
                             "baseURL": "http://127.0.0.1:32123/v1",
                             "apiKey": "{env:" + TOKEN_ENV + "}",
                         },
-                        "models": {config.WORKER_MODEL: {"variants": {"max": {}}}},
+                        "models": {
+                            config.WORKER_MODEL: {
+                                "variants": {config.WORKER_EFFORT: {}},
+                            },
+                        },
                     }
                 },
                 environment=lambda: {TOKEN_ENV: gateway_token},

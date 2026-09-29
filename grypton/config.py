@@ -168,9 +168,10 @@ def private_egress_proxy_redaction_values(proxy: str) -> tuple[str, ...]:
 # Exact requested model/provider/effort routes.
 # --------------------------------------------------------------------------
 
-WORKER_PROVIDER = os.environ.get("GRYPTON_WORKER_PROVIDER", "zai-coding-plan")
-WORKER_MODEL = os.environ.get("GRYPTON_WORKER_MODEL", "zai-coding-plan/glm-5.3")
-WORKER_EFFORT = os.environ.get("GRYPTON_WORKER_EFFORT", "max")
+WORKER_PROVIDER = os.environ.get("GRYPTON_WORKER_PROVIDER", "go")
+WORKER_MODEL = os.environ.get(
+    "GRYPTON_WORKER_MODEL", "go/longcat-2.5-preview-free")
+WORKER_EFFORT = os.environ.get("GRYPTON_WORKER_EFFORT", "on")
 MANAGER_PROVIDER = os.environ.get("GRYPTON_MANAGER_PROVIDER", "go")
 MANAGER_MODEL = os.environ.get(
     "GRYPTON_MANAGER_MODEL", "go/muse-spark-1.3-contributor")
@@ -219,7 +220,7 @@ def resolve_manager_model(name: str) -> str:
 
 
 def resolve_worker_model(name: str) -> str:
-    """Expand the supported GLM shortcut; qualified OpenCode routes pass through."""
+    """Expand supported shortcuts; qualified OpenClaude routes pass through."""
     if not name:
         return ""
     return normalize_model_route(WORKER_MODEL_ALIASES.get(name.strip().lower(), name.strip()))

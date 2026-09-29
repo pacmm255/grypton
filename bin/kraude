@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Source-checkout launcher for the GLM-backed Kraude role console."""
+"""Source-checkout launcher for the LongCat-backed Kraude role console."""
 import os
 from pathlib import Path
 import sys

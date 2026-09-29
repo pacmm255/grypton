@@ -226,7 +226,10 @@ class RuntimeTests(unittest.TestCase):
 
             def current_models(self):
                 return {
-                    "kraude": {"route": config.WORKER_MODEL, "effort": "max"},
+                    "kraude": {
+                        "route": config.WORKER_MODEL,
+                        "effort": config.WORKER_EFFORT,
+                    },
                     "kryptex": {"route": config.MANAGER_MODEL, "effort": "xhigh"},
                     "validator": {"route": config.VALIDATOR_MODEL, "effort": "max"},
                 }

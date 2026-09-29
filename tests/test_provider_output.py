@@ -46,7 +46,8 @@ class ProviderOutputTests(unittest.TestCase):
                 workspace = config.ENGAGEMENTS_DIR / "pre-spawn-call"
                 workspace.mkdir(parents=True)
                 client = OpenCodeClient(
-                    role="worker", route=config.WORKER_MODEL, effort="max",
+                    role="worker", route=config.WORKER_MODEL,
+                    effort=config.WORKER_EFFORT,
                     workspace=workspace, target_slug="pre-spawn-call",
                     allow_tools=True, agent_prompt="test",
                 )
@@ -162,7 +163,8 @@ class ProviderOutputTests(unittest.TestCase):
                 workspace = config.ENGAGEMENTS_DIR / "normalized-call"
                 workspace.mkdir(parents=True)
                 client = OpenCodeClient(
-                    role="worker", route=config.WORKER_MODEL, effort="max",
+                    role="worker", route=config.WORKER_MODEL,
+                    effort=config.WORKER_EFFORT,
                     workspace=workspace, target_slug="normalized-call",
                     allow_tools=True, agent_prompt="test",
                 )
@@ -296,7 +298,8 @@ class ProviderOutputTests(unittest.TestCase):
                 workspace = config.ENGAGEMENTS_DIR / "sanitized-native-call"
                 workspace.mkdir(parents=True)
                 client = OpenCodeClient(
-                    role="worker", route=config.WORKER_MODEL, effort="max",
+                    role="worker", route=config.WORKER_MODEL,
+                    effort=config.WORKER_EFFORT,
                     workspace=workspace, target_slug="sanitized-native-call",
                     allow_tools=True, agent_prompt="test",
                 )
@@ -623,7 +626,8 @@ class ProviderOutputTests(unittest.TestCase):
                 workspace = config.ENGAGEMENTS_DIR / "short-secret-call"
                 workspace.mkdir(parents=True)
                 client = OpenCodeClient(
-                    role="worker", route=config.WORKER_MODEL, effort="max",
+                    role="worker", route=config.WORKER_MODEL,
+                    effort=config.WORKER_EFFORT,
                     workspace=workspace, target_slug="short-secret-call",
                     allow_tools=True, agent_prompt="test",
                 )
@@ -868,7 +872,8 @@ class ProviderOutputTests(unittest.TestCase):
                 workspace = config.ENGAGEMENTS_DIR / "timeout-call"
                 workspace.mkdir(parents=True)
                 client = OpenCodeClient(
-                    role="worker", route=config.WORKER_MODEL, effort="max",
+                    role="worker", route=config.WORKER_MODEL,
+                    effort=config.WORKER_EFFORT,
                     workspace=workspace, target_slug="timeout-call",
                     allow_tools=True, agent_prompt="test",
                 )
@@ -958,7 +963,8 @@ class ProviderOutputTests(unittest.TestCase):
                 workspace = config.ENGAGEMENTS_DIR / "active-timeout-call"
                 workspace.mkdir(parents=True)
                 client = OpenCodeClient(
-                    role="worker", route=config.WORKER_MODEL, effort="max",
+                    role="worker", route=config.WORKER_MODEL,
+                    effort=config.WORKER_EFFORT,
                     workspace=workspace, target_slug="active-timeout-call",
                     allow_tools=True, agent_prompt="test",
                 )
@@ -1038,7 +1044,8 @@ class ProviderOutputTests(unittest.TestCase):
                 workspace = config.ENGAGEMENTS_DIR / "nested-active-timeout-call"
                 workspace.mkdir(parents=True)
                 client = OpenCodeClient(
-                    role="worker", route=config.WORKER_MODEL, effort="max",
+                    role="worker", route=config.WORKER_MODEL,
+                    effort=config.WORKER_EFFORT,
                     workspace=workspace, target_slug="nested-active-timeout-call",
                     allow_tools=True, agent_prompt="test",
                 )
@@ -1114,7 +1121,8 @@ class ProviderOutputTests(unittest.TestCase):
                 workspace = config.ENGAGEMENTS_DIR / "stream-call"
                 workspace.mkdir(parents=True)
                 client = OpenCodeClient(
-                    role="worker", route=config.WORKER_MODEL, effort="max",
+                    role="worker", route=config.WORKER_MODEL,
+                    effort=config.WORKER_EFFORT,
                     workspace=workspace, target_slug="stream-call",
                     allow_tools=True, agent_prompt="test",
                 )

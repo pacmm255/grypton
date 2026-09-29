@@ -51,7 +51,7 @@ class MockWorker:
         # emit stream-like events so the full engine/renderer event path runs
         if self.on_event:
             if self.counter == 1:
-                self.on_event({"type": "system", "subtype": "init", "model": "mock-glm-5.3",
+                self.on_event({"type": "system", "subtype": "init", "model": "mock-longcat-2.5",
                                "tools": ["Bash", "Read"], "mcp_servers": [{"name": "grypton"}],
                                "session_id": "mock"})
             self.on_event({"type": "stream_event",
