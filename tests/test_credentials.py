@@ -1634,6 +1634,37 @@ else:
                 credentials.session_status(target, alias)["attempts"], 1
             )
 
+    def test_expired_pending_browser_step_up_is_deleted_and_unavailable(self):
+        with isolated_runtime():
+            target, alias = "expired-step-up-target", "primary"
+            origin = "https://app.example.test:443"
+            credentials.save_credential(target, alias, "user", "password")
+            attempt = credentials.begin_login_attempt(target, alias)
+            credentials.record_login_outcome(
+                target, alias,
+                blocked_reason="MFA/OTP challenge was presented",
+            )
+            credentials.save_pending_browser_step_up(
+                target, alias, attempt=attempt, origin=origin,
+                challenge_url=origin + "/login",
+                profile_revision="0123456789ab", cookies=[],
+                local_storage={"challenge": "private-state"},
+                session_storage={}, tokens={}, otp_selector="#otp",
+                otp_fields=1,
+            )
+            path = credentials.pending_browser_step_up_path(target, alias)
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record["created_at"] -= 15 * 60 + 1
+            path.write_text(json.dumps(record), encoding="utf-8")
+
+            pending = credentials.load_pending_browser_step_up(target, alias)
+
+            self.assertEqual(pending, {"available": False, "reserved": False})
+            self.assertFalse(path.exists())
+            status = credentials.session_status(target, alias)
+            self.assertFalse(status["has_pending_step_up"])
+            self.assertEqual(status["state"], "blocked")
+
     def test_pending_browser_step_up_accepts_only_bound_request_fingerprint(self):
         with isolated_runtime():
             target, alias = "replay-target", "primary"

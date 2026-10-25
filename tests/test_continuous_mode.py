@@ -27,6 +27,7 @@ from grypton.runtime import (
     supervise,
 )
 from grypton.workspace import Constraints, Workspace
+from tests.evidence_helpers import write_evidence_package
 
 
 @contextmanager
@@ -217,7 +218,7 @@ class ContinuousRuntimeTests(unittest.TestCase):
         with isolated_runtime():
             ws = Workspace("completion-predicate")
             ws.create("example.test", "web")
-            finding = ws.record_finding(title="Claimed critical", severity="P1")
+            finding = ws.record_finding(title="Claimed critical", severity="P1", evidence_package=write_evidence_package(ws))
             ws.set_severity_verdict(finding["id"], {
                 "finding_id": finding["id"],
                 "verdict": "downgrade",
@@ -359,7 +360,7 @@ class ContinuousEngineTests(unittest.IsolatedAsyncioTestCase):
             )
 
             def worker_script(_worker, _directive):
-                engine.ws.record_finding(title="Critical claim", severity="P1")
+                engine.ws.record_finding(title="Critical claim", severity="P1", evidence_package=write_evidence_package(engine.ws))
                 return "Recorded candidate."
 
             engine.worker.script = worker_script
@@ -401,7 +402,7 @@ class ContinuousEngineTests(unittest.IsolatedAsyncioTestCase):
             )
 
             def worker_script(_worker, _directive):
-                engine.ws.record_finding(title="Critical claim", severity="P1")
+                engine.ws.record_finding(title="Critical claim", severity="P1", evidence_package=write_evidence_package(engine.ws))
                 return "Recorded candidate."
 
             engine.worker.script = worker_script
@@ -436,7 +437,7 @@ class ContinuousEngineTests(unittest.IsolatedAsyncioTestCase):
         ):
             ws = Workspace("until-p2-provenance")
             ws.create("https://example.test", "web")
-            finding = ws.record_finding(title="High claim", severity="P2")
+            finding = ws.record_finding(title="High claim", severity="P2", evidence_package=write_evidence_package(ws))
             ws.set_severity_verdict(finding["id"], {
                 "finding_id": finding["id"],
                 "verdict": "confirm",

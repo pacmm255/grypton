@@ -448,6 +448,42 @@ class TemporaryMailboxTests(unittest.TestCase):
             self.assertNotIn(private_sixth_value, audit)
             self.assertIn("#workspace", audit)
 
+    def test_private_otp_continuation_remains_pending_when_no_code_arrives(self):
+        with isolated_runtime():
+            workspace = authorized_workspace()
+            record = mailbox_record()
+            credentials.save_mailbox(workspace.slug, "signup", record)
+            credentials.save_credential(
+                workspace.slug, "signup", record["address"],
+                record["target_password"],
+            )
+            with patch(
+                "grypton.toolserver.temporary_mail.poll",
+                return_value={
+                    "ok": True,
+                    "summary": "No matching OTP arrived.",
+                    "data": {"alias": "signup", "ready": False},
+                },
+            ), patch(
+                "grypton.toolserver.credentials.load_auth_profile_optional",
+                return_value={"strategy": "browser"},
+            ), patch(
+                "grypton.toolserver.credentials.load_pending_browser_step_up",
+                return_value={"available": True},
+            ), patch(
+                "grypton.toolserver.tools.credential_browser_step_up",
+            ) as continuation:
+                result = dispatch(
+                    workspace, "temporary_account_browser_continue",
+                    {"alias": "signup", "sender_domain": "example.test"},
+                )
+
+            self.assertFalse(result["ok"])
+            self.assertFalse(result["data"]["ready"])
+            self.assertTrue(result["data"]["pending"])
+            self.assertIn("remains pending", result["summary"])
+            continuation.assert_not_called()
+
     def test_private_otp_preflight_failure_leaves_mailbox_message_retryable(self):
         with isolated_runtime():
             workspace = authorized_workspace()
@@ -1059,6 +1095,7 @@ class TemporaryMailboxTests(unittest.TestCase):
                     "Researchers may create an account. API requests require "
                     "an Authorization header."
                 ),
+                "You may sign up for an account using your personal email address.",
                 (
                     "Researchers may create an account. Approval is required "
                     "before submitting a vulnerability report."
@@ -1067,6 +1104,11 @@ class TemporaryMailboxTests(unittest.TestCase):
                     "Researchers may create an account and test invitation "
                     "acceptance."
                 ),
+                (
+                    "You may create an account and then create an access token "
+                    "from Account Settings."
+                ),
+                "You must create accounts for testing purposes.",
                 "Researchers may create an account. No credentials are provided.",
                 (
                     "Provided credentials are optional. Researchers may create "
@@ -1099,6 +1141,41 @@ class TemporaryMailboxTests(unittest.TestCase):
                     self.assertFalse(unrelated["disposable_email_prohibited"])
                     self.assertTrue(
                         unrelated["temporary_mail_account_bootstrap_allowed"]
+                    )
+
+            base["data"]["brief"]["description"] = (
+                "You may create an access token from the Account Settings page."
+            )
+            path.write_text(json.dumps(base), encoding="utf-8")
+            access_token = analyze_snapshot(path)
+            self.assertFalse(access_token["self_created_account_permission"])
+            self.assertFalse(
+                access_token["temporary_mail_account_bootstrap_allowed"]
+            )
+
+            for description in (
+                (
+                    "You may sign up for an account using your "
+                    "@bugcrowdninja.com email address."
+                ),
+                (
+                    "Researchers can sign up for an account using an "
+                    "@security.example address."
+                ),
+                (
+                    "You must create accounts using an "
+                    "@bugcrowdninja.com email address."
+                ),
+            ):
+                with self.subTest(description=description):
+                    base["data"]["brief"]["description"] = description
+                    path.write_text(json.dumps(base), encoding="utf-8")
+                    required_signup_domain = analyze_snapshot(path)
+                    self.assertTrue(required_signup_domain["credential_requirement"])
+                    self.assertFalse(
+                        required_signup_domain[
+                            "temporary_mail_account_bootstrap_allowed"
+                        ]
                     )
 
             base["data"]["brief"]["description"] = (
@@ -1211,6 +1288,8 @@ class TemporaryMailboxTests(unittest.TestCase):
                     "Researchers may create an account. Use the login supplied "
                     "by support."
                 ),
+                "You must create accounts using the assigned credentials.",
+                "You must create accounts provided by the program.",
             ):
                 with self.subTest(description=description):
                     base["data"]["brief"]["description"] = description

@@ -781,6 +781,16 @@ without a profile keeps the explicitly requested tool behavior:
    it for a single-page application or another JavaScript-driven form.
 4. `authenticated_http_request` uses the verified cookie or bearer session for
    later scoped requests.
+5. `browser_workflow` keeps one Chromium context alive for an ordered sequence
+   of page actions. It can navigate, click, fill, select, check, press keys,
+   wait, inspect text, take a page snapshot, and upload a bounded workspace
+   file. Give it a proven credential alias to restore and update that exact
+   browser session across a multi-step application flow.
+
+The workflow captures request URLs and status codes plus the final rendered
+DOM. Form values, cookies, tokens, and private browser storage remain outside
+the transcript and tool audit. Every navigation and browser request still goes
+through the engagement scope check.
 
 For a staged browser login that sends an identifier before showing the OTP
 form, an operator can start and finish the same private web session with:
@@ -1119,8 +1129,8 @@ Common manual commands:
 | Group | Main tools |
 | --- | --- |
 | HTTP and captures | `http_request`, `proxy_flows`, `flow_read`, `flow_replay` |
-| Private authentication | `credential_status`, `credential_login`, `credential_browser_login`, `authenticated_http_request` |
-| Browser and reconnaissance | `browse`, `httpx_probe`, `dns_lookup`, `tls_certificate`, `port_scan`, `subdomain_enum` |
+| Private authentication | `credential_status`, `credential_login`, `credential_browser_login`, `authenticated_http_request`, `authenticated_browser_request` |
+| Browser and reconnaissance | `browse`, `browser_workflow`, `httpx_probe`, `dns_lookup`, `tls_certificate`, `port_scan`, `subdomain_enum` |
 | Goja proxy | `goja_start`, `goja_status`, `goja_request`, `goja_stop` |
 | APK and protocol work | `tcp_exchange`, `artifact_download`, `apk_inspect`, `apk_extract_asset` |
 | Engagement records | `attack_surface_add`, `tested_technique_log`, `prior_attempts`, `record_finding` |
@@ -1172,20 +1182,14 @@ useradd --system --no-create-home --home-dir /nonexistent \
 ./bin/grypton doctor
 ```
 
-If `doctor` reports that this identity cannot traverse the browser path on a
-host whose filesystem root is private, grant that account traverse-only access
-and rerun the check:
-
-```bash
-setfacl -m u:grypton-browser:x /
-./bin/grypton doctor
-```
-
 Grypton gives that account a fresh private browser profile for each call and
-drops supplementary groups, gid, and uid before Chromium starts. It does not
-reuse `nobody` or another service identity. Until the dedicated account exists,
-`browse` fails closed with setup instructions and `grypton doctor` reports the
-browser sandbox boundary as `FAIL`. Grypton never creates the account itself.
+drops supplementary groups, gid, and uid before Chromium starts. On a host with
+a private filesystem root, it launches Chromium inside a private mount and PID
+namespace with a small read-only runtime tree; it does not change the host root
+ACL. It does not reuse `nobody` or another service identity. Until the dedicated
+account exists, browser tools fail closed with setup instructions and
+`./bin/grypton doctor` reports the browser sandbox boundary as `FAIL`. Grypton
+never creates the account itself.
 
 ---
 

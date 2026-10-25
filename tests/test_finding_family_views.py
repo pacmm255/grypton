@@ -33,6 +33,7 @@ from grypton.finding_views import (
 from grypton.reporting import audit_workspace, render_report
 from grypton.web import dashboard_state, engagement_detail, engagement_summary
 from grypton.workspace import Constraints, Workspace
+from tests.evidence_helpers import write_evidence_package
 
 
 @contextmanager
@@ -81,7 +82,7 @@ def family_workspace(slug: str = "family-view") -> tuple[Workspace, dict, dict]:
         evidence="flows/flow-0002.http",
         source="fixture",
         family_id=anchor["id"],
-        case_kind="feed replacement",
+        case_kind="feed replacement", evidence_package=write_evidence_package(ws),
     )
     ws.set_severity_verdict(child["id"], {
         "finding_id": child["id"],
@@ -140,6 +141,48 @@ class FindingFamilyViewTests(unittest.TestCase):
             self.assertEqual(run_status["finding_families"], 1)
             self.assertEqual(run_status["finding_cases"], 2)
             self.assertEqual(run_status["last_health"]["findings"], 2)
+
+            runtime_state["last_health"] = {
+                "turns": 105, "run_turns": 5,
+                "tool_calls": 1200, "run_tool_calls": 80,
+                "surface": 40, "run_surface": 3,
+                "tested": 90, "run_tested": 7,
+                "finding_cases": 2, "run_finding_cases": 0,
+                "finding_families": 1, "run_finding_families": 0,
+                "provider_calls": 50, "run_provider_calls": 8,
+                "provider_failures": 7, "run_provider_failures": 2,
+                "provider_partial_calls": 3, "run_provider_partial_calls": 1,
+                "worker_provider_failures": 4,
+                "run_worker_provider_failures": 1,
+                "manager_provider_failures": 2,
+                "run_manager_provider_failures": 1,
+                "validator_provider_failures": 1,
+                "run_validator_provider_failures": 0,
+                "astra_confirmed_p1": 0, "run_astra_confirmed_p1": 0,
+                "astra_confirmed_p2_or_higher": 0,
+                "run_astra_confirmed_p2_or_higher": 0,
+                "auth_credentials": 2, "auth_established": 1,
+                "auth_browser_sessions": 1, "auth_pending_step_up": 0,
+                "browser_available": True,
+                "family_stagnation_streak": 4,
+                "coverage_rotation_cursor": 2,
+                "proof_rotation_cursor": 1,
+                "active_provider_call": True,
+                "active_provider_turn": 106,
+                "active_provider_age_seconds": 12,
+            }
+            output = io.StringIO()
+            with patch("grypton.runtime.public_status", return_value=runtime_state), \
+                    redirect_stdout(output):
+                self.assertEqual(cmd_run_status(SimpleNamespace(
+                    target=ws.slug, json=False,
+                )), 0)
+            rendered = output.getvalue()
+            self.assertIn("health (run)  turns=5 tools=80", rendered)
+            self.assertIn("providers     calls=8 failures=2 partial=1", rendered)
+            self.assertIn("established=1", rendered)
+            self.assertIn("browser-binary=available", rendered)
+            self.assertIn("provider=active turn=106 age=12s", rendered)
 
     def test_findings_json_remains_raw_while_terminal_groups_cases(self):
         with isolated_runtime():

@@ -363,10 +363,20 @@ class TargetMeta:
     # material revision or a changed Astra request produces a new fingerprint
     # and makes the case schedulable again without trapping the worker on an
     # unchanged prerequisite forever.
+    proof_pending_record_id: str = ""  # proof directive saved for the next turn
+    proof_pending_fingerprint: str = ""  # dispatch contract awaiting completion
+    proof_pending_epoch_max_id: str = ""  # fair-rotation epoch to commit afterward
+    proof_pending_directive_hash: str = ""  # proves which saved action was attempted
+    proof_pending_turn: int = 0  # completed worker turn that may acknowledge it
     family_stagnation_streak: int = 0  # completed turns without a new family
     validation_retry_cursor: int = 0   # fair cursor for stranded Astra work
     validation_retry_after_id: str = ""  # last stranded case attempted
     validation_retry_epoch_max_id: str = ""  # fixed tail for retry round
+    defense_signals_recent: list[dict] = field(default_factory=list)
+    # Bounded (20) most-recent defense-signal observations, one entry per
+    # affected tool result, restored with strict shape validation and
+    # projected to Kryptex (defense-signal taxonomy).
+    last_coverage_playbook_id: str = ""  # most-recent coverage rotation selection
     notes: str = ""
 
 
@@ -388,6 +398,7 @@ class Workspace:
         self.finding_family_lock = self.root / ".ledger" / "finding-family.lock"
         self.surface = Ledger(self.root / ".ledger" / "attack-surface.jsonl")
         self.tested = Ledger(self.root / ".ledger" / "tested-techniques.jsonl")
+        self.strategy_memory = Ledger(self.root / ".ledger" / "strategy-memory.jsonl")
 
     # ---- lifecycle -------------------------------------------------------
 
@@ -636,6 +647,85 @@ class Workspace:
             self.save_constraints(c)
         return c
 
+    def record_strategy_outcome(
+        self,
+        *,
+        playbook_id: str,
+        outcome: str,
+        reason: str = "",
+        turn_index: int = 0,
+    ) -> dict:
+        """Record a playbook rotation outcome: worked | dead-end | blocked.
+
+        Validates: playbook_id (1-64 chars, ^[a-z0-9-]+$); outcome one of three
+        values; reason string ≤512 chars; turn_index ≥0. Appends a row to the
+        strategy-memory ledger and returns it with ts set.
+        """
+        # Validation
+        playbook_id_str = str(playbook_id or "").strip()
+        if not playbook_id_str or len(playbook_id_str) > 64:
+            raise ValueError("playbook_id must be 1-64 characters")
+        if not re.fullmatch(r"[a-z0-9-]+", playbook_id_str):
+            raise ValueError("playbook_id must match ^[a-z0-9-]+$")
+
+        outcome_str = str(outcome or "").strip().lower()
+        if outcome_str not in {"worked", "dead-end", "blocked"}:
+            raise ValueError("outcome must be one of: worked, dead-end, blocked")
+
+        reason_str = str(reason or "").strip()
+        if len(reason_str) > 512:
+            raise ValueError("reason must be ≤512 characters")
+
+        try:
+            turn_int = int(turn_index or 0)
+        except (TypeError, ValueError):
+            turn_int = 0
+        if turn_int < 0:
+            raise ValueError("turn_index must be ≥0")
+
+        record = {
+            "playbook_id": playbook_id_str,
+            "outcome": outcome_str,
+            "reason": reason_str,
+            "turn_index": turn_int,
+        }
+        return self.strategy_memory.append(record)
+
+    def strategy_outcomes(self) -> dict[str, dict]:
+        """Return per-playbook latest outcome from the last 200 rows.
+
+        Returns: {playbook_id: {"outcome", "reason", "turn_index", "count"}}
+        where count is the number of recorded outcomes for that playbook.
+        """
+        outcomes = {}
+        rows = self.strategy_memory.all()
+        if rows:
+            rows = rows[-200:]  # Bound to last 200 rows
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            playbook_id = str(row.get("playbook_id") or "").strip()
+            if not playbook_id:
+                continue
+            # Track count and update latest
+            if playbook_id not in outcomes:
+                outcomes[playbook_id] = {
+                    "count": 0,
+                    "dead_end_count": 0,
+                    "outcome": "",
+                    "reason": "",
+                    "turn_index": 0,
+                }
+            outcomes[playbook_id]["count"] += 1
+            if str(row.get("outcome") or "") == "dead-end":
+                outcomes[playbook_id]["dead_end_count"] += 1
+            outcomes[playbook_id]["outcome"] = str(row.get("outcome") or "")
+            outcomes[playbook_id]["reason"] = str(row.get("reason") or "")
+            outcomes[playbook_id]["turn_index"] = int(row.get("turn_index") or 0)
+
+        return outcomes
+
     # ---- findings (R22, R28) --------------------------------------------
 
     @staticmethod
@@ -882,8 +972,33 @@ class Workspace:
                        surface: str = "", description: str = "", poc: str = "",
                        evidence: str = "", source: str = "worker",
                        root_cause: str = "", family_id: str = "",
-                       case_kind: str = "", separate_reason: str = "") -> dict:
+                       case_kind: str = "", separate_reason: str = "",
+                       evidence_package: Optional[dict] = None) -> dict:
+        """Record a finding; an evidence package is verified before the ledger
+        accepts it.
+
+        ``evidence_package`` must reference four captured flows (positive,
+        control, and two replays) plus the differential claim they must
+        support. Verification is mechanical and fail-closed: an unverified
+        package raises ``ValueError`` and the observation stays a hypothesis
+        in ``tested_technique_log`` rather than becoming a finding.
+        """
         source = _family_text("source", source, required=True)
+        if evidence_package is not None and not isinstance(evidence_package, dict):
+            raise ValueError("evidence package must be an object with four flow ids")
+        package_flow_ids: dict[str, str] = {}
+        if evidence_package is not None:
+            malformed = [key for key in ("positive_flow_id", "control_flow_id",
+                                         "replay_flow_id", "second_run_flow_id")
+                         if not isinstance(evidence_package.get(key), str)]
+            if malformed:
+                raise ValueError(
+                    "evidence package must carry string flow ids for "
+                    + ", ".join(malformed)
+                )
+            package_flow_ids = {key: evidence_package[key] for key in (
+                "positive_flow_id", "control_flow_id", "replay_flow_id",
+                "second_run_flow_id")}
         structured = any(value != "" for value in (
             root_cause, family_id, case_kind, separate_reason,
         ))
@@ -909,6 +1024,47 @@ class Workspace:
                     normalized_severity) else "validation-not-requested"),
                 "manager_verdict": None,
             }
+            if (config.astra_auto_validation_required(normalized_severity)
+                    and evidence_package is None):
+                raise ValueError(
+                    "evidence package is required for auto-validated "
+                    "severities: record the observation in "
+                    "tested_technique_log until positive, control, replay, "
+                    "and second-run captures exist"
+                )
+            if evidence_package is not None:
+                # Local import: tools imports workspace at module level, so the
+                # verifier can only be bound here, with the ledger lock held.
+                # Verification precedes family routing so evidence failures are
+                # reported before collision guidance.
+                from . import tools as _tools
+                verified = _tools.verify_evidence_package(self, evidence_package)
+                if not verified.get("ok"):
+                    raise ValueError(
+                        "evidence package verification failed: "
+                        f"{verified.get('reason', 'unknown')} — the observation "
+                        "stays a hypothesis in tested_technique_log"
+                    )
+                rec["evidence_package"] = {
+                    "package": {
+                        **package_flow_ids,
+                        "differential_claim": evidence_package.get(
+                            "differential_claim"),
+                        "changed_variable": evidence_package.get(
+                            "changed_variable"),
+                        "control_variable": evidence_package.get(
+                            "control_variable"),
+                        "precondition_notes": evidence_package.get(
+                            "precondition_notes"),
+                        "environment_notes": evidence_package.get(
+                            "environment_notes"),
+                    },
+                    "verified": {
+                        "digests": verified["digests"],
+                        "evidence_chain_sha256": verified[
+                            "evidence_chain_sha256"],
+                    },
+                }
             if structured:
                 root_cause = _family_text("root_cause", root_cause)
                 family_id = _family_text("family_id", family_id)

@@ -31,6 +31,8 @@ import re
 from . import antifab, config, prompts
 from .finding_views import astra_confirmed_cases_at_or_above, safe_display_text
 from .manager import ManagerContext
+from .providers import clean as clean_provider_text
+from . import scenarios as scenarios_module
 from .scenarios import priority_action
 from .worker import WorkerError
 from .workspace import ASTRA_REVALIDATION_REVISION_FIELD, Workspace
@@ -118,15 +120,139 @@ _MAX_WORKER_PROVIDER_RETRY_S = 300
 _WORKER_RETRY_POLL_S = 1.0
 _MAX_WORKER_FAILURE_TOOL_COUNT = 10_000
 _FAMILY_PRIORITY_THRESHOLD = 3
+# Four is deliberately co-prime with the three-turn proof cadence. If both are
+# due together, proof wins that turn and coverage becomes due at the next
+# four-turn checkpoint instead of being starved forever by a fixed collision.
+_COVERAGE_PRIORITY_FREQUENCY = 4
 _PROOF_PRIORITY_FREQUENCY = 3
 _VALIDATION_RETRY_FREQUENCY = 12
 _MAX_PROOF_BACKLOG = 6
 _MAX_PROOF_DISPATCH_FINGERPRINTS = 256
+_MAX_MANAGER_TOOL_CALLS = 40
+_MAX_MANAGER_TOOL_FIELD_CHARS = 320
+_MAX_MANAGER_TOOL_SUMMARY_CHARS = 8_000
+_MANAGER_SAFE_RESULT_TOOLS = frozenset({
+    "apk_extract_asset", "apk_inspect", "artifact_download",
+    "attack_surface_add", "authenticated_browser_request",
+    "authenticated_http_request", "browse", "browser_workflow",
+    "credential_browser_login", "credential_login", "credential_status",
+    "dns_lookup", "finding_family_catalog", "flow_read", "flow_replay",
+    "goja_request", "goja_start", "goja_status", "goja_stop",
+    "http_request", "httpx_probe", "install_tool", "link_finding_family",
+    "local_analyze", "port_scan", "prior_attempts", "proxy_flows",
+    "read_doc", "record_finding", "research", "revise_finding",
+    "save_research", "subdomain_enum", "tcp_exchange",
+    "temporary_account_browser_continue", "temporary_account_browser_signup",
+    "temporary_mailbox_create", "temporary_mailbox_poll",
+    "tested_technique_log", "tls_certificate", "tool_inventory",
+})
 _PARTIAL_TOOL_RECOVERY_ACTION = (
     "Continue from the durable results already recorded. Select a different "
     "highest-impact unresolved lead in the recorded attack surface, test it "
     "with an available tool, and record the observed result."
 )
+
+# Post-turn defense-signal taxonomy. Challenge markers identify active
+# defenses (CAPTCHA/WAF interstitials) that end the probe family; rate limits
+# are escalating defense pressure; a plain 401/403 without a challenge marker
+# is access-control information, not a defense. Signal details carry only the
+# matched marker and status code — never URLs or header values.
+_DEFENSE_SIGNAL_LIMIT = 20
+_DEFENSE_SIGNAL_DETAIL_CHARS = 120
+_DEFENSE_SIGNAL_TEXT_CHARS = 4000
+_DEFENSE_SIGNAL_TOOL_CHARS = 80
+_DEFENSE_SIGNAL_KINDS = frozenset({"challenge", "rate-limit", "access-denied"})
+_DEFENSE_CHALLENGE_MARKERS = (
+    "captcha", "recaptcha", "hcaptcha", "turnstile", "attention required",
+    "cloudflare ray id", "waf", "blocked: suspicious", "challenge platform",
+)
+_DEFENSE_RATE_LIMIT_MARKERS = ("too many requests", "rate limit")
+# Conservative status extraction: an HTTP status line, a "status:"-style
+# key/value pair, or a standalone JSON "status" number in the 4NN range only.
+_DEFENSE_STATUS_RX = re.compile(
+    r"HTTP/[0-9]+(?:\.[0-9]+)?[ \t]+(4\d\d)\b"
+    r"|status[\":= ]+(4\d\d)\b",
+    re.IGNORECASE,
+)
+
+_BROWSER_CAPABILITY_CACHE: tuple[bool, str] | None = None
+
+
+def classify_defense_signal(tool_name: str, output_text: str) -> Optional[dict]:
+    """Classify one tool result against the defense-signal taxonomy.
+
+    Challenge markers describe active defenses that end the probe family;
+    rate limits are defense pressure; a plain 401/403 without a challenge
+    marker is access-control information rather than a defense. Returns None
+    when the output carries no defense or boundary signal. The detail carries
+    only the matched marker word and status code — never URLs or headers.
+    """
+    text = str(output_text or "").lower()[:_DEFENSE_SIGNAL_TEXT_CHARS]
+    tool = " ".join(str(tool_name or "tool").split())[:_DEFENSE_SIGNAL_TOOL_CHARS]
+    status_match = _DEFENSE_STATUS_RX.search(text)
+    status = int(status_match.group(1) or status_match.group(2)) if status_match else 0
+    challenge = next(
+        (m for m in _DEFENSE_CHALLENGE_MARKERS if m in text), "",
+    )
+    if challenge:
+        detail = challenge + " marker"
+        if status:
+            detail += f" with status {status}"
+        return {"kind": "challenge", "tool": tool, "detail": detail}
+    rate_limit = next(
+        (m for m in _DEFENSE_RATE_LIMIT_MARKERS if m in text), "",
+    )
+    if rate_limit or status == 429:
+        detail = rate_limit + " marker" if rate_limit else "status 429"
+        if rate_limit and status:
+            detail += f" with status {status}"
+        return {"kind": "rate-limit", "tool": tool, "detail": detail}
+    if status in (401, 403):
+        return {
+            "kind": "access-denied", "tool": tool,
+            "detail": f"status {status} without challenge marker",
+        }
+    return None
+
+
+def _validated_defense_signals(raw) -> list[dict]:
+    """Restore persisted defense signals, dropping malformed entries.
+
+    Fail closed: entries that do not match the exact persisted shape are
+    discarded rather than coerced, so stale or tampered metadata can never
+    reach a manager prompt. The most recent bounded window wins.
+    """
+    if not isinstance(raw, list):
+        return []
+    signals: list[dict] = []
+    for entry in raw[-_DEFENSE_SIGNAL_LIMIT:]:
+        if not isinstance(entry, dict):
+            continue
+        kind = entry.get("kind")
+        tool = entry.get("tool")
+        detail = entry.get("detail")
+        turn_index = entry.get("turn_index")
+        if (
+            not isinstance(kind, str)
+            or kind not in _DEFENSE_SIGNAL_KINDS
+            or not isinstance(tool, str)
+            or not tool
+            or len(tool) > _DEFENSE_SIGNAL_TOOL_CHARS
+            or not isinstance(detail, str)
+            or not detail
+            or len(detail) > _DEFENSE_SIGNAL_DETAIL_CHARS
+            or not isinstance(turn_index, int)
+            or isinstance(turn_index, bool)
+            or turn_index < 0
+        ):
+            continue
+        signals.append({
+            "kind": kind,
+            "tool": tool,
+            "detail": detail,
+            "turn_index": min(turn_index, 1_000_000_000),
+        })
+    return signals
 
 
 @dataclass(frozen=True)
@@ -136,6 +262,7 @@ class _PrioritySelection:
     record_id: str = ""
     epoch_max_id: str = ""
     proof_fingerprint: str = ""
+    playbook_id: str = ""
 
 
 # Detached deadline runs treat the supervisor deadline as their completion
@@ -185,6 +312,25 @@ def _tool_result_text(content) -> str:
                 parts.append(str(c))
         return "\n".join(p for p in parts if p)
     return "" if content is None else str(content)
+
+
+def dead_end_exclusions(outcomes: dict[str, dict]) -> set[str]:
+    """Compute the set of dead-end playbooks that should be excluded.
+
+    A playbook is excluded if its latest outcome is 'dead-end' and it has
+    been recorded at least twice (two chances, then exclude).
+    """
+    excluded = set()
+    for playbook_id, outcome_data in outcomes.items():
+        if str(outcome_data.get("outcome") or "") != "dead-end":
+            continue
+        # Count only dead-end outcomes: a playbook that worked once and then
+        # dead-ended once has burned one of its two chances, not both.
+        dead_ends = outcome_data.get("dead_end_count",
+                                     outcome_data.get("count"))
+        if int(dead_ends or 0) >= 2:
+            excluded.add(playbook_id)
+    return excluded
 
 
 class Engine:
@@ -244,11 +390,18 @@ class Engine:
         self._passive_stagnation_streak = 0
         self._repetitive_probe_streak = 0
         self._family_stagnation_streak = 0
+        self._defense_signals_recent: list[dict] = []
         self._coverage_rotation_cursor = 0
+        self._last_coverage_playbook_id = ""
         self._proof_rotation_cursor = 0
         self._proof_rotation_after_id = ""
         self._proof_rotation_epoch_max_id = ""
         self._proof_dispatch_fingerprints: dict[str, str] = {}
+        self._proof_pending_record_id = ""
+        self._proof_pending_fingerprint = ""
+        self._proof_pending_epoch_max_id = ""
+        self._proof_pending_directive_hash = ""
+        self._proof_pending_turn = 0
         self._validation_retry_cursor = 0
         self._validation_retry_after_id = ""
         self._validation_retry_epoch_max_id = ""
@@ -331,12 +484,26 @@ class Engine:
         )
         self.turn_index = meta.turn_index
         raw_cursor = getattr(meta, "coverage_rotation_cursor", 0)
+        raw_last_coverage_playbook_id = getattr(meta, "last_coverage_playbook_id", "")
         raw_proof_cursor = getattr(meta, "proof_rotation_cursor", 0)
         raw_proof_after_id = getattr(meta, "proof_rotation_after_id", "")
         raw_proof_epoch_max_id = getattr(meta, "proof_rotation_epoch_max_id", "")
         raw_proof_dispatch_fingerprints = getattr(
             meta, "proof_dispatch_fingerprints", {}
         )
+        raw_proof_pending_record_id = getattr(
+            meta, "proof_pending_record_id", ""
+        )
+        raw_proof_pending_fingerprint = getattr(
+            meta, "proof_pending_fingerprint", ""
+        )
+        raw_proof_pending_epoch_max_id = getattr(
+            meta, "proof_pending_epoch_max_id", ""
+        )
+        raw_proof_pending_directive_hash = getattr(
+            meta, "proof_pending_directive_hash", ""
+        )
+        raw_proof_pending_turn = getattr(meta, "proof_pending_turn", 0)
         raw_family_streak = getattr(meta, "family_stagnation_streak", 0)
         raw_validation_cursor = getattr(meta, "validation_retry_cursor", 0)
         raw_validation_after_id = getattr(meta, "validation_retry_after_id", "")
@@ -347,6 +514,12 @@ class Engine:
             min(raw_cursor, 1_000_000_000)
             if isinstance(raw_cursor, int) and not isinstance(raw_cursor, bool)
             and raw_cursor >= 0 else 0
+        )
+        self._last_coverage_playbook_id = (
+            raw_last_coverage_playbook_id
+            if isinstance(raw_last_coverage_playbook_id, str)
+            and re.fullmatch(r"[a-z0-9-]{1,64}", raw_last_coverage_playbook_id)
+            else ""
         )
         self._proof_rotation_cursor = (
             min(raw_proof_cursor, 1_000_000_000)
@@ -381,11 +554,35 @@ class Engine:
                     and re.fullmatch(r"[0-9a-f]{64}", fingerprint)
                 ):
                     self._proof_dispatch_fingerprints[finding_id] = fingerprint
+        valid_pending_proof = bool(
+            isinstance(raw_proof_pending_record_id, str)
+            and re.fullmatch(r"F\d+", raw_proof_pending_record_id)
+            and isinstance(raw_proof_pending_fingerprint, str)
+            and re.fullmatch(r"[0-9a-f]{64}", raw_proof_pending_fingerprint)
+            and isinstance(raw_proof_pending_epoch_max_id, str)
+            and re.fullmatch(r"F\d+", raw_proof_pending_epoch_max_id)
+            and isinstance(raw_proof_pending_directive_hash, str)
+            and re.fullmatch(r"[0-9a-f]{64}", raw_proof_pending_directive_hash)
+            and isinstance(raw_proof_pending_turn, int)
+            and not isinstance(raw_proof_pending_turn, bool)
+            and raw_proof_pending_turn > 0
+        )
+        if valid_pending_proof:
+            self._proof_pending_record_id = raw_proof_pending_record_id
+            self._proof_pending_fingerprint = raw_proof_pending_fingerprint
+            self._proof_pending_epoch_max_id = raw_proof_pending_epoch_max_id
+            self._proof_pending_directive_hash = raw_proof_pending_directive_hash
+            self._proof_pending_turn = min(
+                raw_proof_pending_turn, 1_000_000_000
+            )
         self._family_stagnation_streak = (
             min(raw_family_streak, 1_000_000_000)
             if isinstance(raw_family_streak, int)
             and not isinstance(raw_family_streak, bool)
             and raw_family_streak >= 0 else 0
+        )
+        self._defense_signals_recent = _validated_defense_signals(
+            getattr(meta, "defense_signals_recent", []),
         )
         self._validation_retry_cursor = (
             min(raw_validation_cursor, 1_000_000_000)
@@ -548,6 +745,14 @@ class Engine:
 
             # ---- worker turn ----
             attempt_turn_index = self.turn_index + 1
+            pending_proof_attempt = self._pending_proof_matches_attempt(
+                directive_text, attempt_turn_index
+            )
+            if self._proof_pending_record_id and not pending_proof_attempt:
+                # An operator message, a changed proof contract, or incompatible
+                # resume state superseded the saved proof action. Keep the case
+                # schedulable; never acknowledge work Kraude did not receive.
+                self._clear_pending_proof(persist=True)
             self.emit("turn", index=attempt_turn_index)
             provider_window_nonce = self._begin_worker_provider_window(
                 turn=attempt_turn_index,
@@ -571,6 +776,13 @@ class Engine:
                     and tool_count == 0
                 )
                 if tool_count or replay_unsafe:
+                    if pending_proof_attempt:
+                        # Native effects may have occurred, so the immediate
+                        # replay is suppressed below. The provider did not
+                        # complete the turn, therefore the proof fingerprint
+                        # remains unacknowledged and can be scheduled later.
+                        self._clear_pending_proof(persist=True)
+                        pending_proof_attempt = False
                     self._worker_provider_window_tainted = True
                     # The failed conversation may end between a tool call and
                     # its model-visible result.  Absence of an observed event is
@@ -681,16 +893,62 @@ class Engine:
             else:
                 self._family_stagnation_streak += 1
 
+            # Record the outcome of the last coverage playbook if one was set
+            if self._last_coverage_playbook_id:
+                if new_family_ids or new_surface > 0:
+                    outcome = "worked"
+                else:
+                    outcome = "dead-end"
+                self.ws.record_strategy_outcome(
+                    playbook_id=self._last_coverage_playbook_id,
+                    outcome=outcome,
+                    turn_index=self.turn_index,
+                )
+                # Clear it so we don't re-record the same outcome, durably so
+                # a resumed run never attributes an unrelated turn to it.
+                self._last_coverage_playbook_id = ""
+                self.ws.update_meta(last_coverage_playbook_id="")
+
+            partial_worker_turn = bool(
+                turn.is_error
+                or (
+                    isinstance(turn.result, dict)
+                    and turn.result.get("partial") is True
+                )
+            )
+            if pending_proof_attempt and partial_worker_turn:
+                # OpenCode can preserve completed tool events while losing the
+                # model's final response. Those effects are useful evidence,
+                # but they do not prove Kraude finished the scheduled proof
+                # contract. Leave the finding eligible for a later, newly
+                # directed attempt without replaying this interrupted turn.
+                proof_completion_changes = self._clear_pending_proof(
+                    persist=False,
+                )
+            else:
+                proof_completion_changes = (
+                    self._acknowledge_pending_proof(attempt_turn_index)
+                    if pending_proof_attempt else {}
+                )
+
             # Status readers should see the completed worker turn while Spark or
             # Astra are still processing, rather than lagging a whole cycle.
             # Replace the consumed directive in the same atomic metadata write;
             # if the child exits before Kryptex chooses the next action, resume
             # advances with this recovery action instead of replaying it.
+            # ---- defense-signal taxonomy ----
+            # Keep only the most recent bounded window so Kryptex sees current
+            # boundary facts rather than a full engagement history.
+            self._defense_signals_recent = (
+                self._defense_signals_recent + self._defense_signals(turn)
+            )[-_DEFENSE_SIGNAL_LIMIT:]
             self.ws.update_meta(
                 turn_index=self.turn_index,
                 worker_uuid=getattr(self.worker, "session_id", "") or "",
                 family_stagnation_streak=self._family_stagnation_streak,
+                defense_signals_recent=self._defense_signals_recent,
                 last_directive=_RECOVERY_ACTION,
+                **proof_completion_changes,
             )
             # The provider may have executed native tools that do not appear in
             # Grypton's MCP effect ledger. Clear the fail-closed supervisor
@@ -998,6 +1256,14 @@ class Engine:
                     "it with an in-scope action."))
                 directive_text = self._continuation_directive()
 
+            # Cursor/pending state describes the action Kraude will actually
+            # receive, after every structural override above.
+            priority_applied = bool(
+                priority_applied
+                and str(directive_text or "").strip()
+                == str(priority_selection.action or "").strip()
+            )
+
             # If Kraude refused/idled this turn, DEEP-rewind the entire idle tail
             # out of the worker's session history before sending the reframed
             # directive — strips the whole anchored "we're done" streak, not just
@@ -1025,47 +1291,20 @@ class Engine:
                 "worker_uuid": getattr(self.worker, "session_id", "") or "",
                 "manager_session_id": getattr(self.manager, "session_id", "") or "",
             }
-            if priority_selection.kind == "coverage":
+            if priority_selection.kind == "coverage" and priority_applied:
                 self._coverage_rotation_cursor += 1
+                self._last_coverage_playbook_id = priority_selection.playbook_id
                 meta_changes["coverage_rotation_cursor"] = (
                     self._coverage_rotation_cursor
                 )
-            elif priority_selection.kind == "proof":
-                self._proof_rotation_cursor += 1
-                meta_changes["proof_rotation_cursor"] = (
-                    self._proof_rotation_cursor
+                meta_changes["last_coverage_playbook_id"] = (
+                    self._last_coverage_playbook_id
                 )
-                self._proof_rotation_after_id = priority_selection.record_id
-                self._proof_rotation_epoch_max_id = (
-                    priority_selection.epoch_max_id
-                )
-                meta_changes["proof_rotation_after_id"] = (
-                    self._proof_rotation_after_id
-                )
-                meta_changes["proof_rotation_epoch_max_id"] = (
-                    self._proof_rotation_epoch_max_id
-                )
-                if (
-                    priority_applied
-                    and priority_selection.record_id
-                    and re.fullmatch(
-                        r"[0-9a-f]{64}",
-                        priority_selection.proof_fingerprint,
-                    )
-                ):
-                    self._proof_dispatch_fingerprints[
-                        priority_selection.record_id
-                    ] = priority_selection.proof_fingerprint
-                    # Keep the newest finding IDs when old terminal cases leave
-                    # behind scheduler state.  Only digests enter target.json.
-                    ordered_dispatches = sorted(
-                        self._proof_dispatch_fingerprints.items(),
-                        key=lambda item: Workspace._finding_id_sort_key(item[0]),
-                    )[-_MAX_PROOF_DISPATCH_FINGERPRINTS:]
-                    self._proof_dispatch_fingerprints = dict(ordered_dispatches)
-                    meta_changes["proof_dispatch_fingerprints"] = dict(
-                        self._proof_dispatch_fingerprints
-                    )
+            elif priority_selection.kind == "proof" and priority_applied:
+                meta_changes.update(self._stage_pending_proof(
+                    priority_selection,
+                    expected_turn=self.turn_index + 1,
+                ))
             self.ws.update_meta(**meta_changes)
             if coverage_priority:
                 self.emit(
@@ -1381,10 +1620,119 @@ class Engine:
             new_finding_cases=self._manager_case_projection(new_findings),
             novel_finding_families=novel_finding_families,
             family_stagnation_streak=self._family_stagnation_streak,
+            defense_signals=tuple(self._defense_signals_recent),
             coverage_priority=coverage_priority,
+            capability_summary=self._capability_summary(),
             validation_backlog=self._bounded_proof_backlog(),
             p1_count=len(self.ws.confirmed_p1s()),
+            exhaustion_breakers=tuple(sorted(dead_end_exclusions(self.ws.strategy_outcomes()))),
         )
+
+    def _capability_summary(self) -> dict:
+        """Project executable, secret-free capability facts to Kryptex.
+
+        Spark cannot choose a workable authentication or proof plan when it
+        only sees tool names from the previous turn.  This view deliberately
+        contains counts and policy booleans only: credential names, cookies,
+        tokens, usernames, mailbox addresses, and profile prose stay private.
+        """
+        from . import credentials
+        from .toolserver import REGISTRY
+        from .tools import browser_runtime_status
+
+        global _BROWSER_CAPABILITY_CACHE
+        if _BROWSER_CAPABILITY_CACHE is None:
+            _BROWSER_CAPABILITY_CACHE = browser_runtime_status(
+                probe=self.backend != "mock"
+            )
+        browser_ready, browser_reason = _BROWSER_CAPABILITY_CACHE
+
+        tool_names = sorted(str(name) for name in REGISTRY)
+        tool_set = set(tool_names)
+        session_rows = []
+        authenticated_principals: set[str] = set()
+        try:
+            aliases = credentials.list_credentials(self.ws.slug)
+            for alias in aliases[:64]:
+                try:
+                    row = credentials.session_status(self.ws.slug, alias)
+                except (OSError, ValueError):
+                    continue
+                if isinstance(row, dict):
+                    session_rows.append(row)
+                    if row.get("established") is True:
+                        try:
+                            username = str(credentials.load_credential(
+                                self.ws.slug, alias,
+                            ).get("username") or "").strip()
+                            try:
+                                username = credentials.normalize_login_username(
+                                    username, "iran-e164",
+                                )
+                            except credentials.CredentialError:
+                                username = username.casefold()
+                            if username:
+                                authenticated_principals.add(hashlib.sha256(
+                                    username.encode("utf-8", "replace")
+                                ).hexdigest())
+                        except (OSError, ValueError):
+                            pass
+        except (OSError, ValueError):
+            aliases = []
+
+        try:
+            profile = self.ws.load_program_profile()
+        except (OSError, ValueError):
+            profile = {}
+        account_creation_allowed = bool(
+            profile.get("self_created_account_permission")
+            and not profile.get("self_created_account_prohibited")
+        )
+        temporary_mail_allowed = bool(
+            profile.get("temporary_mail_account_bootstrap_allowed")
+        )
+        temporary_mail_tools = {
+            "temporary_mailbox_create", "temporary_mailbox_poll",
+            "temporary_account_browser_signup",
+            "temporary_account_browser_continue",
+        }
+        authenticated_count = sum(
+            1 for row in session_rows if row.get("established") is True
+        )
+        browser_session_count = sum(
+            1 for row in session_rows if row.get("has_browser_storage") is True
+        )
+        return {
+            "available_tools": tool_names,
+            "browser_ready": bool(browser_ready),
+            "browser_status": safe_display_text(browser_reason, 240),
+            "credential_count": len(session_rows),
+            "authenticated_session_count": authenticated_count,
+            "authenticated_principal_count": len(authenticated_principals),
+            "browser_session_count": browser_session_count,
+            "pending_step_up_count": sum(
+                1 for row in session_rows
+                if row.get("has_pending_step_up") is True
+            ),
+            "second_authenticated_principal_available": (
+                len(authenticated_principals) >= 2
+            ),
+            "account_workflows_documented": bool(
+                profile.get("account_workflows_supported")
+            ),
+            "account_creation_allowed": account_creation_allowed,
+            "temporary_mail_available": bool(
+                temporary_mail_allowed
+                and temporary_mail_tools.issubset(tool_set)
+                and browser_ready
+            ),
+            "oast_available": any(
+                name in tool_set for name in {
+                    "oast_create", "oast_poll", "collaborator_create",
+                    "collaborator_poll",
+                }
+            ),
+        }
 
     @staticmethod
     def _trusted_astra_verdict(verdict: object) -> bool:
@@ -1588,6 +1936,119 @@ class Engine:
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    @staticmethod
+    def _directive_fingerprint(directive: str) -> str:
+        return hashlib.sha256(
+            str(directive or "").strip().encode("utf-8")
+        ).hexdigest()
+
+    @staticmethod
+    def _empty_pending_proof_meta() -> dict:
+        return {
+            "proof_pending_record_id": "",
+            "proof_pending_fingerprint": "",
+            "proof_pending_epoch_max_id": "",
+            "proof_pending_directive_hash": "",
+            "proof_pending_turn": 0,
+        }
+
+    def _clear_pending_proof(self, *, persist: bool) -> dict:
+        self._proof_pending_record_id = ""
+        self._proof_pending_fingerprint = ""
+        self._proof_pending_epoch_max_id = ""
+        self._proof_pending_directive_hash = ""
+        self._proof_pending_turn = 0
+        changes = self._empty_pending_proof_meta()
+        if persist:
+            self.ws.update_meta(**changes)
+        return changes
+
+    def _stage_pending_proof(
+        self,
+        selection: _PrioritySelection,
+        *,
+        expected_turn: int,
+    ) -> dict:
+        """Persist a selected proof action without claiming it was attempted."""
+        record_id = str(selection.record_id or "")
+        fingerprint = str(selection.proof_fingerprint or "")
+        epoch_max_id = str(selection.epoch_max_id or "")
+        directive_hash = self._directive_fingerprint(selection.action)
+        if not (
+            re.fullmatch(r"F\d+", record_id)
+            and re.fullmatch(r"F\d+", epoch_max_id)
+            and re.fullmatch(r"[0-9a-f]{64}", fingerprint)
+            and selection.action.strip()
+            and isinstance(expected_turn, int)
+            and not isinstance(expected_turn, bool)
+            and expected_turn > self.turn_index
+        ):
+            return {}
+        self._proof_pending_record_id = record_id
+        self._proof_pending_fingerprint = fingerprint
+        self._proof_pending_epoch_max_id = epoch_max_id
+        self._proof_pending_directive_hash = directive_hash
+        self._proof_pending_turn = expected_turn
+        return {
+            "proof_pending_record_id": record_id,
+            "proof_pending_fingerprint": fingerprint,
+            "proof_pending_epoch_max_id": epoch_max_id,
+            "proof_pending_directive_hash": directive_hash,
+            "proof_pending_turn": expected_turn,
+        }
+
+    def _pending_proof_matches_attempt(
+        self, directive: str, attempt_turn: int,
+    ) -> bool:
+        if not self._proof_pending_record_id:
+            return False
+        if attempt_turn != self._proof_pending_turn:
+            return False
+        if (
+            self._directive_fingerprint(directive)
+            != self._proof_pending_directive_hash
+        ):
+            return False
+        finding = self.ws.findings.find(self._proof_pending_record_id)
+        return bool(
+            isinstance(finding, dict)
+            and self._proof_fingerprint(finding)
+            == self._proof_pending_fingerprint
+        )
+
+    def _acknowledge_pending_proof(self, completed_turn: int) -> dict:
+        """Commit a proof dispatch only after its worker turn completed."""
+        if (
+            not self._proof_pending_record_id
+            or completed_turn != self._proof_pending_turn
+        ):
+            return self._clear_pending_proof(persist=False)
+
+        record_id = self._proof_pending_record_id
+        fingerprint = self._proof_pending_fingerprint
+        epoch_max_id = self._proof_pending_epoch_max_id
+        self._proof_dispatch_fingerprints[record_id] = fingerprint
+        # Keep the newest finding IDs when old terminal cases leave scheduler
+        # state behind. Only digests enter target.json.
+        ordered_dispatches = sorted(
+            self._proof_dispatch_fingerprints.items(),
+            key=lambda item: Workspace._finding_id_sort_key(item[0]),
+        )[-_MAX_PROOF_DISPATCH_FINGERPRINTS:]
+        self._proof_dispatch_fingerprints = dict(ordered_dispatches)
+        self._proof_rotation_cursor += 1
+        self._proof_rotation_after_id = record_id
+        self._proof_rotation_epoch_max_id = epoch_max_id
+        changes = {
+            "proof_dispatch_fingerprints": dict(
+                self._proof_dispatch_fingerprints
+            ),
+            "proof_rotation_cursor": self._proof_rotation_cursor,
+            "proof_rotation_after_id": self._proof_rotation_after_id,
+            "proof_rotation_epoch_max_id": self._proof_rotation_epoch_max_id,
+        }
+        changes.update(self._clear_pending_proof(persist=False))
+        return changes
+
     def _scheduled_proof_backlog(self) -> list[dict]:
         """Return proof gaps not yet dispatched for their current evidence."""
         findings = self.ws.findings.all()
@@ -1600,6 +2061,11 @@ class Engine:
             finding_id = str(candidate.get("id") or "")
             fingerprint = self._proof_fingerprint(by_id.get(finding_id, {}))
             if self._proof_dispatch_fingerprints.get(finding_id) == fingerprint:
+                continue
+            if (
+                self._proof_pending_record_id == finding_id
+                and self._proof_pending_fingerprint == fingerprint
+            ):
                 continue
             scheduled.append({
                 **candidate,
@@ -1678,29 +2144,18 @@ class Engine:
     ) -> tuple[str, bool]:
         """Resolve scheduled engine work against Kryptex's chosen action.
 
-        A proof-priority selection represents a concrete outstanding Astra
-        evidence request, so its bounded cadence remains authoritative. A
-        generic coverage rotation is only a recovery action: a healthy,
-        executable Kryptex directive has more current evidence and keeps
-        control. The boolean reports whether the scheduled priority was the
-        action selected for Kraude.
+        Proof acquisition and stagnation coverage each have bounded scheduled
+        turns and are authoritative when due. On every non-scheduled turn a
+        healthy Kryptex directive keeps control. The boolean reports whether
+        the scheduled priority was the action selected for Kraude.
         """
         manager_text = directive.worker_message() if directive is not None else ""
         priority = str(priority_selection.action or "").strip()
         kind = str(priority_selection.kind or "").strip().lower()
 
-        if priority and kind == "proof":
+        if priority and kind in {"proof", "coverage"}:
             return priority, True
 
-        manager_needs_recovery = (
-            force_recovery
-            or directive is None
-            or bool(getattr(directive, "degraded", False))
-            or _looks_like_idle_directive(manager_text)
-            or _looks_like_soft_retreat_directive(manager_text)
-        )
-        if priority and kind == "coverage" and manager_needs_recovery:
-            return priority, True
         if force_recovery:
             return "", False
         return manager_text, False
@@ -1734,18 +2189,43 @@ class Engine:
             )
         if self._family_stagnation_streak < _FAMILY_PRIORITY_THRESHOLD:
             return _PrioritySelection()
+        if (
+            self._family_stagnation_streak - _FAMILY_PRIORITY_THRESHOLD
+        ) % _COVERAGE_PRIORITY_FREQUENCY:
+            return _PrioritySelection()
         cursor = self._coverage_rotation_cursor
         capabilities = set()
         if exhausted or worker_was_idle or convergence_reason:
             capabilities.add("blocker")
         if self._has_mobile_artifact():
             capabilities.add("mobile_artifact")
-        action = priority_action(
-            self.target_type,
-            cursor,
-            capabilities=capabilities,
+
+        # Get strategy outcomes and compute exclusions for dead-end playbooks
+        outcomes = self.ws.strategy_outcomes()
+        exclude_set = dead_end_exclusions(outcomes)
+
+        # Get selected scenarios and filter by exclusions
+        scenarios = scenarios_module.selected_scenarios(
+            self.target_type, capabilities=capabilities
         )
-        return _PrioritySelection(action, "coverage" if action else "")
+        # Playbooks that earned two dead ends stay excluded; when every
+        # matching playbook is exhausted there is no coverage directive this
+        # cycle and the manager's own directive stands.
+        available_scenarios = [
+            s for s in scenarios if s.get("id") not in exclude_set
+        ]
+
+        if not available_scenarios:
+            return _PrioritySelection()
+
+        # Select the scenario at the rotation cursor
+        selected_scenario = available_scenarios[cursor % len(available_scenarios)]
+        action = str(selected_scenario.get("priority_action", "")).strip()
+        playbook_id = str(selected_scenario.get("id", "")).strip()
+
+        return _PrioritySelection(
+            action, "coverage" if action else "", playbook_id=playbook_id
+        )
 
     @staticmethod
     def _manager_case_projection(findings: list[dict]) -> list[dict]:
@@ -1943,6 +2423,124 @@ class Engine:
         ))
 
     @staticmethod
+    def _request_value_digest(value: object) -> str:
+        """Return a bounded, non-reversible identity for a request value."""
+        try:
+            encoded = json.dumps(
+                value, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8", "replace")
+        except (TypeError, ValueError):
+            encoded = str(value).encode("utf-8", "replace")
+        return hashlib.sha256(encoded).hexdigest()[:16]
+
+    @staticmethod
+    def _request_payload_shape(value: object, depth: int = 0) -> object:
+        """Describe request structure and distinguish values without exposing them."""
+        if depth >= 5:
+            return {
+                "type": "depth-limit",
+                "digest": Engine._request_value_digest(value),
+            }
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return {
+                "type": "boolean",
+                "digest": Engine._request_value_digest(value),
+            }
+        if isinstance(value, (int, float)):
+            return {
+                "type": "number",
+                "digest": Engine._request_value_digest(value),
+            }
+        if isinstance(value, dict):
+            return {
+                str(key)[:120]: Engine._request_payload_shape(child, depth + 1)
+                for key, child in sorted(
+                    value.items(), key=lambda item: str(item[0])
+                )[:64]
+            }
+        if isinstance(value, (list, tuple)):
+            return {
+                "array": [
+                    Engine._request_payload_shape(child, depth + 1)
+                    for child in list(value)[:32]
+                ],
+                "length": len(value),
+            }
+        text = str(value)
+        if not text:
+            return "empty-string"
+        if depth == 0 and len(text) <= 256_000:
+            try:
+                decoded = json.loads(text)
+            except (TypeError, ValueError):
+                decoded = None
+            if decoded is not None:
+                return {"json": Engine._request_payload_shape(decoded, depth + 1)}
+            try:
+                form = parse_qsl(text, keep_blank_values=True, strict_parsing=True)
+            except ValueError:
+                form = []
+            if form and "=" in text:
+                return {"form": [
+                    {
+                        "key": key[:120],
+                        "value": Engine._request_payload_shape(
+                            item_value, depth + 1,
+                        ),
+                    }
+                    for key, item_value in sorted(form)[:64]
+                ]}
+        length_bucket = min(16, max(0, len(text).bit_length() - 1))
+        return {
+            "type": "string",
+            "length": f"2^{length_bucket}",
+            "digest": Engine._request_value_digest(text),
+        }
+
+    @staticmethod
+    def _network_outcome_status(tool_use: dict) -> int:
+        """Extract only an HTTP status class from a bounded tool result."""
+        output = tool_use.get("output")
+
+        def find(value: object, depth: int = 0) -> int:
+            if depth > 4:
+                return 0
+            if isinstance(value, dict):
+                for key in ("status", "status_code", "http_status"):
+                    candidate = value.get(key)
+                    if isinstance(candidate, int) and 100 <= candidate <= 599:
+                        return candidate
+                    if isinstance(candidate, str) and candidate.isdigit():
+                        number = int(candidate)
+                        if 100 <= number <= 599:
+                            return number
+                for key in ("data", "response", "result"):
+                    if key in value and (status := find(value[key], depth + 1)):
+                        return status
+            return 0
+
+        status = find(output)
+        if status:
+            return status
+        text = str(output or "")[:20_000]
+        if text.startswith(("{", "[")):
+            try:
+                status = find(json.loads(text))
+            except (TypeError, ValueError):
+                status = 0
+            if status:
+                return status
+        match = re.search(r"(?i)\bHTTP(?:/\d(?:\.\d)?)?\s+(\d{3})\b", text)
+        if match:
+            number = int(match.group(1))
+            if 100 <= number <= 599:
+                return number
+        return 0
+
+    @staticmethod
     def _network_signature(tool_use: dict) -> str:
         name = str(tool_use.get("name") or "").lower()
         name = name.removeprefix("grypton_")
@@ -1952,7 +2550,7 @@ class Engine:
             "subdomain_enum", "credential_login", "credential_browser_login",
             "temporary_mailbox_create", "temporary_mailbox_poll",
             "temporary_account_browser_signup", "temporary_account_browser_continue",
-            "authenticated_http_request", "authenticated_browser_request",
+            "authenticated_http_request", "authenticated_browser_request", "browser_workflow",
             "artifact_download", "tcp_exchange", "research",
         }
         if name not in network_tools:
@@ -1966,6 +2564,15 @@ class Engine:
             args.get("method") or ("GET" if name in request_tools else name)
         ).upper()
         raw_url = str(args.get("url") or "")
+        if name == "browser_workflow" and not raw_url:
+            actions = args.get("actions")
+            if isinstance(actions, list):
+                raw_url = next((
+                    str(action.get("url") or "")
+                    for action in actions
+                    if isinstance(action, dict)
+                    and str(action.get("action") or "").strip().lower() == "goto"
+                ), "")
         if raw_url:
             # Tool arguments are historical model output and therefore an
             # untrusted input boundary.  In particular, a browser may record a
@@ -2029,7 +2636,141 @@ class Engine:
             elif name == "tls_certificate":
                 extra = ":" + str(args.get("port") or 443)
             shape = host + extra
+        experiment: dict[str, object] = {}
+        if name == "browser_workflow":
+            actions = args.get("actions")
+            workflow_shape: list[dict[str, object]] = []
+
+            def workflow_url_shape(raw_value: object) -> str:
+                value = str(raw_value or "").strip()[:8192]
+                try:
+                    split = urlsplit(value)
+                    scheme = split.scheme.lower()
+                    host = (split.hostname or "").lower().rstrip(".")
+                    parsed_port = split.port
+                except (TypeError, ValueError):
+                    return "invalid"
+                if scheme not in {"http", "https"} or not host:
+                    return "invalid"
+                port = f":{parsed_port}" if parsed_port else ""
+                path = re.sub(r"/+", "/", split.path or "/")
+                query_keys = sorted({
+                    key for key, _ in parse_qsl(
+                        split.query, keep_blank_values=True
+                    )
+                })
+                output = f"{scheme}://{host}{port}{path}"
+                if query_keys:
+                    output += "?" + "&".join(query_keys)
+                return output
+
+            if isinstance(actions, list):
+                for raw_action in actions[:20]:
+                    if not isinstance(raw_action, dict):
+                        workflow_shape.append({"action": "invalid"})
+                        continue
+                    action_name = str(
+                        raw_action.get("action") or ""
+                    ).strip().lower()[:32]
+                    row: dict[str, object] = {"action": action_name}
+                    selector = raw_action.get("selector")
+                    if isinstance(selector, str) and selector.strip():
+                        row["selector"] = hashlib.sha256(
+                            selector.strip()[:500].encode("utf-8", "replace")
+                        ).hexdigest()[:12]
+                    if action_name == "goto":
+                        row["url"] = workflow_url_shape(raw_action.get("url"))
+                    elif action_name == "press":
+                        row["key"] = str(raw_action.get("key") or "")[:100]
+                    elif action_name == "wait":
+                        milliseconds = raw_action.get("milliseconds")
+                        row["milliseconds"] = (
+                            milliseconds
+                            if isinstance(milliseconds, int)
+                            and not isinstance(milliseconds, bool)
+                            else "invalid"
+                        )
+                    elif action_name == "inspect":
+                        maximum = raw_action.get("max_chars", 4000)
+                        row["max_chars"] = (
+                            maximum
+                            if isinstance(maximum, int) and not isinstance(maximum, bool)
+                            else "invalid"
+                        )
+                    elif action_name == "select":
+                        values = raw_action.get("values")
+                        row["selection_count"] = (
+                            len(values) if isinstance(values, list)
+                            else 1 if "value" in raw_action else 0
+                        )
+                    elif action_name == "upload":
+                        paths = raw_action.get("paths")
+                        row["file_count"] = (
+                            len(paths) if isinstance(paths, list)
+                            else 1 if "path" in raw_action else 0
+                        )
+                    workflow_shape.append(row)
+            experiment["workflow"] = workflow_shape
+        if "body" in args and args.get("body") is not None and args.get("body") != "":
+            experiment["body"] = Engine._request_payload_shape(args.get("body"))
+        if isinstance(args.get("fields"), dict) and args["fields"]:
+            experiment["fields"] = Engine._request_payload_shape(args["fields"])
+        for key in ("headers", "header_sources"):
+            if isinstance(args.get(key), dict) and args[key]:
+                experiment[key] = sorted(
+                    str(header).strip().casefold()[:120]
+                    for header in list(args[key])[:64]
+                    if str(header).strip()
+                )
+        credential = str(args.get("credential") or "").strip()
+        if credential:
+            experiment["actor"] = hashlib.sha256(
+                credential.encode("utf-8", "replace")
+            ).hexdigest()[:12]
+        status = Engine._network_outcome_status(tool_use)
+        if status:
+            experiment["status"] = status
+        if tool_use.get("is_error") is True:
+            experiment["tool_error"] = True
+        if experiment:
+            digest = hashlib.sha256(json.dumps(
+                experiment, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()[:16]
+            shape += "#" + digest
         return f"{name}|{method}|{shape}"
+
+    def _defense_signals(self, turn) -> list[dict]:
+        """Classify this turn's tool results into bounded defense signals.
+
+        Wraps the pure taxonomy in :func:`classify_defense_signal`, stamps the
+        completed turn index, and never returns more than
+        ``_DEFENSE_SIGNAL_LIMIT`` entries for one turn.
+        """
+        signals: list[dict] = []
+        for tool_use in ((turn.tool_uses if turn else []) or []):
+            if not isinstance(tool_use, dict):
+                continue
+            output = tool_use.get("output")
+            if not isinstance(output, str):
+                try:
+                    output = json.dumps(output, ensure_ascii=False, default=str)
+                except (TypeError, ValueError):
+                    output = str(output)
+            signal = classify_defense_signal(
+                self._manager_safe_tool_text(
+                    tool_use.get("name") or "tool",
+                    limit=_DEFENSE_SIGNAL_TOOL_CHARS,
+                ),
+                output,
+            )
+            if not signal:
+                continue
+            signal["turn_index"] = self.turn_index
+            signals.append(signal)
+            if len(signals) >= _DEFENSE_SIGNAL_LIMIT:
+                break
+        return signals
 
     def _network_novelty(self, tool_uses: list[dict]) -> dict:
         metrics = {"calls": 0, "novel": 0, "repeated": 0, "over_limit": 0,
@@ -2089,19 +2830,160 @@ class Engine:
     def _tool_summary(tool_uses) -> str:
         if not tool_uses:
             return ""
-        lines = []
-        for t in tool_uses[:40]:
-            inp = t.get("input")
-            preview = ""
-            if isinstance(inp, dict):
-                for k in ("command", "url", "file_path", "query", "pattern"):
-                    if k in inp:
-                        preview = f" {k}={str(inp[k])[:120]}"
-                        break
-            lines.append(f"- {t.get('name')}{preview}")
-        if len(tool_uses) > 40:
-            lines.append(f"- … +{len(tool_uses) - 40} more")
-        return "\n".join(lines)
+        lines: list[str] = []
+        used = 0
+        for index, tool_use in enumerate(tool_uses[:_MAX_MANAGER_TOOL_CALLS], 1):
+            if not isinstance(tool_use, dict):
+                tool_use = {}
+            name = Engine._manager_safe_tool_text(
+                tool_use.get("name") or "tool", limit=80,
+            )
+            canonical_name = str(tool_use.get("name") or "").strip().lower()
+            canonical_name = canonical_name.removeprefix("grypton_")
+            trusted_result = canonical_name in _MANAGER_SAFE_RESULT_TOOLS
+            output = tool_use.get("output")
+            parsed = (
+                Engine._structured_tool_result(output)
+                if trusted_result else {}
+            )
+            containers = [parsed]
+            if isinstance(parsed, dict):
+                for key in ("data", "result"):
+                    child = parsed.get(key)
+                    if isinstance(child, dict):
+                        containers.append(child)
+
+            def first(keys: tuple[str, ...]):
+                for container in containers:
+                    if not isinstance(container, dict):
+                        continue
+                    for key in keys:
+                        value = container.get(key)
+                        if value not in (None, "", [], {}):
+                            return value
+                return ""
+
+            summary = first(("summary", "result_summary", "error", "message"))
+            flow = first(("flow_id", "flow"))
+            result_status = first((
+                "status", "status_code", "http_status", "response_status",
+            ))
+            parsed_ok = parsed.get("ok") if isinstance(parsed, dict) else None
+            provider_status = str(tool_use.get("status") or "").strip().lower()
+            normalized_result_status = str(result_status or "").strip().lower()
+            try:
+                numeric_result_status = int(result_status)
+            except (TypeError, ValueError):
+                numeric_result_status = 0
+            error_statuses = {
+                "error", "failed", "failure", "denied", "blocked", "timeout",
+            }
+            success_statuses = {"ok", "success", "completed", "complete"}
+            is_error = (
+                bool(tool_use.get("is_error"))
+                or parsed_ok is False
+                or provider_status in error_statuses
+                or normalized_result_status in error_statuses
+                or numeric_result_status >= 400
+            )
+            if is_error:
+                outcome = "error"
+            elif (
+                parsed_ok is True
+                or provider_status in success_statuses
+                or normalized_result_status in success_statuses
+                or 100 <= numeric_result_status < 400
+            ):
+                outcome = "success"
+            else:
+                outcome = "unknown"
+            details = [f"- [{index}] {name} outcome={outcome}"]
+            output_length, output_digest = Engine._tool_output_identity(output)
+            if output_length:
+                details.append(f"output_chars={output_length}")
+                details.append(f"output_sha256={output_digest}")
+            if result_status not in (None, ""):
+                details.append(
+                    "result_status=" + Engine._manager_safe_tool_text(
+                        result_status, limit=64,
+                    )
+                )
+            if flow not in (None, ""):
+                details.append(
+                    "flow=" + Engine._manager_safe_tool_text(flow, limit=160)
+                )
+            if summary not in (None, ""):
+                details.append(
+                    "summary=" + Engine._manager_safe_tool_text(summary)
+                )
+            line = " ".join(details)
+            if used + len(line) + 1 > _MAX_MANAGER_TOOL_SUMMARY_CHARS:
+                lines.append("- … tool result summary truncated")
+                break
+            lines.append(line)
+            used += len(line) + 1
+        if len(tool_uses) > _MAX_MANAGER_TOOL_CALLS:
+            lines.append(
+                f"- … +{len(tool_uses) - _MAX_MANAGER_TOOL_CALLS} more calls"
+            )
+        return "\n".join(lines)[:_MAX_MANAGER_TOOL_SUMMARY_CHARS]
+
+    @staticmethod
+    def _tool_output_identity(output: object) -> tuple[int, str]:
+        """Identify a result for Spark without forwarding target evidence."""
+        if output in (None, "", [], {}):
+            return 0, ""
+        if isinstance(output, str):
+            text = output
+        else:
+            try:
+                text = json.dumps(
+                    output, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                )
+            except (TypeError, ValueError):
+                text = str(output)
+        return len(text), hashlib.sha256(
+            text.encode("utf-8", "replace")
+        ).hexdigest()[:16]
+
+    @staticmethod
+    def _structured_tool_result(output) -> dict:
+        if isinstance(output, dict):
+            return output
+        if not isinstance(output, str) or not output.strip():
+            return {}
+        try:
+            value = json.loads(output)
+        except (TypeError, ValueError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    @staticmethod
+    def _manager_safe_tool_text(
+        value: object, *, limit: int = _MAX_MANAGER_TOOL_FIELD_CHARS,
+    ) -> str:
+        if isinstance(value, (dict, list, tuple)):
+            try:
+                text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            except (TypeError, ValueError):
+                text = str(value)
+        else:
+            text = str(value or "")
+        text = clean_provider_text(text)
+        # Login identities are credentials too. Exact configured credential
+        # values are already removed at the provider boundary; these patterns
+        # cover summaries returned by hand-built or test worker adapters.
+        text = re.sub(
+            r"\b[^\s@]+@[^\s@]+\.[A-Za-z]{2,}\b", "[IDENTITY]", text,
+        )
+        text = re.sub(
+            r"(?<!\d)(?:\+?98|0)?9\d{9}(?!\d)", "[IDENTITY]", text,
+        )
+        text = " ".join(text.split())
+        if len(text) <= limit:
+            return text
+        return text[: max(0, limit - 1)].rstrip() + "…"
 
     @staticmethod
     def _doc_tail(path: Path, budget: int, tail: bool = False) -> str:

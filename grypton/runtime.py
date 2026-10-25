@@ -341,6 +341,73 @@ def _line_count(path: Path) -> int:
         return 0
 
 
+def _provider_call_health(path: Path) -> dict[str, int]:
+    """Count provider outcomes without copying prompts or provider output."""
+    counters = {
+        "provider_calls": 0,
+        "provider_failures": 0,
+        "provider_partial_calls": 0,
+        "worker_provider_failures": 0,
+        "manager_provider_failures": 0,
+        "validator_provider_failures": 0,
+    }
+    try:
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                if not line.strip():
+                    continue
+                counters["provider_calls"] += 1
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    counters["provider_failures"] += 1
+                    continue
+                if not isinstance(row, dict):
+                    counters["provider_failures"] += 1
+                    continue
+                if row.get("partial") is True or row.get("salvaged") is True:
+                    counters["provider_partial_calls"] += 1
+                if row.get("ok") is not False:
+                    continue
+                counters["provider_failures"] += 1
+                role = str(row.get("role") or "").strip().lower()
+                key = {
+                    "worker": "worker_provider_failures",
+                    "manager": "manager_provider_failures",
+                    "validator": "validator_provider_failures",
+                }.get(role)
+                if key:
+                    counters[key] += 1
+    except OSError:
+        pass
+    return counters
+
+
+_RUN_DELTA_FIELDS = (
+    "turns", "tool_calls", "effectful_tool_starts", "finding_cases",
+    "finding_families", "surface", "tested", "provider_calls",
+    "provider_failures", "provider_partial_calls", "worker_provider_failures",
+    "manager_provider_failures", "validator_provider_failures",
+    "astra_confirmed_p1", "astra_confirmed_p2_or_higher",
+)
+
+
+def _with_run_health(health: dict[str, Any], baseline: object) -> dict[str, Any]:
+    """Add run-local deltas while preserving engagement-lifetime counters."""
+    result = dict(health)
+    if not isinstance(baseline, dict):
+        return result
+    for field in _RUN_DELTA_FIELDS:
+        current = result.get(field)
+        start = baseline.get(field)
+        if (
+            isinstance(current, int) and not isinstance(current, bool)
+            and isinstance(start, int) and not isinstance(start, bool)
+        ):
+            result["run_" + field] = max(0, current - start)
+    return result
+
+
 def engine_lock_path(workspace: Workspace) -> Path:
     """Return the shared lock path used by every engine launch."""
     return workspace.root / ".ledger" / "engine.lock"
@@ -431,6 +498,7 @@ def _health(slug: str, engine_pid: int) -> dict[str, Any]:
     ledger = ws.root / ".ledger"
     finding_cases = _line_count(ledger / "findings.jsonl")
     finding_families = 0
+    findings: list[dict] = []
     if finding_cases:
         try:
             finding_families = len(ws.finding_family_catalog())
@@ -438,6 +506,67 @@ def _health(slug: str, engine_pid: int) -> dict[str, Any]:
             # Health reporting must not take down the supervisor when an interrupted
             # or externally edited ledger needs repair.
             finding_families = 0
+        try:
+            findings = [
+                row for row in ws.findings.all() if isinstance(row, dict)
+            ]
+        except (OSError, TypeError, ValueError):
+            findings = []
+
+    auth_counts = {
+        "auth_credentials": 0,
+        "auth_established": 0,
+        "auth_browser_sessions": 0,
+        "auth_pending_step_up": 0,
+    }
+    browser_available = False
+    if ws.exists():
+        try:
+            from . import credentials
+            aliases = credentials.list_credentials(ws.slug)
+            for alias in aliases[:64]:
+                try:
+                    row = credentials.session_status(ws.slug, alias)
+                except (OSError, ValueError):
+                    continue
+                auth_counts["auth_credentials"] += 1
+                auth_counts["auth_established"] += int(
+                    row.get("established") is True
+                )
+                auth_counts["auth_browser_sessions"] += int(
+                    row.get("has_browser_storage") is True
+                )
+                auth_counts["auth_pending_step_up"] += int(
+                    row.get("has_pending_step_up") is True
+                )
+        except (OSError, ValueError):
+            pass
+        try:
+            from .tools import browser_runtime_status
+            browser_available = bool(browser_runtime_status(probe=False)[0])
+        except (OSError, RuntimeError, ValueError):
+            browser_available = False
+
+    provider_counts = _provider_call_health(
+        ws.transcripts_dir / "provider-calls.jsonl"
+    )
+    current_run_id, current_paths = _current(slug)
+    active_provider_call = False
+    active_provider_turn = 0
+    active_provider_age = 0
+    if current_run_id and current_paths:
+        marker = _read_provider_call_marker(current_paths["provider_call_window"])
+        active_provider_call = marker.get("state") == "active"
+        if active_provider_call:
+            try:
+                active_provider_turn = max(0, int(marker.get("turn") or 0))
+                active_provider_age = max(
+                    0, int(time.time() - float(marker.get("started_at") or 0))
+                )
+            except (TypeError, ValueError):
+                active_provider_turn = 0
+                active_provider_age = 0
+
     return {
         "engine_pid": int(engine_pid or 0),
         "engine_alive": pid_matches(engine_pid, "engine", slug,
@@ -454,9 +583,20 @@ def _health(slug: str, engine_pid: int) -> dict[str, Any]:
         "findings": finding_cases,
         "finding_cases": finding_cases,
         "finding_families": finding_families,
+        "astra_confirmed_p1": len(
+            astra_confirmed_cases_at_or_above(findings, "P1")
+        ),
+        "astra_confirmed_p2_or_higher": len(
+            astra_confirmed_cases_at_or_above(findings, "P2")
+        ),
         "surface": _line_count(ledger / "attack-surface.jsonl"),
         "tested": _line_count(ledger / "tested-techniques.jsonl"),
-        "provider_calls": _line_count(ws.transcripts_dir / "provider-calls.jsonl"),
+        **provider_counts,
+        **auth_counts,
+        "browser_available": browser_available,
+        "active_provider_call": active_provider_call,
+        "active_provider_turn": active_provider_turn,
+        "active_provider_age_seconds": active_provider_age,
     }
 
 
@@ -553,6 +693,11 @@ def _start_background_locked(
     paths = _paths(ws.slug, run_id)
     _mkdir_private(paths["root"])
     deadline = None if indefinite else now + duration
+    initial_health = _health(ws.slug, 0)
+    health_baseline = {
+        field: int(initial_health.get(field) or 0)
+        for field in _RUN_DELTA_FIELDS
+    }
     # This is the only supervisor file containing the brief. It is never
     # returned by status, appended to events, or placed in any process argv.
     spec = {
@@ -563,6 +708,7 @@ def _start_background_locked(
         "backend": str(backend),
         "deadline_at": deadline,
         "starting_turn_index": int(ws.load_meta().turn_index),
+        "health_baseline": health_baseline,
         "run_mode": "until-finding" if indefinite else "finite",
         "until_severity": threshold,
         "max_turns": int(max_turns or 0),
@@ -1118,6 +1264,7 @@ def supervise(slug: str, run_id: str) -> int:
     signal.signal(signal.SIGTERM, on_stop)
     signal.signal(signal.SIGINT, on_stop)
     interval = int(spec["health_interval_seconds"])
+    health_baseline = spec.get("health_baseline")
     restarts = 0
     consecutive_failures = 0
     consecutive_immediate_failures = 0
@@ -1252,7 +1399,9 @@ def supervise(slug: str, run_id: str) -> int:
                     _signal_engine(child, signal.SIGTERM)
                     break
                 if now >= next_health:
-                    health = _health(slug, child.pid)
+                    health = _with_run_health(
+                        _health(slug, child.pid), health_baseline
+                    )
                     _state_update(paths["state"], state, last_health=health)
                     _append_event(paths["events"], "health", **health)
                     next_health = _advance_health_deadline(
@@ -1396,8 +1545,20 @@ def supervise(slug: str, run_id: str) -> int:
             paths["supervisor_pid"].unlink(missing_ok=True)
         except OSError:
             pass
-        _state_update(paths["state"], state, status=exit_status, stop_reason=stop_reason,
-                      ended_at=time.time(), engine_pid=0, restarts=restarts)
+        # A short-lived engine can exit before the first periodic checkpoint,
+        # and work can finish after the most recent one. Always persist a
+        # terminal snapshot so status/debug output describes the completed run.
+        final_health = _with_run_health(_health(slug, 0), health_baseline)
+        _state_update(
+            paths["state"], state,
+            status=exit_status,
+            stop_reason=stop_reason,
+            ended_at=time.time(),
+            engine_pid=0,
+            restarts=restarts,
+            last_health=final_health,
+        )
+        _append_event(paths["events"], "health", final=True, **final_health)
         _append_event(paths["events"], "supervisor_stopped", status=exit_status,
                       reason=stop_reason, restarts=restarts)
     return 0 if exit_status in {"completed", "stopped", "expired"} else 1

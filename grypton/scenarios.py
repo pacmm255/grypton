@@ -85,16 +85,37 @@ def priority_action(
     rotation_index: int,
     *,
     capabilities: set[str] | None = None,
+    exclude: set[str] | None = None,
 ) -> str:
-    """Choose a stable rotating action for a stagnating autonomous run."""
+    """Choose a stable rotating action for a stagnating autonomous run.
+
+    When exclude is provided, rotation advances past playbooks whose id is in
+    the set. If all matching playbooks are excluded, falls back to the original
+    index behavior.
+    """
     actions = priority_actions(target_type, capabilities=capabilities)
     if not actions:
         return ""
+
+    # If no exclusions, use original logic
+    exclude_set = set(exclude or ())
     try:
         index = max(0, int(rotation_index))
     except (TypeError, ValueError):
         index = 0
-    return actions[index % len(actions)]
+    if not exclude_set:
+        return actions[index % len(actions)]
+
+    # Filter by playbook id, not action text: an id never appears in the
+    # rendered sentence, so text comparison could never exclude anything.
+    rows = selected_scenarios(target_type, capabilities=capabilities)
+    filtered = [str(row["priority_action"]).strip() for row in rows
+                if row["id"] not in exclude_set]
+    if not filtered:
+        # Every matching playbook exhausted its chances: no coverage action
+        # this cycle (an empty string means the caller skips the priority).
+        return ""
+    return filtered[index % len(filtered)]
 
 
 def guidance(target_type: str) -> str:

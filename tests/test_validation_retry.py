@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,7 +9,9 @@ from grypton import config
 from grypton.engine import Engine
 from grypton.manager import Directive, KryptexManager, ManagerContext
 from grypton.runtime import _health
+from grypton.worker import TurnResult, WorkerError
 from grypton.workspace import Workspace
+from tests.evidence_helpers import write_evidence_package
 
 
 @contextmanager
@@ -70,7 +73,7 @@ class ValidationRetryTests(unittest.TestCase):
         with isolated_runtime():
             ws = Workspace("validator-retry")
             ws.create("https://example.test", "web")
-            finding = ws.record_finding(title="High candidate", severity="P2")
+            finding = ws.record_finding(title="High candidate", severity="P2", evidence_package=write_evidence_package(ws))
             degraded = {
                 "finding_id": finding["id"],
                 "verdict": "needs-more-evidence",
@@ -107,7 +110,7 @@ class ValidationRetryTests(unittest.TestCase):
             self.assertEqual(current["manager_verdict"]["severity"], "P2")
 
             malformed = ws.record_finding(
-                title="Malformed validator result", severity="P1",
+                title="Malformed validator result", severity="P1", evidence_package=write_evidence_package(ws),
             )
             ws.set_severity_verdict(malformed["id"], {
                 "finding_id": malformed["id"],
@@ -125,7 +128,7 @@ class ValidationRetryTests(unittest.TestCase):
             self.assertEqual(current["manager_verdict"]["verdict"], "confirm")
 
             malformed_degraded = ws.record_finding(
-                title="Malformed degraded flag", severity="P2",
+                title="Malformed degraded flag", severity="P2", evidence_package=write_evidence_package(ws),
             )
             ws.set_severity_verdict(malformed_degraded["id"], {
                 "finding_id": malformed_degraded["id"],
@@ -155,7 +158,7 @@ class ValidationRetryTests(unittest.TestCase):
             ws = Workspace("validator-transport-retry")
             ws.create("https://example.test", "web")
             evidence_gap = ws.record_finding(
-                title="Evidence gap", severity="P2", surface="/account",
+                title="Evidence gap", severity="P2", surface="/account", evidence_package=write_evidence_package(ws),
             )
             ws.set_severity_verdict(evidence_gap["id"], {
                 "finding_id": evidence_gap["id"],
@@ -168,7 +171,7 @@ class ValidationRetryTests(unittest.TestCase):
                 ],
             })
             transport_gap = ws.record_finding(
-                title="Transport gap", severity="P1", surface="/admin",
+                title="Transport gap", severity="P1", surface="/admin", evidence_package=write_evidence_package(ws),
             )
             ws.set_severity_verdict(transport_gap["id"], {
                 "finding_id": transport_gap["id"],
@@ -180,7 +183,7 @@ class ValidationRetryTests(unittest.TestCase):
                 "independent_checks": ["Retry Astra."],
             })
             decisive = ws.record_finding(
-                title="Downgraded case", severity="P1", surface="/cache",
+                title="Downgraded case", severity="P1", surface="/cache", evidence_package=write_evidence_package(ws),
             )
             ws.set_severity_verdict(decisive["id"], {
                 "finding_id": decisive["id"],
@@ -221,7 +224,7 @@ class ValidationRetryTests(unittest.TestCase):
             ws = Workspace("assessed-proof-severity")
             ws.create("https://example.test", "web")
             low = ws.record_finding(
-                title="Claimed critical but bounded", severity="P1",
+                title="Claimed critical but bounded", severity="P1", evidence_package=write_evidence_package(ws),
             )
             ws.set_severity_verdict(low["id"], {
                 "finding_id": low["id"],
@@ -232,7 +235,7 @@ class ValidationRetryTests(unittest.TestCase):
                 "independent_checks": ["Obtain an unavailable server-side fact."],
             })
             high = ws.record_finding(
-                title="Plausibly high impact", severity="P2",
+                title="Plausibly high impact", severity="P2", evidence_package=write_evidence_package(ws),
             )
             ws.set_severity_verdict(high["id"], {
                 "finding_id": high["id"],
@@ -250,7 +253,7 @@ class ValidationRetryTests(unittest.TestCase):
         with isolated_runtime():
             ws = Workspace("validation-retry-cadence")
             ws.create("https://example.test", "web")
-            finding = ws.record_finding(title="Transport retry", severity="P1")
+            finding = ws.record_finding(title="Transport retry", severity="P1", evidence_package=write_evidence_package(ws))
             ws.set_severity_verdict(finding["id"], {
                 "finding_id": finding["id"],
                 "verdict": "needs-more-evidence",
@@ -280,7 +283,7 @@ class ValidationRetryTests(unittest.TestCase):
             ws = Workspace("proof-dispatch-fingerprint")
             ws.create("https://example.test", "web")
             finding = ws.record_finding(
-                title="High evidence gap", severity="P2", evidence="initial",
+                title="High evidence gap", severity="P2", evidence="initial", evidence_package=write_evidence_package(ws),
             )
             verdict = {
                 "finding_id": finding["id"],
@@ -320,7 +323,7 @@ class ValidationRetryTests(unittest.TestCase):
             ws = Workspace("legacy-validator-retry")
             ws.create("https://example.test", "web")
             finding = ws.record_finding(
-                title="Legacy high claim", severity="P2",
+                title="Legacy high claim", severity="P2", evidence_package=write_evidence_package(ws),
             )
             ws.set_severity_verdict(finding["id"], {
                 "finding_id": finding["id"],
@@ -346,7 +349,7 @@ class ValidationRetryTests(unittest.TestCase):
 
             def add_failure(number: int) -> None:
                 finding = ws.record_finding(
-                    title=f"Retry {number}", severity="P2",
+                    title=f"Retry {number}", severity="P2", evidence_package=write_evidence_package(ws),
                 )
                 ws.set_severity_verdict(finding["id"], {
                     "finding_id": finding["id"],
@@ -383,7 +386,7 @@ class ValidationRetryTests(unittest.TestCase):
             for number in range(2):
                 finding = ws.record_finding(
                     title=f"High candidate {number}", severity="P2",
-                    surface=f"/object/{number}",
+                    surface=f"/object/{number}", evidence_package=write_evidence_package(ws),
                 )
                 ws.set_severity_verdict(finding["id"], {
                     "finding_id": finding["id"],
@@ -399,10 +402,10 @@ class ValidationRetryTests(unittest.TestCase):
             engine = Engine(ws.slug, backend="mock")
             engine.target = "https://example.test"
             engine.target_type = "web"
-            engine._family_stagnation_streak = 3
             selections = []
-            for turn in range(1, 7):
+            for turn in range(1, 9):
                 engine.turn_index = turn
+                engine._family_stagnation_streak = turn
                 selection = engine._next_coverage_priority(
                     exhausted=False,
                     worker_was_idle=False,
@@ -416,17 +419,16 @@ class ValidationRetryTests(unittest.TestCase):
                 elif selection.kind == "coverage":
                     engine._coverage_rotation_cursor += 1
 
-            self.assertTrue(all(item.action for item in selections))
             self.assertEqual(
                 [item.kind for item in selections],
-                ["coverage", "coverage", "proof", "coverage", "coverage", "proof"],
+                ["", "", "proof", "", "", "proof", "coverage", ""],
             )
             self.assertIn("For F001", selections[2].action)
             self.assertIn("For F002", selections[5].action)
-            self.assertEqual(engine._coverage_rotation_cursor, 4)
+            self.assertEqual(engine._coverage_rotation_cursor, 1)
             self.assertEqual(engine._proof_rotation_cursor, 2)
 
-    def test_generic_coverage_only_recovers_unusable_manager_directions(self):
+    def test_scheduled_coverage_is_authoritative_and_other_turns_leave_manager_control(self):
         with isolated_runtime():
             ws = Workspace("coverage-recovery-selection")
             ws.create("https://example.test", "web")
@@ -448,8 +450,8 @@ class ValidationRetryTests(unittest.TestCase):
             selected, applied = engine._select_next_directive(
                 concrete, selection,
             )
-            self.assertEqual(selected, concrete.worker_message())
-            self.assertFalse(applied)
+            self.assertEqual(selected, selection.action)
+            self.assertTrue(applied)
 
             recovery_cases = [
                 Directive(directive=""),
@@ -479,13 +481,78 @@ class ValidationRetryTests(unittest.TestCase):
             self.assertEqual(selected, "")
             self.assertFalse(applied)
 
+            engine._family_stagnation_streak = 4
+            non_scheduled = engine._next_coverage_priority(
+                exhausted=False,
+                worker_was_idle=False,
+                convergence_reason="",
+            )
+            self.assertEqual(non_scheduled.kind, "")
+            selected, applied = engine._select_next_directive(
+                concrete, non_scheduled,
+            )
+            self.assertEqual(selected, concrete.worker_message())
+            self.assertFalse(applied)
+
+    def test_manager_tool_summary_reports_results_without_credentials(self):
+        secret = "do-not-forward-this-password"
+        summary = Engine._tool_summary([
+            {
+                "name": "browser_workflow",
+                "input": {"password": secret},
+                "output": json.dumps({
+                    "ok": True,
+                    "summary": (
+                        "Authenticated identity user@example.test with "
+                        f"password={secret}"
+                    ),
+                    "data": {
+                        "flow": "/private/flows/flow-login.http",
+                        "status": 201,
+                    },
+                }),
+            },
+            {
+                "name": "http_request",
+                "output": json.dumps({
+                    "ok": False,
+                    "summary": "Request failed: token=top-secret-token",
+                    "data": {"flow_id": "flow-denied", "status_code": 403},
+                }),
+                "is_error": True,
+            },
+        ])
+
+        self.assertIn("browser_workflow outcome=success", summary)
+        self.assertIn("result_status=201", summary)
+        self.assertIn("flow=/private/flows/flow-login.http", summary)
+        self.assertIn("http_request outcome=error", summary)
+        self.assertIn("result_status=403", summary)
+        self.assertIn("flow=flow-denied", summary)
+        self.assertIn("[IDENTITY]", summary)
+        self.assertNotIn(secret, summary)
+        self.assertNotIn("top-secret-token", summary)
+        self.assertLessEqual(len(summary), 8_000)
+
+        raw_native = "opaque-native-evidence-that-must-stay-with-kraude"
+        native_summary = Engine._tool_summary([{
+            "name": "Bash", "output": raw_native,
+        }, {
+            "name": "Read",
+            "output": json.dumps({"summary": raw_native, "status": 200}),
+        }])
+        self.assertIn("output_chars=", native_summary)
+        self.assertIn("output_sha256=", native_summary)
+        self.assertNotIn(raw_native, native_summary)
+        self.assertNotIn("result_status=200", native_summary)
+
     def test_proof_rotation_uses_every_candidate_and_bounds_manager_context(self):
         with isolated_runtime():
             ws = Workspace("proof-window")
             ws.create("https://example.test", "web")
             for number in range(8):
                 finding = ws.record_finding(
-                    title=f"Candidate {number}", severity="P2",
+                    title=f"Candidate {number}", severity="P2", evidence_package=write_evidence_package(ws),
                 )
                 ws.set_severity_verdict(finding["id"], {
                     "finding_id": finding["id"],
@@ -525,7 +592,7 @@ class ValidationRetryTests(unittest.TestCase):
 
             def add_gap(number: int) -> dict:
                 finding = ws.record_finding(
-                    title=f"Gap {number}", severity="P2",
+                    title=f"Gap {number}", severity="P2", evidence_package=write_evidence_package(ws),
                 )
                 ws.set_severity_verdict(finding["id"], {
                     "finding_id": finding["id"],
@@ -576,7 +643,7 @@ class ValidationRetryTests(unittest.TestCase):
 
             def add_gap(number: int) -> None:
                 finding = ws.record_finding(
-                    title=f"Gap {number}", severity="P2",
+                    title=f"Gap {number}", severity="P2", evidence_package=write_evidence_package(ws),
                 )
                 ws.set_severity_verdict(finding["id"], {
                     "finding_id": finding["id"],
@@ -615,7 +682,7 @@ class ValidationRetryTests(unittest.TestCase):
             ws.create("https://example.test", "web")
             for number in range(4):
                 finding = ws.record_finding(
-                    title=f"Candidate {number}", severity="P2",
+                    title=f"Candidate {number}", severity="P2", evidence_package=write_evidence_package(ws),
                 )
                 ws.set_severity_verdict(finding["id"], {
                     "finding_id": finding["id"],
@@ -660,7 +727,7 @@ class FamilyStagnationLoopTests(unittest.IsolatedAsyncioTestCase):
     async def test_new_families_cannot_starve_periodic_proof_work(self):
         with isolated_runtime(), patch.multiple(
             config.CONFIG,
-            max_turns=3,
+            max_turns=4,
             max_run_seconds=0,
             stop_on_p1=False,
             until_severity="",
@@ -671,7 +738,7 @@ class FamilyStagnationLoopTests(unittest.IsolatedAsyncioTestCase):
             ws = Workspace("proof-cadence-loop")
             ws.create("https://example.test", "web")
             high = ws.record_finding(
-                title="High evidence gap", severity="P2", surface="/account",
+                title="High evidence gap", severity="P2", surface="/account", evidence_package=write_evidence_package(ws),
             )
             ws.set_severity_verdict(high["id"], {
                 "finding_id": high["id"],
@@ -688,7 +755,13 @@ class FamilyStagnationLoopTests(unittest.IsolatedAsyncioTestCase):
                 target_type="web",
             )
 
-            def worker_script(worker, _directive):
+            worker_directives = []
+            pending_before_attempt = []
+
+            def worker_script(worker, directive):
+                worker_directives.append(directive)
+                if worker.counter == 4:
+                    pending_before_attempt.append(worker.ws.load_meta())
                 worker.ws.record_finding(
                     title=f"Low family {worker.counter}",
                     severity="P3",
@@ -709,11 +782,20 @@ class FamilyStagnationLoopTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(
                 [context.family_stagnation_streak for context in contexts],
-                [0, 0, 0],
+                [0, 0, 0, 0],
             )
             self.assertEqual(contexts[0].coverage_priority, "")
             self.assertEqual(contexts[1].coverage_priority, "")
             self.assertIn("For F001", contexts[2].coverage_priority)
+            self.assertEqual(contexts[3].coverage_priority, "")
+            self.assertEqual(worker_directives[3], contexts[2].coverage_priority)
+            self.assertEqual(
+                pending_before_attempt[0].proof_pending_record_id, "F001",
+            )
+            self.assertEqual(pending_before_attempt[0].proof_pending_turn, 4)
+            self.assertNotIn(
+                "F001", pending_before_attempt[0].proof_dispatch_fingerprints,
+            )
             meta = ws.load_meta()
             self.assertEqual(meta.proof_rotation_cursor, 1)
             self.assertEqual(meta.proof_rotation_after_id, "F001")
@@ -722,8 +804,164 @@ class FamilyStagnationLoopTests(unittest.IsolatedAsyncioTestCase):
                 meta.proof_dispatch_fingerprints.get("F001", ""),
                 r"^[0-9a-f]{64}$",
             )
+            self.assertEqual(meta.proof_pending_record_id, "")
+            self.assertEqual(meta.proof_pending_turn, 0)
             self.assertEqual(meta.coverage_rotation_cursor, 0)
-            self.assertEqual(meta.last_directive, contexts[2].coverage_priority)
+            self.assertEqual(meta.last_directive, "Continue discovery.")
+
+    async def test_partial_proof_attempt_is_not_acknowledged_or_replayed(self):
+        with isolated_runtime(), patch.multiple(
+            config.CONFIG,
+            max_turns=4,
+            max_run_seconds=0,
+            stop_on_p1=False,
+            until_severity="",
+            passive_stagnation_limit=99,
+            repetitive_probe_turn_limit=99,
+            exhaustion_threshold=99,
+        ):
+            ws = Workspace("proof-partial-attempt")
+            ws.create("https://example.test", "web")
+            finding = ws.record_finding(
+                title="High evidence gap", severity="P2", surface="/account", evidence_package=write_evidence_package(ws),
+            )
+            ws.set_severity_verdict(finding["id"], {
+                "finding_id": finding["id"],
+                "verdict": "needs-more-evidence",
+                "severity": "P2",
+                "validator_model": config.VALIDATOR_MODEL,
+                "validator_effort": config.VALIDATOR_EFFORT,
+                "independent_checks": ["Capture the peer control."],
+            })
+
+            seed = Engine(ws.slug, backend="mock")
+            seed.target = "https://example.test"
+            seed.target_type = "web"
+            seed.turn_index = 3
+            selection = seed._next_coverage_priority(
+                exhausted=False,
+                worker_was_idle=False,
+                convergence_reason="",
+            )
+            pending = seed._stage_pending_proof(selection, expected_turn=4)
+            ws.update_meta(
+                turn_index=3,
+                last_directive=selection.action,
+                **pending,
+            )
+
+            engine = Engine(
+                ws.slug, backend="mock", run_until_deadline=True,
+            )
+            await engine.setup(
+                brief="",
+                target="https://example.test",
+                target_type="web",
+                fresh_clone=False,
+            )
+            engine.worker.run_turn = AsyncMock(side_effect=[
+                WorkerError(
+                    "provider exited during a proof tool call",
+                    metadata={"tool_count": 1, "replay_safe": False},
+                ),
+                TurnResult(
+                    assistant_text="Recovered on a different durable lead.",
+                    tool_uses=[{"name": "http_request", "input": {}}],
+                    result={"is_error": False},
+                ),
+            ])
+            engine.worker.ensure_started = AsyncMock()
+            engine._wait_for_worker_retry = AsyncMock(return_value=True)
+            engine.manager.direct = AsyncMock(return_value=Directive(
+                directive="Continue with the strongest unresolved lead.",
+            ))
+
+            await engine.run()
+
+            directives = [
+                call.args[0] for call in engine.worker.run_turn.await_args_list
+            ]
+            self.assertEqual(directives[0], selection.action)
+            self.assertNotEqual(directives[1], selection.action)
+            self.assertIn("different highest-impact", directives[1])
+            meta = ws.load_meta()
+            self.assertEqual(meta.proof_pending_record_id, "")
+            self.assertEqual(meta.proof_pending_turn, 0)
+            self.assertNotIn(finding["id"], meta.proof_dispatch_fingerprints)
+            self.assertEqual(meta.proof_rotation_cursor, 0)
+
+    async def test_salvaged_partial_turn_does_not_acknowledge_proof(self):
+        with isolated_runtime(), patch.multiple(
+            config.CONFIG,
+            max_turns=4,
+            max_run_seconds=0,
+            stop_on_p1=False,
+            until_severity="",
+            passive_stagnation_limit=99,
+            repetitive_probe_turn_limit=99,
+            exhaustion_threshold=99,
+        ):
+            ws = Workspace("proof-salvaged-partial")
+            ws.create("https://example.test", "web")
+            finding = ws.record_finding(
+                title="High evidence gap", severity="P2", surface="/account", evidence_package=write_evidence_package(ws),
+            )
+            ws.set_severity_verdict(finding["id"], {
+                "finding_id": finding["id"],
+                "verdict": "needs-more-evidence",
+                "severity": "P2",
+                "validator_model": config.VALIDATOR_MODEL,
+                "validator_effort": config.VALIDATOR_EFFORT,
+                "independent_checks": ["Capture the peer control."],
+            })
+
+            seed = Engine(ws.slug, backend="mock")
+            seed.target = "https://example.test"
+            seed.target_type = "web"
+            seed.turn_index = 3
+            selection = seed._next_coverage_priority(
+                exhausted=False,
+                worker_was_idle=False,
+                convergence_reason="",
+            )
+            pending = seed._stage_pending_proof(selection, expected_turn=4)
+            ws.update_meta(
+                turn_index=3,
+                last_directive=selection.action,
+                **pending,
+            )
+
+            engine = Engine(
+                ws.slug, backend="mock", run_until_deadline=True,
+            )
+            await engine.setup(
+                brief="",
+                target="https://example.test",
+                target_type="web",
+                fresh_clone=False,
+            )
+            engine.worker.run_turn = AsyncMock(return_value=TurnResult(
+                assistant_text="Tool effects survived; final response was lost.",
+                tool_uses=[{
+                    "name": "http_request",
+                    "input": {"url": "https://example.test/account"},
+                    "output": '{"ok":true,"summary":"HTTP 200"}',
+                }],
+                result={"is_error": True, "partial": True},
+                is_error=True,
+            ))
+            engine.manager.direct = AsyncMock(return_value=Directive(
+                directive="Continue with a different unresolved lead.",
+            ))
+
+            await engine.run()
+
+            meta = ws.load_meta()
+            self.assertEqual(meta.turn_index, 4)
+            self.assertEqual(meta.proof_pending_record_id, "")
+            self.assertEqual(meta.proof_pending_turn, 0)
+            self.assertNotIn(finding["id"], meta.proof_dispatch_fingerprints)
+            self.assertEqual(meta.proof_rotation_cursor, 0)
 
     async def test_new_routes_without_new_families_trigger_rotation(self):
         with isolated_runtime(), patch.multiple(
@@ -774,7 +1012,7 @@ class FamilyStagnationLoopTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(meta.proof_rotation_cursor, 0)
             self.assertEqual(
                 meta.last_directive,
-                "Exercise the next unresolved operation.",
+                contexts[2].coverage_priority,
             )
             health = _health(ws.slug, 0)
             self.assertEqual(health["family_stagnation_streak"], 3)

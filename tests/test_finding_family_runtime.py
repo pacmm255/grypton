@@ -414,6 +414,9 @@ class FindingFamilyRuntimeTests(unittest.IsolatedAsyncioTestCase):
             missing = _health("missing-health", 0)
             self.assertEqual(missing["finding_cases"], 0)
             self.assertEqual(missing["finding_families"], 0)
+            self.assertEqual(missing["provider_failures"], 0)
+            self.assertEqual(missing["auth_established"], 0)
+            self.assertFalse(missing["active_provider_call"])
             self.assertFalse(missing_root.exists())
 
             ws = Workspace("family-runtime-health")

@@ -73,6 +73,53 @@ class MockWorker:
                           num_turns=1, duration_s=0.01)
 
     @staticmethod
+    def _evidence_package(ws, *, positive_status: int, control_status: int) -> dict:
+        """Synthesize a mechanically verifiable evidence package for mocks."""
+        from . import tools
+        url = "https://t/api/v2/users/2"
+        headers = {"Accept": "application/json"}
+
+        def response(status: int, body: str) -> str:
+            return (f"HTTP/1.1 {status} {'OK' if status < 400 else 'Denied'}\n"
+                    "Content-Type: application/json\n\n" + body)
+
+        body = '{"user": "2", "email": "other@example.test"}'
+        positive = tools._save_flow(
+            ws, "GET", url, headers, None,
+            response(positive_status, body), transport="curl", returncode=0)
+        control = tools._save_flow(
+            ws, "GET", url, headers, None,
+            response(control_status, '{"error": "forbidden"}'),
+            transport="curl", returncode=0)
+        replay = tools._save_flow(
+            ws, "GET", url, headers, None,
+            response(positive_status, body),
+            transport=f"replay:{positive.stem}", returncode=0)
+        second = tools._save_flow(
+            ws, "GET", url, headers, None,
+            response(positive_status, body),
+            transport=f"replay:{positive.stem}", returncode=0)
+        return {
+            "positive_flow_id": positive.stem,
+            "control_flow_id": control.stem,
+            "replay_flow_id": replay.stem,
+            "second_run_flow_id": second.stem,
+            "differential_claim": {
+                "dimension": "status", "predicate": "differs",
+                "positive_value": str(positive_status),
+                "control_value": str(control_status),
+            },
+            "changed_variable": "session principal (owned vs other user)",
+            "precondition_notes": "authenticated as user 1",
+            "environment_notes": "single origin, cache disabled",
+        }
+
+    def _mock_evidence_package(self, *, positive_status: int,
+                               control_status: int) -> dict:
+        return self._evidence_package(self.ws, positive_status=positive_status,
+                                      control_status=control_status)
+
+    @staticmethod
     def _default_script(self, directive: str) -> str:
         d = (directive or "").lower()
         i = self.counter
@@ -100,7 +147,9 @@ class MockWorker:
                 surface="/api/v2/users/{id}",
                 description="Sequential user IDs expose other users' PII.",
                 poc="GET /api/v2/users/2 returns user 2's profile while authed as user 1.",
-                evidence="flows/flow-idor.http")
+                evidence="flows/flow-idor.http",
+                evidence_package=self._mock_evidence_package(
+                    positive_status=200, control_status=403))
             return "Confirmed an IDOR (claimed P2)."
         if i == 4:
             self.ws.record_finding(
@@ -108,7 +157,9 @@ class MockWorker:
                 vuln_class="Authentication bypass", surface="/api/v2/login",
                 description="Server accepts HS256 tokens signed with the public RSA key.",
                 poc="Forge token with alg=HS256 keyed on the public cert → full account takeover.",
-                evidence="flows/flow-jwt.http")
+                evidence="flows/flow-jwt.http",
+                evidence_package=self._mock_evidence_package(
+                    positive_status=200, control_status=401))
             return "Confirmed a critical authentication bypass (claimed P1)."
         return f"Turn {i}: re-reviewed known surface; nothing new on the current path."
 
@@ -167,11 +218,19 @@ class MockManager:
         severity = finding.get("severity", "P3")
         if not explicit and not config.astra_auto_validation_required(severity):
             raise ValueError("Automatic Astra validation is limited to P1/P2.")
+        package = finding.get("evidence_package")
+        verified = (package.get("verified")
+                    if isinstance(package, dict) else None)
+        ack = {}
+        if isinstance(verified, dict):
+            chain = verified.get("evidence_chain_sha256")
+            if isinstance(chain, str):
+                ack = {"evidence_chain_ack": chain}
         return {"finding_id": finding.get("id"), "verdict": "confirm",
                 "severity": severity, "confidence": 0.85,
                 "reasoning": "Independently reproduced.",
                 "validator_model": config.VALIDATOR_MODEL,
-                "validator_effort": config.VALIDATOR_EFFORT}
+                "validator_effort": config.VALIDATOR_EFFORT, **ack}
 
     async def chat(self, user_message: str, ctx: ManagerContext) -> dict:
         await asyncio.sleep(0)

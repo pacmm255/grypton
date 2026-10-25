@@ -12,6 +12,7 @@ from grypton import config
 from grypton.engine import Engine
 from grypton.manager import Directive
 from grypton.workspace import Constraints, Workspace
+from tests.evidence_helpers import write_evidence_package
 
 
 @contextmanager
@@ -61,7 +62,7 @@ class ValidationOrderTests(unittest.IsolatedAsyncioTestCase):
                     surface="/account",
                     description="A reproducible critical candidate.",
                     poc="request and control",
-                    evidence="flows/critical.http",
+                    evidence="flows/critical.http", evidence_package=write_evidence_package(engine.ws),
                 )
                 already_validated = engine.ws.record_finding(
                     title="Previously validated high candidate",
@@ -70,7 +71,7 @@ class ValidationOrderTests(unittest.IsolatedAsyncioTestCase):
                     surface="/profile",
                     description="A separately validated candidate.",
                     poc="request and control",
-                    evidence="flows/high.http",
+                    evidence="flows/high.http", evidence_package=write_evidence_package(engine.ws),
                 )
                 engine.ws.set_severity_verdict(already_validated["id"], {
                     "finding_id": already_validated["id"],
@@ -179,10 +180,10 @@ class ValidationOrderTests(unittest.IsolatedAsyncioTestCase):
 
             def worker_script(_worker, _directive):
                 finding_ids.append(engine.ws.record_finding(
-                    title="First candidate", severity="P1",
+                    title="First candidate", severity="P1", evidence_package=write_evidence_package(engine.ws),
                 )["id"])
                 finding_ids.append(engine.ws.record_finding(
-                    title="Second candidate", severity="P2",
+                    title="Second candidate", severity="P2", evidence_package=write_evidence_package(engine.ws),
                 )["id"])
                 return "Recorded two candidates."
 
@@ -239,11 +240,11 @@ class ValidationOrderTests(unittest.IsolatedAsyncioTestCase):
             ws.create("https://example.test", "web")
             evidence_case = ws.record_finding(
                 title="Evidence case", severity="P2",
-                description="Initial candidate.", evidence="flows/initial.http",
+                description="Initial candidate.", evidence="flows/initial.http", evidence_package=write_evidence_package(ws),
             )
             description_case = ws.record_finding(
                 title="Description case", severity="P2",
-                description="Initial wording.", evidence="flows/other.http",
+                description="Initial wording.", evidence="flows/other.http", evidence_package=write_evidence_package(ws),
             )
             for finding in (evidence_case, description_case):
                 ws.set_severity_verdict(finding["id"], {
@@ -325,7 +326,7 @@ class ValidationOrderTests(unittest.IsolatedAsyncioTestCase):
         with isolated_runtime():
             ws = Workspace("validation-atomic")
             ws.create("https://example.test", "web")
-            finding = ws.record_finding(title="Candidate", severity="P1")
+            finding = ws.record_finding(title="Candidate", severity="P1", evidence_package=write_evidence_package(ws))
             verdicts = [
                 {
                     "finding_id": finding["id"],
@@ -381,7 +382,7 @@ class ValidationOrderTests(unittest.IsolatedAsyncioTestCase):
             )
 
             def worker_script(_worker, _directive):
-                engine.ws.record_finding(title="Critical candidate", severity="P1")
+                engine.ws.record_finding(title="Critical candidate", severity="P1", evidence_package=write_evidence_package(engine.ws))
                 return "Recorded a critical candidate."
 
             async def validate(finding, _ctx, *, explicit=False):
@@ -425,7 +426,7 @@ class ValidationOrderTests(unittest.IsolatedAsyncioTestCase):
             )
 
             def worker_script(_worker, _directive):
-                engine.ws.record_finding(title="Critical candidate", severity="P1")
+                engine.ws.record_finding(title="Critical candidate", severity="P1", evidence_package=write_evidence_package(engine.ws))
                 return "Recorded a critical candidate."
 
             started = asyncio.Event()
@@ -474,7 +475,7 @@ class ValidationOrderTests(unittest.IsolatedAsyncioTestCase):
             )
 
             def worker_script(_worker, _directive):
-                engine.ws.record_finding(title="Critical candidate", severity="P1")
+                engine.ws.record_finding(title="Critical candidate", severity="P1", evidence_package=write_evidence_package(engine.ws))
                 return "Recorded a critical candidate."
 
             started = asyncio.Event()
@@ -561,7 +562,7 @@ class ValidationOrderTests(unittest.IsolatedAsyncioTestCase):
             )
 
             def worker_script(_worker, _directive):
-                engine.ws.record_finding(title="Critical candidate", severity="P1")
+                engine.ws.record_finding(title="Critical candidate", severity="P1", evidence_package=write_evidence_package(engine.ws))
                 return "Recorded a critical candidate."
 
             engine.worker.script = worker_script

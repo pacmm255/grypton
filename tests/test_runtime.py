@@ -32,6 +32,7 @@ from grypton.runtime import (
     _provider_call_window_active,
     _provider_call_window_begin,
     _provider_call_window_complete,
+    _provider_call_health,
     _process_snapshot,
     _safe_error,
     _restart_delay,
@@ -39,6 +40,7 @@ from grypton.runtime import (
     engine_lock_is_available,
     engine_lock_path,
     _stop_engine,
+    _with_run_health,
     _write_json,
     public_status,
     request_background_stop,
@@ -106,6 +108,46 @@ class _HungProcess:
 
 
 class RuntimeTests(unittest.TestCase):
+    def test_run_health_deltas_keep_lifetime_counters(self):
+        lifetime = {
+            "turns": 143, "tool_calls": 6769, "finding_cases": 2,
+            "provider_calls": 170, "provider_failures": 27,
+            "provider_partial_calls": 3,
+        }
+        projected = _with_run_health(lifetime, {
+            "turns": 140, "tool_calls": 6700, "finding_cases": 2,
+            "provider_calls": 160, "provider_failures": 25,
+            "provider_partial_calls": 1,
+        })
+        self.assertEqual(projected["turns"], 143)
+        self.assertEqual(projected["run_turns"], 3)
+        self.assertEqual(projected["run_tool_calls"], 69)
+        self.assertEqual(projected["run_finding_cases"], 0)
+        self.assertEqual(projected["run_provider_failures"], 2)
+        self.assertEqual(projected["run_provider_partial_calls"], 2)
+
+    def test_provider_health_counts_outcomes_without_returning_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "provider-calls.jsonl"
+            private = "credential-value-must-not-escape"
+            rows = [
+                {"role": "worker", "ok": True, "prompt": private},
+                {"role": "worker", "ok": False, "partial": True,
+                 "error_message": private},
+                {"role": "manager", "ok": False, "stderr": private},
+            ]
+            path.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            counters = _provider_call_health(path)
+        self.assertEqual(counters["provider_calls"], 3)
+        self.assertEqual(counters["provider_failures"], 2)
+        self.assertEqual(counters["provider_partial_calls"], 1)
+        self.assertEqual(counters["worker_provider_failures"], 1)
+        self.assertEqual(counters["manager_provider_failures"], 1)
+        self.assertNotIn(private, json.dumps(counters))
+
     def test_restart_backoff_escalates_to_fifteen_minute_cap(self):
         self.assertEqual(
             [_restart_delay(streak) for streak in range(1, 13)],
@@ -645,6 +687,67 @@ class RuntimeTests(unittest.TestCase):
                 self.assertEqual(supervise(ws.slug, run_id), 0)
             self.assertEqual(popen.call_count, 1)
             self.assertEqual(public_status(ws.slug)["status"], "completed")
+
+    def test_short_run_persists_terminal_health_snapshot(self):
+        with runtime_home():
+            ws = Workspace("short-final-health")
+            ws.create("example.test", "web")
+            run_id = "20260923T000000Z-00000024"
+            paths = _paths(ws.slug, run_id)
+            _write_json(paths["spec"], {
+                "slug": ws.slug,
+                "run_id": run_id,
+                "deadline_at": time.time() + 60,
+                "health_interval_seconds": 600,
+                "restart_limit": 0,
+                "health_baseline": {
+                    "turns": 40,
+                    "tool_calls": 100,
+                    "provider_failures": 2,
+                },
+            })
+            _write_json(paths["state"], {
+                "slug": ws.slug,
+                "run_id": run_id,
+                "status": "starting",
+                "restarts": 0,
+                "last_health": {},
+            })
+            _write_json(
+                config.RUNTIME_DIR
+                / "supervisors/short-final-health/current.json",
+                {"run_id": run_id},
+            )
+            terminal_health = {
+                "workspace_status": "stopped",
+                "turns": 42,
+                "tool_calls": 107,
+                "provider_failures": 3,
+            }
+            process = _Process(pid=43431, returncode=0)
+            with patch(
+                    "grypton.runtime.subprocess.Popen", return_value=process
+                ), patch(
+                    "grypton.runtime._health", return_value=terminal_health
+                ) as health:
+                self.assertEqual(supervise(ws.slug, run_id), 0)
+
+            state = public_status(ws.slug)
+            self.assertEqual(health.call_count, 1)
+            self.assertEqual(state["last_health"]["turns"], 42)
+            self.assertEqual(state["last_health"]["run_turns"], 2)
+            self.assertEqual(state["last_health"]["run_tool_calls"], 7)
+            self.assertEqual(state["last_health"]["run_provider_failures"], 1)
+            events = [
+                json.loads(line)
+                for line in paths["events"].read_text(encoding="utf-8").splitlines()
+            ]
+            final_health = [
+                row for row in events
+                if row.get("event") == "health" and row.get("final") is True
+            ]
+            self.assertEqual(len(final_health), 1)
+            self.assertEqual(final_health[0]["run_turns"], 2)
 
     def test_abnormal_exit_after_completed_effectful_turn_is_restarted(self):
         with runtime_home():

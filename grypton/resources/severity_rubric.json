@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "precedence": [
+    "program-specific rule",
+    "pinned vrt node",
+    "documented internal fallback"
+  ],
+  "rules": [
+    "Severity follows the worst demonstrated operation, never the worst imaginable.",
+    "No arithmetic penalties for authentication or interaction prerequisites; they are usually already encoded in the taxonomy node.",
+    "When the taxonomy default and the CVSS band disagree by one level, take the lower unless the evidence package contains a confirmed cross-account or cross-privilege differential.",
+    "Never convert CVSS score bands directly into P levels."
+  ],
+  "vrt_fallback": [
+    {"vrt_node": "server_security_misconfiguration > rce", "default_priority": "P1", "cvss4_template": "AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H", "notes": "network-reachable code execution"},
+    {"vrt_node": "broken_authentication > auth_bypass", "default_priority": "P1", "cvss4_template": "AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:L/VA:L", "notes": "unauthenticated assumption of another principal's identity or session"},
+    {"vrt_node": "sensitive_data_exposure > critical_prod_secret_live", "default_priority": "P1", "cvss4_template": "AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:H/VA:H", "notes": "proven-live production secret granting privileged access"},
+    {"vrt_node": "server_side_injection > sql_injection", "default_priority": "P1-P2", "cvss4_template": "AV:N/AC:L/AT:N/PR:N/UI:N/VC:H/VI:L/VA:L", "notes": "rate the demonstrated database read or write, not the injection label"},
+    {"vrt_node": "broken_access_control > idor_modify_others", "default_priority": "P2", "cvss4_template": "AV:N/AC:L/AT:N/PR:L/UI:N/VC:L/VI:H/VA:L", "notes": "authenticated modification of another principal's object"},
+    {"vrt_node": "server_side_request_forgery_ssrf > internal_response_bearing", "default_priority": "P2", "cvss4_template": "AV:N/AC:L/AT:N/PR:L/UI:N/VC:H/VI:L/VA:L", "notes": "server fetches an attacker-directed internal URL and returns the response"},
+    {"vrt_node": "cross_site_scripting_xss > stored_privileged_context", "default_priority": "P2-P3", "cvss4_template": "AV:N/AC:L/AT:N/PR:L/UI:P/VC:L/VI:L/VA:L", "notes": "persistent script execution in another principal's browser session"},
+    {"vrt_node": "cross_site_scripting_xss > reflected", "default_priority": "P3", "cvss4_template": "AV:N/AC:L/AT:N/PR:N/UI:P/VC:L/VI:L/VA:L", "notes": "victim interaction required; rate by the demonstrated context"},
+    {"vrt_node": "cross_site_request_forgery_csrf > state_changing", "default_priority": "P3", "cvss4_template": "AV:N/AC:L/AT:N/PR:N/UI:P/VC:N/VI:L/VA:L", "notes": "authenticated state change triggered by victim interaction"},
+    {"vrt_node": "sensitive_data_exposure > internal_metadata", "default_priority": "P4", "cvss4_template": "AV:N/AC:L/AT:N/PR:L/UI:N/VC:L/VI:N/VA:N", "notes": "internal metadata or diagnostics without a proven-live secret"},
+    {"vrt_node": "server_security_misconfiguration > missing_security_header", "default_priority": "P5", "cvss4_template": "AV:N/AC:H/AT:P/PR:N/UI:N/VC:N/VI:N/VA:N", "notes": "header absence with no demonstrated impact"},
+    {"vrt_node": "unreachable_or_informational > self_xss", "default_priority": "P5", "cvss4_template": "AV:N/AC:H/AT:P/PR:L/UI:P/VC:N/VI:N/VA:N", "notes": "impact limited to the attacker's own client context"}
+  ],
+  "boundary_rulings": [
+    {"case": "self-xss", "ruling": "P5 unless an evidenced cross-user boundary exists", "rationale": "no cross-user impact alone"},
+    {"case": "reflected xss on a minor page", "ruling": "P3 by context; traffic volume alone neither raises nor lowers the rating", "rationale": "victim interaction is inherent to the class and is not double-counted"},
+    {"case": "stored xss into a privileged victim's context", "ruling": "P2; requires cross-account control evidence in the package", "rationale": "execution inside a privileged principal's browser is only provable with a cross-user differential"},
+    {"case": "blind internal-only ssrf", "ruling": "P3", "rationale": "no response content returns to the attacker, so the differential is limited to observable side effects"},
+    {"case": "ssrf of cloud metadata with retrieved credentials", "ruling": "P1-P2", "rationale": "rate by what the retrieved credentials unlock; retrieved and proven usable reaches P1"},
+    {"case": "idor read of non-sensitive objects", "ruling": "P4", "rationale": "cross-principal read without sensitive content"},
+    {"case": "idor read of pii", "ruling": "P2-P3", "rationale": "sensitivity and volume of the exposed records decide within the band"},
+    {"case": "idor write", "ruling": "rate by the action's security effect, not by the idor label", "rationale": "the write is only the delivery mechanism for its consequence"},
+    {"case": "rate-limit weakness alone", "ruling": "informational; rate the separately evidenced abuse", "rationale": "a missing limit without demonstrated impact is not a vulnerability"},
+    {"case": "secret versus metadata exposure", "ruling": "rated by what the secret unlocks; proven-live is required to exceed P4", "rationale": "unproven key material is potential impact, not demonstrated impact"}
+  ]
+}

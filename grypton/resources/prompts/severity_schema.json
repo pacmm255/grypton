@@ -17,16 +17,83 @@
     "confidence": { "type": "number", "description": "0.0–1.0" },
     "reasoning": {
       "type": "string",
-      "description": "Why. Cite concrete evidence and impact, and whether you reproduced/verified it."
+      "description": "Why. Cite the saved artifacts and impact that decide the verdict. As a tools-denied reviewer you never imply reproduction or that live checks were performed."
     },
     "independent_checks": {
       "type": "array",
       "items": { "type": "string" },
-      "description": "Independent checks you performed or that must be performed to confirm. Empty array if none."
+      "description": "Observations the saved evidence must still provide to confirm the claim. You perform no live checks; empty array if none are needed."
     },
     "exploitability": {
       "type": "string",
       "description": "Realistic exploitability / preconditions / blast radius. Empty string if unknown."
+    },
+    "vrt_node": {
+      "type": "string",
+      "maxLength": 256,
+      "description": "The single most specific taxonomy node the proven differential supports, for example server_security_misconfiguration > rce."
+    },
+    "vrt_version": {
+      "type": "string",
+      "maxLength": 32,
+      "description": "The pinned taxonomy release the node was read from, when known."
+    },
+    "cvss_vector": {
+      "type": "string",
+      "maxLength": 256,
+      "description": "CVSS v4.0 base vector filled from proven facts only."
+    },
+    "cvss_score": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 10,
+      "description": "CVSS v4.0 score for the supplied vector; never converted directly into the P level."
+    },
+    "cvss_severity": {
+      "type": "string",
+      "enum": ["Low", "Medium", "High", "Critical"],
+      "description": "CVSS qualitative rating for the supplied vector."
+    },
+    "severity_basis": {
+      "type": "string",
+      "maxLength": 512,
+      "description": "Which precedence rule decided the severity: vrt_default, cvss_override, or program_adjustment, with the deciding rule."
+    },
+    "evidence_chain_ack": {
+      "type": "string",
+      "maxLength": 128,
+      "description": "Echo of the dossier's evidence chain id exactly as supplied; empty string when absent."
+    },
+    "artifact_checklist": {
+      "type": "array",
+      "maxItems": 32,
+      "description": "Per-claim review ledger keyed to saved artifacts; empty array when no claims are itemized.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["claim", "satisfied", "proving_artifact_ids", "failing_or_missing_artifact_ids"],
+        "properties": {
+          "claim": {
+            "type": "string",
+            "maxLength": 512,
+            "description": "The assessed claim in safe abstracted wording."
+          },
+          "satisfied": {
+            "type": "boolean",
+            "description": "Whether the saved evidence proves the claim."
+          },
+          "proving_artifact_ids": {
+            "type": "array",
+            "items": { "type": "string", "maxLength": 80 },
+            "description": "Artifact or flow IDs that prove the claim; empty when unsatisfied."
+          },
+          "failing_or_missing_artifact_ids": {
+            "type": "array",
+            "items": { "type": "string", "maxLength": 80 },
+            "description": "Artifact or flow IDs that contradict the claim or are missing; empty when satisfied."
+          }
+        }
+      }
     }
   }
 }

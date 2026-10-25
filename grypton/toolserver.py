@@ -46,6 +46,47 @@ def _family_preview(row: dict) -> dict:
     return item
 
 
+_EVIDENCE_PACKAGE_FLOW_KEYS = ("positive_flow_id", "control_flow_id",
+                               "replay_flow_id", "second_run_flow_id")
+_EVIDENCE_CLAIM_KEYS = ("dimension", "predicate", "positive_value",
+                        "control_value")
+
+
+def _evidence_package_problem(package) -> str:
+    """Return a one-line reason when an evidence package is not structurally
+    valid; mechanical digest verification happens in the workspace."""
+    if not isinstance(package, dict):
+        return "evidence_package must be an object."
+    for key in _EVIDENCE_PACKAGE_FLOW_KEYS:
+        value = package.get(key)
+        if not isinstance(value, str) or not re.fullmatch(r"flow-[0-9]+", value):
+            return f"evidence_package {key} must be a flow-<digits> capture id."
+    if len({package[key] for key in _EVIDENCE_PACKAGE_FLOW_KEYS}) != 4:
+        return "evidence_package roles must reference four distinct captures."
+    control_variable = package.get("control_variable")
+    if control_variable is not None:
+        if (not isinstance(control_variable, dict)
+                or set(control_variable) != {"location", "name"}
+                or control_variable.get("location") not in {
+                    "method", "url_path", "query", "header",
+                    "body_form", "body_json_pointer", "body_text"}
+                or not isinstance(control_variable.get("name"), str)
+                or not 1 <= len(control_variable["name"]) <= 512):
+            return ("evidence_package control_variable must be {location, name} "
+                    "with a supported location.")
+    claim = package.get("differential_claim")
+    if not isinstance(claim, dict) or set(claim) != set(_EVIDENCE_CLAIM_KEYS):
+        return ("evidence_package differential_claim must carry exactly "
+                "dimension, predicate, positive_value, control_value.")
+    for key in _EVIDENCE_CLAIM_KEYS + ("changed_variable", "precondition_notes",
+                                       "environment_notes"):
+        value = package.get(key) if key not in _EVIDENCE_CLAIM_KEYS else claim.get(key)
+        if not isinstance(value, str) or len(value) > 512:
+            return (f"evidence_package {key} must be a string of at most "
+                    "512 characters.")
+    return ""
+
+
 def _record_finding(ws, args):
     required = ("title", "severity", "vuln_class", "surface", "description",
                 "poc", "evidence", "case_kind")
@@ -62,6 +103,18 @@ def _record_finding(ws, args):
                 + ". Keep incomplete hypotheses in tested_technique_log."
             ),
         }
+    evidence_package = args.get("evidence_package")
+    if config.astra_auto_validation_required(str(args.get("severity") or "")):
+        if _evidence_package_problem(evidence_package):
+            return {
+                "ok": False,
+                "summary": (
+                    "P1/P2 candidates require an evidence package "
+                    "(positive/control/replay/second_run flow ids + "
+                    "differential_claim). Keep unproven observations in "
+                    "tested_technique_log."
+                ),
+            }
     try:
         record = ws.record_finding(title=args["title"], severity=args["severity"],
             vuln_class=args.get("vuln_class", ""), surface=args.get("surface", ""),
@@ -69,7 +122,8 @@ def _record_finding(ws, args):
             evidence=args.get("evidence", ""), source="worker",
             root_cause=args.get("root_cause", ""), family_id=args.get("family_id", ""),
             case_kind=args.get("case_kind", ""),
-            separate_reason=args.get("separate_reason", ""))
+            separate_reason=args.get("separate_reason", ""),
+            evidence_package=evidence_package)
     except FindingFamilyCollision as exc:
         catalog = {row["family_id"]: row for row in ws.finding_family_catalog()}
         candidates = [_family_preview(catalog[family_id])
@@ -78,6 +132,12 @@ def _record_finding(ws, args):
             "candidate_families": candidates,
             "total_candidates": len(exc.family_ids),
         }}
+    except ValueError as exc:
+        message = str(exc)
+        if message.startswith("evidence package"):
+            return {"ok": False,
+                    "summary": f"Evidence verification failed: {exc}"}
+        raise
     if config.astra_auto_validation_required(record["severity"]):
         summary = f"Recorded {record['id']} for independent Astra validation."
     else:
@@ -307,9 +367,12 @@ def _temporary_account_browser_continue(ws, args):
     message_id = str(mailbox_data.get("_message_id") or "")
     if not code:
         return {
-            "ok": True,
-            "summary": f"No matching OTP arrived for temporary mailbox {alias!r}.",
-            "data": {"alias": alias, "ready": False},
+            "ok": False,
+            "summary": (
+                f"No matching OTP has arrived for temporary mailbox {alias!r}; "
+                "the browser signup challenge remains pending."
+            ),
+            "data": {"alias": alias, "ready": False, "pending": True},
         }
     continuation_observation: dict[str, bool] = {}
     result = tools.credential_browser_step_up(
@@ -429,18 +492,24 @@ def _profiled_auth_login(ws: Workspace, requested: str,
         browser = profile["browser"]
         verification = browser.get("verification")
         state = credentials.load_attempt_state(ws.slug, str(credential or ""))
-        if isinstance(verification, dict) and state["ever_established"]:
-            result = (
-                tools.credential_browser_state_upgrade(
-                    ws, str(credential or "")
-                )
-                if requested == "credential_browser_login"
+        if state["ever_established"]:
+            if (
+                requested == "credential_browser_login"
                 and upgrade_browser_state
-                else tools.ensure_browser_status_session(
-                    ws, str(credential or "")
+            ):
+                return _with_auth_dispatch(
+                    tools.credential_browser_state_upgrade(
+                        ws, str(credential or "")
+                    ),
+                    metadata,
                 )
-            )
-            return _with_auth_dispatch(result, metadata)
+            if isinstance(verification, dict):
+                return _with_auth_dispatch(
+                    tools.ensure_browser_status_session(
+                        ws, str(credential or "")
+                    ),
+                    metadata,
+                )
         browser_args = {
             "credential": credential,
             "username_transform": profile["username_transform"],
@@ -672,6 +741,53 @@ def _authenticated_browser(ws, args):
         return {"ok": False, "summary": str(exc)}
 
 
+def _browser_workflow(ws, args):
+    credential = str(args.get("credential") or "").strip()
+    if not credential:
+        return tools.browser_workflow(
+            ws, args.get("actions"), timeout=args.get("timeout", 60)
+        )
+    try:
+        with credentials.auth_profile_lock(ws.slug, credential):
+            profile = credentials.load_auth_profile_optional(ws.slug, credential)
+            verification = (
+                profile.get("browser", {}).get("verification")
+                if isinstance(profile, dict) and profile.get("strategy") == "browser"
+                else None
+            )
+            maintenance = None
+            state = credentials.load_attempt_state(ws.slug, credential)
+            if isinstance(verification, dict) and state["ever_established"]:
+                ensured = tools.ensure_browser_status_session(ws, credential)
+                ensured_data = (
+                    ensured.get("data") if isinstance(ensured.get("data"), dict) else {}
+                )
+                maintenance = ensured_data.get("session_maintenance")
+                if not ensured.get("ok"):
+                    state_after = credentials.load_attempt_state(ws.slug, credential)
+                    if not state_after["established"]:
+                        return ensured
+                    if not isinstance(maintenance, dict):
+                        maintenance = {
+                            "action": "revalidation-deferred",
+                            "credential_submission": False,
+                        }
+            result = tools.browser_workflow(
+                ws, args.get("actions"), credential=credential,
+                timeout=args.get("timeout", 60),
+            )
+            if isinstance(maintenance, dict):
+                data = (
+                    dict(result.get("data"))
+                    if isinstance(result.get("data"), dict) else {}
+                )
+                data["session_maintenance"] = maintenance
+                result["data"] = data
+            return result
+    except credentials.CredentialError as exc:
+        return {"ok": False, "summary": str(exc)}
+
+
 def _goja_request(ws, args):
     return tools.Goja.request(ws, args["url"], method=args.get("method", "GET"),
         headers=args.get("headers"), body=args.get("body"), timeout=args.get("timeout", 30),
@@ -681,6 +797,10 @@ def _goja_request(ws, args):
 def _flow_replay(ws, args):
     return tools.flow_replay(ws, args["flow_id"], url=args.get("url", ""),
         method=args.get("method", ""), headers=args.get("headers"), body=args.get("body"))
+
+
+def _verify_finding(ws, args):
+    return tools.verify_finding(ws, args)
 
 
 def _save_research(ws, args):
@@ -713,7 +833,35 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
                  "root_cause": _family_string("Canonical technical root cause", "root_cause"),
                  "family_id": _family_string("Existing anchor finding ID", "family_id"),
                  "case_kind": _family_string("Distinct exploit, delivery, or impact case", "case_kind"),
-                 "separate_reason": _family_string("Reason an exact root match is a distinct family", "separate_reason")},
+                 "separate_reason": _family_string("Reason an exact root match is a distinct family", "separate_reason"),
+                 "evidence_package": {"type": "object", "additionalProperties": False,
+                    "description": (
+                        "Required for P1/P2: four capture ids "
+                        "(positive_flow_id, control_flow_id, replay_flow_id, "
+                        "second_run_flow_id) plus differential_claim "
+                        "{dimension, predicate, positive_value, control_value}, "
+                        "changed_variable, precondition_notes, environment_notes. "
+                        "The verifier recomputes digests from the referenced "
+                        "captures and rejects claims they do not support; keep "
+                        "unproven observations in tested_technique_log."),
+                    "properties": {
+                        "positive_flow_id": _string("Positive capture id (flow-<digits>)"),
+                        "control_flow_id": _string("Control capture id testing the alternative explanation"),
+                        "replay_flow_id": _string("Machine replay of the positive capture (flow_replay)"),
+                        "second_run_flow_id": _string("Second independent replay of the positive capture"),
+                        "differential_claim": {"type": "object", "additionalProperties": False,
+                            "description": "The exact difference the captures must demonstrate.",
+                            "properties": {
+                                "dimension": _string("status | body_sha256 | body_bytes | header_present:<name> | header_value:<name>"),
+                                "predicate": _string("differs | equals | positive_matches"),
+                                "positive_value": _string("Expected value on the positive side"),
+                                "control_value": _string("Expected value on the control side"),
+                            }},
+                        "changed_variable": _string("The single variable that differs between positive and control"),
+                        "precondition_notes": _string("Auth state, roles, owned-vs-other object ids"),
+                        "environment_notes": _string("Origin/edge node, cache state, time window, identity header"),
+                    }},
+                },
                 ("title", "severity", "vuln_class", "surface", "description",
                  "poc", "evidence", "case_kind")),
          "anyOf": [{"required": ["root_cause"]}, {"required": ["family_id"]}]},
@@ -1003,6 +1151,89 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
             },
             "timeout": {"type": "integer", "minimum": 5, "maximum": 120},
         }, ("url", "credential")), _authenticated_browser),
+    "browser_workflow": (
+        "Run 1-20 declarative interactions in one scoped Chromium context, capture "
+        "sanitized request/status flows and the final DOM, and optionally reuse an "
+        "exact proven private browser session by credential alias.",
+        _object({
+            "credential": _string(
+                "Optional credential alias with an exact proven rich browser session"
+            ),
+            "actions": {
+                "type": "array", "minItems": 1, "maxItems": 20,
+                "description": (
+                    "Bounded ordered actions. At least one goto is required; no script "
+                    "or JavaScript action is available."
+                ),
+                "items": {
+                    "oneOf": [
+                        _object({
+                            "action": {"type": "string", "const": "goto"},
+                            "url": _string("In-scope HTTP(S) URL"),
+                        }, ("action", "url")),
+                        _object({
+                            "action": {"type": "string", "const": "click"},
+                            "selector": _string("CSS selector"),
+                        }, ("action", "selector")),
+                        _object({
+                            "action": {"type": "string", "const": "fill"},
+                            "selector": _string("CSS selector"),
+                            "value": _string("Value to enter; redacted from the tool audit"),
+                        }, ("action", "selector", "value")),
+                        _object({
+                            "action": {"type": "string", "const": "select"},
+                            "selector": _string("CSS selector"),
+                            "value": _string("One option value"),
+                            "values": {
+                                "type": "array", "minItems": 1, "maxItems": 20,
+                                "items": {"type": "string", "maxLength": 2000},
+                            },
+                        }, ("action", "selector")),
+                        _object({
+                            "action": {
+                                "type": "string", "enum": ["check", "uncheck"]
+                            },
+                            "selector": _string("CSS selector"),
+                        }, ("action", "selector")),
+                        _object({
+                            "action": {"type": "string", "const": "press"},
+                            "selector": _string("CSS selector"),
+                            "key": _string("Playwright key such as Enter or Control+A"),
+                        }, ("action", "selector", "key")),
+                        _object({
+                            "action": {"type": "string", "const": "wait"},
+                            "milliseconds": {
+                                "type": "integer", "minimum": 0, "maximum": 5000,
+                            },
+                        }, ("action", "milliseconds")),
+                        _object({
+                            "action": {"type": "string", "const": "inspect"},
+                            "selector": _string("CSS selector whose visible text is returned"),
+                            "max_chars": {
+                                "type": "integer", "minimum": 1, "maximum": 20000,
+                            },
+                        }, ("action", "selector")),
+                        _object({
+                            "action": {"type": "string", "const": "snapshot"},
+                        }, ("action",)),
+                        _object({
+                            "action": {"type": "string", "const": "upload"},
+                            "selector": _string("File-input CSS selector"),
+                            "path": _string(
+                                "One regular file beneath the engagement or tool-output root"
+                            ),
+                            "paths": {
+                                "type": "array", "minItems": 1, "maxItems": 4,
+                                "items": {"type": "string", "maxLength": 4096},
+                            },
+                        }, ("action", "selector")),
+                    ],
+                },
+            },
+            "timeout": {"type": "integer", "minimum": 5, "maximum": 120},
+        }, ("actions",)),
+        _browser_workflow,
+    ),
     "goja_start": ("Start Grypton's managed Goja SOCKS5 TLS-fingerprint proxy.", _object({}),
         lambda ws, args: tools.Goja.start()),
     "goja_status": ("Read managed Goja status.", _object({}), lambda ws, args: tools.Goja.status()),
@@ -1040,6 +1271,69 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
                  "method": _string("Optional method"),
                  "headers": {"type": "object", "additionalProperties": {"type": "string"}},
                  "body": _string("Optional replacement body")}, ("flow_id",)), _flow_replay),
+    "verify_finding": (
+        "Read-only differential harness over saved captures: checks that a declared single-variable change produces a visible, replay-stable response difference.",
+        {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["positive_exchange_id", "control_exchange_id", "replay_exchange_ids", "changed_variable"],
+            "properties": {
+                "positive_exchange_id": {
+                    "type": "string",
+                    "pattern": "^flow-[0-9]+$",
+                    "maxLength": 80,
+                    "description": "flow-... ID of the positive capture",
+                },
+                "control_exchange_id": {
+                    "type": "string",
+                    "pattern": "^flow-[0-9]+$",
+                    "maxLength": 80,
+                    "description": "flow-... ID of the control capture",
+                },
+                "replay_exchange_ids": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 2,
+                    "uniqueItems": True,
+                    "items": {
+                        "type": "string",
+                        "pattern": "^flow-[0-9]+$",
+                        "maxLength": 80,
+                    },
+                    "description": "1-2 flow-... IDs of replay captures",
+                },
+                "changed_variable": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["location", "name"],
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "enum": ["method", "url_path", "query", "header", "body_form", "body_json_pointer", "body_text"],
+                            "description": "Request location that changed",
+                        },
+                        "name": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 512,
+                            "description": "Name or pointer of the changed variable",
+                        },
+                    },
+                    "description": "The single declared variable that differs",
+                },
+                "selected_response_headers": {
+                    "type": "array",
+                    "maxItems": 16,
+                    "uniqueItems": True,
+                    "items": {
+                        "type": "string",
+                        "pattern": "^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$",
+                    },
+                    "description": "Response header names to track digests for",
+                },
+            },
+        },
+        _verify_finding),
     "httpx_probe": ("Probe scoped hosts with ProjectDiscovery httpx.",
         _object({"targets": _string("Whitespace-separated scoped hosts/URLs")}, ("targets",)),
         lambda ws, a: tools.httpx_probe(ws, a["targets"])),
@@ -1075,20 +1369,24 @@ REGISTRY: dict[str, tuple[str, dict, Callable]] = {
     "subdomain_enum": ("Run passive subfinder enumeration for an in-scope domain.",
         _object({"domain": _string("In-scope base domain"), "timeout": {"type": "integer"}}, ("domain",)),
         lambda ws, a: tools.subdomain_enum(ws, a["domain"], timeout=a.get("timeout", 180))),
-    "local_analyze": ("Inspect or search one engagement or worker tool-output file with bounded output.",
+    "local_analyze": ("Inspect or search one engagement or worker tool-output file with bounded output. Use patterns to search up to 32 indicators in one read.",
         _object({"path": _string(
                     "Engagement-relative path, engagement/... alias, opencode-tool-output/... alias, or an exact allowed absolute path"
                  ),
                  "analyzer": {"type": "string", "enum": ["file", "strings", "sha256", "literal", "regex"]},
                  "min_length": {"type": "integer", "minimum": 4, "maximum": 64},
                  "pattern": _string("Required literal text or byte-oriented regular expression for search analyzers"),
+                 "patterns": {"type": "array", "items": {"type": "string", "minLength": 1},
+                              "minItems": 1, "maxItems": 32,
+                              "description": "Optional batch of literal texts or byte-oriented regular expressions; shares max_matches across the whole batch"},
                  "ignore_case": {"type": "boolean"},
                  "context_bytes": {"type": "integer", "minimum": 0, "maximum": 2048},
                  "max_matches": {"type": "integer", "minimum": 1, "maximum": 50}},
                 ("path", "analyzer")),
         lambda ws, a: tools.local_analyze(
             ws, a["path"], analyzer=a["analyzer"], min_length=a.get("min_length", 6),
-            pattern=a.get("pattern", ""), ignore_case=a.get("ignore_case", False),
+            pattern=a.get("pattern", ""), patterns=a.get("patterns"),
+            ignore_case=a.get("ignore_case", False),
             context_bytes=a.get("context_bytes", 160), max_matches=a.get("max_matches", 20),
         )),
     "install_tool": ("Install one approved OS package from Grypton's fixed allowlist.",
@@ -1129,6 +1427,7 @@ _RESTART_SAFE_READ_ONLY_TOOLS = frozenset({
     "goja_status",
     "proxy_flows",
     "flow_read",
+    "verify_finding",
     "apk_inspect",
     "local_analyze",
     "read_doc",
@@ -1193,6 +1492,33 @@ def _redacted(value, secret_values=()):
 def _audit_redacted_args(name: str, args: dict, secret_values=()) -> object:
     """Redact and bound private onboarding values even for malformed calls."""
     output = _redacted(args, secret_values)
+    if name == "browser_workflow" and isinstance(output, dict):
+        raw_actions = args.get("actions")
+        if not isinstance(raw_actions, list):
+            output["actions"] = "[REDACTED INVALID VALUE]"
+            return output
+        safe_actions: list[object] = []
+        for raw_action in raw_actions[:20]:
+            if not isinstance(raw_action, dict):
+                safe_actions.append("[REDACTED INVALID ACTION]")
+                continue
+            action_name = str(raw_action.get("action") or "").strip().lower()[:32]
+            safe_action = _redacted(raw_action, secret_values)
+            if isinstance(safe_action, dict):
+                if action_name == "fill" and "value" in safe_action:
+                    safe_action["value"] = "[REDACTED]"
+                if action_name == "select":
+                    if "value" in safe_action:
+                        safe_action["value"] = "[REDACTED]"
+                    if "values" in safe_action:
+                        values = raw_action.get("values")
+                        count = len(values) if isinstance(values, list) else 0
+                        safe_action["values"] = ["[REDACTED]"] * min(count, 20)
+            safe_actions.append(safe_action)
+        if len(raw_actions) > 20:
+            safe_actions.append({"[TRUNCATED_ACTIONS]": len(raw_actions) - 20})
+        output["actions"] = safe_actions
+        return output
     if (
         name != "temporary_account_browser_continue"
         or not isinstance(output, dict)
@@ -1243,9 +1569,28 @@ def _audit_secret_values(workspace: Workspace, name: str, args: dict) -> tuple[s
     if name not in {
         "credential_login", "credential_browser_login",
         "temporary_account_browser_signup", "temporary_account_browser_continue",
+        "browser_workflow",
     }:
         return ()
     values: list[str] = []
+    if name == "browser_workflow":
+        actions = args.get("actions")
+        if isinstance(actions, list):
+            for action in actions[:20]:
+                if not isinstance(action, dict):
+                    continue
+                action_name = str(action.get("action") or "").strip().lower()
+                if action_name == "fill" and isinstance(action.get("value"), str):
+                    values.append(action["value"])
+                if action_name == "select":
+                    if isinstance(action.get("value"), str):
+                        values.append(action["value"])
+                    selections = action.get("values")
+                    if isinstance(selections, list):
+                        values.extend(
+                            item for item in selections[:20]
+                            if isinstance(item, str)
+                        )
     if name == "temporary_account_browser_continue":
         stages = args.get("post_otp_stages")
         if isinstance(stages, list):

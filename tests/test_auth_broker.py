@@ -240,6 +240,46 @@ class AuthBrokerTests(unittest.TestCase):
             ):
                 self.assertNotIn(private_value, observable)
 
+    def test_established_marker_profile_routes_explicit_browser_state_upgrade(self):
+        origin = "https://app.example.test"
+        with isolated_runtime():
+            ws = self._workspace(origin)
+            profile = credentials.save_auth_profile(
+                ws.slug, "primary", browser_profile(origin)
+            )
+            revision = credentials.auth_profile_revision(profile)
+            credentials.begin_login_attempt(ws.slug, "primary")
+            credentials.record_login_outcome(
+                ws.slug, "primary", established=True, origin=origin,
+                profile_revision=revision,
+            )
+            expected = {
+                "ok": True,
+                "summary": "Marker session gained exact browser state.",
+                "data": {},
+            }
+            with (
+                patch(
+                    "grypton.toolserver.tools.credential_browser_state_upgrade",
+                    return_value=expected,
+                ) as upgrade,
+                patch(
+                    "grypton.toolserver.tools.credential_browser_login",
+                ) as login,
+            ):
+                result = dispatch(ws, "credential_browser_login", {
+                    "credential": "primary",
+                    "upgrade_browser_state": True,
+                })
+
+            self.assertTrue(result["ok"], result)
+            upgrade.assert_called_once_with(ws, "primary")
+            login.assert_not_called()
+            self._assert_dispatch(
+                result, "credential_browser_login",
+                "credential_browser_login", revision,
+            )
+
     def test_http_profile_routes_both_public_tools_and_ignores_overrides(self):
         origin = "https://api.example.test"
         with isolated_runtime():

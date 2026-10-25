@@ -137,8 +137,13 @@ class ManagerContext:
     novel_finding_families: int = 0
     family_stagnation_streak: int = 0
     coverage_priority: str = ""
+    capability_summary: dict[str, Any] = field(default_factory=dict)
     validation_backlog: list[dict] = field(default_factory=list)
     p1_count: int = 0
+    # Bounded recent engine-classified defense observations (challenge,
+    # rate-limit, access-denied); details carry no URLs or header values.
+    defense_signals: tuple = ()
+    exhaustion_breakers: tuple = ()
 
 
 @dataclass
@@ -209,7 +214,96 @@ def _check_schema(value: Any, schema: dict, path: str = "$") -> list[str]:
             errors.extend(_check_schema(item, child, f"{path}[{index}]"))
     if "enum" in schema and value not in schema["enum"]:
         errors.append(f"{path}: value is outside enum")
+    if isinstance(value, str):
+        if "minLength" in schema and len(value) < schema["minLength"]:
+            errors.append(f"{path}: shorter than minLength")
+        if "maxLength" in schema and len(value) > schema["maxLength"]:
+            errors.append(f"{path}: longer than maxLength")
+        if "pattern" in schema:
+            try:
+                if not re.search(schema["pattern"], value):
+                    errors.append(f"{path}: does not match pattern")
+            except re.error:
+                errors.append(f"{path}: schema pattern is invalid")
+    if (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and expected == "number"):
+        if "minimum" in schema and value < schema["minimum"]:
+            errors.append(f"{path}: below minimum")
+        if "maximum" in schema and value > schema["maximum"]:
+            errors.append(f"{path}: above maximum")
+    if isinstance(value, list):
+        if "minItems" in schema and len(value) < schema["minItems"]:
+            errors.append(f"{path}: fewer than minItems")
+        if "maxItems" in schema and len(value) > schema["maxItems"]:
+            errors.append(f"{path}: more than maxItems")
+        if schema.get("uniqueItems"):
+            rendered = [json.dumps(item, sort_keys=True) for item in value]
+            if len(set(rendered)) != len(rendered):
+                errors.append(f"{path}: items are not unique")
     return errors
+
+
+_RUBRIC_PRIORITY = re.compile(r"^P[1-5](?:-P[1-5])?$")
+_RUBRIC_FALLBACK_FIELDS = {"vrt_node", "default_priority", "cvss4_template", "notes"}
+_RUBRIC_RULING_FIELDS = {"case", "ruling", "rationale"}
+
+
+def load_severity_rubric(path: Path | None = None) -> dict:
+    """Load the severity rubric; raise on any defect so startup fails closed."""
+    rubric_path = path or config.SEVERITY_RUBRIC_PATH
+    try:
+        value = json.loads(rubric_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"severity rubric {rubric_path} is not valid JSON: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError("severity rubric must be an object")
+    if not isinstance(value.get("version"), int) or isinstance(value.get("version"), bool):
+        raise ValueError("severity rubric has no integer version")
+    for key in ("precedence", "rules"):
+        rows = value.get(key)
+        if (not isinstance(rows, list) or not rows
+                or not all(isinstance(row, str) and row.strip() for row in rows)):
+            raise ValueError(f"severity rubric has invalid {key}")
+    fallback = value.get("vrt_fallback")
+    if not isinstance(fallback, list) or not fallback:
+        raise ValueError("severity rubric has no vrt_fallback rows")
+    seen_nodes: set[str] = set()
+    for index, row in enumerate(fallback):
+        if not isinstance(row, dict) or set(row) != _RUBRIC_FALLBACK_FIELDS:
+            raise ValueError(
+                f"severity rubric vrt_fallback {index} must have exactly "
+                "vrt_node, default_priority, cvss4_template, notes"
+            )
+        for key in sorted(_RUBRIC_FALLBACK_FIELDS):
+            if not isinstance(row[key], str) or not row[key].strip():
+                raise ValueError(f"severity rubric vrt_fallback {index} has empty {key}")
+        if not _RUBRIC_PRIORITY.match(row["default_priority"]):
+            raise ValueError(
+                f"severity rubric vrt_fallback {index} has invalid default_priority: "
+                f"{row['default_priority']}"
+            )
+        if row["vrt_node"] in seen_nodes:
+            raise ValueError(f"duplicate severity rubric vrt_node: {row['vrt_node']}")
+        seen_nodes.add(row["vrt_node"])
+    rulings = value.get("boundary_rulings")
+    if not isinstance(rulings, list) or not rulings:
+        raise ValueError("severity rubric has no boundary_rulings rows")
+    seen_cases: set[str] = set()
+    for index, row in enumerate(rulings):
+        if not isinstance(row, dict) or set(row) != _RUBRIC_RULING_FIELDS:
+            raise ValueError(
+                f"severity rubric boundary_rulings {index} must have exactly "
+                "case, ruling, rationale"
+            )
+        for key in sorted(_RUBRIC_RULING_FIELDS):
+            if not isinstance(row[key], str) or not row[key].strip():
+                raise ValueError(
+                    f"severity rubric boundary_rulings {index} has empty {key}"
+                )
+        if row["case"] in seen_cases:
+            raise ValueError(f"duplicate severity rubric ruling case: {row['case']}")
+        seen_cases.add(row["case"])
+    return value
 
 
 class KryptexManager:
@@ -234,6 +328,7 @@ class KryptexManager:
         self.directive_schema = self._load_schema("directive_schema.json")
         self.chat_schema = self._load_schema("chat_schema.json")
         self.severity_schema = self._load_schema("severity_schema.json")
+        self.severity_rubric = load_severity_rubric()
         self.client = self._new_client()
         self.validator = CodexValidator(self.ws.root, self.ws.slug)
 
@@ -469,6 +564,17 @@ class KryptexManager:
             errors = _check_schema(value, self.severity_schema)
             if errors:
                 raise ProviderError("Astra verdict failed schema validation: " + "; ".join(errors[:8]))
+            verified_package = finding.get("evidence_package", {}).get("verified") \
+                if isinstance(finding.get("evidence_package"), dict) else None
+            expected_chain = (verified_package.get("evidence_chain_sha256")
+                              if isinstance(verified_package, dict) else None)
+            if isinstance(expected_chain, str) and expected_chain:
+                ack = value.get("evidence_chain_ack")
+                if ack != expected_chain:
+                    raise ProviderError(
+                        "Astra verdict did not echo the dossier evidence chain "
+                        f"id ({'missing' if not ack else 'mismatched'}); the "
+                        "verdict cannot be tied to the reviewed evidence")
             value["validator_model"] = config.VALIDATOR_MODEL
             value["validator_effort"] = config.VALIDATOR_EFFORT
             return value
@@ -561,10 +667,59 @@ class KryptexManager:
         validation_backlog = json.dumps(
             ctx.validation_backlog, ensure_ascii=False, separators=(",", ":")
         )
+        capabilities = json.dumps(
+            ctx.capability_summary, ensure_ascii=False, separators=(",", ":")
+        )
         activity = (
             f"No worker tool call in the last turn; idle streak {ctx.worker_idle_streak}."
             if ctx.worker_was_idle else "Worker tool activity was recorded."
         )
+        # Bounded block: title + fixed instruction + at most six signal lines.
+        defense_lines = [
+            "TARGET DEFENSE OBSERVATIONS:",
+            "Challenge pages, CAPTCHA, and rate limits end that probe family; "
+            "do not retry or evade them. Plain 401/403 responses are "
+            "access-control information: record the boundary fact and continue "
+            "elsewhere.",
+        ]
+        all_signals = tuple(ctx.defense_signals or ())
+        # Newest first: a fresh challenge or rate-limit signal must never be
+        # dropped by the window while stale access-denied rows fill it.
+        defense_entries = [
+            signal for signal in all_signals[-6:]
+            if isinstance(signal, dict)
+        ][::-1]
+        if defense_entries:
+            for signal in defense_entries:
+                detail = " ".join(str(signal.get("detail") or "").split())[:120]
+                defense_lines.append(
+                    f"- {signal.get('kind')} via {signal.get('tool')}: {detail}"
+                )
+        else:
+            defense_lines.append("(none recorded)")
+        defense_block = "\n".join(defense_lines)
+
+        # Build exhaustion breakers block when stagnation is detected
+        exhaustion_breakers_block = ""
+        if ctx.exhaustion_streak > 0:
+            breaker_lines = [
+                "EXHAUSTION BREAKERS:",
+                "1. Negative space: list what is conspicuously absent from captured responses — "
+                "a missing check on a sibling endpoint, a header present everywhere except one route, "
+                "a parameter the client sends that documentation omits, an error that is too uniform.",
+                "2. Re-fingerprint at a different layer: the same stack hides at TLS, DNS, HTTP headers, "
+                "and JS bundles; one layer often reveals what another hides.",
+                "3. State-machine abuse: for one multi-step flow, generate the transition matrix — "
+                "skip, reorder, repeat, downgrade a server-trusted value, resume a stale state — "
+                "and test one cell.",
+                "4. Refuting observation: for the strongest open hypothesis, state the observation that "
+                "would disprove it and go produce that observation.",
+            ]
+            if ctx.exhaustion_breakers:
+                excluded_ids = ", ".join(str(x) for x in ctx.exhaustion_breakers if x)
+                breaker_lines.append(f"Currently-excluded dead-end playbooks: {excluded_ids}")
+            exhaustion_breakers_block = "\n".join(breaker_lines)
+
         return f"""Manage Kraude's next action for turn {ctx.turn_index}. Resolve blockers autonomously and
 choose the most useful next tool action from the evidence below. Kraude can use every tool exposed in
 its session. The `directive` field contains one short affirmative next action; the engagement data
@@ -579,11 +734,18 @@ ENGAGEMENT DATA:
 WORKER TOOL ACTIVITY:
 {ctx.worker_tool_summary or '(no tool calls)'}
 
+AVAILABLE CAPABILITIES JSON:
+{capabilities}
+
 WORKER REPORT:
 {ctx.worker_last_text or '(no report)'}
 
 ENGINE FLAGS:
 {json.dumps(ctx.antifab_flags, ensure_ascii=False)}
+
+{defense_block}
+
+{exhaustion_breakers_block}
 
 NEW FINDING CASES JSON:
 {new_cases}
@@ -638,10 +800,31 @@ Return only JSON matching this schema:
 {json.dumps(self.chat_schema, ensure_ascii=False)}
 """
 
+    @staticmethod
+    def _render_severity_rubric(rubric: dict) -> str:
+        """Render the loaded rubric as the severity prompt's decision aid."""
+        precedence = " > ".join(rubric["precedence"])
+        rules = "\n".join(f"- {rule}" for rule in rubric["rules"])
+        fallback = "\n".join(
+            f"- {row['vrt_node']} | {row['default_priority']} | "
+            f"{row['cvss4_template']} | {row['notes']}"
+            for row in rubric["vrt_fallback"]
+        )
+        rulings = "\n".join(
+            f"- {row['case']}: {row['ruling']} ({row['rationale']})"
+            for row in rubric["boundary_rulings"]
+        )
+        return (
+            f"Precedence: {precedence}.\n"
+            f"Rules:\n{rules}\n"
+            "Fallback nodes (vrt node | default P | CVSS4 template | notes):\n"
+            f"{fallback}\n"
+            f"Boundary rulings:\n{rulings}"
+        )
+
     def _build_severity_prompt(self, finding: dict, ctx: ManagerContext) -> str:
         dossier = {
             "finding_id": str(finding.get("id") or ""),
-            "claimed_severity": str(finding.get("severity") or "P3").upper(),
             "title": _validator_safe_text(finding.get("title"), limit=800),
             "vulnerability_class": _validator_safe_text(
                 finding.get("vuln_class"), limit=800
@@ -662,15 +845,78 @@ Return only JSON matching this schema:
                 finding.get("family_case_kind"), limit=1000
             ),
         }
+        package = finding.get("evidence_package")
+        verified_package = (package.get("verified")
+                            if isinstance(package, dict) else None)
+        if isinstance(verified_package, dict):
+            raw_chain = verified_package.get("evidence_chain_sha256")
+            # A chain id is a hex digest by construction; pass it through
+            # verbatim because generic safe-text would elide long hex strings.
+            if (isinstance(raw_chain, str)
+                    and re.fullmatch(r"[0-9a-f]{16,128}", raw_chain)):
+                dossier["evidence_chain_id"] = raw_chain
+            roles = {}
+            stale_roles = []
+            source = (package.get("package")
+                      if isinstance(package.get("package"), dict) else package)
+            for role, key in (("positive", "positive_flow_id"),
+                              ("control", "control_flow_id"),
+                              ("replay", "replay_flow_id"),
+                              ("second_run", "second_run_flow_id")):
+                flow_id = source.get(key)
+                digest = verified_package.get("digests", {}).get(flow_id)
+                if isinstance(flow_id, str) and isinstance(digest, dict):
+                    roles[role] = {
+                        "flow_id": flow_id,
+                        "status": digest.get("response_status"),
+                        "body_sha256": digest.get("response_body_sha256"),
+                        "body_bytes": digest.get("response_body_bytes"),
+                    }
+                    current = self._flow_artifact_sha256(flow_id)
+                    stored = digest.get("artifact_sha256")
+                    if (current is not None and isinstance(stored, str)
+                            and current != stored):
+                        stale_roles.append(role)
+            if stale_roles:
+                dossier["evidence_stale"] = {
+                    "roles": stale_roles,
+                    "note": "a referenced capture changed on disk after "
+                            "admission; stored digests no longer describe it",
+                }
+            if roles:
+                dossier["evidence_roles"] = roles
         evidence_snapshot = self._evidence_snapshot(finding)
-        return f"""You are an independent evidence reviewer. This is a retrospective severity
-classification for an authorized security assessment. Do not provide exploitation instructions,
-payloads, target identifiers, or operational guidance. Review only the abstracted observations below.
-You have no execution tools and must never imply that you reproduced an action. The orchestrator has
-already enforced scope; target identity and executable reproduction details are intentionally withheld.
-Judge whether the evidence establishes the claimed vulnerability and realistic impact. If a decisive
-check is missing, return needs-more-evidence and name only safe evidence requirements. Be conservative
-and specific.
+        worker_severity = str(finding.get("severity") or "P3").upper()
+        if worker_severity not in {"P1", "P2", "P3", "P4", "P5"}:
+            worker_severity = "P3"
+        return f"""You are the independent severity reviewer for an authorized security assessment.
+You review saved evidence only: you have no execution tools, you cannot reach any target, and you
+must never imply that you reproduced an action or performed a live check. The orchestrator has
+already enforced scope; target identity and executable reproduction details are intentionally
+withheld. Judge only the abstracted artifacts embedded below, decide whether the proven differential
+supports the claim, and be conservative and specific.
+
+DECISION PROCEDURE:
+1. Artifact presence: a server-impact claim requires both a positive artifact and a control
+   artifact; a reproducibility claim requires replay evidence. When a required artifact is missing,
+   return needs-more-evidence and name the missing artifacts.
+2. Request identity: the positive and every replay must share one request identity; the control must
+   differ only in the single declared variable.
+3. Differential: check the declared difference against the response digests. A relationship that is
+   not visible in the digests is unproven.
+4. Reproducibility: deterministic classes need identical response body digests across replays.
+5. Client versus server: DOM-only impact with no server-response digest caps the finding at
+   informational (P5).
+6. Classify: select the single most specific taxonomy node the proven differential supports, start
+   from its default priority, fill the CVSS vector from proven facts only, then apply the rubric
+   rules and boundary rulings below.
+
+THE RUBRIC:
+{self._render_severity_rubric(self.severity_rubric)}
+
+ANCHORING CONTROL: Fix your own severity using only the decision procedure and the rubric BEFORE you
+read the dossier's last line. The worker-proposed severity appears there; compare only after your
+independent rating is already decided.
 
 ASSET CLASS: {_validator_safe_text(ctx.target_type, limit=100)}
 
@@ -680,9 +926,33 @@ FINDING DOSSIER:
 ABSTRACTED REFERENCED EVIDENCE (read and sanitized by the orchestrator):
 {evidence_snapshot or '(no readable referenced artifact was supplied)'}
 
+Worker-proposed severity (compare only after your independent rating): {worker_severity}
+
+OUTPUT GUIDANCE:
+- Cite artifact or flow IDs for every decisive conclusion.
+- Name missing observations, never payloads, commands, or target identifiers.
+- When the dossier carries an evidence chain id, echo it exactly in evidence_chain_ack.
+- Report your independently assigned severity in severity; the worker's proposal only decides the
+  verdict direction (confirm, upgrade, downgrade), never your rating.
+
 Return only JSON matching this schema:
 {json.dumps(self.severity_schema, ensure_ascii=False)}
 """
+
+    def _flow_artifact_sha256(self, flow_id: str) -> str | None:
+        """Current whole-file sha256 of one capture, or None when unreadable."""
+        if not isinstance(flow_id, str) or not re.fullmatch(r"flow-[0-9]+", flow_id):
+            return None
+        import hashlib
+        path = self.ws.flows_dir / f"{flow_id}.http"
+        try:
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                while chunk := stream.read(64 * 1024):
+                    digest.update(chunk)
+            return digest.hexdigest()
+        except OSError:
+            return None
 
     def _evidence_snapshot(self, finding: dict) -> str:
         """Copy bounded, explicitly referenced workspace artifacts into Astra's prompt."""
@@ -692,6 +962,15 @@ Return only JSON matching this schema:
             r"(?:[A-Za-z]:)?(?:/[^\s,;`'\"]+|(?:flows|loot|research|workspace|scripts)/[^\s,;`'\"]+|flow-[A-Za-z0-9._-]+\.http)",
             combined,
         )
+        package = finding.get("evidence_package")
+        if isinstance(package, dict):
+            source = (package.get("package")
+                      if isinstance(package.get("package"), dict) else package)
+            for key in ("positive_flow_id", "control_flow_id",
+                        "replay_flow_id", "second_run_flow_id"):
+                flow_id = source.get(key)
+                if isinstance(flow_id, str) and re.fullmatch(r"flow-[0-9]+", flow_id):
+                    candidates.append(f"flows/{flow_id}.http")
         root = self.ws.root.resolve()
         seen: set[Path] = set()
         paths: list[Path] = []

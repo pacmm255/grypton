@@ -617,6 +617,12 @@ class AuthenticatedBrowserRequestTests(unittest.TestCase):
             },
         }
 
+    def _marker_upgrade_profile(self, port: int) -> dict:
+        profile = self._upgrade_profile(port)
+        profile["success_marker"] = '"authenticated":true'
+        profile["browser"].pop("verification")
+        return profile
+
     def _seed_legacy_session(self, ws: Workspace, port: int) -> dict:
         origin = f"http://127.0.0.1:{port}"
         credentials.save_credential(
@@ -624,6 +630,27 @@ class AuthenticatedBrowserRequestTests(unittest.TestCase):
         )
         profile = credentials.save_auth_profile(
             ws.slug, "primary", self._upgrade_profile(port)
+        )
+        credentials.begin_login_attempt(ws.slug, "primary")
+        tools._browser_auth_install_cookies(ws, "primary", [{
+            "name": "app_session", "value": _UpgradeHandler.session,
+            "domain": "127.0.0.1", "path": "/", "expires": -1,
+            "httpOnly": True, "secure": False, "sameSite": "Strict",
+        }], origin)
+        credentials.record_login_outcome(
+            ws.slug, "primary", established=True, origin=origin,
+            profile_revision=credentials.auth_profile_revision(profile),
+        )
+        return profile
+
+    def _seed_legacy_marker_session(self, ws: Workspace, port: int) -> dict:
+        origin = f"http://127.0.0.1:{port}"
+        credentials.save_credential(
+            ws.slug, "primary", _UpgradeHandler.username,
+            _UpgradeHandler.password,
+        )
+        profile = credentials.save_auth_profile(
+            ws.slug, "primary", self._marker_upgrade_profile(port)
         )
         credentials.begin_login_attempt(ws.slug, "primary")
         tools._browser_auth_install_cookies(ws, "primary", [{
@@ -665,6 +692,36 @@ class AuthenticatedBrowserRequestTests(unittest.TestCase):
             self.assertEqual(_UpgradeHandler.login_posts, 1)
             self.assertTrue(
                 credentials.load_browser_storage(ws.slug, "primary")["available"]
+            )
+            again = dispatch(ws, "credential_browser_login", {
+                "credential": "primary", "upgrade_browser_state": True,
+            })
+            self.assertTrue(again["ok"], again)
+            self.assertEqual(_UpgradeHandler.login_posts, 1)
+
+    def test_legacy_marker_state_accepts_explicit_single_upgrade(self):
+        with isolated_runtime(), local_server(_UpgradeHandler) as port:
+            ws = self._workspace(port)
+            self._seed_legacy_marker_session(ws, port)
+
+            missing = dispatch(ws, "authenticated_browser_request", {
+                "url": f"http://127.0.0.1:{port}/verify",
+                "credential": "primary",
+            })
+            self.assertFalse(missing["ok"], missing)
+            self.assertTrue(missing["data"]["migration_required"])
+            self.assertIn("literal option", missing["summary"])
+
+            upgraded = dispatch(ws, "credential_browser_login", {
+                "credential": "primary", "upgrade_browser_state": True,
+            })
+
+            self.assertTrue(upgraded["ok"], upgraded)
+            self.assertEqual(_UpgradeHandler.login_posts, 1)
+            self.assertTrue(
+                credentials.load_browser_storage(
+                    ws.slug, "primary"
+                )["available"]
             )
             again = dispatch(ws, "credential_browser_login", {
                 "credential": "primary", "upgrade_browser_state": True,

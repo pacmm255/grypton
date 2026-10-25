@@ -52,6 +52,7 @@ _BROWSER_STORAGE_MAX_TOTAL_CHARS = 1_000_000
 _BROWSER_STORAGE_MAX_COOKIES = 200
 # Promotion snapshots use the same one-megabyte private-material bound.
 _PENDING_BROWSER_SESSION_MAX_BYTES = 1_000_000
+_PENDING_BROWSER_STEP_UP_MAX_AGE_S = 15 * 60
 _PENDING_IDENTIFIER_REPLAY_MEDIA_TYPES = frozenset({
     "application/json", "text/json", "application/x-www-form-urlencoded",
 })
@@ -1734,6 +1735,9 @@ def _load_pending_browser_step_up_unlocked(target: str, name: str) -> dict[str, 
         raise CredentialError("pending browser step-up creation time is invalid") from exc
     if not math.isfinite(created_at) or created_at <= 0:
         raise CredentialError("pending browser step-up creation time is invalid")
+    if time.time() - created_at >= _PENDING_BROWSER_STEP_UP_MAX_AGE_S:
+        path.unlink(missing_ok=True)
+        return empty
     if not isinstance(value.get("reserved"), bool):
         raise CredentialError("pending browser step-up reservation is invalid")
     canonical = canonical_browser_storage(

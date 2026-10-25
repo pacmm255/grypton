@@ -12,6 +12,7 @@ from hashlib import sha256
 from html import unescape
 from html.parser import HTMLParser
 import json
+import math
 from pathlib import Path
 import re
 from urllib.parse import urlsplit
@@ -195,7 +196,10 @@ _AUTOMATION_DENY = re.compile(
 
 _ACCOUNT_ACTOR = r"(?:you|researchers?|testers?|participants?)"
 _ACCOUNT_ACTION = (
-    r"(?:(?:create|set\s+up)\b[^;.!?\n]{0,48}\b(?:test\s+)?accounts?\b|"
+    r"(?:(?:create|set\s+up)\b"
+    r"(?:(?!\b(?:tokens?|keys?|credentials?)\b)[^;.!?\n]){0,48}"
+    r"\b(?:test\s+)?accounts?\b"
+    r"(?!\s+(?:settings?|pages?|sections?|menus?|tabs?)\b)|"
     r"register(?:ing)?(?:\s+for)?\b[^;.!?\n]{0,32}\baccounts?\b|"
     r"sign[ -]?up\b)"
 )
@@ -218,7 +222,8 @@ _ACCOUNT_SUPPORTED = re.compile(
 )
 _SELF_CREATED_ACCOUNT_PERMIT = re.compile(
     rf"(?i)(?:\b{_ACCOUNT_ACTOR}\s+"
-    r"(?:may(?:\s+want\s+to)?|can|are\s+(?:allowed|permitted)\s+to)\s+"
+    r"(?:may(?:\s+want\s+to)?|can|must|"
+    r"are\s+(?:allowed|permitted)\s+to)\s+"
     rf"{_ACCOUNT_ACTION}|{_SELF_PROVISIONED_ACCOUNT})"
 )
 _SELF_CREATED_ACCOUNT_DENY = re.compile(
@@ -331,7 +336,8 @@ _CREDENTIAL_REQUIRED = re.compile(
     r"(?i)(?:test using only accounts? created with|"
     r"must use (?:the )?(?:assigned )?credentials?|"
     r"ensure that you use your @bugcrowdninja\.com|"
-    r"when (?:registering|creating)[^.\n]{0,160}(?:use|using|with|provide)"
+    r"(?:when\s+)?(?:register(?:ing)?|creat(?:e|ing)|sign(?:ing)?[ -]?up)"
+    r"[^.\n]{0,160}(?:use|using|with|provide)"
     r"[^.\n]{0,80}@[A-Za-z0-9.-]+|"
     r"must use[^.\n]{0,100}@[A-Za-z0-9.-]+|"
     r"(?:use|provide)[^.\n]{0,60}(?:work|business|corporate|company)[ -]email)"
@@ -491,6 +497,26 @@ def _severity_label(value) -> str:
     return _SEVERITY_LABELS.get(match.group(0).lower(), "") if match else ""
 
 
+def _rewarded_group_severity(group: dict) -> str:
+    """Return the highest-impact priority with an explicit numeric reward range."""
+    rewards = group.get("rewardRangeData")
+    if not isinstance(rewards, dict):
+        return ""
+    for priority in range(1, 6):
+        entry = rewards.get(str(priority), rewards.get(priority))
+        if not isinstance(entry, dict):
+            continue
+        amounts = (entry.get("min"), entry.get("max"))
+        if any(
+            isinstance(amount, (int, float))
+            and not isinstance(amount, bool)
+            and math.isfinite(amount)
+            for amount in amounts
+        ):
+            return _SEVERITY_LABELS[f"p{priority}"]
+    return ""
+
+
 def _target_severity(target: dict, group: dict) -> str:
     for container in (target, group):
         for key in ("maxSeverity", "maximumSeverity", "max_severity",
@@ -505,6 +531,12 @@ def _target_severity(target: dict, group: dict) -> str:
             label = _severity_label(tag)
         if label:
             return label
+    # Current Bugcrowd briefs expose the accepted priority ceiling through the
+    # structured reward map when maxSeverity is absent. Null and malformed
+    # entries do not establish a severity.
+    rewarded = _rewarded_group_severity(group)
+    if rewarded:
+        return rewarded
     # Group titles are free-form display text (for example, "High value web
     # assets") and therefore cannot serve as explicit severity metadata.
     return ""

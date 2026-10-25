@@ -55,6 +55,7 @@ RESOURCES_DIR = PACKAGE_DIR / "resources"
 PROMPTS_DIR = RESOURCES_DIR / "prompts"
 SKILLS_DIR = RESOURCES_DIR / "skills"
 SCENARIOS_PATH = RESOURCES_DIR / "autonomous_scenarios.json"
+SEVERITY_RUBRIC_PATH = RESOURCES_DIR / "severity_rubric.json"
 BIN_DIR = (
     SOURCE_ROOT / "bin"
     if (SOURCE_ROOT / "bin").is_dir()

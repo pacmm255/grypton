@@ -26,6 +26,7 @@ MAX_STREAM_BYTES = 16_000_000
 MCP_TIMEOUT_MS = 120_000
 MAX_ASSISTANT_TEXT_CHARS = 12_000
 MAX_FAILURE_TOOL_COUNT = 10_000
+LONGCAT_WORKER_STEP_LIMIT = 14
 _OPENCODE_VERSION: Optional[str] = None
 _CONTROL = re.compile(
     r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|"
@@ -41,6 +42,9 @@ _SENSITIVE_PROVIDER_KEYS = frozenset({
 _PROVIDER_STRUCTURAL_KEYS = frozenset({
     "call_id", "finish_reason", "id", "model", "provider", "role",
     "session_id", "status", "tool", "type",
+})
+_PRIVATE_BROWSER_WORKFLOW_TOOLS = frozenset({
+    "browser_workflow", "grypton_browser_workflow",
 })
 _SENSITIVE_HEADER_LINE = re.compile(
     r"(?im)^(\s*(?:authorization|proxy-authorization|cookie|set-cookie|"
@@ -113,6 +117,15 @@ def _bounded_tool_event_count(events: list[dict]) -> int:
         if isinstance(event, dict) and event.get("type") == "tool_use"
     )
     return min(count, MAX_FAILURE_TOOL_COUNT)
+
+
+def _opencode_agent_steps(route: str, allow_tools: bool) -> int:
+    """Return the explicit per-call agent ceiling for one canonical route."""
+    if not allow_tools:
+        return 4
+    if route == "go/longcat-2.5-preview-free":
+        return LONGCAT_WORKER_STEP_LIMIT
+    return 40
 
 
 def tool_state_text(state: dict) -> str:
@@ -195,6 +208,60 @@ def _provider_structural_field(path: tuple[str, ...], key: str) -> bool:
     if path == ("part", "state"):
         return key == "status"
     return False
+
+
+def _redact_browser_workflow_input(event: dict) -> dict:
+    """Hide private form values in one browser workflow tool-use event."""
+    if event.get("type") != "tool_use":
+        return event
+    part = event.get("part")
+    if (not isinstance(part, dict)
+            or part.get("tool") not in _PRIVATE_BROWSER_WORKFLOW_TOOLS):
+        return event
+    state = part.get("state")
+    if not isinstance(state, dict):
+        return event
+    tool_input = state.get("input")
+    if not isinstance(tool_input, dict):
+        return event
+    actions = tool_input.get("actions")
+    if not isinstance(actions, list):
+        return event
+
+    safe_actions: list[object] = []
+    changed = False
+    for action in actions:
+        action_name = (
+            str(action.get("action") or "").strip().lower()
+            if isinstance(action, dict) else ""
+        )
+        if not isinstance(action, dict) or action_name not in {"fill", "select"}:
+            safe_actions.append(action)
+            continue
+        safe_action = dict(action)
+        if "value" in safe_action:
+            safe_action["value"] = "[REDACTED]"
+            changed = True
+        if action_name == "select" and "values" in safe_action:
+            raw_values = safe_action["values"]
+            safe_action["values"] = (
+                ["[REDACTED]"] * len(raw_values)
+                if isinstance(raw_values, list) else "[REDACTED]"
+            )
+            changed = True
+        safe_actions.append(safe_action)
+    if not changed:
+        return event
+
+    safe_input = dict(tool_input)
+    safe_input["actions"] = safe_actions
+    safe_state = dict(state)
+    safe_state["input"] = safe_input
+    safe_part = dict(part)
+    safe_part["state"] = safe_state
+    safe_event = dict(event)
+    safe_event["part"] = safe_part
+    return safe_event
 
 
 def _clean_provider_value(value, secrets=(), _path: tuple[str, ...] = ()):
@@ -525,6 +592,7 @@ class OpenCodeResult:
     cost: float = 0.0
     stderr: str = ""
     returncode: int = 0
+    metadata: dict = field(default_factory=dict)
     _raw_text: str | None = field(default=None, repr=False, compare=False)
     _value_redactor: Callable[[object], object] | None = field(
         default=None, repr=False, compare=False,
@@ -871,6 +939,7 @@ class OpenCodeClient:
         )
         transport_provider = "openclaude"
         transport_route = gateway.model_route
+        agent_steps = _opencode_agent_steps(self.route, self.allow_tools)
         inline = {
             "$schema": "https://opencode.ai/config.json",
             "snapshot": False,
@@ -892,7 +961,7 @@ class OpenCodeClient:
                     "model": transport_route,
                     "prompt": self.agent_prompt,
                     "permission": permissions,
-                    "steps": 40 if self.allow_tools else 4,
+                    "steps": agent_steps,
                 }
             },
             "mcp": {},
@@ -1095,6 +1164,7 @@ class OpenCodeClient:
             if (self.role == "manager" and event.get("type") == "text"
                     and isinstance(raw_part.get("text"), str)):
                 raw_texts.append(raw_part["text"])
+            event = _redact_browser_workflow_input(event)
             event = _clean_provider_value(event, event_secrets)
             cleaned_lines.append(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
             events.append(event)
@@ -1136,6 +1206,113 @@ class OpenCodeClient:
         io_task = asyncio.gather(stdout_task, stderr_task, self.proc.wait())
         terminal_task = asyncio.create_task(self._terminal_signal.wait())
         failure_class = ""
+
+        def summarize_events() -> dict:
+            """Derive one sanitized result view from the events seen so far."""
+            result_session = session_id
+            texts: list[str] = []
+            tools: list[dict] = []
+            usage: list[dict] = []
+            cost = 0.0
+            errors: list[str] = []
+            for event in events:
+                candidate = event.get("sessionID") or event.get("session_id")
+                if isinstance(candidate, str) and candidate:
+                    result_session = candidate
+                event_type = event.get("type")
+                part = event.get("part") if isinstance(event.get("part"), dict) else {}
+                if event_type == "text" and isinstance(part.get("text"), str):
+                    texts.append(part["text"])
+                elif event_type == "tool_use":
+                    state = part.get("state") if isinstance(part.get("state"), dict) else {}
+                    metadata = (
+                        state.get("metadata")
+                        if isinstance(state.get("metadata"), dict) else {}
+                    )
+                    status = str(state.get("status", ""))
+                    tools.append({
+                        "id": part.get("callID") or part.get("id") or f"tool-{len(tools)+1}",
+                        "name": part.get("tool") or "tool",
+                        "input": state.get("input") if isinstance(state.get("input"), dict) else {},
+                        "output": tool_state_text(state),
+                        "is_error": status in {"error", "failed"} or bool(metadata.get("exit")),
+                        "status": status,
+                    })
+                elif event_type == "step_finish":
+                    tokens = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
+                    usage.append(tokens)
+                    try:
+                        cost += float(part.get("cost") or 0)
+                    except (TypeError, ValueError):
+                        pass
+                elif event_type == "error":
+                    errors.append(str(event.get("error") or event.get("message") or event)[:1000])
+            return {
+                "session_id": result_session,
+                "texts": texts,
+                "tools": tools,
+                "usage": usage,
+                "cost": cost,
+                "errors": errors,
+            }
+
+        def partial_worker_result(
+            exc: BaseException,
+            classification: str,
+            *,
+            stderr: str = "",
+            returncode: int | None = None,
+        ) -> OpenCodeResult | None:
+            """Salvage effectful worker events without replaying their directive."""
+            summary = summarize_events()
+            if self.role != "worker" or not summary["tools"]:
+                return None
+            error_message = clean(str(exc), event_secrets)[:1000]
+            provider_metadata = (
+                exc.metadata
+                if isinstance(exc, ProviderError) and isinstance(exc.metadata, dict)
+                else {}
+            )
+            error = {
+                "class": classification,
+                "type": type(exc).__name__,
+                "message": error_message,
+                "tool_count": min(len(summary["tools"]), MAX_FAILURE_TOOL_COUNT),
+                "replay_safe": False,
+                "session_reset": True,
+            }
+            for key in (
+                "source", "reason", "upstream_status", "pool_size", "retry_after_s",
+            ):
+                value = provider_metadata.get(key)
+                if isinstance(value, (str, int)) and not isinstance(value, bool) and value:
+                    error[key] = clean(value, event_secrets) if isinstance(value, str) else value
+            assistant_text = (
+                "Provider interruption after observed tool execution: "
+                f"{error_message} Observed tool events were preserved as a partial "
+                "turn. Treat their outputs as partial evidence and choose the next "
+                "step without repeating the interrupted directive."
+            )
+            return OpenCodeResult(
+                text=assistant_text,
+                # A provider that stopped between tool execution and final text
+                # may have left an unresumable conversation tail. The events
+                # retain its observed session for audit, while the worker starts
+                # its next manager-directed turn in a fresh provider session.
+                session_id="",
+                events=events,
+                tools=summary["tools"],
+                usage=summary["usage"],
+                duration_s=time.time() - started,
+                cost=summary["cost"],
+                stderr=stderr,
+                returncode=(
+                    returncode if isinstance(returncode, int)
+                    else self.proc.returncode if isinstance(self.proc.returncode, int)
+                    else 0
+                ),
+                metadata={"partial": True, "provider_error": error},
+            )
 
         def append_failure_record(exc: BaseException, classification: str) -> None:
             """Record one sanitized row for a call that cannot reach final parsing."""
@@ -1182,6 +1359,7 @@ class OpenCodeClient:
             except (TypeError, ValueError):
                 retry_after_s = 0
 
+            partial = self.role == "worker" and bool(summarize_events()["tools"])
             record = {
                 "at": time.time(),
                 "role": self.role,
@@ -1204,6 +1382,9 @@ class OpenCodeClient:
                 ).hexdigest(),
                 "stderr_present": bool(cleaned_stderr),
                 "ok": False,
+                "partial": partial,
+                "salvaged": partial,
+                "session_reset": partial,
                 "error_class": classification,
                 "error_type": type(exc).__name__,
                 "error_message": clean(str(exc), event_secrets)[:1000],
@@ -1288,6 +1469,9 @@ class OpenCodeClient:
                 "replay_safe": False,
             }
             append_failure_record(exc, failure_class)
+            partial = partial_worker_result(exc, failure_class)
+            if partial is not None:
+                return partial
             raise
         except BaseException as exc:
             if not failure_class:
@@ -1303,13 +1487,17 @@ class OpenCodeClient:
             if isinstance(exc, asyncio.CancelledError):
                 raise
             if isinstance(exc, Exception):
-                raise ProviderError(
+                wrapped = ProviderError(
                     f"{self.role} OpenCode call failed ({type(exc).__name__}).",
                     metadata={
                         "tool_count": _bounded_tool_event_count(events),
                         "replay_safe": False,
                     },
-                ) from exc
+                )
+                partial = partial_worker_result(wrapped, failure_class)
+                if partial is not None:
+                    return partial
+                raise wrapped from exc
             raise
         finally:
             if not terminal_task.done():
@@ -1331,41 +1519,13 @@ class OpenCodeClient:
         if malformed:
             append_jsonl(stream_path, {"type": "malformed", "lines": malformed})
 
-        result_session = session_id
-        texts: list[str] = []
-        tools: list[dict] = []
-        usage: list[dict] = []
-        cost = 0.0
-        errors: list[str] = []
-        for event in events:
-            candidate = event.get("sessionID") or event.get("session_id")
-            if isinstance(candidate, str) and candidate:
-                result_session = candidate
-            event_type = event.get("type")
-            part = event.get("part") if isinstance(event.get("part"), dict) else {}
-            if event_type == "text" and isinstance(part.get("text"), str):
-                texts.append(part["text"])
-            elif event_type == "tool_use":
-                state = part.get("state") if isinstance(part.get("state"), dict) else {}
-                metadata = state.get("metadata") if isinstance(state.get("metadata"), dict) else {}
-                status = str(state.get("status", ""))
-                tools.append({
-                    "id": part.get("callID") or part.get("id") or f"tool-{len(tools)+1}",
-                    "name": part.get("tool") or "tool",
-                    "input": state.get("input") if isinstance(state.get("input"), dict) else {},
-                    "output": tool_state_text(state),
-                    "is_error": status in {"error", "failed"} or bool(metadata.get("exit")),
-                    "status": status,
-                })
-            elif event_type == "step_finish":
-                tokens = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
-                usage.append(tokens)
-                try:
-                    cost += float(part.get("cost") or 0)
-                except (TypeError, ValueError):
-                    pass
-            elif event_type == "error":
-                errors.append(str(event.get("error") or event.get("message") or event)[:1000])
+        summary = summarize_events()
+        result_session = summary["session_id"]
+        texts = summary["texts"]
+        tools = summary["tools"]
+        usage = summary["usage"]
+        cost = summary["cost"]
+        errors = summary["errors"]
 
         raw_assistant_text = None
         if self.role == "manager":
@@ -1391,7 +1551,19 @@ class OpenCodeClient:
             "prompt_sha256": prompt_hash,
             "stdout_sha256": hashlib.sha256(cleaned_stdout.encode("utf-8")).hexdigest(),
             "stderr_present": bool(cleaned_stderr),
-            "ok": not returncode and not errors and bool(texts),
+            "ok": not returncode and not errors and bool(assistant_text),
+            "partial": bool(
+                self.role == "worker" and tools
+                and (returncode or errors or not assistant_text)
+            ),
+            "salvaged": bool(
+                self.role == "worker" and tools
+                and (returncode or errors or not assistant_text)
+            ),
+            "session_reset": bool(
+                self.role == "worker" and tools
+                and (returncode or errors or not assistant_text)
+            ),
             **text_metadata,
         }
         gateway_events = gateway.drain_events()
@@ -1415,7 +1587,7 @@ class OpenCodeClient:
                 "error_type": "ProviderError",
                 "error_message": clean(errors[-1], event_secrets)[:1000],
             })
-        elif not texts:
+        elif not assistant_text:
             call_record.update({
                 "error_class": "empty_response",
                 "error_type": "ProviderError",
@@ -1427,20 +1599,41 @@ class OpenCodeClient:
             "replay_safe": False,
         }
         if returncode:
-            raise ProviderError(
+            failure = ProviderError(
                 f"{self.role} OpenCode exited with {returncode}: {detail}",
                 metadata=failure_metadata,
             )
+            partial = partial_worker_result(
+                failure, "process_exit", stderr=cleaned_stderr,
+                returncode=returncode,
+            )
+            if partial is not None:
+                return partial
+            raise failure
         if errors:
-            raise ProviderError(
+            failure = ProviderError(
                 f"{self.role} OpenCode error: {errors[-1]}",
                 metadata=failure_metadata,
             )
-        if not texts:
-            raise ProviderError(
+            partial = partial_worker_result(
+                failure, "provider_event_error", stderr=cleaned_stderr,
+                returncode=returncode,
+            )
+            if partial is not None:
+                return partial
+            raise failure
+        if not assistant_text:
+            failure = ProviderError(
                 f"{self.role} OpenCode returned no final text.",
                 metadata=failure_metadata,
             )
+            partial = partial_worker_result(
+                failure, "empty_response", stderr=cleaned_stderr,
+                returncode=returncode,
+            )
+            if partial is not None:
+                return partial
+            raise failure
         return OpenCodeResult(
             text=assistant_text,
             session_id=result_session,

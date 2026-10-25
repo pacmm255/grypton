@@ -38,6 +38,7 @@ from grypton.providers import (MCP_TIMEOUT_MS, OpenCodeClient, OpenCodeResult, P
 from grypton.reporting import audit_workspace, render_report
 from grypton.toolserver import REGISTRY, dispatch
 from grypton.tools import (_browser_executable, _isolated_browser_profile,
+                           browser_runtime_status,
                            Goja, apk_extract_asset, apk_inspect,
                            artifact_download, browse, check_host_scope, check_port_scope,
                            check_research_scope, check_url_scope, flow_read, flow_replay,
@@ -45,6 +46,8 @@ from grypton.tools import (_browser_executable, _isolated_browser_profile,
                            research, tcp_exchange, MAX_RESPONSE_BYTES)
 from grypton.worker import OpenCodeWorker, WorkerError, WorkerSpec
 from grypton.workspace import Constraints, Workspace
+
+from tests.evidence_helpers import write_evidence_package
 
 
 @contextmanager
@@ -501,14 +504,63 @@ class ToolTests(unittest.TestCase):
         account = SimpleNamespace(pw_uid=23456, pw_gid=23456,
                                   pw_name="grypton-browser")
         denied = SimpleNamespace(returncode=1, stdout="", stderr="permission denied")
+        @contextmanager
+        def fake_profile(_executable):
+            yield {
+                "executable": "/safe/launcher",
+                "environment": {"PATH": "/usr/bin:/bin"},
+            }
         with patch("grypton.cli.os.geteuid", return_value=0), \
                 patch("grypton.cli.pwd.getpwnam", return_value=account), \
                 patch("grypton.tools._browser_executable", return_value="/browser"), \
-                patch("grypton.cli.config.find_binary", return_value="/usr/sbin/runuser"), \
+                patch("grypton.tools._isolated_browser_profile", fake_profile), \
                 patch("grypton.cli.subprocess.run", return_value=denied):
             ok, detail = _browser_sandbox_check()
         self.assertFalse(ok)
-        self.assertIn("cannot traverse or execute", detail)
+        self.assertIn("permission denied", detail)
+
+    def test_browser_runtime_status_probes_isolated_launcher_and_bounds_failure(self):
+        observed = {}
+
+        @contextmanager
+        def fake_profile(executable):
+            observed["executable"] = executable
+            yield {
+                "executable": "/safe/launcher",
+                "environment": {"PATH": "/usr/bin:/bin"},
+                "identity": "grypton-browser",
+            }
+
+        failed = SimpleNamespace(
+            returncode=1, stdout="",
+            stderr="private transport detail " + "x" * 500,
+        )
+        with patch(
+            "grypton.tools._browser_executable", return_value="/opt/chromium"
+        ), patch(
+            "grypton.tools._isolated_browser_profile", fake_profile
+        ), patch(
+            "grypton.tools.subprocess.run", return_value=failed
+        ) as run:
+            ok, detail = browser_runtime_status()
+
+        self.assertFalse(ok)
+        self.assertEqual(observed["executable"], "/opt/chromium")
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0], ["/safe/launcher", "--version"])
+        self.assertLessEqual(len(detail), 279)
+
+        ready = SimpleNamespace(returncode=0, stdout="Chromium 1", stderr="")
+        with patch(
+            "grypton.tools._browser_executable", return_value="/opt/chromium"
+        ), patch(
+            "grypton.tools._isolated_browser_profile", fake_profile
+        ), patch(
+            "grypton.tools.subprocess.run", return_value=ready
+        ):
+            ok, detail = browser_runtime_status()
+        self.assertTrue(ok, detail)
+        self.assertIn("identity=grypton-browser", detail)
 
     def test_root_browser_profile_uses_private_drop_launcher(self):
         account = SimpleNamespace(pw_uid=23456, pw_gid=23456)
@@ -527,8 +579,28 @@ class ToolTests(unittest.TestCase):
                 self.assertEqual(profile["identity"], "grypton-browser")
                 self.assertEqual(launcher.stat().st_mode & 0o777, 0o500)
                 self.assertIn("os.setgroups([])", script)
-                self.assertIn("os.setgid(23456)", script)
-                self.assertIn("os.setuid(23456)", script)
+                self.assertIn("GID = 23456", script)
+                self.assertIn("UID = 23456", script)
+                self.assertIn("os.setgid(GID)", script)
+                self.assertIn("os.setuid(UID)", script)
+                self.assertIn(
+                    "libc.unshare(0x00020000 | 0x20000000)", script
+                )
+                self.assertIn("namespace_child = os.fork()", script)
+                self.assertIn(
+                    "libc.prctl(1, signal.SIGKILL, 0, 0, 0)", script
+                )
+                self.assertIn("parent_state = os.read(death_read, 1)", script)
+                self.assertLess(
+                    script.index("namespace_child = os.fork()"),
+                    script.index("libc.prctl(1, signal.SIGKILL"),
+                )
+                self.assertLess(
+                    script.index("libc.prctl(1, signal.SIGKILL"),
+                    script.index("run_mount('-t', 'proc'"),
+                )
+                self.assertIn("run_mount('--make-rprivate', '/')", script)
+                self.assertIn("os.chroot(JAIL_ROOT)", script)
                 self.assertNotIn("AWS_SECRET_ACCESS_KEY", profile["environment"])
                 self.assertNotIn("HTTPS_PROXY", profile["environment"])
                 self.assertEqual(Path(profile["environment"]["HOME"]).parent, data_root)
@@ -1441,7 +1513,10 @@ class ToolTests(unittest.TestCase):
             low = dispatch(ws, "record_finding", {"title": "Low", "severity": "P5",
                                                    "root_cause": "low fixture", **common})
             high = dispatch(ws, "record_finding", {"title": "High", "severity": "P2",
-                                                    "root_cause": "high fixture", **common})
+                                                    "root_cause": "high fixture",
+                                                    **common,
+                                                    "evidence_package":
+                                                        write_evidence_package(ws)})
             self.assertIn("not requested for P5", low["summary"])
             self.assertIn("independent Astra validation", high["summary"])
 
@@ -1492,7 +1567,7 @@ class ToolTests(unittest.TestCase):
             self.assertTrue(result["ok"], result)
             self.assertTrue(result["target_dir_empty"])
             self.assertEqual(result["validation_not_requested"], [low["id"]])
-            high = ws.record_finding(title="High candidate", severity="P2")
+            high = ws.record_finding(title="High candidate", severity="P2", evidence_package=write_evidence_package(ws))
             self.assertEqual(high["status"], "validation-pending")
             result = audit_workspace(ws)
             self.assertFalse(result["ok"])
@@ -1607,6 +1682,25 @@ class ManagerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(marker, manager.client.agent_prompt)
             self.assertNotIn(marker, prompt)
             self.assertIn("CONVERGENCE GUARD", prompt)
+
+    async def test_manager_receives_bounded_capability_facts(self):
+        with isolated_runtime():
+            ws = Workspace("manager-capabilities")
+            ws.create("127.0.0.1", "web")
+            manager = KryptexManager(ws, "system")
+            prompt = manager._build_direction_prompt(ManagerContext(
+                target="127.0.0.1", target_type="web", turn_index=2,
+                capability_summary={
+                    "available_tools": ["browse", "credential_login"],
+                    "browser_ready": True,
+                    "authenticated_session_count": 1,
+                    "oast_available": False,
+                },
+            ))
+            self.assertIn("AVAILABLE CAPABILITIES JSON", prompt)
+            self.assertIn('"browser_ready":true', prompt)
+            self.assertIn('"authenticated_session_count":1', prompt)
+            self.assertNotIn("password", prompt.casefold())
 
     async def test_spark_cannot_supply_validation_verdicts(self):
         with isolated_runtime():
@@ -2408,11 +2502,103 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
         selected = Engine._automatic_validation_candidates(findings)
         self.assertEqual([finding["id"] for finding in selected], ["F001", "F002"])
 
+    def test_capability_summary_projects_readiness_without_credential_values(self):
+        with isolated_runtime():
+            ws = Workspace("capability-summary")
+            ws.create("https://example.test", "web")
+            ws.save_program_profile({
+                "account_workflows_supported": True,
+                "self_created_account_permission": True,
+                "self_created_account_prohibited": False,
+                "temporary_mail_account_bootstrap_allowed": True,
+            })
+            engine = Engine(ws.slug, backend="real")
+            with patch("grypton.engine._BROWSER_CAPABILITY_CACHE", None), \
+                    patch("grypton.tools.browser_runtime_status", return_value=(
+                        True, "isolated browser runtime is ready",
+                    )), patch(
+                        "grypton.credentials.list_credentials",
+                        return_value=["primary", "secondary"],
+                    ), patch(
+                        "grypton.credentials.session_status",
+                        side_effect=[
+                            {"established": True, "has_browser_storage": True,
+                             "has_pending_step_up": False,
+                             "password": "must-never-appear"},
+                            {"established": False, "has_browser_storage": False,
+                             "has_pending_step_up": True,
+                             "token": "must-never-appear"},
+                        ],
+                    ):
+                summary = engine._capability_summary()
+
+            self.assertTrue(summary["browser_ready"])
+            self.assertEqual(summary["credential_count"], 2)
+            self.assertEqual(summary["authenticated_session_count"], 1)
+            self.assertEqual(summary["authenticated_principal_count"], 0)
+            self.assertEqual(summary["browser_session_count"], 1)
+            self.assertEqual(summary["pending_step_up_count"], 1)
+            self.assertTrue(summary["account_creation_allowed"])
+            self.assertTrue(summary["temporary_mail_available"])
+            self.assertFalse(summary["oast_available"])
+            rendered = json.dumps(summary)
+            self.assertNotIn("must-never-appear", rendered)
+            self.assertNotIn("primary", rendered)
+
+    def test_capability_summary_distinguishes_principals_from_session_aliases(self):
+        with isolated_runtime():
+            ws = Workspace("capability-principals")
+            ws.create("https://example.test", "web")
+            engine = Engine(ws.slug, backend="mock")
+            established = {
+                "established": True, "has_browser_storage": True,
+                "has_pending_step_up": False,
+            }
+            with patch("grypton.engine._BROWSER_CAPABILITY_CACHE", None), \
+                    patch("grypton.credentials.list_credentials", return_value=[
+                        "phone-local", "phone-e164",
+                    ]), patch(
+                        "grypton.credentials.session_status",
+                        side_effect=[established, established],
+                    ), patch(
+                        "grypton.credentials.load_credential",
+                        side_effect=[
+                            {"username": "09123456789", "password": "first"},
+                            {"username": "+989123456789", "password": "second"},
+                        ],
+                    ):
+                same_principal = engine._capability_summary()
+
+            self.assertEqual(same_principal["authenticated_session_count"], 2)
+            self.assertEqual(same_principal["authenticated_principal_count"], 1)
+            self.assertFalse(
+                same_principal["second_authenticated_principal_available"]
+            )
+            self.assertNotIn("09123456789", json.dumps(same_principal))
+
+            with patch("grypton.engine._BROWSER_CAPABILITY_CACHE", None), \
+                    patch("grypton.credentials.list_credentials", return_value=[
+                        "first", "second",
+                    ]), patch(
+                        "grypton.credentials.session_status",
+                        side_effect=[established, established],
+                    ), patch(
+                        "grypton.credentials.load_credential",
+                        side_effect=[
+                            {"username": "first@example.test", "password": "one"},
+                            {"username": "second@example.test", "password": "two"},
+                        ],
+                    ):
+                distinct = engine._capability_summary()
+
+            self.assertEqual(distinct["authenticated_principal_count"], 2)
+            self.assertTrue(distinct["second_authenticated_principal_available"])
+
     def test_unvalidated_p1_is_not_confirmed(self):
         with isolated_runtime():
             ws = Workspace("pending-p1")
             ws.create("127.0.0.1", "web")
-            finding = ws.record_finding(title="Critical candidate", severity="P1")
+            finding = ws.record_finding(title="Critical candidate", severity="P1", evidence_package=write_evidence_package(ws))
             self.assertEqual(finding["status"], "validation-pending")
             self.assertEqual(ws.confirmed_p1s(), [])
 
@@ -2430,6 +2616,41 @@ class EngineTests(unittest.IsolatedAsyncioTestCase):
             repeat = engine._network_novelty([second])
             self.assertEqual(repeat["novel"], 0)
             self.assertEqual(repeat["repeated"], 1)
+
+    def test_network_signature_distinguishes_value_shape_actor_and_status_safely(self):
+        base = {
+            "name": "grypton_authenticated_http_request",
+            "input": {
+                "method": "POST", "url": "https://example.test/api/object",
+                "credential": "private-primary-alias",
+                "body": '{"object_id":"secret-one","enabled":true}',
+            },
+            "output": {"data": {"status": 200}},
+        }
+        same_shape = {
+            **base,
+            "input": {
+                **base["input"],
+                "body": '{"object_id":"different-secret","enabled":false}',
+            },
+        }
+        changed_field = {
+            **base,
+            "input": {**base["input"], "body": '{"tenant_id":"secret-one"}'},
+        }
+        changed_actor = {
+            **base,
+            "input": {**base["input"], "credential": "private-secondary-alias"},
+        }
+        changed_status = {**base, "output": {"data": {"status": 403}}}
+
+        baseline = Engine._network_signature(base)
+        self.assertNotEqual(baseline, Engine._network_signature(same_shape))
+        self.assertNotEqual(baseline, Engine._network_signature(changed_field))
+        self.assertNotEqual(baseline, Engine._network_signature(changed_actor))
+        self.assertNotEqual(baseline, Engine._network_signature(changed_status))
+        self.assertNotIn("private-primary-alias", baseline)
+        self.assertNotIn("secret-one", baseline)
 
     def test_network_signature_skips_local_and_malformed_urls(self):
         local_urls = [

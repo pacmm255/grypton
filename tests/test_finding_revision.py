@@ -12,6 +12,7 @@ from grypton import config
 from grypton.toolserver import REGISTRY, cli_main, dispatch
 from grypton.workspace import (ASTRA_REVALIDATION_REVISION_FIELD,
                                FINDING_NARRATIVE_FIELDS, Workspace)
+from tests.evidence_helpers import write_evidence_package
 
 
 @contextmanager
@@ -182,7 +183,7 @@ class FindingRevisionTests(unittest.TestCase):
             finding = ws.record_finding(
                 title="High candidate", severity="P2",
                 description="Initial observed behavior.",
-                evidence="flows/initial.http",
+                evidence="flows/initial.http", evidence_package=write_evidence_package(ws),
             )
             prior = {
                 "finding_id": finding["id"],
@@ -249,7 +250,7 @@ class FindingRevisionTests(unittest.TestCase):
             ws.create("https://example.test", "web")
             finding = ws.record_finding(
                 title="Critical candidate", severity="P1",
-                evidence="flows/initial.http",
+                evidence="flows/initial.http", evidence_package=write_evidence_package(ws),
             )
             ws.set_severity_verdict(finding["id"], {
                 "finding_id": finding["id"],

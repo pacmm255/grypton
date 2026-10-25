@@ -12,9 +12,12 @@ from unittest.mock import AsyncMock, patch
 
 from grypton import config, credentials
 from grypton.manager import KryptexManager, ManagerContext
-from grypton.providers import (MAX_ASSISTANT_TEXT_CHARS, OpenCodeClient,
+from grypton.providers import (LONGCAT_WORKER_STEP_LIMIT,
+                               MAX_ASSISTANT_TEXT_CHARS, OpenCodeClient,
                                OpenCodeResult, ProviderError,
-                               _select_assistant_text, clean)
+                               _opencode_agent_steps, _select_assistant_text,
+                               clean)
+from grypton.worker import OpenCodeWorker, WorkerSpec
 from grypton.workspace import Workspace
 
 
@@ -40,6 +43,18 @@ def isolated_runtime():
 
 
 class ProviderOutputTests(unittest.TestCase):
+    def test_longcat_worker_uses_bounded_agent_steps_without_route_switching(self):
+        self.assertEqual(LONGCAT_WORKER_STEP_LIMIT, 14)
+        self.assertEqual(
+            _opencode_agent_steps("go/longcat-2.5-preview-free", True), 14
+        )
+        self.assertEqual(
+            _opencode_agent_steps("go/muse-spark-1.3-contributor", True), 40
+        )
+        self.assertEqual(
+            _opencode_agent_steps("go/longcat-2.5-preview-free", False), 4
+        )
+
     def test_pre_spawn_provider_failure_is_replay_safe(self):
         async def exercise():
             with isolated_runtime():
@@ -66,6 +81,227 @@ class ProviderOutputTests(unittest.TestCase):
                         await client.call("fixture prompt")
                 self.assertIs(raised.exception.metadata["replay_safe"], True)
                 spawn.assert_not_awaited()
+
+        asyncio.run(exercise())
+
+    def test_worker_salvages_post_tool_error_or_empty_text_once(self):
+        class _Input:
+            def write(self, value):
+                self.value = value
+
+            async def drain(self):
+                return None
+
+            def close(self):
+                return None
+
+        class _Stream:
+            def __init__(self, payload=b""):
+                self.payload = payload
+
+            async def read(self, _size):
+                payload, self.payload = self.payload, b""
+                return payload
+
+        class _Process:
+            pid = 43217
+
+            def __init__(self, payload):
+                self.stdin = _Input()
+                self.stdout = _Stream(payload)
+                self.stderr = _Stream()
+                self.returncode = None
+
+            async def wait(self):
+                self.returncode = 0
+                return 0
+
+        async def call_with_events(slug, events):
+            workspace = config.ENGAGEMENTS_DIR / slug
+            workspace.mkdir(parents=True)
+            client = OpenCodeClient(
+                role="worker", route=config.WORKER_MODEL,
+                effort=config.WORKER_EFFORT,
+                workspace=workspace, target_slug=slug,
+                allow_tools=True, agent_prompt="test",
+            )
+            payload = b"".join(
+                (json.dumps(event) + "\n").encode() for event in events
+            )
+            gateway = SimpleNamespace(
+                model_route=f"openclaude/{config.WORKER_MODEL}",
+                drain_events=lambda: [],
+            )
+            with patch.object(client, "_ensure_gateway", AsyncMock(return_value=gateway)), \
+                    patch.object(client, "_environment", return_value=({}, "fixture-secret")), \
+                    patch.object(client, "_ensure_network_broker", AsyncMock()), \
+                    patch.object(config, "require_binary", return_value="/usr/bin/true"), \
+                    patch("grypton.providers.asyncio.create_subprocess_exec",
+                          new=AsyncMock(return_value=_Process(payload))):
+                result = await client.call("one effectful directive")
+            records = [json.loads(line) for line in (
+                workspace / "transcripts/provider-calls.jsonl"
+            ).read_text(encoding="utf-8").splitlines()]
+            return result, records
+
+        async def exercise():
+            with isolated_runtime():
+                tool = {
+                    "type": "tool_use", "sessionID": "ses-partial",
+                    "part": {
+                        "callID": "call-once", "tool": "http_request",
+                        "state": {
+                            "status": "completed",
+                            "input": {"url": "https://example.test/check"},
+                            "output": "HTTP 200 fixture response",
+                        },
+                    },
+                }
+                cases = (
+                    ("partial-error", [tool, {
+                        "type": "error",
+                        "error": "Upstream stream was truncated before completion",
+                    }], "provider_event_error"),
+                    ("partial-empty", [tool], "empty_response"),
+                )
+                for slug, events, error_class in cases:
+                    with self.subTest(error_class=error_class):
+                        result, records = await call_with_events(slug, events)
+                        self.assertTrue(result.metadata["partial"])
+                        self.assertEqual(
+                            result.metadata["provider_error"]["class"], error_class
+                        )
+                        self.assertFalse(
+                            result.metadata["provider_error"]["replay_safe"]
+                        )
+                        self.assertEqual(result.session_id, "")
+                        self.assertTrue(
+                            result.metadata["provider_error"]["session_reset"]
+                        )
+                        self.assertEqual(len(result.tools), 1)
+                        self.assertIn("without repeating", result.text)
+                        self.assertEqual(len(records), 1)
+                        self.assertFalse(records[0]["ok"])
+                        self.assertTrue(records[0]["partial"])
+                        self.assertTrue(records[0]["salvaged"])
+                        self.assertTrue(records[0]["session_reset"])
+                        self.assertEqual(records[0]["error_class"], error_class)
+
+        asyncio.run(exercise())
+
+    def test_pre_tool_error_remains_a_provider_failure(self):
+        class _Input:
+            def write(self, value):
+                self.value = value
+
+            async def drain(self):
+                return None
+
+            def close(self):
+                return None
+
+        class _Stream:
+            def __init__(self, payload=b""):
+                self.payload = payload
+
+            async def read(self, _size):
+                payload, self.payload = self.payload, b""
+                return payload
+
+        class _Process:
+            pid = 43218
+
+            def __init__(self, payload):
+                self.stdin = _Input()
+                self.stdout = _Stream(payload)
+                self.stderr = _Stream()
+                self.returncode = None
+
+            async def wait(self):
+                self.returncode = 0
+                return 0
+
+        async def exercise():
+            with isolated_runtime():
+                workspace = config.ENGAGEMENTS_DIR / "pre-tool-error"
+                workspace.mkdir(parents=True)
+                client = OpenCodeClient(
+                    role="worker", route=config.WORKER_MODEL,
+                    effort=config.WORKER_EFFORT,
+                    workspace=workspace, target_slug="pre-tool-error",
+                    allow_tools=True, agent_prompt="test",
+                )
+                payload = (json.dumps({
+                    "type": "error",
+                    "error": "Upstream stream was truncated before completion",
+                }) + "\n").encode()
+                gateway = SimpleNamespace(
+                    model_route=f"openclaude/{config.WORKER_MODEL}",
+                    drain_events=lambda: [],
+                )
+                with patch.object(client, "_ensure_gateway", AsyncMock(return_value=gateway)), \
+                        patch.object(client, "_environment", return_value=({}, "fixture-secret")), \
+                        patch.object(client, "_ensure_network_broker", AsyncMock()), \
+                        patch.object(config, "require_binary", return_value="/usr/bin/true"), \
+                        patch("grypton.providers.asyncio.create_subprocess_exec",
+                              new=AsyncMock(return_value=_Process(payload))):
+                    with self.assertRaisesRegex(
+                        ProviderError, "truncated before completion"
+                    ) as raised:
+                        await client.call("safe to retry directive")
+                self.assertEqual(raised.exception.metadata["tool_count"], 0)
+                records = (workspace / "transcripts/provider-calls.jsonl").read_text(
+                    encoding="utf-8"
+                ).splitlines()
+                self.assertEqual(len(records), 1)
+                self.assertFalse(json.loads(records[0])["partial"])
+
+        asyncio.run(exercise())
+
+    def test_worker_exposes_partial_provider_metadata_to_manager_context(self):
+        async def exercise():
+            with isolated_runtime():
+                worker = OpenCodeWorker(WorkerSpec(
+                    session_uuid="", cwd=config.ENGAGEMENTS_DIR / "partial-worker",
+                    system_prompt="test",
+                    extra_env={"GRYPTON_TARGET": "partial-worker"},
+                ))
+                worker.client.call = AsyncMock(return_value=OpenCodeResult(
+                    text=(
+                        "Provider interruption after observed tool execution: "
+                        "upstream truncated. Choose the next step without repeating."
+                    ),
+                    session_id="", events=[{"type": "tool_use"}],
+                    tools=[{
+                        "id": "call-once", "name": "http_request",
+                        "input": {"url": "https://example.test/check"},
+                        "output": "HTTP 200", "is_error": False,
+                    }],
+                    usage=[], duration_s=0.1,
+                    metadata={
+                        "partial": True,
+                        "provider_error": {
+                            "class": "provider_event_error",
+                            "message": "upstream truncated",
+                            "tool_count": 1,
+                            "replay_safe": False,
+                        },
+                    },
+                ))
+
+                turn = await worker.run_turn("effectful directive")
+
+                self.assertTrue(turn.is_error)
+                self.assertTrue(turn.result["partial"])
+                self.assertEqual(
+                    turn.result["provider_error"]["class"],
+                    "provider_event_error",
+                )
+                self.assertEqual(len(turn.tool_uses), 1)
+                self.assertIn("without repeating", turn.assistant_text)
+                self.assertEqual(worker.client.call.await_count, 1)
+                self.assertEqual(worker.session_id, "")
+                self.assertEqual(worker.spec.session_uuid, "")
 
         asyncio.run(exercise())
 
@@ -393,6 +629,189 @@ class ProviderOutputTests(unittest.TestCase):
                 self.assertNotIn("SYNTHETIC_", result.tools[0]["output"])
                 self.assertIsNone(result._raw_text)
                 self.assertIsNone(result._value_redactor)
+
+        asyncio.run(exercise())
+
+    def test_browser_workflow_values_are_private_before_provider_consumers(self):
+        class _Input:
+            def write(self, value):
+                self.value = value
+
+            async def drain(self):
+                return None
+
+            def close(self):
+                return None
+
+        class _Stream:
+            def __init__(self, payload=b""):
+                self.payload = payload
+
+            async def read(self, _size):
+                payload, self.payload = self.payload, b""
+                return payload
+
+        class _Process:
+            pid = 43220
+
+            def __init__(self, stdout):
+                self.stdin = _Input()
+                self.stdout = _Stream(stdout)
+                self.stderr = _Stream()
+                self.returncode = None
+
+            async def wait(self):
+                self.returncode = 0
+                return 0
+
+        async def exercise():
+            with isolated_runtime():
+                slug = "browser-workflow-provider-redaction"
+                workspace = config.ENGAGEMENTS_DIR / slug
+                workspace.mkdir(parents=True)
+                streamed = []
+                client = OpenCodeClient(
+                    role="worker", route=config.WORKER_MODEL,
+                    effort=config.WORKER_EFFORT,
+                    workspace=workspace, target_slug=slug,
+                    allow_tools=True, agent_prompt="test",
+                    event_callback=streamed.append,
+                )
+                private_values = [
+                    "private-fill-first-6e2b",
+                    "private-select-first-99aa",
+                    "private-multi-first-a143",
+                    "private-multi-first-b244",
+                    "private-fill-prefixed-24c1",
+                    "private-select-prefixed-35d2",
+                    "private-multi-prefixed-e411",
+                    "private-multi-prefixed-f522",
+                ]
+
+                def workflow_event(tool_name, offset, suffix):
+                    return {
+                        "type": "tool_use", "sessionID": "ses-browser-private",
+                        "part": {
+                            "callID": f"tool-{suffix}", "tool": tool_name,
+                            "state": {
+                                "status": "completed",
+                                "input": {
+                                    "value": f"public-envelope-{suffix}",
+                                    "actions": [
+                                        {
+                                            "action": "goto",
+                                            "url": "https://example.test/form",
+                                            "value": f"public-goto-{suffix}",
+                                        },
+                                        {
+                                            "action": " FILL ", "selector": "#name",
+                                            "value": private_values[offset],
+                                        },
+                                        {
+                                            "action": "SeLeCt", "selector": "#kind",
+                                            "value": private_values[offset + 1],
+                                            "values": private_values[offset + 2:offset + 4],
+                                        },
+                                    ],
+                                },
+                                "output": "workflow complete",
+                            },
+                        },
+                    }
+
+                events = [
+                    workflow_event("browser_workflow", 0, "plain"),
+                    workflow_event("grypton_browser_workflow", 4, "prefixed"),
+                    {
+                        "type": "tool_use", "sessionID": "ses-browser-private",
+                        "part": {
+                            "callID": "tool-generic", "tool": "generic_tool",
+                            "state": {
+                                "status": "completed",
+                                "input": {
+                                    "value": "public-generic-value",
+                                    "actions": [{
+                                        "action": "fill",
+                                        "value": "public-nonworkflow-fill-value",
+                                    }],
+                                },
+                                "output": "generic complete",
+                            },
+                        },
+                    },
+                    {
+                        "type": "text", "sessionID": "ses-browser-private",
+                        "part": {"text": "done"},
+                    },
+                ]
+                process = _Process(b"".join(
+                    (json.dumps(event) + "\n").encode() for event in events
+                ))
+                gateway = SimpleNamespace(
+                    model_route=f"openclaude/{config.WORKER_MODEL}",
+                    drain_events=lambda: [],
+                )
+                with patch.object(client, "_ensure_gateway", AsyncMock(return_value=gateway)), \
+                        patch.object(client, "_environment", return_value=({}, "gateway-secret")), \
+                        patch.object(client, "_ensure_network_broker", AsyncMock()), \
+                        patch.object(config, "require_binary", return_value="/usr/bin/true"), \
+                        patch("grypton.providers.credentials.provider_redaction_values",
+                              return_value=()), \
+                        patch("grypton.providers.asyncio.create_subprocess_exec",
+                              new=AsyncMock(return_value=process)):
+                    result = await client.call("browser workflow prompt")
+
+                persisted = [json.loads(line) for line in (
+                    workspace / "transcripts/worker.opencode.events.jsonl"
+                ).read_text(encoding="utf-8").splitlines()]
+                worker = OpenCodeWorker(WorkerSpec(
+                    session_uuid="", cwd=workspace, system_prompt="test",
+                    extra_env={"GRYPTON_TARGET": slug},
+                ))
+                worker._started = True
+                worker.client.call = AsyncMock(return_value=result)
+                turn = await worker.run_turn("consume sanitized result")
+
+                observable = json.dumps({
+                    "persisted": persisted,
+                    "streamed": streamed,
+                    "events": result.events,
+                    "tools": result.tools,
+                    "turn_tools": turn.tool_uses,
+                })
+                for value in private_values:
+                    self.assertNotIn(value, observable)
+                self.assertIn("[REDACTED]", observable)
+
+                for source in (persisted, streamed, result.events):
+                    for index, suffix in enumerate(("plain", "prefixed")):
+                        tool_input = source[index]["part"]["state"]["input"]
+                        self.assertEqual(
+                            tool_input["value"], f"public-envelope-{suffix}"
+                        )
+                        self.assertEqual(
+                            tool_input["actions"][0]["value"],
+                            f"public-goto-{suffix}",
+                        )
+                        self.assertEqual(
+                            tool_input["actions"][1]["value"], "[REDACTED]"
+                        )
+                        self.assertEqual(
+                            tool_input["actions"][2]["value"], "[REDACTED]"
+                        )
+                        self.assertEqual(
+                            tool_input["actions"][2]["values"],
+                            ["[REDACTED]"] * 2,
+                        )
+
+                for tools in (result.tools, turn.tool_uses):
+                    self.assertEqual(
+                        tools[2]["input"]["value"], "public-generic-value"
+                    )
+                    self.assertEqual(
+                        tools[2]["input"]["actions"][0]["value"],
+                        "public-nonworkflow-fill-value",
+                    )
 
         asyncio.run(exercise())
 

@@ -228,6 +228,13 @@ class OpenCodeWorker:
         self.session_id = result.session_id
         self.spec.session_uuid = result.session_id
         context_tokens = usage_context_tokens(result.usage)
+        provider_metadata = (
+            result.metadata if isinstance(result.metadata, dict) else {}
+        )
+        provider_error = provider_metadata.get("provider_error")
+        if not isinstance(provider_error, dict):
+            provider_error = {}
+        partial = provider_metadata.get("partial") is True
         tools = [{
             "name": self._tool_name(item.get("name")),
             "input": item.get("input") if isinstance(item.get("input"), dict) else {},
@@ -243,10 +250,15 @@ class OpenCodeWorker:
                 "usage": result.usage,
                 "event_count": len(result.events),
                 "returncode": result.returncode,
+                "partial": partial,
+                **({
+                    "provider_error": dict(provider_error),
+                } if provider_error else {}),
                 **({
                     "context_tokens": context_tokens,
                 } if context_tokens is not None else {}),
             },
+            is_error=partial,
             num_turns=1,
             duration_s=time.time() - started,
             cost_usd=result.cost,

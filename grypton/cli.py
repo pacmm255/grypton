@@ -1458,13 +1458,61 @@ def cmd_run_status(ns) -> int:
         )
     health = state.get("last_health") or {}
     if health:
-        print(f"  health  turns={health.get('turns', 0)} tools={health.get('tool_calls', 0)} "
-              f"surface={health.get('surface', 0)} tested={health.get('tested', 0)} "
-              f"finding-families={state.get('finding_families', 0)} "
-              f"cases={state.get('finding_cases', health.get('findings', 0))} "
-              f"family-stagnation={health.get('family_stagnation_streak', 0)} "
-              f"rotation={health.get('coverage_rotation_cursor', 0)} "
-              f"proofs={health.get('proof_rotation_cursor', 0)}")
+        has_run_deltas = any(
+            ("run_" + key) in health
+            for key in ("turns", "tool_calls", "provider_calls")
+        )
+
+        def metric(key: str, fallback=0):
+            if has_run_deltas:
+                return health.get("run_" + key, fallback)
+            return health.get(key, fallback)
+
+        label = "run" if has_run_deltas else "lifetime"
+        print(
+            f"  health ({label})  turns={metric('turns')} "
+            f"tools={metric('tool_calls')} surface={metric('surface')} "
+            f"tested={metric('tested')} "
+            f"finding-families={metric('finding_families')} "
+            f"cases={metric('finding_cases', health.get('findings', 0))} "
+            f"astra-p1={metric('astra_confirmed_p1')} "
+            f"astra-p2+={metric('astra_confirmed_p2_or_higher')}"
+        )
+        if has_run_deltas:
+            print(
+                f"  lifetime      turns={health.get('turns', 0)} "
+                f"tools={health.get('tool_calls', 0)} "
+                f"finding-families={state.get('finding_families', health.get('finding_families', 0))} "
+                f"cases={state.get('finding_cases', health.get('finding_cases', health.get('findings', 0)))}"
+            )
+        print(
+            f"  providers     calls={metric('provider_calls')} "
+            f"failures={metric('provider_failures')} "
+            f"partial={metric('provider_partial_calls')} "
+            f"worker/manager/astra-failures="
+            f"{metric('worker_provider_failures')}/"
+            f"{metric('manager_provider_failures')}/"
+            f"{metric('validator_provider_failures')}"
+        )
+        print(
+            f"  access        credentials={health.get('auth_credentials', 0)} "
+            f"established={health.get('auth_established', 0)} "
+            f"browser-sessions={health.get('auth_browser_sessions', 0)} "
+            f"pending-step-up={health.get('auth_pending_step_up', 0)} "
+            f"browser-binary={'available' if health.get('browser_available') else 'unavailable'}"
+        )
+        active = bool(health.get("active_provider_call"))
+        print(
+            f"  scheduler     family-stagnation={health.get('family_stagnation_streak', 0)} "
+            f"rotation={health.get('coverage_rotation_cursor', 0)} "
+            f"proofs={health.get('proof_rotation_cursor', 0)} "
+            f"provider={'active' if active else 'idle'}"
+            + (
+                f" turn={health.get('active_provider_turn', 0)} "
+                f"age={health.get('active_provider_age_seconds', 0)}s"
+                if active else ""
+            )
+        )
     if state.get("events"):
         print(f"  logs    {state['events']}")
     return 0
@@ -1781,29 +1829,8 @@ def _browser_sandbox_check() -> tuple[bool, str]:
         )
     if account.pw_uid == 0 or account.pw_gid == 0:
         return False, "grypton-browser must have a non-root uid and gid"
-    from .tools import _browser_executable
-    executable = _browser_executable()
-    runuser = config.find_binary("runuser")
-    if not executable or not runuser:
-        return False, "browser executable or runuser probe is unavailable"
-    try:
-        probe = subprocess.run(
-            [runuser, "-u", account.pw_name, "--", executable, "--version"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, timeout=10, text=True,
-            env={"PATH": "/usr/bin:/bin", "HOME": "/nonexistent",
-                 "LANG": "C", "LC_ALL": "C"},
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False, "grypton-browser could not execute the configured browser"
-    if probe.returncode != 0:
-        return False, (
-            "grypton-browser cannot traverse or execute the configured browser path"
-        )
-    return True, (
-        f"root launcher drops to grypton-browser uid={account.pw_uid}; "
-        f"Chromium sandbox enabled ({Path(executable).name})"
-    )
+    from .tools import browser_runtime_status
+    return browser_runtime_status(probe=True)
 
 
 def cmd_doctor(ns) -> int:

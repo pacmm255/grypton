@@ -41,6 +41,45 @@ def isolated_runtime():
             yield root
 
 
+@contextmanager
+def isolated_real_browser(workspace: Workspace):
+    """Launch a low-level browser test through the product OS isolation.
+
+    These tests observe native CORS preflights, so installing Playwright's
+    request route would change the behavior under test.  Their servers bind
+    only to the loopback origins recorded in ``workspace``.
+    """
+    from playwright.sync_api import sync_playwright
+
+    executable = tools._browser_executable()
+    if not executable:
+        raise RuntimeError("No Playwright-compatible browser is installed")
+    with tools._isolated_browser_profile(executable) as launch_profile:
+        with sync_playwright() as playwright:
+            context = playwright.chromium.launch_persistent_context(
+                user_data_dir=launch_profile["profile"],
+                headless=True,
+                executable_path=launch_profile["executable"],
+                ignore_default_args=["--enable-unsafe-swiftshader"],
+                env=launch_profile["environment"],
+                chromium_sandbox=True,
+                ignore_https_errors=True,
+                service_workers="block",
+                args=[
+                    "--disable-gpu", "--disable-software-rasterizer",
+                    "--disable-gpu-compositing", "--disable-dev-shm-usage",
+                    "--disable-background-networking",
+                    "--disable-webrtc-multiple-routes",
+                    "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                    "--disable-features=WebTransport",
+                ],
+            )
+            try:
+                yield context
+            finally:
+                context.close()
+
+
 class _SpaAuthHandler(BaseHTTPRequestHandler):
     username = "+989123456789"
     password = "browser-password-never-log"
@@ -3254,10 +3293,11 @@ class BrowserCredentialTests(unittest.TestCase):
             )
 
     def test_real_chromium_emits_exact_json_cors_sequence(self):
-        from playwright.sync_api import sync_playwright
-
-        with cross_origin_signup_servers(json_requests=True) as ports:
+        with isolated_runtime(), cross_origin_signup_servers(
+            json_requests=True
+        ) as ports:
             primary_port, api_port = ports
+            ws = self._cross_origin_signup_workspace(primary_port, api_port)
             primary_origin = f"http://127.0.0.1:{primary_port}"
             api_origin = f"http://127.0.0.1:{api_port}"
             check_endpoint = api_origin + "/auth/check-email"
@@ -3271,51 +3311,39 @@ class BrowserCredentialTests(unittest.TestCase):
             }
             validation_errors = []
 
-            executable = tools._browser_executable()
-            self.assertTrue(executable)
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(
-                    headless=True, executable_path=executable,
-                    args=["--no-sandbox"],
-                )
-                try:
-                    page = browser.new_page()
-                    session = page.context.new_cdp_session(page)
+            with isolated_real_browser(ws) as context:
+                page = context.new_page()
+                session = context.new_cdp_session(page)
 
-                    def observe_request(event):
-                        request = event.get("request") or {}
-                        method = str(request.get("method") or "").upper()
-                        url = str(request.get("url") or "")
-                        try:
-                            if method == "OPTIONS":
-                                _endpoint, counter_key = (
-                                    tools._browser_cors_preflight_contract(
-                                        url, method,
-                                        str(request.get("postData") or ""),
-                                        request.get("headers") or {},
-                                        primary_origin=primary_origin,
-                                        final_endpoint=final_endpoint,
-                                        preflight_endpoints=(check_endpoint,),
-                                        state=cors_state,
-                                    )
+                def observe_request(event):
+                    request = event.get("request") or {}
+                    method = str(request.get("method") or "").upper()
+                    url = str(request.get("url") or "")
+                    try:
+                        if method == "OPTIONS":
+                            _endpoint, counter_key = (
+                                tools._browser_cors_preflight_contract(
+                                    url, method,
+                                    str(request.get("postData") or ""),
+                                    request.get("headers") or {},
+                                    primary_origin=primary_origin,
+                                    final_endpoint=final_endpoint,
+                                    preflight_endpoints=(check_endpoint,),
+                                    state=cors_state,
                                 )
-                                cors_state["cors_preflight_seen"][
-                                    counter_key
-                                ] = 1
-                        except Exception as exc:
-                            validation_errors.append(str(exc))
+                            )
+                            cors_state["cors_preflight_seen"][counter_key] = 1
+                    except Exception as exc:
+                        validation_errors.append(str(exc))
 
-                    session.on("Network.requestWillBeSent", observe_request)
-                    session.send("Network.enable")
-                    page.goto(primary_origin + "/signup")
-                    page.fill("#email", _CrossOriginSignupHandler.email)
-                    page.fill("#password", "target-password-never-log")
-                    page.check("#privacy")
-                    page.click("#create-account")
-                    page.locator("#otp").wait_for(timeout=5000)
-                finally:
-                    browser.close()
-
+                session.on("Network.requestWillBeSent", observe_request)
+                session.send("Network.enable")
+                page.goto(primary_origin + "/signup")
+                page.fill("#email", _CrossOriginSignupHandler.email)
+                page.fill("#password", "target-password-never-log")
+                page.check("#privacy")
+                page.click("#create-account")
+                page.locator("#otp").wait_for(timeout=5000)
             self.assertEqual(validation_errors, [])
             self.assertEqual(_CrossOriginSignupHandler.request_order, [
                 "OPTIONS /auth/check-email", "POST /auth/check-email",
@@ -3466,8 +3494,6 @@ class BrowserCredentialTests(unittest.TestCase):
             self.assertEqual(_CrossOriginSignupHandler.redirect_followups, 0)
 
     def test_identifier_signup_does_not_follow_cors_preflight_redirect(self):
-        from playwright.sync_api import sync_playwright
-
         with isolated_runtime(), cross_origin_signup_servers(
             json_requests=True, redirect_options=True
         ) as ports:
@@ -3475,38 +3501,27 @@ class BrowserCredentialTests(unittest.TestCase):
             ws = self._cross_origin_signup_workspace(primary_port, api_port)
             primary_origin = f"http://127.0.0.1:{primary_port}"
             api_origin = f"http://127.0.0.1:{api_port}"
-            executable = tools._browser_executable()
-            self.assertTrue(executable)
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(
-                    headless=True, executable_path=executable,
-                    args=["--no-sandbox"],
-                )
-                try:
-                    context = browser.new_context()
-                    page = context.new_page()
-                    capture, _responses = (
-                        tools._browser_auth_enable_response_capture(
-                            context, page, ws, [],
-                            (_CrossOriginSignupHandler.email,),
-                            ("target-password-never-log",),
-                            submission_url=api_origin + "/auth/signup",
-                            preflight_urls=(
-                                api_origin + "/auth/check-email",
-                            ),
-                            reject_submission_redirects=True,
-                        )
+            with isolated_real_browser(ws) as context:
+                page = context.new_page()
+                capture, _responses = (
+                    tools._browser_auth_enable_response_capture(
+                        context, page, ws, [],
+                        (_CrossOriginSignupHandler.email,),
+                        ("target-password-never-log",),
+                        submission_url=api_origin + "/auth/signup",
+                        preflight_urls=(
+                            api_origin + "/auth/check-email",
+                        ),
+                        reject_submission_redirects=True,
                     )
-                    page.goto(primary_origin + "/signup")
-                    page.fill("#email", _CrossOriginSignupHandler.email)
-                    page.fill("#password", "target-password-never-log")
-                    page.check("#privacy")
-                    page.click("#create-account")
-                    page.wait_for_timeout(500)
-                    capture.send("Fetch.disable")
-                finally:
-                    browser.close()
-
+                )
+                page.goto(primary_origin + "/signup")
+                page.fill("#email", _CrossOriginSignupHandler.email)
+                page.fill("#password", "target-password-never-log")
+                page.check("#privacy")
+                page.click("#create-account")
+                page.wait_for_timeout(500)
+                capture.send("Fetch.disable")
             self.assertEqual(
                 _CrossOriginSignupHandler.options_requests,
                 ["/auth/check-email"],
@@ -3705,17 +3720,12 @@ class BrowserCredentialTests(unittest.TestCase):
             self.assertFalse(pending["reserved"])
 
     def test_discovers_grouped_numeric_otp_without_maxlength(self):
-        from playwright.sync_api import sync_playwright
-
-        executable = tools._browser_executable()
-        self.assertTrue(executable)
-        with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(
-                headless=True, executable_path=executable,
-                args=["--no-sandbox"],
-            )
-            try:
-                page = browser.new_page()
+        with isolated_runtime():
+            ws = Workspace("browser-control-discovery")
+            ws.create("https://example.test", "web")
+            ws.save_constraints(Constraints(in_scope=["example.test"]))
+            with isolated_real_browser(ws) as context:
+                page = context.new_page()
                 for challenge_text in (
                     "Enter the verification code",
                     "We sent a code to your email",
@@ -3750,8 +3760,6 @@ class BrowserCredentialTests(unittest.TestCase):
                 controls = tools._browser_auth_discover_step_up_controls(page)
                 self.assertEqual(controls["otp_selector"], "")
                 self.assertEqual(controls["otp_fields"], 0)
-            finally:
-                browser.close()
 
     def test_identifier_replay_canonicalizes_implicit_default_https_port(self):
         body = '{"email":"researcher@example.test"}'

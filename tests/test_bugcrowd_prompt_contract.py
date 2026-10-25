@@ -179,6 +179,87 @@ class BugcrowdPromptContractTests(unittest.TestCase):
             ):
                 _constraints(namespace(path), "https://example.test/app")
 
+    def test_reward_range_sets_critical_group_severity(self):
+        document = snapshot()
+        group = document["data"]["scope"][0]
+        group.pop("maxSeverity")
+        group["rewardRangeData"] = {
+            "1": {"min": 6500, "max": 7500},
+            "2": {"min": 2500, "max": 5000},
+            "3": {"min": 500, "max": 1500},
+            "4": {"min": 150, "max": 150},
+            "5": {"min": None, "max": None},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "brief.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            imported = structured_scope(analyze_snapshot(path))
+
+        self.assertEqual(imported["url_severities"], {
+            "https://example.test/app": "Critical",
+            "https://example.test/help": "Medium",
+        })
+
+    def test_reward_range_uses_highest_impact_offered_priority(self):
+        document = snapshot()
+        group = document["data"]["scope"][0]
+        group.pop("maxSeverity")
+        group["targets"][1].pop("maxSeverity")
+        group["rewardRangeData"] = {
+            "1": {"min": None, "max": None},
+            "2": {"min": 0, "max": 2000},
+            "3": {"min": 250, "max": 750},
+            "4": {"min": 100, "max": 100},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "brief.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            imported = structured_scope(analyze_snapshot(path))
+
+        self.assertEqual(imported["url_severities"], {
+            "https://example.test/app": "High",
+            "https://example.test/help": "High",
+        })
+
+    def test_explicit_max_severity_precedes_reward_range(self):
+        document = snapshot()
+        group = document["data"]["scope"][0]
+        group["maxSeverity"] = "P3"
+        group["rewardRangeData"] = {
+            "1": {"min": 5000, "max": 10000},
+            "2": {"min": 1000, "max": 2500},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "brief.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            imported = structured_scope(analyze_snapshot(path))
+
+        self.assertEqual(imported["url_severities"], {
+            "https://example.test/app": "Medium",
+            "https://example.test/help": "Medium",
+        })
+
+    def test_all_null_or_malformed_reward_range_remains_unlabelled(self):
+        document = snapshot()
+        group = document["data"]["scope"][0]
+        group.pop("maxSeverity")
+        group["targets"][1].pop("maxSeverity")
+        group["rewardRangeData"] = {
+            "1": {"min": None, "max": None},
+            "2": {"min": "100", "max": "200"},
+            "critical": {"min": 1000, "max": 2000},
+            "3": [],
+            "4": {"min": True, "max": False},
+            "5": {"minimum": 0, "maximum": 0},
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "brief.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            profile = analyze_snapshot(path)
+            self.assertEqual(structured_scope(profile)["url_severities"], {})
+            with self.assertRaisesRegex(ValueError, "missing an explicit severity"):
+                _constraints(namespace(path), "https://example.test/app")
+
     def test_free_form_group_title_is_not_inferred_as_severity(self):
         document = snapshot()
         document["data"]["scope"].append({

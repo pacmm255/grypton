@@ -10,6 +10,7 @@ from html.parser import HTMLParser
 import http.client
 import ipaddress
 import json
+import mimetypes
 import os
 from pathlib import Path
 import pwd
@@ -44,6 +45,10 @@ _AUTH_EXPIRY_SKEW_S = 60
 # enough for a later tool call/restart, then re-prove both sides at promotion.
 _PENDING_RENEWAL_MAX_AGE_S = 24 * 60 * 60
 _PENDING_STEP_UP_MAX_AGE_S = 15 * 60
+_BROWSER_WORKFLOW_MAX_ACTIONS = 20
+_BROWSER_WORKFLOW_MAX_NETWORK_REQUESTS = 100
+_BROWSER_WORKFLOW_MAX_UPLOAD_BYTES = 16 * 1024 * 1024
+_BROWSER_WORKFLOW_MAX_INSPECT_CHARS = 20_000
 
 _SENSITIVE_HEADERS = frozenset({
     "authorization", "proxy-authorization", "cookie", "set-cookie",
@@ -2643,6 +2648,1010 @@ def flow_replay(workspace: Workspace, flow_id: str, *, url: str = "", method: st
                         transport=f"replay:{Path(flow_id).stem}")
 
 
+_EVIDENCE_FLOW_ID_RE = re.compile(r"flow-[0-9]+")
+_EVIDENCE_PACKAGE_FLOW_IDS = ("positive_flow_id", "control_flow_id",
+                              "replay_flow_id", "second_run_flow_id")
+_EVIDENCE_DIGEST_FIELDS = ("request_method", "request_target_sha256",
+                           "response_status", "response_body_sha256",
+                           "response_body_bytes", "artifact_sha256")
+_EVIDENCE_READ_BYTES = MAX_RESPONSE_BYTES + 65_536
+
+
+def _evidence_flow_digests(workspace: Workspace, flow_id: str) -> dict:
+    """Compute the digest fields one referenced capture contributes to a package.
+
+    Fails closed by raising ``ValueError`` on any capture that is not a
+    well-formed Grypton flow. Parsing reads at most ``_EVIDENCE_READ_BYTES``
+    while ``artifact_sha256`` streams the entire file, so a truncated parse can
+    never certify bytes the artifact digest did not cover. The returned dict
+    also carries internal ``metadata``, ``header_block``, and ``path_stem``
+    keys that callers must not publish.
+    """
+    path = _flow_path(workspace, flow_id)
+    if path is None:
+        raise ValueError("the capture does not resolve inside the engagement")
+    if path.is_symlink() or not path.is_file():
+        # An in-directory alias is not a capture the collector wrote; evidence
+        # must come from regular files only.
+        raise ValueError("the capture is not a regular file")
+    hasher = hashlib.sha256()
+    prefix = bytearray()
+    with path.open("rb") as stream:
+        while chunk := stream.read(64 * 1024):
+            hasher.update(chunk)
+            if len(prefix) < _EVIDENCE_READ_BYTES:
+                prefix.extend(chunk[:_EVIDENCE_READ_BYTES - len(prefix)])
+    # curl-persisted wire bytes carry CRLF while the flow's own section
+    # markers are LF. Split on either ending but keep body bytes exactly as
+    # stored, so digests and byte counts describe the real capture.
+    text = bytes(prefix).decode("utf-8", "replace")
+    metadata_line, request_sep, rest = text.partition("\n### REQUEST\n")
+    if not request_sep or not metadata_line.startswith("### GRYPTON FLOW "):
+        raise ValueError("the capture is missing the Grypton flow header")
+    try:
+        metadata = json.loads(metadata_line[len("### GRYPTON FLOW "):])
+    except json.JSONDecodeError:
+        raise ValueError("the capture metadata line is not valid JSON") from None
+    if not isinstance(metadata, dict):
+        raise ValueError("the capture metadata is not an object")
+    request_section, response_sep, response_section = rest.partition(
+        "\n### RESPONSE\n"
+    )
+    if not response_sep:
+        raise ValueError("the capture is missing the RESPONSE section")
+    if ("### RESPONSE" in request_section
+            or "\n### REQUEST\n" in request_section + response_section):
+        raise ValueError("the capture framing is ambiguous: a section marker "
+                         "appears inside saved content")
+    request_line = request_section.split("\n", 1)[0].rstrip("\r")
+    request_match = re.match(r"^([A-Z]{1,20})\s+(\S+)\s*$", request_line)
+    if not request_match:
+        raise ValueError("the capture request line is malformed")
+    request_rest = request_section.split("\n", 1)[1] if "\n" in request_section else ""
+    request_headers, request_body = _split_header_body(request_rest)
+    status_line, _, after_status = response_section.partition("\n")
+    status_match = re.match(r"^HTTP/\S+\s+(\d{3})", status_line)
+    if not status_match:
+        raise ValueError("the capture response status line is malformed")
+    header_block, body_text = _split_header_body(after_status)
+    canonical_request_headers = _canonical_header_block(request_headers)
+    body = body_text.encode("utf-8", "replace")
+    request_target = request_match.group(2)
+    parsed_target = urlsplit(request_target)
+    request_origin = f"{parsed_target.scheme}://{parsed_target.netloc}"
+    return {
+        "request_method": request_match.group(1),
+        "request_target": request_target,
+        "request_origin": request_origin,
+        "request_target_sha256": hashlib.sha256(
+            request_line.encode("utf-8")
+        ).hexdigest(),
+        "request_header_sha256": hashlib.sha256(
+            canonical_request_headers.encode("utf-8")
+        ).hexdigest(),
+        "request_body_sha256": hashlib.sha256(
+            request_body.encode("utf-8", "replace")
+        ).hexdigest(),
+        "response_status": int(status_match.group(1)),
+        "response_body_sha256": hashlib.sha256(body).hexdigest(),
+        "response_body_bytes": len(body),
+        "artifact_sha256": hasher.hexdigest(),
+        "metadata": metadata,
+        "header_block": header_block,
+        "request_header_block": request_headers,
+        "path_stem": path.stem,
+    }
+
+
+_CONTROL_VARIABLE_LOCATIONS = frozenset({
+    "method", "url_path", "query", "header",
+    "body_form", "body_json_pointer", "body_text",
+})
+
+
+def _request_header_map(header_block: str) -> dict[str, str]:
+    """Parsed request headers keyed by lowercased name (last value wins)."""
+    mapping: dict[str, str] = {}
+    for line in header_block.split("\n"):
+        line = line.rstrip("\r")
+        if ":" not in line:
+            continue
+        name, _, value = line.partition(":")
+        mapping[name.strip().casefold()] = value.strip()
+    return mapping
+
+
+def _control_variable_problem(positive: dict, control: dict,
+                              control_variable) -> str:
+    """Return a one-line reason when the control is not a single-variable
+    comparison, or an empty string when it is sound.
+
+    The control must always share the positive capture's origin. Without a
+    declared ``control_variable`` the control request must be byte-identical
+    to the positive request; with one, exactly the named input may differ.
+    """
+    if control["request_origin"] != positive["request_origin"]:
+        return ("control targets a different origin than the positive capture; "
+                "a cross-origin comparison cannot isolate one variable")
+    if control_variable is None:
+        if (control["request_target_sha256"] != positive["request_target_sha256"]
+                or control["request_header_sha256"]
+                != positive["request_header_sha256"]
+                or control["request_body_sha256"]
+                != positive["request_body_sha256"]):
+            return ("control changes the request without declaring "
+                    "control_variable {location, name}; an undeclared control "
+                    "must repeat the positive request exactly")
+        return ""
+    if (not isinstance(control_variable, dict)
+            or set(control_variable) != {"location", "name"}
+            or control_variable.get("location") not in _CONTROL_VARIABLE_LOCATIONS
+            or not isinstance(control_variable.get("name"), str)
+            or not 1 <= len(control_variable["name"]) <= 512):
+        return ("control_variable must be {location, name} with location one of "
+                + ", ".join(sorted(_CONTROL_VARIABLE_LOCATIONS)))
+    location = control_variable["location"]
+    name = control_variable["name"]
+    pos_target = urlsplit(positive["request_target"])
+    ctl_target = urlsplit(control["request_target"])
+    if location == "method":
+        if positive["request_method"] == control["request_method"]:
+            return "declared method variable does not differ between the captures"
+    elif positive["request_method"] != control["request_method"]:
+        return "control changes the HTTP method without declaring it"
+    if location == "url_path":
+        if pos_target.path == ctl_target.path:
+            return "declared path variable does not differ between the captures"
+    elif pos_target.path != ctl_target.path:
+        return "control changes the request path without declaring it"
+    if location == "query":
+        if sorted(parse_qsl(pos_target.query)) == sorted(parse_qsl(ctl_target.query)):
+            return "declared query variable does not differ between the captures"
+    elif sorted(parse_qsl(pos_target.query)) != sorted(parse_qsl(ctl_target.query)):
+        return "control changes the query string without declaring it"
+    if location == "header":
+        pos_map = dict(_request_header_map(positive["request_header_block"]))
+        ctl_map = dict(_request_header_map(control["request_header_block"]))
+        wanted = name.casefold()
+        remainder_pos = {k: v for k, v in pos_map.items() if k != wanted}
+        remainder_ctl = {k: v for k, v in ctl_map.items() if k != wanted}
+        if remainder_pos != remainder_ctl:
+            return ("control changes request headers other than the declared "
+                    f"{name!r}")
+        if pos_map.get(wanted) == ctl_map.get(wanted):
+            return f"declared header {name!r} does not differ between the captures"
+    elif (positive["request_header_sha256"]
+            != control["request_header_sha256"]):
+        return "control changes request headers without declaring one"
+    body_locations = {"body_text", "body_form", "body_json_pointer"}
+    if location in body_locations:
+        if (positive["request_body_sha256"]
+                == control["request_body_sha256"]):
+            return "declared body variable does not differ between the captures"
+    elif positive["request_body_sha256"] != control["request_body_sha256"]:
+        return "control changes the request body without declaring it"
+    return ""
+
+
+def _split_header_body(section_text: str) -> tuple[str, str]:
+    """Split one wire section into its header block and raw body text.
+
+    Accepts both LF and CRLF blank-line boundaries while preserving body bytes
+    exactly as stored, so digests and byte counts describe the real capture.
+    """
+    match = re.search(r"\r?\n\r?\n", section_text)
+    if match is None:
+        return section_text.rstrip("\r"), ""
+    body = section_text[match.end():]
+    if body.endswith("\n"):
+        body = body[:-1]
+    return (section_text[:match.start()].rstrip("\r"), body)
+
+
+def _canonical_header_block(header_block: str) -> str:
+    """Normalize a header block for request-identity comparison.
+
+    Line endings are folded to LF and ``Content-Length`` is dropped because
+    ``flow_replay`` legitimately re-issues saved requests without it.
+    """
+    lines = [line.rstrip("\r") for line in header_block.split("\n")]
+    kept = [line for line in lines
+            if line.strip()
+            and line.split(":", 1)[0].strip().casefold() != "content-length"]
+    return "\n".join(kept)
+
+
+def _header_line_value(header_block: str, name: str) -> str | None:
+    """Return the exact value of one named header, or None when absent.
+
+    Matching is by parsed header NAME only (case-insensitive), never by
+    substring, so a name that appears inside another header's value cannot
+    masquerade as presence.
+    """
+    wanted = name.casefold()
+    for line in header_block.split("\n"):
+        line = line.rstrip("\r")
+        if ":" not in line:
+            continue
+        candidate, _, value = line.partition(":")
+        if candidate.strip().casefold() == wanted:
+            return value.strip()
+    return None
+
+
+def _evidence_dimension_rendering(digests: dict, dimension: str,
+                                  header_name: str) -> str:
+    """Render one capture's value for a differential claim dimension."""
+    if dimension == "status":
+        return str(digests["response_status"])
+    if dimension == "body_sha256":
+        return digests["response_body_sha256"]
+    if dimension == "body_bytes":
+        return str(digests["response_body_bytes"])
+    present = bool(header_name) and (
+        _header_line_value(digests["header_block"], header_name) is not None
+    )
+    if dimension == "header_present":
+        return "present" if present else "absent"
+    value = (_header_line_value(digests["header_block"], header_name)
+             if header_name else None)
+    return "" if value is None else value
+
+
+def verify_evidence_package(workspace: Workspace, package: dict) -> dict:
+    """Mechanically verify a differential evidence package against captures.
+
+    Pure-local verification: only flow captures inside the engagement are
+    read and no network request is made. A package passes only when every
+    referenced flow exists, the replay captures were machine-replayed from the
+    positive capture, positive/replay/second-run repeat one identical request,
+    the declared differential claim is actually supported by the computed
+    digests, and the replays are at least as fresh as the positive capture.
+    Returns ``{"ok": True, "digests": ..., "evidence_chain_sha256": ...}`` on
+    success or ``{"ok": False, "reason": ...}`` naming the failed check; the
+    caller must treat an unverified package as an unproven hypothesis.
+    """
+
+    def rejected(reason: str) -> dict:
+        return {"ok": False, "reason": reason}
+
+    if not isinstance(package, dict):
+        return rejected("package: the evidence package must be an object")
+    flow_ids: dict[str, str] = {}
+    for key in _EVIDENCE_PACKAGE_FLOW_IDS:
+        value = package.get(key)
+        if not isinstance(value, str) or not _EVIDENCE_FLOW_ID_RE.fullmatch(value):
+            return rejected(f"existence: {key} must be a flow-<digits> capture id")
+        if _flow_path(workspace, value) is None:
+            return rejected(
+                f"existence: flow {value!r} ({key}) was not found in this engagement"
+            )
+        flow_ids[key] = value
+    if len(set(flow_ids.values())) != len(flow_ids):
+        return rejected(
+            "existence: each evidence role must reference a distinct capture; "
+            "reusing one flow for two roles proves nothing"
+        )
+    claim = package.get("differential_claim")
+    if not isinstance(claim, dict):
+        return rejected("claim support: differential_claim must be an object")
+    verified: dict[str, dict] = {}
+    for flow_id in sorted(set(flow_ids.values())):
+        try:
+            verified[flow_id] = _evidence_flow_digests(workspace, flow_id)
+        except ValueError as exc:
+            return rejected(f"digests: {flow_id} could not be verified — {exc}")
+    positive = verified[flow_ids["positive_flow_id"]]
+    control = verified[flow_ids["control_flow_id"]]
+    for flow_id, digests in verified.items():
+        if digests["metadata"].get("response_truncated"):
+            return rejected(
+                f"digests: {flow_id} is a truncated capture; a truncated capture "
+                "cannot certify evidence"
+            )
+    dimension = claim.get("dimension")
+    predicate = claim.get("predicate")
+    positive_value = claim.get("positive_value")
+    control_value = claim.get("control_value")
+    if not all(isinstance(value, str)
+               for value in (dimension, predicate, positive_value, control_value)):
+        return rejected(
+            "claim support: differential_claim dimension, predicate, "
+            "positive_value, and control_value must be strings"
+        )
+    header_name = ""
+    if dimension in ("header_present", "header_value"):
+        header_name = positive_value
+    elif ":" in dimension:
+        base, _, named = dimension.partition(":")
+        if base in ("header_present", "header_value"):
+            dimension, header_name = base, named
+    if dimension == "header_value" and not header_name:
+        return rejected(
+            "claim support: header_value requires a named header "
+            "(dimension header_value:<name>)"
+        )
+    if dimension not in ("status", "body_sha256", "body_bytes",
+                         "header_present", "header_value"):
+        return rejected(
+            f"claim support: unsupported differential dimension {dimension!r} "
+            "(timing and unmodeled dimensions cannot be verified mechanically)"
+        )
+    if predicate not in ("differs", "equals", "positive_matches"):
+        return rejected(f"claim support: unsupported predicate {predicate!r}")
+    control_variable = package.get("control_variable")
+    control_problem = _control_variable_problem(positive, control, control_variable)
+    if control_problem:
+        return rejected(f"control isolation: {control_problem}")
+    positive_rendering = _evidence_dimension_rendering(
+        positive, dimension, header_name)
+    control_rendering = _evidence_dimension_rendering(
+        control, dimension, header_name)
+    if positive_rendering == control_rendering and dimension != "header_present":
+        # A package must demonstrate a real difference between the two
+        # captures somewhere; an identical pair proves nothing regardless of
+        # predicate. header_present is exempt because its rendering is the
+        # constant "present"/"absent" pair which differs by construction.
+        if (positive["response_status"] == control["response_status"]
+                and positive["response_body_sha256"]
+                == control["response_body_sha256"]
+                and positive["response_body_bytes"]
+                == control["response_body_bytes"]):
+            return rejected(
+                "claim support: the positive and control captures are "
+                "indistinguishable in every modeled dimension; there is no "
+                "demonstrated differential"
+            )
+    for role in ("replay_flow_id", "second_run_flow_id"):
+        replay = verified[flow_ids[role]]
+        transport = replay["metadata"].get("transport")
+        if not isinstance(transport, str) or not transport.startswith("replay:"):
+            return rejected(
+                f"replay integrity: {role} {flow_ids[role]} was not captured by "
+                f"flow_replay (transport {transport!r})"
+            )
+        if transport[len("replay:"):] != positive["path_stem"]:
+            return rejected(
+                f"replay integrity: {role} {flow_ids[role]} replays "
+                f"{transport[len('replay:'):]!r} instead of the positive capture "
+                f"{positive['path_stem']!r}"
+            )
+        if (replay["request_method"] != positive["request_method"]
+                or replay["request_target_sha256"]
+                != positive["request_target_sha256"]
+                or replay["request_header_sha256"]
+                != positive["request_header_sha256"]
+                or replay["request_body_sha256"]
+                != positive["request_body_sha256"]):
+            return rejected(
+                f"request identity: {role} {flow_ids[role]} does not repeat the "
+                "positive capture's request"
+            )
+        if (replay["response_status"] != positive["response_status"]
+                or replay["response_body_sha256"]
+                != positive["response_body_sha256"]
+                or _evidence_dimension_rendering(
+                    replay, dimension, header_name) != positive_rendering):
+            return rejected(
+                f"replay stability: {role} {flow_ids[role]} observed a different "
+                "response than the positive capture; the claimed difference is "
+                "not reproducible"
+            )
+    if predicate == "differs":
+        supported = positive_rendering != control_rendering
+    elif predicate == "equals":
+        supported = positive_rendering == control_rendering
+    else:
+        supported = bool(positive_value) and positive_value in positive_rendering
+    sensitive = dimension in ("header_value", "header_present")
+
+    def _shown(value: str) -> str:
+        # Header values can carry session material; never echo them back.
+        return "<redacted>" if sensitive and value else repr(value)
+
+    if supported and predicate in ("differs", "equals"):
+        # Declared values are part of the claim: they must be stated, and they
+        # must match the computed renderings, or the claim verified is not the
+        # claim that was made.
+        if not positive_value or not control_value:
+            return rejected(
+                "claim support: differs/equals claims must state both "
+                "positive_value and control_value"
+            )
+        if (positive_value != positive_rendering
+                or control_value != control_rendering):
+            return rejected(
+                "claim support: declared positive_value/control_value do not "
+                f"match the captures (computed {_shown(positive_rendering)} "
+                f"vs {_shown(control_rendering)})"
+            )
+    if supported and predicate == "positive_matches" and control_value:
+        if control_value != control_rendering:
+            return rejected(
+                "claim support: declared control_value does not match the "
+                f"control capture (computed {_shown(control_rendering)})"
+            )
+    if not supported:
+        return rejected(
+            f"claim support: the captures do not support {predicate!r} on "
+            f"{dimension!r} (positive {_shown(positive_rendering)} vs control "
+            f"{_shown(control_rendering)})"
+        )
+    positive_captured = positive["metadata"].get("captured_at")
+    for role in ("replay_flow_id", "second_run_flow_id"):
+        captured = verified[flow_ids[role]]["metadata"].get("captured_at")
+        numeric = (isinstance(positive_captured, (int, float))
+                   and not isinstance(positive_captured, bool)
+                   and isinstance(captured, (int, float))
+                   and not isinstance(captured, bool))
+        if not numeric or captured < positive_captured:
+            return rejected(
+                f"freshness: {role} {flow_ids[role]} was not captured at or "
+                "after the positive flow"
+            )
+    chain = hashlib.sha256(("gypton-evidence-v1\n" + "\n".join(
+        f"{key}:{flow_ids[key]}:{verified[flow_ids[key]]['artifact_sha256']}"
+        for key in _EVIDENCE_PACKAGE_FLOW_IDS
+    )).encode("utf-8")).hexdigest()
+    return {
+        "ok": True,
+        "digests": {flow_id: {field: verified[flow_id][field]
+                              for field in _EVIDENCE_DIGEST_FIELDS}
+                    for flow_id in sorted(verified)},
+        "evidence_chain_sha256": chain,
+    }
+
+
+def _parse_http_flow(path: Path, max_bytes: int = 2_100_000) -> dict:
+    """Parse one saved HTTP flow capture from its stored bytes.
+
+    Re-parses from disk rather than trusting index metadata and reuses the
+    same section/framing discipline as the evidence-package parser
+    (``_split_header_body``): section markers are LF, but curl-persisted wire
+    content may carry CRLF, so body slices are kept exactly as stored (embedded
+    CRLF preserved) instead of being normalized. ``response.body_bytes`` is the
+    byte length of that exact stored body. Raises ``ValueError`` on any framing
+    or parse failure (missing/legacy header, malformed start lines, missing
+    RESPONSE section, or an ambiguous section marker inside saved content).
+
+    The returned ``read_truncated`` flag is True when the file is larger than
+    ``max_bytes``; the parse then describes only the prefix that was read, and
+    callers must treat the capture as incomplete.
+
+    Returns: {
+        "request": {"method", "url", "origin", "headers": str, "body": str},
+        "response": {"status": int, "headers": str, "body": str, "body_bytes": int},
+        "metadata": dict,
+        "read_truncated": bool,
+    }
+    """
+    try:
+        file_size = path.stat().st_size
+    except OSError:
+        file_size = 0
+    if path.is_symlink() or not path.is_file():
+        # Evidence-grade parsing accepts regular captures only; an in-directory
+        # alias is not a file the collector wrote.
+        raise ValueError("the capture is not a regular file")
+    prefix = bytearray()
+    with path.open("rb") as stream:
+        while len(prefix) < max_bytes:
+            chunk = stream.read(min(64 * 1024, max_bytes - len(prefix)))
+            if not chunk:
+                break
+            prefix.extend(chunk)
+    read_truncated = file_size > max_bytes
+    text = bytes(prefix).decode("utf-8", "replace")
+
+    metadata_line, request_sep, rest = text.partition("\n### REQUEST\n")
+    if not request_sep or not metadata_line.startswith("### GRYPTON FLOW "):
+        raise ValueError("the capture is missing the Grypton flow header")
+    try:
+        metadata = json.loads(metadata_line[len("### GRYPTON FLOW "):])
+    except json.JSONDecodeError:
+        raise ValueError("the capture metadata line is not valid JSON") from None
+    if not isinstance(metadata, dict):
+        raise ValueError("the capture metadata is not an object")
+
+    request_section, response_sep, response_section = rest.partition(
+        "\n### RESPONSE\n"
+    )
+    if not response_sep:
+        raise ValueError("the capture is missing the RESPONSE section")
+    if ("### RESPONSE" in request_section
+            or "\n### REQUEST\n" in request_section + response_section):
+        raise ValueError("the capture framing is ambiguous: a section marker "
+                         "appears inside saved content")
+
+    request_line = request_section.split("\n", 1)[0].rstrip("\r")
+    request_match = re.match(r"^([A-Z]{1,20})\s+(\S+)\s*$", request_line)
+    if not request_match:
+        raise ValueError("the capture request line is malformed")
+    method, url = request_match.groups()
+    request_rest = (request_section.split("\n", 1)[1]
+                    if "\n" in request_section else "")
+    request_headers, request_body = _split_header_body(request_rest)
+
+    status_line, _, after_status = response_section.partition("\n")
+    status_match = re.match(r"^HTTP/\S+\s+(\d{3})", status_line)
+    if not status_match:
+        raise ValueError("the capture response status line is malformed")
+    status = int(status_match.group(1))
+    response_headers, response_body_text = _split_header_body(after_status)
+    response_body = response_body_text.encode("utf-8", "replace")
+
+    parsed_target = urlsplit(url)
+    request_origin = f"{parsed_target.scheme}://{parsed_target.netloc}"
+
+    return {
+        "request": {
+            "method": method,
+            "url": url,
+            "origin": request_origin,
+            "headers": request_headers,
+            "body": request_body,
+        },
+        "response": {
+            "status": status,
+            "headers": response_headers,
+            "body": response_body_text,
+            "body_bytes": len(response_body),
+        },
+        "metadata": metadata,
+        "read_truncated": read_truncated,
+    }
+
+
+def _parse_query_string(query: str) -> dict:
+    """Parse query string into a canonicalized form for comparison."""
+    if not query:
+        return {}
+    try:
+        pairs = parse_qsl(query, keep_blank_values=True)
+        return {name: sorted(values) for name, values in
+                _group_by_name(pairs).items()}
+    except (ValueError, UnicodeDecodeError):
+        return {}
+
+
+def _group_by_name(pairs: list) -> dict:
+    """Group (name, value) pairs by name."""
+    grouped = {}
+    for name, value in pairs:
+        if name not in grouped:
+            grouped[name] = []
+        grouped[name].append(value)
+    return grouped
+
+
+def _canonicalize_headers(header_block: str) -> dict:
+    """Parse and canonicalize HTTP headers for comparison."""
+    headers = {}
+    for line in header_block.split("\n"):
+        if ":" in line:
+            key, value = line.split(":", 1)
+            key_lower = key.strip().lower()
+            value = value.strip()
+            if key_lower not in headers:
+                headers[key_lower] = []
+            headers[key_lower].append(value)
+    return headers
+
+
+_REDACTED_PLACEHOLDER = "[redacted]"
+
+
+def _request_projection(request: dict) -> dict:
+    """Canonical request projections used by the differential comparator.
+
+    ``query`` is a sorted list of ``(name, value)`` pairs; ``headers`` is a
+    name->value map keyed by the lowercased header name (last value wins, the
+    same discipline the evidence parser uses). ``origin`` and ``path`` come
+    from the stored request target.
+    """
+    parsed = urlsplit(request["url"])
+    origin = request.get("origin") or f"{parsed.scheme}://{parsed.netloc}"
+    return {
+        "method": request["method"],
+        "origin": origin,
+        "path": parsed.path,
+        "query": sorted(parse_qsl(parsed.query, keep_blank_values=True)),
+        "headers": _request_header_map(request["headers"]),
+        "body": request["body"],
+    }
+
+
+def _json_pointer_resolve(document, pointer: str) -> tuple[bool, object]:
+    """Resolve an RFC 6901 JSON pointer. Returns (found, value)."""
+    if pointer == "":
+        return True, document
+    if not pointer.startswith("/"):
+        return False, None
+    current = document
+    for raw_token in pointer.split("/")[1:]:
+        token = raw_token.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, dict):
+            if token not in current:
+                return False, None
+            current = current[token]
+        elif isinstance(current, list):
+            if not re.fullmatch(r"0|[1-9][0-9]*", token):
+                return False, None
+            index = int(token)
+            if index >= len(current):
+                return False, None
+            current = current[index]
+        else:
+            return False, None
+    return True, current
+
+
+def _requests_differ_only_at(positive_req: dict, control_req: dict,
+                             location: str, name: str) -> tuple[bool, list, str]:
+    """Named-projection comparator for the differential harness.
+
+    Builds canonical projections (method, origin, path, query, headers, body)
+    for the positive and control requests, then requires the declared
+    ``(location, name)`` projection to DIFFER while every OTHER projection —
+    and the origin — stays EQUAL.
+
+    Returns ``(only_declared_changed, unexpected_changes, ambiguity)``. A
+    non-empty ``ambiguity`` string means the declared variable cannot be
+    evaluated — the named query/header/form field or JSON pointer is absent
+    from both captures, carries a ``[REDACTED]`` placeholder, or (for
+    ``body_json_pointer``) the bodies are not both valid JSON containing the
+    pointer — and the caller must reject the request. For ``body_json_pointer``
+    the simplest sound rule is used: both bodies must be valid JSON that
+    contain the pointer and the whole body must differ. ``method``,
+    ``url_path`` and ``body_text`` compare whole projections and carry no
+    named sub-value, so the absent/redacted guard does not apply to them.
+    """
+    pos = _request_projection(positive_req)
+    ctl = _request_projection(control_req)
+    unexpected: list[str] = []
+
+    # Origin is never the declared variable; it must always match.
+    if pos["origin"] != ctl["origin"]:
+        unexpected.append("origin")
+
+    def is_redacted(value) -> bool:
+        return _REDACTED_PLACEHOLDER in str(value).casefold()
+
+    def flag(key: str, label: str) -> None:
+        if pos[key] != ctl[key]:
+            unexpected.append(label)
+
+    declared_differs = False
+    ambiguity = ""
+
+    if location == "method":
+        declared_differs = pos["method"] != ctl["method"]
+        flag("path", "url_path")
+        flag("query", "query")
+        flag("headers", "header")
+        flag("body", "body")
+    elif location == "url_path":
+        declared_differs = pos["path"] != ctl["path"]
+        flag("method", "method")
+        flag("query", "query")
+        flag("headers", "header")
+        flag("body", "body")
+    elif location == "query":
+        pos_named = sorted(v for n, v in pos["query"] if n == name)
+        ctl_named = sorted(v for n, v in ctl["query"] if n == name)
+        present = any(n == name for n, _ in pos["query"] + ctl["query"])
+        if not present:
+            ambiguity = (f"declared query parameter {name!r} is absent from both "
+                         "captures, so no single-variable change can be isolated")
+        elif any(is_redacted(v) for v in pos_named + ctl_named):
+            ambiguity = (f"declared query parameter {name!r} is a redacted "
+                         "placeholder; its change cannot be evaluated")
+        declared_differs = pos_named != ctl_named
+        pos_other = [pair for pair in pos["query"] if pair[0] != name]
+        ctl_other = [pair for pair in ctl["query"] if pair[0] != name]
+        if pos_other != ctl_other:
+            unexpected.append("query")
+        flag("method", "method")
+        flag("path", "url_path")
+        flag("headers", "header")
+        flag("body", "body")
+    elif location == "header":
+        wanted = name.casefold()
+        pos_val = pos["headers"].get(wanted)
+        ctl_val = ctl["headers"].get(wanted)
+        if wanted not in pos["headers"] and wanted not in ctl["headers"]:
+            ambiguity = (f"declared header {name!r} is absent from both captures, "
+                         "so no single-variable change can be isolated")
+        elif is_redacted(pos_val) or is_redacted(ctl_val):
+            ambiguity = (f"declared header {name!r} is a redacted placeholder; "
+                         "its change cannot be evaluated")
+        declared_differs = pos_val != ctl_val
+        pos_other = {k: v for k, v in pos["headers"].items() if k != wanted}
+        ctl_other = {k: v for k, v in ctl["headers"].items() if k != wanted}
+        if pos_other != ctl_other:
+            unexpected.append("header")
+        flag("method", "method")
+        flag("path", "url_path")
+        flag("query", "query")
+        flag("body", "body")
+    elif location == "body_text":
+        declared_differs = pos["body"] != ctl["body"]
+        flag("method", "method")
+        flag("path", "url_path")
+        flag("query", "query")
+        flag("headers", "header")
+    elif location == "body_form":
+        pos_form = parse_qsl(pos["body"], keep_blank_values=True)
+        ctl_form = parse_qsl(ctl["body"], keep_blank_values=True)
+        pos_named = sorted(v for n, v in pos_form if n == name)
+        ctl_named = sorted(v for n, v in ctl_form if n == name)
+        present = any(n == name for n, _ in pos_form + ctl_form)
+        if not present:
+            ambiguity = (f"declared form field {name!r} is absent from both "
+                         "captures, so no single-variable change can be isolated")
+        elif any(is_redacted(v) for v in pos_named + ctl_named):
+            ambiguity = (f"declared form field {name!r} is a redacted "
+                         "placeholder; its change cannot be evaluated")
+        declared_differs = pos_named != ctl_named
+        pos_other = sorted(pair for pair in pos_form if pair[0] != name)
+        ctl_other = sorted(pair for pair in ctl_form if pair[0] != name)
+        if pos_other != ctl_other:
+            unexpected.append("body")
+        flag("method", "method")
+        flag("path", "url_path")
+        flag("query", "query")
+        flag("headers", "header")
+    elif location == "body_json_pointer":
+        try:
+            pos_doc = json.loads(pos["body"])
+            ctl_doc = json.loads(ctl["body"])
+        except (json.JSONDecodeError, ValueError):
+            ambiguity = (f"declared JSON pointer {name!r} cannot be evaluated: "
+                         "both request bodies must be valid JSON")
+            pos_doc = ctl_doc = None
+        if not ambiguity:
+            pos_found, pos_value = _json_pointer_resolve(pos_doc, name)
+            ctl_found, ctl_value = _json_pointer_resolve(ctl_doc, name)
+            if not (pos_found and ctl_found):
+                ambiguity = (f"declared JSON pointer {name!r} does not resolve in "
+                             "both request bodies")
+            elif is_redacted(pos_value) or is_redacted(ctl_value):
+                ambiguity = (f"declared JSON pointer {name!r} resolves to a "
+                             "redacted placeholder; its change cannot be evaluated")
+        declared_differs = pos["body"] != ctl["body"]
+        flag("method", "method")
+        flag("path", "url_path")
+        flag("query", "query")
+        flag("headers", "header")
+
+    only_declared = declared_differs and not unexpected and not ambiguity
+    return only_declared, unexpected[:8], ambiguity
+
+
+def verify_finding(workspace: Workspace, args: dict) -> dict:
+    """Read-only differential harness over saved captures.
+
+    Verifies that a declared single-variable change produces a visible,
+    replay-stable response difference between positive and control captures.
+    """
+
+    def rejected(reason: str) -> dict:
+        return _err(reason)
+
+    if not isinstance(args, dict):
+        return rejected("Input must be an object.")
+
+    positive_id = args.get("positive_exchange_id")
+    control_id = args.get("control_exchange_id")
+    replay_ids = args.get("replay_exchange_ids", [])
+    changed_var = args.get("changed_variable")
+    selected_headers = args.get("selected_response_headers", [])
+
+    if not isinstance(positive_id, str) or not re.fullmatch(r"flow-[0-9]+", positive_id):
+        return rejected("positive_exchange_id must match ^flow-[0-9]+$")
+    if not isinstance(control_id, str) or not re.fullmatch(r"flow-[0-9]+", control_id):
+        return rejected("control_exchange_id must match ^flow-[0-9]+$")
+
+    if not isinstance(replay_ids, list) or not replay_ids:
+        return rejected("replay_exchange_ids must be a non-empty array")
+    if len(replay_ids) > 2:
+        return rejected("replay_exchange_ids must have at most 2 items")
+
+    # The id-set must cover ALL roles. A set literal collapses an equal
+    # positive/control pair silently, so check that pair explicitly before
+    # folding the replays in; reusing one capture for two roles proves nothing.
+    if positive_id == control_id:
+        return rejected(f"Duplicate exchange id: {control_id} "
+                        "(positive and control must be distinct captures)")
+    seen_ids = {positive_id, control_id}
+    for rid in replay_ids:
+        if not isinstance(rid, str) or not re.fullmatch(r"flow-[0-9]+", rid):
+            return rejected(f"replay_exchange_ids item {rid!r} must match ^flow-[0-9]+$")
+        if rid in seen_ids:
+            return rejected(f"Duplicate exchange id: {rid}")
+        seen_ids.add(rid)
+
+    if not isinstance(changed_var, dict):
+        return rejected("changed_variable must be an object")
+    if set(changed_var.keys()) != {"location", "name"}:
+        return rejected("changed_variable must have exactly 'location' and 'name' keys")
+
+    location = changed_var.get("location")
+    name = changed_var.get("name")
+
+    if location not in ("method", "url_path", "query", "header", "body_form",
+                        "body_json_pointer", "body_text"):
+        return rejected(f"changed_variable.location must be one of the defined enum values")
+
+    if not isinstance(name, str) or not (1 <= len(name) <= 512):
+        return rejected("changed_variable.name must be a string of 1-512 characters")
+
+    if not isinstance(selected_headers, list):
+        return rejected("selected_response_headers must be an array")
+    if len(selected_headers) > 16:
+        return rejected("selected_response_headers must have at most 16 items")
+
+    for header_name in selected_headers:
+        if not isinstance(header_name, str):
+            return rejected("selected_response_headers items must be strings")
+        if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}", header_name):
+            return rejected(f"selected_response_headers item {header_name!r} is not a valid header name")
+
+    exchanges = {}
+    limitations = []
+
+    for ex_id in [positive_id, control_id] + replay_ids:
+        path = _flow_path(workspace, ex_id)
+        if path is None:
+            return rejected(f"Unknown flow {ex_id!r}")
+
+        try:
+            parsed = _parse_http_flow(path)
+        except ValueError as exc:
+            return rejected(f"Failed to parse {ex_id}: {exc}")
+
+        # The capture itself is unusable when its stored response was truncated
+        # (metadata flag) or when the file is larger than the parser's read cap
+        # so only a prefix was read: either way the response vectors cannot be
+        # trusted and the comparison is inconclusive.
+        if parsed["metadata"].get("response_truncated"):
+            limitations.append(
+                f"{ex_id}: the stored response was truncated, so its response "
+                "vector cannot be trusted")
+        elif parsed["read_truncated"]:
+            limitations.append(
+                f"{ex_id}: the capture is larger than the read cap, so only a "
+                "prefix was parsed and its response vector is incomplete")
+
+        exchanges[ex_id] = parsed
+
+    positive = exchanges[positive_id]
+    control = exchanges[control_id]
+    replays = [exchanges[rid] for rid in replay_ids]
+
+    only_declared_changed, req_comparison, ambiguity = _requests_differ_only_at(
+        positive["request"], control["request"], location, name
+    )
+
+    exchanges_data = []
+    for ex_id in [positive_id, control_id] + replay_ids:
+        ex = exchanges[ex_id]
+        body_sha = hashlib.sha256(
+            ex["response"]["body"].encode("utf-8", "replace")
+        ).hexdigest()
+
+        resp_digest = {
+            "status": ex["response"]["status"],
+            "body_sha256": body_sha,
+            "body_bytes": ex["response"]["body_bytes"],
+            "selected_headers": {},
+        }
+
+        resp_headers = _canonicalize_headers(ex["response"]["headers"])
+        for header_name in selected_headers:
+            header_lower = header_name.lower()
+            if header_lower in resp_headers:
+                values = resp_headers[header_lower]
+                value_text = ", ".join(values)
+                value_sha = hashlib.sha256(value_text.encode("utf-8")).hexdigest()
+                resp_digest["selected_headers"][header_name] = {
+                    "present": True,
+                    "sha256": value_sha,
+                }
+            else:
+                resp_digest["selected_headers"][header_name] = {
+                    "present": False,
+                }
+
+        role = "positive" if ex_id == positive_id else ("control" if ex_id == control_id else "replay")
+        exchanges_data.append({
+            "id": ex_id,
+            "role": role,
+            "response_digest": resp_digest,
+        })
+
+    pos_digest = exchanges_data[0]["response_digest"]
+    ctl_digest = exchanges_data[1]["response_digest"]
+    replay_digests = [entry["response_digest"] for entry in exchanges_data[2:]]
+
+    different_dims = []
+    if pos_digest["status"] != ctl_digest["status"]:
+        different_dims.append("status")
+    if pos_digest["body_sha256"] != ctl_digest["body_sha256"]:
+        different_dims.append("body_sha256")
+    if pos_digest["body_bytes"] != ctl_digest["body_bytes"]:
+        different_dims.append("body_bytes")
+
+    for header_name in selected_headers:
+        pos_h = pos_digest["selected_headers"].get(header_name, {})
+        ctl_h = ctl_digest["selected_headers"].get(header_name, {})
+        if pos_h.get("present") != ctl_h.get("present"):
+            if f"header:{header_name}" not in different_dims:
+                different_dims.append(f"header:{header_name}")
+        elif pos_h.get("present") and pos_h.get("sha256") != ctl_h.get("sha256"):
+            if f"header:{header_name}" not in different_dims:
+                different_dims.append(f"header:{header_name}")
+
+    # A replay matches only when its FULL response vector equals the positive
+    # capture's: status, body sha256, body byte length, AND every selected
+    # response header's presence+value digest. The digest dicts carry exactly
+    # these fields, so dict equality is the full-vector comparison.
+    replay_matching = sum(1 for digest in replay_digests if digest == pos_digest)
+
+    # Verdict table (applied in order):
+    #   (a) any capture truncated/incomplete -> inconclusive
+    #   (b) declared variable does not differ or other projections differ
+    #       -> invalid-control
+    #   (c) positive and control response vectors fully equal
+    #       -> no-visible-difference
+    #   (d) vectors differ and every replay matches -> supported
+    #   (e) vectors differ but some replay differs -> visible-but-unstable
+    vectors_differ = bool(different_dims)
+    # A difference is visible only when the request changes at the declared
+    # location, nothing else in the request changes, and the positive response
+    # vector differs from the control's.
+    visible = only_declared_changed and vectors_differ
+    if limitations:
+        verdict = "inconclusive"
+    elif ambiguity:
+        return rejected(ambiguity)
+    elif not only_declared_changed:
+        verdict = "invalid-control"
+    elif not vectors_differ:
+        verdict = "no-visible-difference"
+    elif replay_matching == len(replays):
+        verdict = "supported"
+    else:
+        verdict = "visible-but-unstable"
+
+    return _ok(
+        f"Differential harness: {verdict}",
+        {
+            "verdict": verdict,
+            "declared_change": {
+                "location": location,
+                "name": name,
+                "visible": visible,
+            },
+            "request_comparison": {
+                "only_declared_variable_changed": only_declared_changed,
+                "unexpected_changes": req_comparison,
+            },
+            "exchanges": exchanges_data,
+            "positive_vs_control": {
+                "different": len(different_dims) > 0,
+                "dimensions": different_dims,
+            },
+            "replay_stability": {
+                "stable": replay_matching == len(replays),
+                "matching_replays": replay_matching,
+                "total_replays": len(replays),
+            },
+            "limitations": limitations,
+        },
+    )
+
+
 def _non_url_rule_authorizes(workspace: Workspace, host: str,
                               port: Optional[int] = None) -> bool:
     """Return whether a bare host/port has a non-URL scope grant."""
@@ -2854,6 +3863,130 @@ def _browser_safe_error(exc: BaseException,
     )
 
 
+def _browser_namespace_launcher_script(
+    *,
+    executable: str,
+    jail_root: Path,
+    data_root: Path,
+    home: Path,
+    uid: int,
+    gid: int,
+) -> str:
+    """Build the root-only launcher used for the dedicated browser identity.
+
+    Some managed hosts deliberately remove search permission from the host
+    filesystem root.  A plain ``setuid`` followed by ``execve('/opt/...')``
+    then fails even though the browser binary itself is world executable.  Do
+    not loosen that shared ACL.  Instead, give Chromium a private mount
+    and PID namespaces plus a chroot whose root is searchable, bind only the
+    runtime trees it needs, and drop every credential before executing the
+    browser.  The PID namespace is entered by the required post-unshare fork,
+    before its private procfs is mounted, so a renderer cannot inspect sibling
+    browser jobs through host-wide ``/proc``.
+
+    Mounts live only for the Chromium process tree and disappear when it exits;
+    the parent namespace and host ACLs are never changed.
+    """
+    mount = config.find_binary("mount") or "/usr/bin/mount"
+    # Keep this as generated source rather than a shell command: Playwright
+    # appends browser arguments, and they must remain an argv array throughout.
+    return (
+        f"#!{sys.executable}\n"
+        "import ctypes\n"
+        "import os\n"
+        "from pathlib import Path\n"
+        "import signal\n"
+        "import subprocess\n"
+        "import sys\n"
+        f"EXECUTABLE = {executable!r}\n"
+        f"JAIL_ROOT = Path({str(jail_root)!r})\n"
+        f"DATA_ROOT = Path({str(data_root)!r})\n"
+        f"HOME_DIR = {str(home)!r}\n"
+        f"MOUNT = {mount!r}\n"
+        f"UID = {uid}\n"
+        f"GID = {gid}\n"
+        "def run_mount(*args):\n"
+        "    result = subprocess.run([MOUNT, *args], stdin=subprocess.DEVNULL, "
+        "stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)\n"
+        "    if result.returncode:\n"
+        "        detail = (result.stderr or result.stdout or 'mount failed').strip()\n"
+        "        raise RuntimeError(detail[:500])\n"
+        "libc = ctypes.CDLL(None, use_errno=True)\n"
+        "if libc.unshare(0x00020000 | 0x20000000) != 0:  # CLONE_NEWNS | CLONE_NEWPID\n"
+        "    error = ctypes.get_errno()\n"
+        "    raise OSError(error, os.strerror(error))\n"
+        "death_read, death_write = os.pipe()\n"
+        "namespace_child = os.fork()\n"
+        "if namespace_child:\n"
+        "    os.close(death_read)\n"
+        "    def forward_signal(signum, _frame):\n"
+        "        try:\n"
+        "            os.kill(namespace_child, signum)\n"
+        "        except ProcessLookupError:\n"
+        "            pass\n"
+        "    for forwarded in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):\n"
+        "        signal.signal(forwarded, forward_signal)\n"
+        "    while True:\n"
+        "        try:\n"
+        "            _waited, child_status = os.waitpid(namespace_child, 0)\n"
+        "            break\n"
+        "        except InterruptedError:\n"
+        "            continue\n"
+        "    if os.WIFEXITED(child_status):\n"
+        "        raise SystemExit(os.WEXITSTATUS(child_status))\n"
+        "    if os.WIFSIGNALED(child_status):\n"
+        "        raise SystemExit(128 + os.WTERMSIG(child_status))\n"
+        "    raise SystemExit(1)\n"
+        "os.close(death_write)\n"
+        "if libc.prctl(1, signal.SIGKILL, 0, 0, 0) != 0:  # PR_SET_PDEATHSIG\n"
+        "    error = ctypes.get_errno()\n"
+        "    raise OSError(error, os.strerror(error))\n"
+        "os.set_blocking(death_read, False)\n"
+        "try:\n"
+        "    parent_state = os.read(death_read, 1)\n"
+        "except BlockingIOError:\n"
+        "    parent_state = None\n"
+        "if parent_state == b'':\n"
+        "    os.kill(os.getpid(), signal.SIGKILL)\n"
+        "os.close(death_read)\n"
+        "run_mount('--make-rprivate', '/')\n"
+        "for source in ('/opt', '/usr', '/lib', '/lib64', '/etc'):\n"
+        "    target = JAIL_ROOT / source.lstrip('/')\n"
+        "    target.mkdir(parents=True, exist_ok=True)\n"
+        "    run_mount('--bind', source, str(target))\n"
+        "    run_mount('-o', 'remount,bind,ro', str(target))\n"
+        "dev = JAIL_ROOT / 'dev'\n"
+        "dev.mkdir(parents=True, exist_ok=True)\n"
+        "run_mount('-t', 'tmpfs', '-o', "
+        "'mode=0755,nosuid,nodev,noexec,size=8m', 'tmpfs', str(dev))\n"
+        "for name in ('null', 'zero', 'random', 'urandom'):\n"
+        "    target = dev / name\n"
+        "    target.touch(mode=0o666, exist_ok=True)\n"
+        "    run_mount('--bind', '/dev/' + name, str(target))\n"
+        "shm = dev / 'shm'\n"
+        "shm.mkdir(mode=0o1777, exist_ok=True)\n"
+        "run_mount('-t', 'tmpfs', '-o', "
+        "'mode=1777,nosuid,nodev,noexec,size=64m', 'tmpfs', str(shm))\n"
+        "proc = JAIL_ROOT / 'proc'\n"
+        "proc.mkdir(parents=True, exist_ok=True)\n"
+        "run_mount('-t', 'proc', '-o', 'nosuid,nodev,noexec', 'proc', str(proc))\n"
+        "data_target = JAIL_ROOT / str(DATA_ROOT).lstrip('/')\n"
+        "data_target.parent.mkdir(parents=True, exist_ok=True, mode=0o1777)\n"
+        "os.chmod(data_target.parent, 0o1777)\n"
+        "data_target.mkdir(mode=0o700, exist_ok=True)\n"
+        "run_mount('--bind', str(DATA_ROOT), str(data_target))\n"
+        "os.chroot(JAIL_ROOT)\n"
+        "os.chdir(HOME_DIR)\n"
+        "os.umask(0o077)\n"
+        "os.setgroups([])\n"
+        "os.setgid(GID)\n"
+        "os.setuid(UID)\n"
+        "if os.geteuid() != UID or os.getegid() != GID:\n"
+        "    raise SystemExit('browser privilege drop failed')\n"
+        "os.execv(EXECUTABLE, [EXECUTABLE, *sys.argv[1:]])\n"
+    )
+
+
 @contextmanager
 def _isolated_browser_profile(executable: str):
     """Yield a Chromium profile that never executes the browser as root."""
@@ -2903,19 +4036,16 @@ def _isolated_browser_profile(executable: str):
                 prefix="grypton-browser-launcher-", dir="/tmp"
             ))
             os.chmod(launcher_root, 0o755)
+            jail_root = launcher_root / "root"
+            jail_root.mkdir(mode=0o755)
             launcher = launcher_root / "launch.py"
-            script = (
-                f"#!{sys.executable}\n"
-                "import os\n"
-                "import sys\n"
-                "os.umask(0o077)\n"
-                f"os.chdir({str(directories['home'])!r})\n"
-                "os.setgroups([])\n"
-                f"os.setgid({gid})\n"
-                f"os.setuid({uid})\n"
-                f"if os.geteuid() != {uid} or os.getegid() != {gid}:\n"
-                "    raise SystemExit('browser privilege drop failed')\n"
-                f"os.execv({executable!r}, [{executable!r}, *sys.argv[1:]])\n"
+            script = _browser_namespace_launcher_script(
+                executable=executable,
+                jail_root=jail_root,
+                data_root=data_root,
+                home=directories["home"],
+                uid=uid,
+                gid=gid,
             )
             flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(launcher, flags, 0o500)
@@ -2947,6 +4077,44 @@ def _isolated_browser_profile(executable: str):
         if launcher_root is not None:
             shutil.rmtree(launcher_root, ignore_errors=True)
         shutil.rmtree(data_root, ignore_errors=True)
+
+
+def browser_runtime_status(probe: bool = True) -> tuple[bool, str]:
+    """Report whether the configured browser can run through its isolation boundary."""
+    executable = _browser_executable()
+    if not executable:
+        return False, "browser executable is unavailable"
+    executable_name = Path(executable).name[:80] or "browser"
+    if not probe:
+        return True, f"browser executable is available ({executable_name})"
+
+    try:
+        with _isolated_browser_profile(executable) as launch_profile:
+            result = subprocess.run(
+                [str(launch_profile["executable"]), "--version"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=15,
+                text=True,
+                env=launch_profile["environment"],
+            )
+            identity = str(launch_profile.get("identity") or "isolated")
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        detail = _browser_safe_error(exc)
+        detail = " ".join(detail.strip().split())[:240] or "probe failed"
+        return False, f"isolated browser runtime probe failed: {detail}"
+
+    if result.returncode != 0:
+        raw_detail = result.stderr or result.stdout or "browser exited unsuccessfully"
+        detail = _browser_safe_error(RuntimeError(raw_detail))
+        detail = " ".join(detail.strip().split())[:240]
+        return False, f"isolated browser runtime probe failed: {detail}"
+    safe_identity = re.sub(r"[^A-Za-z0-9_.=-]", "", identity)[:80] or "isolated"
+    return True, (
+        f"isolated browser runtime is ready ({executable_name}; "
+        f"identity={safe_identity})"
+    )
 
 
 _BROWSER_SPLIT_CODE_STEMS = frozenset({
@@ -6301,7 +7469,7 @@ def _credential_browser_login_locked(
         )
         if maintenance_generation is None:
             credentials.ensure_login_attempt_available(workspace.slug, credential)
-        elif status_verification is None:
+        elif status_verification is None and _refresh_generation is not None:
             return _err(
                 "Browser session maintenance requires status-differential verification."
             )
@@ -9493,9 +10661,10 @@ def credential_browser_state_upgrade(workspace: Workspace,
                 return _err("Browser-state upgrade requires a browser authentication profile.")
             browser = profile["browser"]
             verification = browser.get("verification")
-            if not isinstance(verification, dict):
+            success_marker = str(profile.get("success_marker") or "")
+            if not isinstance(verification, dict) and not success_marker:
                 return _err(
-                    "Browser-state upgrade requires status-differential verification."
+                    "Browser-state upgrade requires configured browser verification."
                 )
             profile_revision = credentials.auth_profile_revision(profile)
             with credentials.session_material_lock(workspace.slug, credential):
@@ -9534,14 +10703,594 @@ def credential_browser_state_upgrade(workspace: Workspace,
                     username_selector=browser["username_selector"],
                     password_selector=browser["password_selector"],
                     submit_selector=browser["submit_selector"],
-                    verify_url=profile["verify_url"], success_marker="",
+                    verify_url=profile["verify_url"],
+                    success_marker=(
+                        "" if isinstance(verification, dict) else success_marker
+                    ),
                     verify_headers=browser["verify_headers"],
-                    verification=verification, timeout=profile["timeout"],
+                    verification=(
+                        verification if isinstance(verification, dict) else None
+                    ),
+                    timeout=profile["timeout"],
                     _upgrade_generation=generation,
                     _profile_revision=profile_revision,
                 )
     except (OSError, ValueError, credentials.CredentialError) as exc:
         return _err(str(exc))
+
+
+def _browser_workflow_selector(value: object) -> str:
+    selector = str(value or "").strip()
+    if (
+        not selector or len(selector) > 500
+        or any(ord(char) < 0x20 or ord(char) == 0x7f for char in selector)
+    ):
+        raise ValueError("Browser workflow selectors must be 1-500 printable characters.")
+    return selector
+
+
+def _browser_workflow_actions(value: object) -> list[dict]:
+    """Validate the complete declarative workflow before launching Chromium."""
+    if not isinstance(value, list) or not 1 <= len(value) <= _BROWSER_WORKFLOW_MAX_ACTIONS:
+        raise ValueError(
+            f"Browser workflow actions must contain 1-{_BROWSER_WORKFLOW_MAX_ACTIONS} items."
+        )
+    allowed_keys = {
+        "goto": {"action", "url"},
+        "click": {"action", "selector"},
+        "fill": {"action", "selector", "value"},
+        "select": {"action", "selector", "value", "values"},
+        "check": {"action", "selector"},
+        "uncheck": {"action", "selector"},
+        "press": {"action", "selector", "key"},
+        "wait": {"action", "milliseconds"},
+        "inspect": {"action", "selector", "max_chars"},
+        "snapshot": {"action"},
+        "upload": {"action", "selector", "path", "paths"},
+    }
+    normalized: list[dict] = []
+    waited = 0
+    saw_goto = False
+    for index, raw in enumerate(value):
+        if not isinstance(raw, dict):
+            raise ValueError(f"Browser workflow action {index + 1} must be an object.")
+        action = str(raw.get("action") or "").strip().lower()
+        if action not in allowed_keys:
+            raise ValueError(f"Browser workflow action {index + 1} has an unsupported type.")
+        unknown = sorted(str(key) for key in set(raw) - allowed_keys[action])
+        if unknown:
+            raise ValueError(
+                f"Browser workflow action {index + 1} has unsupported fields: "
+                + ", ".join(unknown)
+                + "."
+            )
+        item: dict[str, object] = {"action": action}
+        if action == "goto":
+            url = str(raw.get("url") or "").strip()
+            if not url or len(url) > 8192:
+                raise ValueError("Browser workflow goto URLs must be 1-8192 characters.")
+            item["url"] = url
+            saw_goto = True
+        elif action in {"click", "fill", "select", "check", "uncheck", "press", "inspect", "upload"}:
+            item["selector"] = _browser_workflow_selector(raw.get("selector"))
+        if action == "fill":
+            fill_value = raw.get("value")
+            if not isinstance(fill_value, str):
+                raise ValueError("Browser workflow fill values must be strings.")
+            if len(fill_value.encode("utf-8")) > 100_000:
+                raise ValueError("Browser workflow fill value exceeds 100,000 bytes.")
+            item["value"] = fill_value
+        elif action == "select":
+            if ("value" in raw) == ("values" in raw):
+                raise ValueError("Browser workflow select requires exactly one of value or values.")
+            selections = raw.get("values") if "values" in raw else [raw.get("value")]
+            if not isinstance(selections, list) or not 1 <= len(selections) <= 20:
+                raise ValueError("Browser workflow select accepts 1-20 string values.")
+            if any(not isinstance(item_value, str) or len(item_value) > 2000
+                   for item_value in selections):
+                raise ValueError("Browser workflow select values must be strings up to 2,000 characters.")
+            item["values"] = list(selections)
+        elif action == "press":
+            key = raw.get("key")
+            if (
+                not isinstance(key, str) or not 1 <= len(key) <= 100
+                or any(ord(char) < 0x20 or ord(char) == 0x7f for char in key)
+            ):
+                raise ValueError("Browser workflow press keys must be 1-100 printable characters.")
+            item["key"] = key
+        elif action == "wait":
+            milliseconds = raw.get("milliseconds")
+            if (
+                isinstance(milliseconds, bool) or not isinstance(milliseconds, int)
+                or not 0 <= milliseconds <= 5000
+            ):
+                raise ValueError("Browser workflow waits must be 0-5,000 milliseconds.")
+            waited += milliseconds
+            if waited > 10_000:
+                raise ValueError("Browser workflow cumulative wait exceeds 10,000 milliseconds.")
+            item["milliseconds"] = milliseconds
+        elif action == "inspect":
+            maximum = raw.get("max_chars", 4000)
+            if (
+                isinstance(maximum, bool) or not isinstance(maximum, int)
+                or not 1 <= maximum <= _BROWSER_WORKFLOW_MAX_INSPECT_CHARS
+            ):
+                raise ValueError(
+                    f"Browser workflow inspect max_chars must be 1-{_BROWSER_WORKFLOW_MAX_INSPECT_CHARS}."
+                )
+            item["max_chars"] = maximum
+        elif action == "upload":
+            if ("path" in raw) == ("paths" in raw):
+                raise ValueError("Browser workflow upload requires exactly one of path or paths.")
+            paths = raw.get("paths") if "paths" in raw else [raw.get("path")]
+            if not isinstance(paths, list) or not 1 <= len(paths) <= 4:
+                raise ValueError("Browser workflow upload accepts 1-4 file paths.")
+            if any(not isinstance(path, str) or not path.strip() or len(path) > 4096
+                   for path in paths):
+                raise ValueError("Browser workflow upload paths must be non-empty strings.")
+            item["paths"] = [str(path).strip() for path in paths]
+        normalized.append(item)
+    if not saw_goto:
+        raise ValueError("Browser workflow requires at least one goto action.")
+    return normalized
+
+
+def _browser_workflow_upload_payload(workspace: Workspace, path: str) -> tuple[dict, str]:
+    """Read one upload through the anchored engagement/tool-output opener."""
+    root, root_parts, relative, display = _local_analysis_file_reference(workspace, path)
+    fd, size = _open_regular_file_beneath(root, relative, root_parts=root_parts)
+    try:
+        if size > _BROWSER_WORKFLOW_MAX_UPLOAD_BYTES:
+            raise ValueError("browser upload exceeds the 16 MB per-file limit")
+        chunks: list[bytes] = []
+        remaining = size
+        while remaining:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                raise ValueError("browser upload changed while it was being read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(fd, 1):
+            raise ValueError("browser upload changed while it was being read")
+    finally:
+        os.close(fd)
+    filename = Path(relative).name
+    mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return {"name": filename, "mimeType": mime_type, "buffer": b"".join(chunks)}, display
+
+
+def _browser_workflow_final_page(context, page):
+    pages = getattr(context, "pages", None)
+    if isinstance(pages, list) and pages:
+        return pages[-1]
+    return page
+
+
+def browser_workflow(
+    workspace: Workspace, actions: object, *, credential: str = "", timeout: int = 60,
+) -> dict:
+    """Run one bounded stateful sequence in a single scoped Chromium context."""
+    try:
+        normalized_actions = _browser_workflow_actions(actions)
+        if not isinstance(credential, str):
+            raise ValueError("Browser workflow credential must be an alias string.")
+        credential = credential.strip()
+        timeout_seconds = max(5, min(int(timeout), 120))
+        deadline = time.monotonic() + timeout_seconds
+        for action in normalized_actions:
+            if action["action"] == "goto":
+                blocked = _scope_error(workspace, str(action["url"]))
+                if blocked:
+                    return blocked
+        policy_values = request_policy.all_resolved_secret_values(workspace.slug)
+    except (OSError, TypeError, ValueError, request_policy.RequestPolicyError) as exc:
+        return _err(str(exc))
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return _err("Python Playwright is not installed.")
+    executable = _browser_executable()
+    if not executable:
+        return _err("No Playwright-compatible Chromium or Chrome executable is installed.")
+
+    def run_locked() -> dict:
+        profile = None
+        state: dict = {}
+        rich_state: dict = {}
+        bound_origin = ""
+        private_values: list[str] = list(policy_values)
+        tokens: dict[str, str] = {}
+        if credential:
+            profile = credentials.load_auth_profile_optional(workspace.slug, credential)
+            state = credentials.load_attempt_state(workspace.slug, credential)
+            if not state["established"]:
+                return _err(f"Named credential {credential!r} has no established session.")
+            if not isinstance(profile, dict) or profile.get("strategy") != "browser":
+                return _err(
+                    "Browser workflows require the current configured browser authentication profile."
+                )
+            revision = credentials.auth_profile_revision(profile)
+            if str(state.get("proof_profile_revision") or "") != revision:
+                return _err(
+                    "The browser authentication profile changed after the current session proof; "
+                    "reauthenticate before a browser workflow."
+                )
+            bound_origin = credentials.normalize_origin(str(state.get("origin") or ""))
+            for action in normalized_actions:
+                if action["action"] == "goto" and credentials.normalize_origin(
+                    str(action["url"])
+                ) != bound_origin:
+                    return _err(
+                        "Authenticated browser workflow goto URLs must match the session's exact origin."
+                    )
+            rich_state = credentials.load_browser_storage(workspace.slug, credential)
+            if not rich_state.get("available"):
+                return _err(
+                    "Exact private browser state is unavailable for this proven legacy session; "
+                    "upgrade the configured browser session before using browser workflows.",
+                    {"credential": credential, "migration_required": True,
+                     "session": credentials.session_status(workspace.slug, credential)},
+                )
+            if (
+                rich_state.get("origin") != bound_origin
+                or rich_state.get("proof_generation") != state["proof_generation"]
+                or rich_state.get("profile_revision") != revision
+            ):
+                return _err("Private browser state no longer matches the session proof.")
+            secret = credentials.load_credential(workspace.slug, credential)
+            tokens = credentials.load_tokens(workspace.slug, credential)
+            private_values.extend((secret["username"], secret["password"], *tokens.values()))
+            for cookie in rich_state.get("cookies") or []:
+                if isinstance(cookie, dict):
+                    private_values.append(str(cookie.get("value") or ""))
+            for area_name in ("local_storage", "session_storage"):
+                area = rich_state.get(area_name) or {}
+                if isinstance(area, dict):
+                    private_values.extend(str(item) for item in area.values())
+
+        private_values.extend(
+            str(action.get("value") or "")
+            for action in normalized_actions if action["action"] == "fill"
+        )
+        private_values.extend(
+            str(item)
+            for action in normalized_actions if action["action"] == "select"
+            for item in action.get("values") or []
+        )
+        class BoundedDeniedRequests(list):
+            def append(self, value) -> None:
+                if len(self) < 100:
+                    super().append(str(value)[:8192])
+
+        denied_requests: list[str] = BoundedDeniedRequests()
+        network_state = {
+            "count": 0, "blocked": 0,
+            "limit": _BROWSER_WORKFLOW_MAX_NETWORK_REQUESTS,
+        }
+        request_rows: list[dict] = []
+        request_indexes: dict[int, int] = {}
+        action_results: list[dict] = []
+        final_cookies = list(rich_state.get("cookies") or [])
+        final_local = dict(rich_state.get("local_storage") or {})
+        final_session = dict(rich_state.get("session_storage") or {})
+        context = None
+        page = None
+        browser_identity = ""
+        failure = ""
+        final_url = ""
+        rendered_dom = ""
+
+        def remember_request(request) -> None:
+            if len(request_rows) >= _BROWSER_WORKFLOW_MAX_NETWORK_REQUESTS:
+                return
+            row = {
+                "method": str(request.method or "GET").upper(),
+                "url": str(request.url or "")[:8192],
+                "resource_type": str(request.resource_type or ""),
+                "status": 0, "failed": False, "response_seen": False,
+            }
+            request_indexes[id(request)] = len(request_rows)
+            request_rows.append(row)
+
+        def remember_response(response) -> None:
+            index = request_indexes.get(id(response.request))
+            if index is None:
+                return
+            request_rows[index]["status"] = int(response.status or 0)
+            request_rows[index]["response_seen"] = True
+
+        def remember_failure(request) -> None:
+            index = request_indexes.get(id(request))
+            if index is not None:
+                request_rows[index]["failed"] = True
+
+        try:
+            with _isolated_browser_profile(executable) as launch_profile:
+                browser_identity = str(launch_profile["identity"])
+                with sync_playwright() as playwright:
+                    context = _launch_scoped_browser_context(
+                        playwright, launch_profile, workspace, denied_requests,
+                        exact_origin=bound_origin,
+                        network_state=network_state,
+                        launch_timeout_ms=max(1, int((deadline - time.monotonic()) * 1000)),
+                    )
+                    if credential:
+                        context.add_cookies(list(rich_state.get("cookies") or []))
+                        _browser_auth_restore_storage(context, bound_origin, rich_state)
+                    context.on("request", remember_request)
+                    context.on("response", remember_response)
+                    context.on("requestfailed", remember_failure)
+                    page = context.new_page()
+                    for index, action in enumerate(normalized_actions):
+                        remaining_ms = int((deadline - time.monotonic()) * 1000)
+                        if remaining_ms <= 0:
+                            raise TimeoutError("browser workflow deadline expired")
+                        if hasattr(page, "set_default_timeout"):
+                            page.set_default_timeout(max(1, min(remaining_ms, 15_000)))
+                        action_name = str(action["action"])
+                        result: dict[str, object] = {
+                            "index": index + 1, "action": action_name,
+                        }
+                        if action_name == "goto":
+                            response = page.goto(
+                                str(action["url"]), wait_until="domcontentloaded",
+                                timeout=max(1, min(remaining_ms, 30_000)),
+                            )
+                            result["status"] = int(response.status) if response else 0
+                        elif action_name == "click":
+                            page.locator(str(action["selector"])).click()
+                        elif action_name == "fill":
+                            page.locator(str(action["selector"])).fill(str(action["value"]))
+                        elif action_name == "select":
+                            page.locator(str(action["selector"])).select_option(
+                                list(action["values"])
+                            )
+                        elif action_name == "check":
+                            page.locator(str(action["selector"])).check()
+                        elif action_name == "uncheck":
+                            page.locator(str(action["selector"])).uncheck()
+                        elif action_name == "press":
+                            page.locator(str(action["selector"])).press(str(action["key"]))
+                        elif action_name == "wait":
+                            page.wait_for_timeout(int(action["milliseconds"]))
+                        elif action_name == "inspect":
+                            text_value = str(
+                                page.locator(str(action["selector"])).inner_text() or ""
+                            )
+                            maximum = int(action["max_chars"])
+                            result["text"] = text_value[:maximum]
+                            result["truncated"] = len(text_value) > maximum
+                        elif action_name == "snapshot":
+                            result["title"] = str(page.title() or "")[:1000]
+                        elif action_name == "upload":
+                            files: list[dict] = []
+                            displayed: list[str] = []
+                            for upload_path in action["paths"]:
+                                payload, display = _browser_workflow_upload_payload(
+                                    workspace, str(upload_path)
+                                )
+                                files.append(payload)
+                                displayed.append(display)
+                            page.locator(str(action["selector"])).set_input_files(files)
+                            result["files"] = displayed
+                        page = _browser_workflow_final_page(context, page)
+                        current_url = str(page.url or "")
+                        allowed, reason = check_url_scope(workspace, current_url)
+                        if not allowed:
+                            raise RuntimeError(
+                                f"browser workflow ended outside scope after action {index + 1}: {reason}"
+                            )
+                        if bound_origin and credentials.normalize_origin(current_url) != bound_origin:
+                            raise RuntimeError(
+                                f"browser workflow left the authenticated session origin after action {index + 1}"
+                            )
+                        result["url"] = current_url[:8192]
+                        action_results.append(result)
+                    if page is not None:
+                        final_local = _browser_auth_local_storage(page)
+                        final_session = _browser_auth_session_storage(page)
+                    if credential:
+                        final_cookies = _browser_auth_persistable_cookies(
+                            list(context.cookies()), bound_origin
+                        )
+                    if page is not None:
+                        final_url = str(page.url or "")[:8192]
+                        rendered_dom = str(page.content() or "")[:MAX_RESPONSE_BYTES]
+                    # Capture while Playwright and the browser transport are
+                    # still alive.  Once the sync_playwright context exits,
+                    # page.content() and context.close() can no longer reach
+                    # the browser even though their Python objects remain.
+                    context.close()
+                    context = None
+        except Exception as exc:
+            failure = _browser_safe_error(exc, _serialized_secret_variants(private_values))
+        finally:
+            if context is not None:
+                try:
+                    if page is not None:
+                        final_url = str(page.url or "")[:8192]
+                        rendered_dom = str(page.content() or "")[:MAX_RESPONSE_BYTES]
+                except Exception:
+                    failure = failure or "Browser workflow final DOM capture failed."
+                if credential:
+                    try:
+                        if page is not None:
+                            final_local = _browser_auth_local_storage(page)
+                            final_session = _browser_auth_session_storage(page)
+                        final_cookies = _browser_auth_persistable_cookies(
+                            list(context.cookies()), bound_origin
+                        )
+                    except Exception:
+                        pass
+                try:
+                    context.close()
+                except Exception:
+                    pass
+        new_tokens = dict(tokens)
+        if credential:
+            new_tokens.update(_browser_auth_tokens((), final_local, final_session))
+        private_values.extend(new_tokens.values())
+        private_values.extend(
+            str(cookie.get("value") or "")
+            for cookie in final_cookies if isinstance(cookie, dict)
+        )
+        for area in (final_local, final_session):
+            private_values.extend(str(item) for item in area.values())
+        for result in action_results:
+            for field in ("text", "title"):
+                observed = result.get(field)
+                if isinstance(observed, str):
+                    private_values.extend(
+                        _browser_private_response_values(observed, {})
+                    )
+            private_values.extend(_browser_private_response_values(
+                "", {"location": str(result.get("url") or "")}
+            ))
+        private_values.extend(_browser_private_response_values(rendered_dom, {}))
+        private_values.extend(
+            value
+            for row in request_rows
+            for value in _browser_private_response_values(
+                "", {"location": str(row.get("url") or "")}
+            )
+        )
+        private_values.extend(
+            _browser_private_response_values("", {"location": final_url})
+        )
+        secrets = _serialized_secret_variants(private_values)
+        safe_actions = _redacted_capture_value(action_results, secrets)
+        safe_dom = redact_sensitive_text(rendered_dom, secrets)
+        safe_final_url = redact_sensitive_text(final_url, secrets)
+        flow_paths: list[str] = []
+        capture_failed = False
+        for row in request_rows:
+            try:
+                flow = _save_flow(
+                    workspace, str(row.get("method") or "GET"),
+                    str(row.get("url") or ""), {}, None,
+                    "HTTP " + str(int(row.get("status") or 0)),
+                    transport=(
+                        f"credential-browser-workflow:{credential}"
+                        if credential else "browser-workflow"
+                    ),
+                    returncode=1 if row.get("failed") else 0,
+                    secret_values=secrets,
+                )
+                flow_paths.append(str(flow))
+            except OSError:
+                capture_failed = True
+                failure = failure or "Browser workflow request capture could not be saved."
+                break
+        dom_path = ""
+        if not failure:
+            try:
+                workspace.scratch_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                output = workspace.scratch_dir / f"browser-workflow-{time.time_ns()}.html"
+                fd = os.open(
+                    output, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600
+                )
+                with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                    stream.write(safe_dom)
+                dom_path = str(output)
+            except OSError:
+                capture_failed = True
+                failure = "Browser workflow final DOM capture could not be saved."
+
+        committed = False
+        rolled_back = False
+        if credential and not failure and not capture_failed:
+            snapshots: list[tuple[Path, tuple[bool, bytes, int]]] = []
+            try:
+                credentials.canonical_browser_storage(
+                    origin=bound_origin, cookies=final_cookies,
+                    local_storage=final_local, session_storage=final_session,
+                )
+                current_state = credentials.load_attempt_state(workspace.slug, credential)
+                if (
+                    not current_state["established"]
+                    or current_state["proof_generation"] != state["proof_generation"]
+                    or str(current_state.get("proof_profile_revision") or "")
+                    != str(state.get("proof_profile_revision") or "")
+                ):
+                    raise credentials.CredentialError(
+                        "authenticated session proof changed during browser workflow"
+                    )
+                paths = (
+                    credentials.cookie_jar_storage_path(workspace.slug, credential),
+                    credentials.token_path(workspace.slug, credential),
+                    credentials.browser_storage_path(workspace.slug, credential),
+                )
+                snapshots = [(path, _snapshot_private_material(path)) for path in paths]
+                _browser_auth_install_cookies(
+                    workspace, credential, final_cookies, bound_origin
+                )
+                if new_tokens:
+                    credentials.save_tokens(
+                        workspace.slug, credential, new_tokens, origin=bound_origin
+                    )
+                credentials.save_browser_storage(
+                    workspace.slug, credential, origin=bound_origin,
+                    cookies=final_cookies, local_storage=final_local,
+                    session_storage=final_session,
+                )
+                committed = True
+            except Exception:
+                failure = "Private browser session changes could not be saved."
+                rolled_back = True
+                for path, snapshot in reversed(snapshots):
+                    try:
+                        _restore_private_material(path, snapshot)
+                    except (OSError, credentials.CredentialError):
+                        pass
+
+        safe_network = [
+            {
+                "method": str(row.get("method") or "GET"),
+                "url": redact_sensitive_text(str(row.get("url") or ""), secrets),
+                "resource_type": str(row.get("resource_type") or ""),
+                "status": int(row.get("status") or 0),
+                "failed": bool(row.get("failed")),
+                "flow": flow_paths[index] if index < len(flow_paths) else "",
+            }
+            for index, row in enumerate(request_rows)
+        ]
+        data = {
+            "credential": credential,
+            "authenticated": bool(credential),
+            "actions": safe_actions,
+            "actions_completed": len(action_results),
+            "final_url": safe_final_url,
+            "html_path": dom_path,
+            "flows": flow_paths,
+            "network_requests": safe_network,
+            "network_request_count": int(network_state.get("count") or 0),
+            "blocked_requests": [
+                redact_sensitive_text(item, secrets) for item in denied_requests[:100]
+            ],
+            "blocked_request_count": int(network_state.get("blocked") or 0),
+            "browser_identity": browser_identity,
+            "session_material_committed": committed,
+            "session_material_rollback": rolled_back,
+        }
+        if credential:
+            data["session"] = credentials.session_status(workspace.slug, credential)
+        if failure:
+            return _err(f"Browser workflow failed: {failure}", data)
+        return _ok(
+            f"Browser workflow completed {len(action_results)} actions and captured "
+            f"{len(flow_paths)} request flows.",
+            data,
+        )
+
+    try:
+        if credential:
+            with credentials.auth_profile_lock(workspace.slug, credential):
+                with credentials.session_material_lock(workspace.slug, credential):
+                    return run_locked()
+        return run_locked()
+    except (OSError, ValueError, credentials.CredentialError) as exc:
+        return _err(_browser_safe_error(exc, _serialized_secret_variants(policy_values)))
 
 
 def authenticated_browser_request(
@@ -9651,9 +11400,9 @@ def authenticated_browser_request(
                 if not rich_state.get("available"):
                     return _err(
                         "Exact private browser state is unavailable for this proven legacy "
-                        "session; call credential_browser_login with "
-                        "upgrade_browser_state=true once before using browser-context "
-                        "requests.",
+                        "session; call the configured credential_browser_login with the "
+                        "literal option upgrade_browser_state=true once before using "
+                        "browser-context requests.",
                         {
                             "credential": credential,
                             "migration_required": True,
@@ -10822,6 +12571,8 @@ _RESEARCH_DOCUMENTATION_HOSTS = frozenset({
 _MAX_LOCAL_ANALYZE_BYTES = 64 * 1024 * 1024
 _MAX_LOCAL_ANALYZE_OUTPUT = 64_000
 _MAX_LOCAL_SEARCH_PATTERN_BYTES = 4096
+_MAX_LOCAL_SEARCH_PATTERNS = 32
+_MAX_LOCAL_SEARCH_TOTAL_PATTERN_BYTES = 16_384
 _MAX_LOCAL_SEARCH_MATCHES = 50
 _MAX_LOCAL_SEARCH_CONTEXT_BYTES = 2048
 _MAX_LOCAL_SEARCH_RETURN_BYTES = 48_000
@@ -11110,6 +12861,7 @@ def _render_search_matches(data: bytes, positions: list[tuple[int, int]], *,
 
 def local_analyze(workspace: Workspace, path: str, *, analyzer: str = "file",
                   min_length: int = 6, pattern: str = "",
+                  patterns: Optional[list[str]] = None,
                   ignore_case: bool = False, context_bytes: int = 160,
                   max_matches: int = 20) -> dict:
     """Run one fixed, offline analyzer against one safely opened workspace file."""
@@ -11130,19 +12882,121 @@ def local_analyze(workspace: Workspace, path: str, *, analyzer: str = "file",
     try:
         if analyzer in {"literal", "regex"}:
             try:
-                encoded_pattern = str(pattern or "").encode("utf-8")
                 requested_matches = int(max_matches)
                 requested_context = int(context_bytes)
             except (TypeError, ValueError, UnicodeError):
                 return _err("Search parameters must be valid UTF-8 text and integers.")
-            if not encoded_pattern:
-                return _err("Search pattern must not be empty.")
-            if len(encoded_pattern) > _MAX_LOCAL_SEARCH_PATTERN_BYTES:
-                return _err("Search pattern exceeds the 4096-byte limit.")
             if not 1 <= requested_matches <= _MAX_LOCAL_SEARCH_MATCHES:
                 return _err("max_matches must be between 1 and 50.")
             if not 0 <= requested_context <= _MAX_LOCAL_SEARCH_CONTEXT_BYTES:
                 return _err("context_bytes must be between 0 and 2048.")
+
+            batch_requested = patterns is not None
+            raw_patterns: list[object]
+            if batch_requested:
+                if not isinstance(patterns, list) or not patterns:
+                    return _err("patterns must be a non-empty array of search strings.")
+                if len(patterns) > _MAX_LOCAL_SEARCH_PATTERNS:
+                    return _err("patterns may contain at most 32 search strings.")
+                raw_patterns = list(patterns)
+            else:
+                raw_patterns = [pattern]
+
+            prepared: list[tuple[str, bytes]] = []
+            seen_patterns: set[str] = set()
+            total_pattern_bytes = 0
+            for raw_pattern in raw_patterns:
+                if not isinstance(raw_pattern, str):
+                    return _err("Every search pattern must be UTF-8 text.")
+                try:
+                    encoded_pattern = raw_pattern.encode("utf-8")
+                except UnicodeError:
+                    return _err("Every search pattern must be UTF-8 text.")
+                if not encoded_pattern:
+                    return _err("Search patterns must not be empty.")
+                if len(encoded_pattern) > _MAX_LOCAL_SEARCH_PATTERN_BYTES:
+                    return _err("Each search pattern must fit the 4096-byte limit.")
+                total_pattern_bytes += len(encoded_pattern)
+                if total_pattern_bytes > _MAX_LOCAL_SEARCH_TOTAL_PATTERN_BYTES:
+                    return _err("Combined search patterns exceed the 16384-byte limit.")
+                if raw_pattern in seen_patterns:
+                    continue
+                seen_patterns.add(raw_pattern)
+                prepared.append((raw_pattern, encoded_pattern))
+
+            # A batch shares one global match and response budget. This lets
+            # Kraude inventory many routes/keys in one tool turn without
+            # allowing an N-pattern request to multiply the existing bounds.
+            if batch_requested:
+                data = _read_open_file(fd, size)
+                results = []
+                returned_total = 0
+                response_bytes = 0
+                any_truncated = False
+                for text_pattern, encoded_pattern in prepared:
+                    remaining = max(0, requested_matches - returned_total)
+                    search_limit = max(1, remaining + 1)
+                    if analyzer == "literal":
+                        positions = _literal_search_positions(
+                            data, encoded_pattern, ignore_case=bool(ignore_case),
+                            limit=search_limit,
+                        )
+                    else:
+                        positions = _regex_search_positions(
+                            fd, size, text_pattern, ignore_case=bool(ignore_case),
+                            limit=search_limit,
+                        )
+                    selected = positions[:remaining]
+                    matches, response_truncated = _render_search_matches(
+                        data, selected, context_bytes=requested_context,
+                    )
+                    # Preserve the single-search response-size ceiling across
+                    # the whole batch rather than once per pattern.
+                    accepted = []
+                    for match in matches:
+                        rendered_bytes = len(json.dumps(
+                            match, ensure_ascii=False, separators=(",", ":")
+                        ).encode("utf-8"))
+                        if accepted and response_bytes + rendered_bytes > _MAX_LOCAL_SEARCH_RETURN_BYTES:
+                            response_truncated = True
+                            break
+                        if not accepted and response_bytes + rendered_bytes > _MAX_LOCAL_SEARCH_RETURN_BYTES:
+                            response_truncated = True
+                            break
+                        response_bytes += rendered_bytes
+                        accepted.append(match)
+                    returned_total += len(accepted)
+                    truncated = (
+                        len(positions) > len(accepted)
+                        or response_truncated
+                        or returned_total >= requested_matches
+                        and len(positions) > len(accepted)
+                    )
+                    any_truncated = any_truncated or truncated
+                    results.append({
+                        "pattern": text_pattern,
+                        "matches_returned": len(accepted),
+                        "truncated": truncated,
+                        "matches": accepted,
+                    })
+                qualifier = "; additional matches omitted" if any_truncated else ""
+                return _ok(
+                    f"Searched {len(prepared)} {analyzer} pattern(s) in "
+                    f"{display_path}; returned {returned_total} match(es){qualifier}.",
+                    {
+                        "analyzer": analyzer,
+                        "path": display_path,
+                        "bytes": size,
+                        "patterns_requested": len(raw_patterns),
+                        "patterns_searched": len(prepared),
+                        "matches_returned": returned_total,
+                        "truncated": any_truncated,
+                        "context_bytes": requested_context,
+                        "results": results,
+                    },
+                )
+
+            encoded_pattern = prepared[0][1]
             search_limit = requested_matches + 1
             if analyzer == "literal":
                 data = _read_open_file(fd, size)

@@ -118,6 +118,44 @@ class LocalAnalyzeSearchTests(unittest.TestCase):
             self.assertTrue(match["match_truncated"])
             self.assertLess(len(match["match_preview"]), 700)
 
+    def test_batch_search_reads_once_and_shares_global_match_budget(self):
+        with isolated_runtime():
+            workspace = self.workspace("batch-search")
+            payload = (
+                b"const user='/api/users';\n"
+                b"const admin='/api/admin';\n"
+                b"fetch('/api/users'); fetch('/api/users');\n"
+            )
+            (workspace.loot_dir / "bundle.js").write_bytes(payload)
+
+            result = local_analyze(
+                workspace, "loot/bundle.js", analyzer="literal",
+                patterns=["/api/users", "/api/admin", "/missing", "/api/users"],
+                context_bytes=8, max_matches=3,
+            )
+
+            self.assertTrue(result["ok"], result)
+            data = result["data"]
+            self.assertEqual(data["patterns_requested"], 4)
+            self.assertEqual(data["patterns_searched"], 3)
+            self.assertEqual(data["matches_returned"], 3)
+            self.assertTrue(data["truncated"])
+            self.assertEqual(
+                [row["pattern"] for row in data["results"]],
+                ["/api/users", "/api/admin", "/missing"],
+            )
+            self.assertEqual(data["results"][0]["matches_returned"], 3)
+            self.assertEqual(data["results"][1]["matches_returned"], 0)
+
+            regex = local_analyze(
+                workspace, "loot/bundle.js", analyzer="regex",
+                patterns=[r"/api/(?:users|admin)", r"fetch\("],
+                context_bytes=0, max_matches=6,
+            )
+            self.assertTrue(regex["ok"], regex)
+            self.assertEqual(regex["data"]["patterns_searched"], 2)
+            self.assertGreaterEqual(regex["data"]["matches_returned"], 4)
+
     def test_search_rejects_invalid_input_and_schema_exposes_bounds(self):
         with isolated_runtime():
             workspace = self.workspace("invalid-search")
@@ -140,6 +178,7 @@ class LocalAnalyzeSearchTests(unittest.TestCase):
             self.assertEqual(schema["properties"]["context_bytes"]["maximum"], 2048)
             self.assertIn("literal", schema["properties"]["analyzer"]["enum"])
             self.assertIn("regex", schema["properties"]["analyzer"]["enum"])
+            self.assertEqual(schema["properties"]["patterns"]["maxItems"], 32)
             self.assertIn("engagement/", schema["properties"]["path"]["description"])
             self.assertIn(
                 "opencode-tool-output/",
